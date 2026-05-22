@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime/debug"
 	"sort"
 	"strings"
@@ -47,13 +48,14 @@ const (
 )
 
 type Entry struct {
-	Path      string
-	Name      string
-	LowerPath string
-	LowerName string
-	Size      int64
-	Mode      uint32
-	ModUnix   int64
+	Path        string
+	Name        string
+	LowerPath   string
+	LowerName   string
+	Size        int64
+	Mode        uint32
+	ModUnix     int64
+	IndexSource string
 }
 
 type jsonError struct {
@@ -69,6 +71,7 @@ type jsonResult struct {
 	Size        *int64 `json:"size,omitempty"`
 	Modified    string `json:"modified,omitempty"`
 	IndexSource string `json:"index_source,omitempty"`
+	Exists      *bool  `json:"exists,omitempty"`
 }
 
 type jsonSearchResponse struct {
@@ -92,6 +95,15 @@ type jsonInfoResponse struct {
 	ContentHash string   `json:"content_hash,omitempty"`
 }
 
+type benchSummary struct {
+	OK         bool               `json:"ok"`
+	Mode       string             `json:"mode"`
+	Iterations int                `json:"iterations"`
+	Failures   int                `json:"failures"`
+	Queries    int                `json:"queries"`
+	Stats      map[string]float64 `json:"stats_ms"`
+}
+
 type Index struct {
 	Version          int
 	Roots            []string
@@ -109,6 +121,44 @@ type Index struct {
 	CompactNameOrder []int
 	NameBlob         []byte
 	PathTokenIndex   map[string][]int
+	DBPath           string
+}
+
+type appConfig struct {
+	DBs          []string
+	Volumes      []string
+	ServicePipe  string
+	DefaultLimit int
+}
+
+type queryOptions struct {
+	Query         string `json:"query"`
+	MatchPath     bool   `json:"match_path"`
+	Limit         int    `json:"limit"`
+	Under         string `json:"under,omitempty"`
+	Exists        bool   `json:"exists,omitempty"`
+	CWDBias       string `json:"cwd_bias,omitempty"`
+	RootBias      string `json:"root_bias,omitempty"`
+	Recent        string `json:"recent,omitempty"`
+	ModifiedAfter string `json:"modified_after,omitempty"`
+	CaseSensitive bool   `json:"case_sensitive,omitempty"`
+}
+
+type parsedQuery struct {
+	Raw           string
+	Terms         []string
+	CaseSensitive bool
+	Exts          []string
+	Dirs          []string
+	Globs         []string
+	Regexps       []*regexp.Regexp
+	Type          string
+	Under         string
+	Exists        bool
+	ModifiedAfter time.Time
+	HasModAfter   bool
+	CWDBias       string
+	RootBias      string
 }
 
 type CompactRecord struct {
@@ -219,6 +269,8 @@ func run(args []string) error {
 		return cmdServiceInfo(args[1:])
 	case "token-sidecar":
 		return cmdTokenSidecar(args[1:])
+	case "bench-agent":
+		return cmdBenchAgent(args[1:])
 	case "compare-es":
 		return cmdCompareES(args[1:])
 	case "info":
@@ -255,6 +307,7 @@ func usage() error {
   seekfs service-status [--json]
   seekfs service-info [--json]
   seekfs token-sidecar -db seekfs.gsi [-out seekfs.gsi.tok] [-query "term term"] [-term term]
+  seekfs bench-agent [-db index.gsi...] [-service] [--json] [-iterations 100]
   seekfs compare-es -es path\to\es.exe [-instance 1.5a] [-db seekfs.gsi] [-n 100] <query>
   seekfs info [-db seekfs.gsi] [--json]
   seekfs help-search
@@ -609,6 +662,7 @@ func buildOrders(idx *Index) {
 func cmdSearch(args []string, countOnly bool) error {
 	fs := flag.NewFlagSet("search", flag.ContinueOnError)
 	var dbs stringList
+	configPath := fs.String("config", "", "optional seekfs.toml config path")
 	fs.Var(&dbs, "db", "index database path; repeatable")
 	tokens := fs.String("tokens", "", "optional path-token sidecar; defaults to <db>.tok when present")
 	addr := fs.String("addr", "", "resident server address")
@@ -617,18 +671,56 @@ func cmdSearch(args []string, countOnly bool) error {
 	jsonOut := fs.Bool("json", false, "write machine-readable JSON")
 	limit := fs.Int("n", 100, "maximum results")
 	matchPath := fs.Bool("path", false, "match full path")
+	under := fs.String("under", "", "only return results under this path")
+	exists := fs.Bool("exists", false, "verify result paths still exist")
+	cwdBias := fs.Bool("cwd-bias", false, "rank paths under the current working directory first")
+	rootBias := fs.String("root-bias", "", "rank paths under this root first")
+	recent := fs.String("recent", "", "only return results modified within this duration, for example 24h")
+	modifiedAfter := fs.String("modified-after", "", "only return results modified after RFC3339 time or YYYY-MM-DD")
+	caseSensitive := fs.Bool("case", false, "case-sensitive query matching")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	cfg, err := loadConfig(*configPath)
+	if err != nil {
+		return err
+	}
+	if len(dbs) == 0 && len(cfg.DBs) > 0 {
+		dbs = append(dbs, cfg.DBs...)
+	}
+	if *pipeName == defaultServicePipe && cfg.ServicePipe != "" {
+		*pipeName = cfg.ServicePipe
+	}
+	if *limit == 100 && cfg.DefaultLimit > 0 {
+		*limit = cfg.DefaultLimit
 	}
 	query := strings.TrimSpace(strings.Join(fs.Args(), " "))
 	if query == "" {
 		return errors.New("query required")
 	}
+	opts := queryOptions{
+		Query:         query,
+		MatchPath:     *matchPath,
+		Limit:         *limit,
+		Under:         *under,
+		Exists:        *exists,
+		RootBias:      *rootBias,
+		Recent:        *recent,
+		ModifiedAfter: *modifiedAfter,
+		CaseSensitive: *caseSensitive,
+	}
+	if *cwdBias {
+		cwd, err := os.Getwd()
+		if err != nil {
+			return err
+		}
+		opts.CWDBias = cwd
+	}
 	if *addr != "" {
-		return searchRemote(*addr, query, *matchPath, *limit, countOnly, *jsonOut)
+		return searchRemote(*addr, opts, countOnly, *jsonOut)
 	}
 	if *useService {
-		return searchService(*pipeName, query, *matchPath, *limit, countOnly, *jsonOut)
+		return searchService(*pipeName, opts, countOnly, *jsonOut)
 	}
 	if len(dbs) == 0 {
 		dbs = append(dbs, defaultDB())
@@ -637,7 +729,10 @@ func cmdSearch(args []string, countOnly bool) error {
 	if err != nil {
 		return err
 	}
-	matches := searchAll(indexes, query, *matchPath, *limit, countOnly)
+	matches, err := searchAll(indexes, opts, countOnly)
+	if err != nil {
+		return err
+	}
 	if *jsonOut {
 		resp := jsonSearchResponse{
 			OK:    true,
@@ -665,8 +760,16 @@ func cmdInfo(args []string) error {
 	fs := flag.NewFlagSet("info", flag.ContinueOnError)
 	db := fs.String("db", defaultDB(), "index database path")
 	jsonOut := fs.Bool("json", false, "write machine-readable JSON")
+	configPath := fs.String("config", "", "optional seekfs.toml config path")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	cfg, err := loadConfig(*configPath)
+	if err != nil {
+		return err
+	}
+	if *db == defaultDB() && len(cfg.DBs) > 0 {
+		*db = cfg.DBs[0]
 	}
 	idx, err := loadIndex(*db)
 	if err != nil {
@@ -716,7 +819,10 @@ func cmdCompareES(args []string) error {
 	if err != nil {
 		return err
 	}
-	ours := search(idx, query, *matchPath, *limit, false)
+	ours, err := search(idx, queryOptions{Query: query, MatchPath: *matchPath, Limit: *limit}, false)
+	if err != nil {
+		return err
+	}
 	esArgs := []string{}
 	if *instance != "" {
 		esArgs = append(esArgs, "-instance", *instance)
@@ -817,6 +923,121 @@ func cmdTokenSidecar(args []string) error {
 	return nil
 }
 
+func cmdBenchAgent(args []string) error {
+	fs := flag.NewFlagSet("bench-agent", flag.ContinueOnError)
+	var dbs stringList
+	configPath := fs.String("config", "", "optional seekfs.toml config path")
+	fs.Var(&dbs, "db", "index database path; repeatable")
+	useService := fs.Bool("service", false, "query the installed seekfs service")
+	pipeName := fs.String("pipe", defaultServicePipe, "service named pipe")
+	jsonOut := fs.Bool("json", false, "write machine-readable JSON")
+	iterations := fs.Int("iterations", 100, "number of benchmark iterations")
+	limit := fs.Int("n", 20, "maximum results per query")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	cfg, err := loadConfig(*configPath)
+	if err != nil {
+		return err
+	}
+	if len(dbs) == 0 && len(cfg.DBs) > 0 {
+		dbs = append(dbs, cfg.DBs...)
+	}
+	if *pipeName == defaultServicePipe && cfg.ServicePipe != "" {
+		*pipeName = cfg.ServicePipe
+	}
+	queries := fs.Args()
+	if len(queries) == 0 {
+		queries = []string{"ext:go", "glob:*.md", "type:dir docs", "README", "main"}
+	}
+	if *iterations <= 0 {
+		return errors.New("iterations must be positive")
+	}
+	var indexes []*Index
+	if !*useService {
+		if len(dbs) == 0 {
+			dbs = append(dbs, defaultDB())
+		}
+		indexes, err = loadIndexes(dbs, "")
+		if err != nil {
+			return err
+		}
+	}
+	timings := make([]float64, 0, *iterations)
+	failures := 0
+	for i := 0; i < *iterations; i++ {
+		query := queries[i%len(queries)]
+		opts := queryOptions{Query: query, MatchPath: true, Limit: *limit}
+		start := time.Now()
+		if *useService {
+			err = benchServiceQuery(*pipeName, opts)
+		} else {
+			_, err = searchAll(indexes, opts, false)
+		}
+		elapsed := float64(time.Since(start).Microseconds()) / 1000
+		timings = append(timings, elapsed)
+		if err != nil {
+			failures++
+		}
+	}
+	summary := benchSummary{
+		OK:         failures == 0,
+		Mode:       map[bool]string{true: "service", false: "local"}[*useService],
+		Iterations: *iterations,
+		Failures:   failures,
+		Queries:    len(queries),
+		Stats:      latencyStats(timings),
+	}
+	if *jsonOut {
+		return writeJSON(os.Stdout, summary)
+	}
+	fmt.Printf("mode: %s\niterations: %d\nqueries: %d\nfailures: %d\n", summary.Mode, summary.Iterations, summary.Queries, summary.Failures)
+	for _, key := range []string{"min", "median", "p90", "p95", "max"} {
+		fmt.Printf("%s_ms: %.3f\n", key, summary.Stats[key])
+	}
+	return nil
+}
+
+func benchServiceQuery(pipeName string, opts queryOptions) error {
+	resp, err := callService(pipeName, serviceRequestFromOptions(opts, false))
+	if err != nil {
+		return err
+	}
+	if !resp.OK {
+		return errors.New(resp.Message)
+	}
+	return nil
+}
+
+func latencyStats(values []float64) map[string]float64 {
+	stats := map[string]float64{"min": 0, "median": 0, "p90": 0, "p95": 0, "max": 0}
+	if len(values) == 0 {
+		return stats
+	}
+	sorted := append([]float64(nil), values...)
+	sort.Float64s(sorted)
+	stats["min"] = sorted[0]
+	stats["median"] = percentile(sorted, 0.50)
+	stats["p90"] = percentile(sorted, 0.90)
+	stats["p95"] = percentile(sorted, 0.95)
+	stats["max"] = sorted[len(sorted)-1]
+	return stats
+}
+
+func percentile(sorted []float64, p float64) float64 {
+	if len(sorted) == 0 {
+		return 0
+	}
+	i := int(float64(len(sorted)-1) * p)
+	if i < 0 {
+		i = 0
+	}
+	if i >= len(sorted) {
+		i = len(sorted) - 1
+	}
+	return sorted[i]
+}
+
 func splitLines(s string) []string {
 	lines := strings.Split(strings.ReplaceAll(s, "\r\n", "\n"), "\n")
 	out := lines[:0]
@@ -830,10 +1051,17 @@ func splitLines(s string) []string {
 }
 
 type request struct {
-	Query     string `json:"query"`
-	MatchPath bool   `json:"match_path"`
-	Limit     int    `json:"limit"`
-	CountOnly bool   `json:"count_only"`
+	Query         string `json:"query"`
+	MatchPath     bool   `json:"match_path"`
+	Limit         int    `json:"limit"`
+	CountOnly     bool   `json:"count_only"`
+	Under         string `json:"under,omitempty"`
+	Exists        bool   `json:"exists,omitempty"`
+	CWDBias       string `json:"cwd_bias,omitempty"`
+	RootBias      string `json:"root_bias,omitempty"`
+	Recent        string `json:"recent,omitempty"`
+	ModifiedAfter string `json:"modified_after,omitempty"`
+	CaseSensitive bool   `json:"case_sensitive,omitempty"`
 }
 
 type response struct {
@@ -843,13 +1071,20 @@ type response struct {
 }
 
 type serviceRequest struct {
-	Command   string `json:"command"`
-	Volume    string `json:"volume,omitempty"`
-	DB        string `json:"db,omitempty"`
-	Query     string `json:"query,omitempty"`
-	MatchPath bool   `json:"match_path,omitempty"`
-	Limit     int    `json:"limit,omitempty"`
-	CountOnly bool   `json:"count_only,omitempty"`
+	Command       string `json:"command"`
+	Volume        string `json:"volume,omitempty"`
+	DB            string `json:"db,omitempty"`
+	Query         string `json:"query,omitempty"`
+	MatchPath     bool   `json:"match_path,omitempty"`
+	Limit         int    `json:"limit,omitempty"`
+	CountOnly     bool   `json:"count_only,omitempty"`
+	Under         string `json:"under,omitempty"`
+	Exists        bool   `json:"exists,omitempty"`
+	CWDBias       string `json:"cwd_bias,omitempty"`
+	RootBias      string `json:"root_bias,omitempty"`
+	Recent        string `json:"recent,omitempty"`
+	ModifiedAfter string `json:"modified_after,omitempty"`
+	CaseSensitive bool   `json:"case_sensitive,omitempty"`
 }
 
 type serviceResponse struct {
@@ -898,11 +1133,22 @@ func serviceLog(format string, args ...any) {
 func cmdService(args []string) error {
 	var dbs stringList
 	fs := flag.NewFlagSet("service", flag.ContinueOnError)
+	configPath := fs.String("config", "", "optional seekfs.toml config path")
 	pipeName := fs.String("pipe", defaultServicePipe, "service named pipe")
 	sddl := fs.String("sddl", defaultServiceSDDL, "pipe security descriptor SDDL")
 	fs.Var(&dbs, "db", "index database path to load for service search; repeatable")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	cfg, err := loadConfig(*configPath)
+	if err != nil {
+		return err
+	}
+	if len(dbs) == 0 && len(cfg.DBs) > 0 {
+		dbs = append(dbs, cfg.DBs...)
+	}
+	if *pipeName == defaultServicePipe && cfg.ServicePipe != "" {
+		*pipeName = cfg.ServicePipe
 	}
 	isService, err := svc.IsWindowsService()
 	if err != nil {
@@ -918,11 +1164,22 @@ func cmdService(args []string) error {
 func cmdInstallService(args []string) error {
 	var dbs stringList
 	fs := flag.NewFlagSet("install-service", flag.ContinueOnError)
+	configPath := fs.String("config", "", "optional seekfs.toml config path")
 	pipeName := fs.String("pipe", defaultServicePipe, "service named pipe")
 	sddl := fs.String("sddl", defaultServiceSDDL, "pipe security descriptor SDDL")
 	fs.Var(&dbs, "db", "index database path to load for service search; repeatable")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	cfg, err := loadConfig(*configPath)
+	if err != nil {
+		return err
+	}
+	if len(dbs) == 0 && len(cfg.DBs) > 0 {
+		dbs = append(dbs, cfg.DBs...)
+	}
+	if *pipeName == defaultServicePipe && cfg.ServicePipe != "" {
+		*pipeName = cfg.ServicePipe
 	}
 	exe, err := os.Executable()
 	if err != nil {
@@ -978,11 +1235,19 @@ func cmdUninstallService(args []string) error {
 
 func cmdServiceIndexUSN(args []string) error {
 	fs := flag.NewFlagSet("service-index-usn", flag.ContinueOnError)
+	configPath := fs.String("config", "", "optional seekfs.toml config path")
 	pipeName := fs.String("pipe", defaultServicePipe, "service named pipe")
 	db := fs.String("db", defaultDB(), "index database path")
 	volume := fs.String("volume", "C:", "NTFS volume")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	cfg, err := loadConfig(*configPath)
+	if err != nil {
+		return err
+	}
+	if *pipeName == defaultServicePipe && cfg.ServicePipe != "" {
+		*pipeName = cfg.ServicePipe
 	}
 	req := serviceRequest{Command: "index-usn", Volume: *volume, DB: *db}
 	resp, err := callService(*pipeName, req)
@@ -998,11 +1263,19 @@ func cmdServiceIndexUSN(args []string) error {
 
 func cmdServiceSimple(args []string, command string) error {
 	fs := flag.NewFlagSet(command, flag.ContinueOnError)
+	configPath := fs.String("config", "", "optional seekfs.toml config path")
 	pipeName := fs.String("pipe", defaultServicePipe, "service named pipe")
 	volume := fs.String("volume", "C:", "NTFS volume")
 	jsonOut := fs.Bool("json", false, "write machine-readable JSON")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	cfg, err := loadConfig(*configPath)
+	if err != nil {
+		return err
+	}
+	if *pipeName == defaultServicePipe && cfg.ServicePipe != "" {
+		*pipeName = cfg.ServicePipe
 	}
 	resp, err := callService(*pipeName, serviceRequest{Command: command, Volume: *volume})
 	if err != nil {
@@ -1020,10 +1293,18 @@ func cmdServiceSimple(args []string, command string) error {
 
 func cmdServiceInfo(args []string) error {
 	fs := flag.NewFlagSet("service-info", flag.ContinueOnError)
+	configPath := fs.String("config", "", "optional seekfs.toml config path")
 	pipeName := fs.String("pipe", defaultServicePipe, "service named pipe")
 	jsonOut := fs.Bool("json", false, "write machine-readable JSON")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	cfg, err := loadConfig(*configPath)
+	if err != nil {
+		return err
+	}
+	if *pipeName == defaultServicePipe && cfg.ServicePipe != "" {
+		*pipeName = cfg.ServicePipe
 	}
 	resp, err := callService(*pipeName, serviceRequest{Command: "info"})
 	if err != nil {
@@ -1257,7 +1538,11 @@ func handleServiceConn(conn *os.File, s *goSearchService) {
 			_ = json.NewEncoder(conn).Encode(serviceResponse{OK: false, Message: "service has no search indexes loaded"})
 			return
 		}
-		matches := searchAll(indexes, req.Query, req.MatchPath, req.Limit, req.CountOnly)
+		matches, err := searchAll(indexes, requestToOptionsFromService(req), req.CountOnly)
+		if err != nil {
+			_ = json.NewEncoder(conn).Encode(serviceResponse{OK: false, Message: err.Error()})
+			return
+		}
 		resp := serviceResponse{OK: true, Count: len(matches)}
 		if !req.CountOnly {
 			resp.Results = make([]string, len(matches))
@@ -1400,11 +1685,19 @@ func runUSNMonitor(mon *volumeMonitor) {
 func cmdServe(args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	var dbs stringList
+	configPath := fs.String("config", "", "optional seekfs.toml config path")
 	fs.Var(&dbs, "db", "index database path; repeatable")
 	tokens := fs.String("tokens", "", "optional path-token sidecar; defaults to <db>.tok when present")
 	addr := fs.String("addr", "127.0.0.1:47832", "listen address")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	cfg, err := loadConfig(*configPath)
+	if err != nil {
+		return err
+	}
+	if len(dbs) == 0 && len(cfg.DBs) > 0 {
+		dbs = append(dbs, cfg.DBs...)
 	}
 	if len(dbs) == 0 {
 		dbs = append(dbs, defaultDB())
@@ -1438,7 +1731,11 @@ func handleConn(conn net.Conn, indexes []*Index) {
 		_ = json.NewEncoder(conn).Encode(response{Error: err.Error()})
 		return
 	}
-	matches := searchAll(indexes, req.Query, req.MatchPath, req.Limit, req.CountOnly)
+	matches, err := searchAll(indexes, requestToOptions(req), req.CountOnly)
+	if err != nil {
+		_ = json.NewEncoder(conn).Encode(response{Error: err.Error()})
+		return
+	}
 	resp := response{Count: len(matches)}
 	if !req.CountOnly {
 		resp.Results = make([]string, len(matches))
@@ -1449,13 +1746,13 @@ func handleConn(conn net.Conn, indexes []*Index) {
 	_ = json.NewEncoder(conn).Encode(resp)
 }
 
-func searchRemote(addr string, query string, matchPath bool, limit int, countOnly bool, jsonOut bool) error {
+func searchRemote(addr string, opts queryOptions, countOnly bool, jsonOut bool) error {
 	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
 	if err != nil {
 		return err
 	}
 	defer conn.Close()
-	req := request{Query: query, MatchPath: matchPath, Limit: limit, CountOnly: countOnly}
+	req := optionsToRequest(opts, countOnly)
 	if err := json.NewEncoder(conn).Encode(req); err != nil {
 		return err
 	}
@@ -1469,9 +1766,9 @@ func searchRemote(addr string, query string, matchPath bool, limit int, countOnl
 	if jsonOut {
 		jsonResp := jsonSearchResponse{
 			OK:    true,
-			Query: query,
+			Query: opts.Query,
 			Count: resp.Count,
-			Limit: limit,
+			Limit: opts.Limit,
 		}
 		if !countOnly {
 			jsonResp.Results = pathsToJSON(resp.Results)
@@ -1489,14 +1786,8 @@ func searchRemote(addr string, query string, matchPath bool, limit int, countOnl
 	return w.Flush()
 }
 
-func searchService(pipeName string, query string, matchPath bool, limit int, countOnly bool, jsonOut bool) error {
-	resp, err := callService(pipeName, serviceRequest{
-		Command:   "search",
-		Query:     query,
-		MatchPath: matchPath,
-		Limit:     limit,
-		CountOnly: countOnly,
-	})
+func searchService(pipeName string, opts queryOptions, countOnly bool, jsonOut bool) error {
+	resp, err := callService(pipeName, serviceRequestFromOptions(opts, countOnly))
 	if err != nil {
 		return err
 	}
@@ -1506,9 +1797,9 @@ func searchService(pipeName string, query string, matchPath bool, limit int, cou
 	if jsonOut {
 		jsonResp := jsonSearchResponse{
 			OK:    true,
-			Query: query,
+			Query: opts.Query,
 			Count: resp.Count,
-			Limit: limit,
+			Limit: opts.Limit,
 		}
 		if !countOnly {
 			jsonResp.Results = pathsToJSON(resp.Results)
@@ -1526,37 +1817,97 @@ func searchService(pipeName string, query string, matchPath bool, limit int, cou
 	return w.Flush()
 }
 
-func search(idx *Index, query string, matchPath bool, limit int, countOnly bool) []Entry {
-	if idx.Compact {
-		return searchCompact(idx, query, matchPath, limit, countOnly)
+func optionsToRequest(opts queryOptions, countOnly bool) request {
+	return request{
+		Query:         opts.Query,
+		MatchPath:     opts.MatchPath,
+		Limit:         opts.Limit,
+		CountOnly:     countOnly,
+		Under:         opts.Under,
+		Exists:        opts.Exists,
+		CWDBias:       opts.CWDBias,
+		RootBias:      opts.RootBias,
+		Recent:        opts.Recent,
+		ModifiedAfter: opts.ModifiedAfter,
+		CaseSensitive: opts.CaseSensitive,
 	}
-	q := strings.ToLower(query)
-	terms := strings.Fields(q)
-	if len(terms) == 0 {
-		return nil
+}
+
+func requestToOptions(req request) queryOptions {
+	return queryOptions{
+		Query:         req.Query,
+		MatchPath:     req.MatchPath,
+		Limit:         req.Limit,
+		Under:         req.Under,
+		Exists:        req.Exists,
+		CWDBias:       req.CWDBias,
+		RootBias:      req.RootBias,
+		Recent:        req.Recent,
+		ModifiedAfter: req.ModifiedAfter,
+		CaseSensitive: req.CaseSensitive,
+	}
+}
+
+func serviceRequestFromOptions(opts queryOptions, countOnly bool) serviceRequest {
+	return serviceRequest{
+		Command:       "search",
+		Query:         opts.Query,
+		MatchPath:     opts.MatchPath,
+		Limit:         opts.Limit,
+		CountOnly:     countOnly,
+		Under:         opts.Under,
+		Exists:        opts.Exists,
+		CWDBias:       opts.CWDBias,
+		RootBias:      opts.RootBias,
+		Recent:        opts.Recent,
+		ModifiedAfter: opts.ModifiedAfter,
+		CaseSensitive: opts.CaseSensitive,
+	}
+}
+
+func requestToOptionsFromService(req serviceRequest) queryOptions {
+	return queryOptions{
+		Query:         req.Query,
+		MatchPath:     req.MatchPath,
+		Limit:         req.Limit,
+		Under:         req.Under,
+		Exists:        req.Exists,
+		CWDBias:       req.CWDBias,
+		RootBias:      req.RootBias,
+		Recent:        req.Recent,
+		ModifiedAfter: req.ModifiedAfter,
+		CaseSensitive: req.CaseSensitive,
+	}
+}
+
+func search(idx *Index, opts queryOptions, countOnly bool) ([]Entry, error) {
+	if idx.Compact {
+		return searchCompact(idx, opts, countOnly)
+	}
+	pq, err := parseQuery(opts)
+	if err != nil {
+		return nil, err
 	}
 	order := idx.NameOrder
-	if matchPath {
+	if opts.MatchPath {
 		order = idx.PathOrder
 	}
-	if limit <= 0 && !countOnly {
-		limit = 100
+	limit := normalizedLimit(opts.Limit, countOnly)
+	if pq.RootBias != "" || pq.CWDBias != "" {
+		order = biasOrderEntries(idx, order, firstNonEmpty(pq.CWDBias, pq.RootBias))
 	}
 	results := make([]Entry, 0, min(limit, 1024))
 	for _, entryIndex := range order {
 		entry := idx.Entries[entryIndex]
-		haystack := entry.LowerName
-		if matchPath {
-			haystack = entry.LowerPath
-		}
-		if containsAll(haystack, terms) {
+		entry.IndexSource = idx.Source
+		if entryMatches(entry, pq, opts.MatchPath) {
 			results = append(results, entry)
 			if !countOnly && len(results) >= limit {
 				break
 			}
 		}
 	}
-	return results
+	return results, nil
 }
 
 func writeJSON(w io.Writer, v any) error {
@@ -1592,9 +1943,10 @@ func pathsToJSON(paths []string) []jsonResult {
 	out := make([]jsonResult, len(paths))
 	for i, path := range paths {
 		out[i] = jsonResult{
-			Path:   filepath.Clean(path),
-			Name:   filepath.Base(path),
-			Volume: filepath.VolumeName(path),
+			Path:        filepath.Clean(path),
+			Name:        filepath.Base(path),
+			Volume:      filepath.VolumeName(path),
+			IndexSource: "service",
 		}
 	}
 	return out
@@ -1602,10 +1954,11 @@ func pathsToJSON(paths []string) []jsonResult {
 
 func entryToJSON(entry Entry) jsonResult {
 	result := jsonResult{
-		Path:   filepath.Clean(entry.Path),
-		Name:   entry.Name,
-		Volume: filepath.VolumeName(entry.Path),
-		IsDir:  entry.Mode&uint32(os.ModeDir) != 0,
+		Path:        filepath.Clean(entry.Path),
+		Name:        entry.Name,
+		Volume:      filepath.VolumeName(entry.Path),
+		IsDir:       entry.Mode&uint32(os.ModeDir) != 0,
+		IndexSource: entry.IndexSource,
 	}
 	if result.Name == "" {
 		result.Name = filepath.Base(result.Path)
@@ -1620,10 +1973,11 @@ func entryToJSON(entry Entry) jsonResult {
 	return result
 }
 
-func searchAll(indexes []*Index, query string, matchPath bool, limit int, countOnly bool) []Entry {
+func searchAll(indexes []*Index, opts queryOptions, countOnly bool) ([]Entry, error) {
 	if len(indexes) == 1 {
-		return search(indexes[0], query, matchPath, limit, countOnly)
+		return search(indexes[0], opts, countOnly)
 	}
+	limit := normalizedLimit(opts.Limit, countOnly)
 	results := make([]Entry, 0, min(limit, 1024))
 	for _, idx := range indexes {
 		perIndexLimit := limit
@@ -1633,24 +1987,26 @@ func searchAll(indexes []*Index, query string, matchPath bool, limit int, countO
 				break
 			}
 		}
-		matches := search(idx, query, matchPath, perIndexLimit, countOnly)
+		childOpts := opts
+		childOpts.Limit = perIndexLimit
+		matches, err := search(idx, childOpts, countOnly)
+		if err != nil {
+			return nil, err
+		}
 		results = append(results, matches...)
 	}
-	return results
+	return results, nil
 }
 
-func searchCompact(idx *Index, query string, matchPath bool, limit int, countOnly bool) []Entry {
-	q := strings.ToLower(query)
-	terms := strings.Fields(q)
-	if len(terms) == 0 {
-		return nil
+func searchCompact(idx *Index, opts queryOptions, countOnly bool) ([]Entry, error) {
+	pq, err := parseQuery(opts)
+	if err != nil {
+		return nil, err
 	}
-	if limit <= 0 && !countOnly {
-		limit = 100
-	}
+	limit := normalizedLimit(opts.Limit, countOnly)
 	order := idx.CompactNameOrder
-	if matchPath {
-		if candidates, ok := idx.pathCandidates(terms); ok {
+	if opts.MatchPath && len(pq.Terms) > 0 {
+		if candidates, ok := idx.pathCandidates(pq.Terms); ok {
 			order = candidates
 		}
 	}
@@ -1660,38 +2016,41 @@ func searchCompact(idx *Index, query string, matchPath bool, limit int, countOnl
 			order[i] = i
 		}
 	}
+	if pq.RootBias != "" || pq.CWDBias != "" {
+		order = idx.biasOrderCompact(order, firstNonEmpty(pq.CWDBias, pq.RootBias))
+	}
 	results := make([]Entry, 0, min(limit, 1024))
 	pathCache := make(map[int]string)
 	for _, recIndex := range order {
 		rec := idx.Records[recIndex]
-		haystack := rec.LowerName
-		path := ""
-		if matchPath {
-			if !idx.compactPathContainsAll(recIndex, terms) {
-				continue
-			}
-			path = idx.reconstructCompactPathCached(recIndex, pathCache)
-			haystack = strings.ToLower(path)
+		path := idx.reconstructCompactPathCached(recIndex, pathCache)
+		entry := Entry{
+			Path:        path,
+			Name:        rec.Name,
+			LowerPath:   strings.ToLower(path),
+			LowerName:   rec.LowerName,
+			Mode:        rec.Mode,
+			Size:        rec.Size,
+			ModUnix:     rec.ModUnix,
+			IndexSource: idx.Source,
 		}
-		if containsAll(haystack, terms) {
-			if path == "" {
-				path = idx.reconstructCompactPathCached(recIndex, pathCache)
-			}
+		if entryMatches(entry, pq, opts.MatchPath) {
 			results = append(results, Entry{
-				Path:      path,
-				Name:      rec.Name,
-				LowerPath: strings.ToLower(path),
-				LowerName: rec.LowerName,
-				Mode:      rec.Mode,
-				Size:      rec.Size,
-				ModUnix:   rec.ModUnix,
+				Path:        entry.Path,
+				Name:        entry.Name,
+				LowerPath:   entry.LowerPath,
+				LowerName:   entry.LowerName,
+				Mode:        entry.Mode,
+				Size:        entry.Size,
+				ModUnix:     entry.ModUnix,
+				IndexSource: entry.IndexSource,
 			})
 			if !countOnly && len(results) >= limit {
 				break
 			}
 		}
 	}
-	return results
+	return results, nil
 }
 
 func (idx *Index) compactPathContainsAll(i int, terms []string) bool {
@@ -1701,6 +2060,224 @@ func (idx *Index) compactPathContainsAll(i int, terms []string) bool {
 		}
 	}
 	return true
+}
+
+func parseQuery(opts queryOptions) (parsedQuery, error) {
+	pq := parsedQuery{
+		Raw:           opts.Query,
+		CaseSensitive: opts.CaseSensitive,
+		Under:         normalizeFilterPath(opts.Under),
+		Exists:        opts.Exists,
+		CWDBias:       normalizeFilterPath(opts.CWDBias),
+		RootBias:      normalizeFilterPath(opts.RootBias),
+	}
+	if opts.ModifiedAfter != "" {
+		t, err := parseTimeValue(opts.ModifiedAfter)
+		if err != nil {
+			return pq, err
+		}
+		pq.ModifiedAfter = t
+		pq.HasModAfter = true
+	}
+	if opts.Recent != "" {
+		d, err := time.ParseDuration(opts.Recent)
+		if err != nil {
+			return pq, fmt.Errorf("invalid --recent duration: %w", err)
+		}
+		pq.ModifiedAfter = time.Now().Add(-d)
+		pq.HasModAfter = true
+	}
+	for _, raw := range strings.Fields(opts.Query) {
+		switch {
+		case strings.HasPrefix(raw, "ext:"):
+			ext := strings.TrimPrefix(raw, "ext:")
+			ext = strings.TrimPrefix(ext, ".")
+			if ext != "" {
+				pq.Exts = append(pq.Exts, normalizeCase(ext, pq.CaseSensitive))
+			}
+		case strings.HasPrefix(raw, "dir:"):
+			dir := strings.TrimPrefix(raw, "dir:")
+			if dir != "" {
+				pq.Dirs = append(pq.Dirs, normalizeCase(dir, pq.CaseSensitive))
+			}
+		case strings.HasPrefix(raw, "glob:"):
+			glob := strings.TrimPrefix(raw, "glob:")
+			if glob != "" {
+				pq.Globs = append(pq.Globs, normalizeCase(glob, pq.CaseSensitive))
+			}
+		case strings.HasPrefix(raw, "regex:"):
+			pat := strings.TrimPrefix(raw, "regex:")
+			if pat == "" {
+				continue
+			}
+			if !pq.CaseSensitive {
+				pat = "(?i)" + pat
+			}
+			re, err := regexp.Compile(pat)
+			if err != nil {
+				return pq, fmt.Errorf("invalid regex %q: %w", pat, err)
+			}
+			pq.Regexps = append(pq.Regexps, re)
+		case raw == "case:" || raw == "case:true":
+			pq.CaseSensitive = true
+		case raw == "case:false":
+			pq.CaseSensitive = false
+		case raw == "type:file" || raw == "type:dir":
+			pq.Type = strings.TrimPrefix(raw, "type:")
+		default:
+			pq.Terms = append(pq.Terms, normalizeCase(raw, pq.CaseSensitive))
+		}
+	}
+	if len(pq.Terms) == 0 && len(pq.Exts) == 0 && len(pq.Dirs) == 0 && len(pq.Globs) == 0 && len(pq.Regexps) == 0 && pq.Type == "" && pq.Under == "" && !pq.HasModAfter {
+		return pq, errors.New("query has no searchable terms or filters")
+	}
+	return pq, nil
+}
+
+func entryMatches(entry Entry, pq parsedQuery, matchPath bool) bool {
+	path := filepath.Clean(entry.Path)
+	name := entry.Name
+	if name == "" {
+		name = filepath.Base(path)
+	}
+	cmpPath := normalizeCase(path, pq.CaseSensitive)
+	cmpName := normalizeCase(name, pq.CaseSensitive)
+	haystack := cmpName
+	if matchPath {
+		haystack = cmpPath
+	}
+	if pq.Under != "" && !pathUnder(path, pq.Under) {
+		return false
+	}
+	if pq.Exists {
+		if _, err := os.Stat(path); err != nil {
+			return false
+		}
+	}
+	if pq.HasModAfter {
+		if entry.ModUnix == 0 || !time.Unix(0, entry.ModUnix).After(pq.ModifiedAfter) {
+			return false
+		}
+	}
+	if pq.Type == "file" && entry.Mode&uint32(os.ModeDir) != 0 {
+		return false
+	}
+	if pq.Type == "dir" && entry.Mode&uint32(os.ModeDir) == 0 {
+		return false
+	}
+	if !containsAll(haystack, pq.Terms) {
+		return false
+	}
+	for _, ext := range pq.Exts {
+		actual := strings.TrimPrefix(filepath.Ext(name), ".")
+		if normalizeCase(actual, pq.CaseSensitive) != ext {
+			return false
+		}
+	}
+	for _, dir := range pq.Dirs {
+		if !strings.Contains(cmpPath, dir) {
+			return false
+		}
+	}
+	for _, glob := range pq.Globs {
+		ok, err := filepath.Match(glob, cmpName)
+		if err != nil || !ok {
+			return false
+		}
+	}
+	for _, re := range pq.Regexps {
+		if !re.MatchString(path) {
+			return false
+		}
+	}
+	return true
+}
+
+func normalizedLimit(limit int, countOnly bool) int {
+	if limit <= 0 && !countOnly {
+		return 100
+	}
+	if limit <= 0 && countOnly {
+		return 0
+	}
+	return limit
+}
+
+func normalizeCase(s string, caseSensitive bool) string {
+	if caseSensitive {
+		return s
+	}
+	return strings.ToLower(s)
+}
+
+func normalizeFilterPath(path string) string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return ""
+	}
+	if abs, err := filepath.Abs(path); err == nil {
+		path = abs
+	}
+	return filepath.Clean(path)
+}
+
+func pathUnder(path, root string) bool {
+	path = normalizeFilterPath(path)
+	root = normalizeFilterPath(root)
+	if strings.EqualFold(path, root) {
+		return true
+	}
+	rel, err := filepath.Rel(root, path)
+	if err != nil {
+		return false
+	}
+	return rel != "." && rel != "" && !strings.HasPrefix(rel, "..") && !filepath.IsAbs(rel)
+}
+
+func parseTimeValue(value string) (time.Time, error) {
+	if t, err := time.Parse(time.RFC3339Nano, value); err == nil {
+		return t, nil
+	}
+	if t, err := time.Parse("2006-01-02", value); err == nil {
+		return t, nil
+	}
+	return time.Time{}, fmt.Errorf("invalid time %q; use RFC3339 or YYYY-MM-DD", value)
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func biasOrderEntries(idx *Index, order []int, root string) []int {
+	if root == "" || len(order) == 0 {
+		return order
+	}
+	out := append([]int(nil), order...)
+	sort.SliceStable(out, func(i, j int) bool {
+		a := pathUnder(idx.Entries[out[i]].Path, root)
+		b := pathUnder(idx.Entries[out[j]].Path, root)
+		return a && !b
+	})
+	return out
+}
+
+func (idx *Index) biasOrderCompact(order []int, root string) []int {
+	if root == "" || len(order) == 0 {
+		return order
+	}
+	cache := make(map[int]string)
+	out := append([]int(nil), order...)
+	sort.SliceStable(out, func(i, j int) bool {
+		a := pathUnder(idx.reconstructCompactPathCached(out[i], cache), root)
+		b := pathUnder(idx.reconstructCompactPathCached(out[j], cache), root)
+		return a && !b
+	})
+	return out
 }
 
 func (idx *Index) pathCandidates(terms []string) ([]int, bool) {
@@ -2249,6 +2826,92 @@ func loadIndex(path string) (*Index, error) {
 	return readIndex(bufio.NewReaderSize(f, 16*1024*1024))
 }
 
+func loadConfig(path string) (appConfig, error) {
+	if path == "" {
+		path = findDefaultConfig()
+	}
+	if path == "" {
+		return appConfig{}, nil
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return appConfig{}, err
+	}
+	cfg := appConfig{}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		key := strings.TrimSpace(parts[0])
+		value := strings.TrimSpace(parts[1])
+		switch key {
+		case "db", "db_path":
+			if s := parseTOMLString(value); s != "" {
+				cfg.DBs = append(cfg.DBs, s)
+			}
+		case "dbs", "db_paths":
+			cfg.DBs = append(cfg.DBs, parseTOMLStringArray(value)...)
+		case "volume":
+			if s := parseTOMLString(value); s != "" {
+				cfg.Volumes = append(cfg.Volumes, s)
+			}
+		case "volumes":
+			cfg.Volumes = append(cfg.Volumes, parseTOMLStringArray(value)...)
+		case "service_pipe":
+			cfg.ServicePipe = parseTOMLString(value)
+		case "default_limit":
+			var n int
+			if _, err := fmt.Sscanf(value, "%d", &n); err == nil {
+				cfg.DefaultLimit = n
+			}
+		}
+	}
+	return cfg, nil
+}
+
+func findDefaultConfig() string {
+	candidates := []string{"seekfs.toml"}
+	if dir, err := os.UserConfigDir(); err == nil {
+		candidates = append(candidates, filepath.Join(dir, "seekfs", "seekfs.toml"))
+	}
+	for _, path := range candidates {
+		if _, err := os.Stat(path); err == nil {
+			return path
+		}
+	}
+	return ""
+}
+
+func parseTOMLString(value string) string {
+	value = strings.TrimSpace(strings.TrimSuffix(value, ","))
+	if len(value) >= 2 && ((value[0] == '"' && value[len(value)-1] == '"') || (value[0] == '\'' && value[len(value)-1] == '\'')) {
+		return value[1 : len(value)-1]
+	}
+	return value
+}
+
+func parseTOMLStringArray(value string) []string {
+	value = strings.TrimSpace(value)
+	value = strings.TrimPrefix(value, "[")
+	value = strings.TrimSuffix(value, "]")
+	if strings.TrimSpace(value) == "" {
+		return nil
+	}
+	parts := strings.Split(value, ",")
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if s := parseTOMLString(part); s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
 func loadIndexes(paths []string, tokenPath string) ([]*Index, error) {
 	indexes := make([]*Index, 0, len(paths))
 	for _, path := range paths {
@@ -2256,6 +2919,7 @@ func loadIndexes(paths []string, tokenPath string) ([]*Index, error) {
 		if err != nil {
 			return nil, err
 		}
+		idx.DBPath = path
 		if err := loadOptionalTokenSidecar(idx, path, tokenPath); err != nil {
 			return nil, err
 		}

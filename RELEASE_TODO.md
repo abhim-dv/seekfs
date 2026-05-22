@@ -8,7 +8,7 @@ This checklist tracks work required before a public release.
 - [x] Stable JSON error format with nonzero exit codes.
 - [x] `service-info` command showing loaded DBs, entry counts, build time,
   volume, and journal checkpoint.
-- [ ] Config file support, for example `seekfs.toml`, covering indexed
+- [x] Config file support, for example `seekfs.toml`, covering indexed
   volumes, DB paths, service pipe, and default limits.
 - [x] Machine-readable result metadata:
   - [x] `path`
@@ -17,30 +17,30 @@ This checklist tracks work required before a public release.
   - [x] `is_dir`
   - [x] `size`, when available
   - [x] `modified`, when available
-  - [ ] `index_source`
+  - [x] `index_source`
 - [x] Agent-safe default limits so accidental broad queries do not dump millions
   of paths.
 - [x] `--absolute` / normalized path guarantees.
-- [ ] `--exists` stale-result verification mode.
-- [ ] Query syntax useful for agents:
-  - [ ] `ext:go`
-  - [ ] `dir:src`
-  - [ ] `glob:*.py`
-  - [ ] `regex:`
-  - [ ] `case:`
-  - [ ] `type:file`
-  - [ ] `type:dir`
-- [ ] `--cwd-bias` or `--root-bias` ranking for coding agents working in a repo.
-- [ ] `--under <path>` filter to constrain search to a project/workspace.
-- [ ] `--recent` / `--modified-after` filters.
+- [x] `--exists` stale-result verification mode.
+- [x] Query syntax useful for agents:
+  - [x] `ext:go`
+  - [x] `dir:src`
+  - [x] `glob:*.py`
+  - [x] `regex:`
+  - [x] `case:`
+  - [x] `type:file`
+  - [x] `type:dir`
+- [x] `--cwd-bias` or `--root-bias` ranking for coding agents working in a repo.
+- [x] `--under <path>` filter to constrain search to a project/workspace.
+- [x] `--recent` / `--modified-after` filters.
 - [x] Open protocol documentation for service pipe request/response JSON.
-- [ ] Benchmark mode for agents: random local queries, repeated service queries,
+- [x] Benchmark mode for agents: random local queries, repeated service queries,
   and JSON summary.
 - [ ] Optional MCP server later, after CLI/service are stable.
 
 ## Release Requirements
 
-- [ ] Choose final project name.
+- [x] Choose final project name.
 - [x] Add license: MIT or Apache-2.0.
 - [x] Add disclaimer: independent project, not affiliated with Everything or
   voidtools.

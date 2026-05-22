@@ -69,6 +69,15 @@ Search full paths:
 .\seekfs.exe search -service -path -n 50 "src cmd"
 ```
 
+Agent-friendly filters:
+
+```powershell
+.\seekfs.exe search -service -path --json "ext:go dir:cmd main"
+.\seekfs.exe search -service -path --under F:\git\seekfs "type:file glob:*.md"
+.\seekfs.exe search -service -path --exists --recent 24h "ext:go"
+.\seekfs.exe bench-agent -service --json -iterations 100
+```
+
 Inspect an index:
 
 ```powershell
@@ -122,6 +131,7 @@ failures: 0
 ## Documentation
 
 - [Service setup](docs/SERVICE.md)
+- [Configuration](docs/CONFIG.md)
 - [Service pipe protocol](docs/OPEN_PROTOCOL.md)
 - [Benchmarks](docs/BENCHMARKS.md)
 - [Security notes](SECURITY.md)

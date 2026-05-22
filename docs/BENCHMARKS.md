@@ -37,3 +37,25 @@ For repeatable agent-oriented benchmarks, use a script that records:
 - result count
 
 The built-in agent benchmark mode is still on the release TODO list.
+## Agent Benchmark Mode
+
+Use `bench-agent` for a quick machine-readable benchmark over common local
+queries.
+
+Local indexes:
+
+```powershell
+.\seekfs.exe bench-agent -db F:\seekfs_c.gsi -db F:\seekfs_f.gsi --json -iterations 100
+```
+
+Resident service:
+
+```powershell
+.\seekfs.exe bench-agent -service --json -iterations 100
+```
+
+You can pass explicit benchmark queries after the flags:
+
+```powershell
+.\seekfs.exe bench-agent -service --json -iterations 100 "ext:go" "type:dir docs" "glob:*.md"
+```

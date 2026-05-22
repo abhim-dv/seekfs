@@ -2,81 +2,48 @@
 
 ## Supported
 
-`seekfs` currently supports a deliberately small query language:
+`seekfs` supports a small agent-friendly query language:
 
-- Case-insensitive substring matching.
+- Case-insensitive substring matching by default.
 - Whitespace-separated terms are ANDed.
 - Name search by default.
 - Full-path search with `-path`.
 - Result limit with `-n`.
 - Count-only mode with `count`.
+- Extension filters with `ext:go`.
+- Directory/path segment filters with `dir:src`.
+- Glob filters with `glob:*.py`.
+- Regular expressions with `regex:<pattern>`.
+- Case-sensitive matching with `case:` or `--case`.
+- Type filters with `type:file` and `type:dir`.
+- Workspace scoping with `--under <path>`.
+- Stale-result verification with `--exists`.
+- Recency filters with `--recent 24h` or `--modified-after 2026-05-22`.
+- Ranking bias with `--cwd-bias` or `--root-bias <path>`.
 
-Examples:
-
-```powershell
-.\seekfs.exe search -db .\seekfs_docs_downloads_v3.gsi bench
-.\seekfs.exe search -db .\seekfs_docs_downloads_v3.gsi "bench py"
-.\seekfs.exe search -db .\seekfs_docs_downloads_v3.gsi -path "Codex 2026"
-.\seekfs.exe count  -db .\seekfs_docs_downloads_v3.gsi needle
-```
-
-## Current Behavior From Manual Checks
-
-Plain substring:
-
-```powershell
-.\seekfs.exe search -db .\seekfs_docs_downloads_v3.gsi -n 5 bench
-```
-
-Works.
-
-Multi-term AND:
+## Examples
 
 ```powershell
-.\seekfs.exe search -db .\seekfs_docs_downloads_v3.gsi -n 5 "bench py"
+.\seekfs.exe search -service -path -n 20 "ext:go dir:cmd main"
+.\seekfs.exe search -service -path -n 20 "glob:*.py"
+.\seekfs.exe search -service -path -n 20 "regex:README\\.(md|txt)"
+.\seekfs.exe search -service -path --under F:\git\seekfs "type:file ext:go"
+.\seekfs.exe search -service -path --exists --recent 24h "ext:md"
+.\seekfs.exe search -service -path --cwd-bias "main"
+.\seekfs.exe count  -service -path "type:dir docs"
 ```
 
-Works; both terms must appear in the selected search field.
+## Notes
 
-Path matching:
-
-```powershell
-.\seekfs.exe search -db .\seekfs_docs_downloads_v3.gsi -path -n 5 "Codex 2026"
-```
-
-Works against the full path.
-
-Extension approximation:
-
-```powershell
-.\seekfs.exe search -db .\seekfs_docs_downloads_v3.gsi -n 5 .py
-```
-
-Works as a substring search. This is not the same as Everything's `ext:py`.
+- `ext:` matches exact file extensions without the leading dot.
+- `glob:` currently matches the file name, not the full path.
+- `dir:` is a path substring filter.
+- `regex:` evaluates against the normalized full path.
+- `--exists` calls `os.Stat` and is slower, but filters stale index entries.
 
 ## Not Implemented Yet
 
-These Everything-style features are currently treated literally and generally
-return no results unless the filename literally contains the text:
-
-- `ext:py`
-- `dm:today`
-- `size:>1mb`
-- `attrib:h`
-- `parent:"C:\path"`
-- wildcards such as `*.py`
-- regex mode
-- OR / NOT operators
-- date macros
-- Everything-compatible ranking
-
-## Recommended Next Search Features
-
-1. `ext:<list>` extension filter.
-2. Wildcard expansion for `*` and `?`.
-3. Negation with `!term`.
-4. OR groups with `a|b`.
-5. Quoted phrase parsing inside the Go CLI.
-6. Size/date/attribute predicates.
-7. Regex mode.
-
+- Everything filters such as `dm:`, `size:`, `attrib:`, `parent:`.
+- OR / NOT operators.
+- Date macros such as `today` or `lastweek`.
+- Everything-compatible ranking.
