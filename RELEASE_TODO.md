@@ -36,7 +36,6 @@ This checklist tracks work required before a public release.
 - [x] Open protocol documentation for service pipe request/response JSON.
 - [x] Benchmark mode for agents: random local queries, repeated service queries,
   and JSON summary.
-- [ ] Optional MCP server later, after CLI/service are stable.
 
 ## Release Requirements
 

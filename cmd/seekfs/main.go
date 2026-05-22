@@ -285,9 +285,13 @@ func run(args []string) error {
 		fmt.Printf("seekfs %s commit=%s date=%s\n", version, commit, date)
 		return nil
 	case "help", "-h", "--help":
-		return usage()
+		printUsage(os.Stdout)
+		return nil
 	case "help-search":
 		printSearchHelp()
+		return nil
+	case "help-agent":
+		printAgentHelp()
 		return nil
 	default:
 		return usage()
@@ -295,7 +299,12 @@ func run(args []string) error {
 }
 
 func usage() error {
-	fmt.Fprintln(os.Stderr, `Usage:
+	printUsage(os.Stderr)
+	return errors.New("unknown or missing command")
+}
+
+func printUsage(w io.Writer) {
+	fmt.Fprintln(w, `Usage:
   seekfs index -root <path> [-root <path>...] [-db seekfs.db]
   seekfs index-usn -volume C: [-db seekfs.db]
   seekfs service [-pipe \\.\pipe\seekfs-service] [-sddl <sddl>] [-db index.gsi...]
@@ -311,41 +320,112 @@ func usage() error {
   seekfs compare-es -es path\to\es.exe [-instance 1.5a] [-db seekfs.gsi] [-n 100] <query>
   seekfs info [-db seekfs.gsi] [--json]
   seekfs help-search
+  seekfs help-agent
   seekfs search [-db seekfs.db...] [-tokens seekfs.db.tok] [-addr 127.0.0.1:47832] [-service] [--json] [-n 100] [-path] <query>
   seekfs count [-db seekfs.db...] [-tokens seekfs.db.tok] [-addr 127.0.0.1:47832] [-service] [--json] [-path] <query>
   seekfs serve [-db seekfs.db] [-tokens seekfs.db.tok] [-addr 127.0.0.1:47832]
-  seekfs version`)
-	return errors.New("unknown or missing command")
+  seekfs version
+
+Agent starting points:
+  seekfs help-agent
+  seekfs search -service --json -path -n 20 "ext:go dir:cmd main"
+  seekfs count  -service --json -path "type:file ext:go"`)
 }
 
 func printSearchHelp() {
 	fmt.Print(`seekfs search syntax
 
 Supported today:
-  plain text       Case-insensitive substring match against file name.
-  multiple terms   Whitespace-separated terms are ANDed.
-  -path            Match terms against the full path instead of just the name.
-  -n <num>         Limit returned rows.
-  count            Print the number of matches instead of result paths.
+  plain text        Case-insensitive substring match against file name.
+  multiple terms    Whitespace-separated terms are ANDed.
+  -path             Match terms against the full path instead of just the name.
+  -n <num>          Limit returned rows; default is agent-safe 100.
+  --json            Emit machine-readable JSON.
+  --under <path>    Only return results under a workspace/project.
+  --exists          Verify result paths still exist on disk.
+  --cwd-bias        Rank paths under the current directory first.
+  --root-bias path  Rank paths under a specific root first.
+  --recent 24h      Only return entries modified within a duration.
+  --modified-after  Only return entries modified after RFC3339 or YYYY-MM-DD.
+  --case            Case-sensitive matching.
+  count             Print the number of matches instead of result paths.
+
+Query filters:
+  ext:go            Match exact extension without leading dot.
+  dir:src           Match a directory/path segment substring.
+  glob:*.py         Match file name glob.
+  regex:<pattern>   Match normalized full path regex.
+  case:             Enable case-sensitive matching from the query.
+  type:file         Only files.
+  type:dir          Only directories.
 
 Examples:
-  seekfs search -db index.gsi bench
-  seekfs search -db index.gsi "bench py"
-  seekfs search -db index.gsi -path "Codex 2026"
-  seekfs count  -db index.gsi needle
+  seekfs search -service --json -path -n 20 "ext:go dir:cmd main"
+  seekfs search -service --json -path --under F:\git\seekfs "type:file glob:*.md"
+  seekfs search -service --json -path --exists --recent 24h "ext:go"
+  seekfs count  -service --json -path "type:dir docs"
 
 Not implemented yet:
-  Everything filters such as ext:, dm:, size:, attrib:, parent:
-  wildcard operators such as *.go
-  regex mode
+  Everything filters such as dm:, size:, attrib:, parent:
   OR / NOT operators
   quoted phrase parsing beyond the shell's normal argument grouping
   date macros such as today or lastweek
   ranking compatible with Everything
+`)
+}
 
-Workarounds:
-  Use ".py" as a substring to approximate ext:py for now.
-  Use -path when you need folder/path matching.
+func printAgentHelp() {
+	fmt.Print(`seekfs agent help
+
+Purpose:
+  Agent-first indexed file search for local filesystems. Prefer service mode
+  for low latency; it avoids loading large indexes on each CLI invocation.
+
+Recommended commands:
+  seekfs service-info --json
+  seekfs search -service --json -path -n 20 "ext:go dir:cmd main"
+  seekfs count  -service --json -path "type:file ext:go"
+  seekfs bench-agent -service --json -iterations 100
+
+JSON result shape:
+  {
+    "ok": true,
+    "query": "ext:go main",
+    "count": 1,
+    "limit": 20,
+    "results": [{
+      "path": "F:\\repo\\cmd\\seekfs\\main.go",
+      "name": "main.go",
+      "volume": "F:",
+      "is_dir": false,
+      "size": 123,
+      "modified": "2026-05-22T12:00:00Z",
+      "index_source": "walk"
+    }]
+  }
+
+Useful search controls:
+  --json              Required for robust automation.
+  -service            Query the installed resident service.
+  -path               Match full paths, not just names.
+  -n 20               Keep result sets bounded.
+  --under <path>      Constrain search to a workspace.
+  --exists            Filter stale index entries.
+  --cwd-bias          Prefer current repo paths.
+  --root-bias <path>  Prefer a specific repo/root.
+
+Query filters:
+  ext:go, dir:src, glob:*.py, regex:<pattern>, case:, type:file, type:dir
+
+Config:
+  seekfs reads seekfs.toml from the current directory or user config dir.
+  Supported keys: dbs, db, db_paths, db_path, volumes, volume, service_pipe,
+  default_limit.
+
+Errors:
+  With --json, errors are written to stderr as:
+  {"ok":false,"error":"message"}
+  and the process exits nonzero.
 `)
 }
 
