@@ -146,3 +146,14 @@ go vet ./...
 go build -o seekfs.exe ./cmd/seekfs
 powershell -ExecutionPolicy Bypass -File .\test_seekfs_cli.ps1
 ```
+
+## Release Artifacts
+
+The initial release artifact is an unsigned zip:
+
+```text
+seekfs-windows-amd64.zip
+```
+
+It contains `seekfs.exe`, service scripts, README, license, notice, and docs.
+Windows may warn about unsigned executables until code signing is added.

@@ -1,0 +1,9 @@
+# Example seekfs configuration.
+#
+# Copy this file to ./seekfs.toml or %AppData%\seekfs\seekfs.toml and adjust
+# the paths for your machine.
+
+dbs = ["F:\\seekfs_c.gsi", "F:\\seekfs_f.gsi"]
+volumes = ["C:", "F:"]
+service_pipe = "\\\\.\\pipe\\seekfs-service"
+default_limit = 100

@@ -1,0 +1,44 @@
+# seekfs 0.1.0 Release Notes
+
+`seekfs` is an agent-first indexed file search CLI for local filesystems. This
+first release targets Windows and NTFS/USN indexing with a resident service mode
+for low-latency repeated searches.
+
+## Highlights
+
+- Service-backed CLI search with JSON output.
+- Compact C: + F: indexes measured under the Everything DB size baseline on the
+  development machine.
+- Agent query filters for common coding workflows.
+- Machine-readable service info and benchmark output.
+
+## Install
+
+Download `seekfs-windows-amd64.zip`, extract it, and run:
+
+```powershell
+.\seekfs.exe version
+```
+
+## Service Setup
+
+```powershell
+.\seekfs.exe install-service
+Start-Service seekfs
+.\seekfs.exe service-index-usn -volume C: -db F:\seekfs_c.gsi
+.\seekfs.exe service-index-usn -volume F: -db F:\seekfs_f.gsi
+.\install_seekfs_service.ps1 -Db F:\seekfs_c.gsi,F:\seekfs_f.gsi
+```
+
+## Smoke Test
+
+```powershell
+.\seekfs.exe service-info --json
+.\seekfs.exe search -service --json -path -n 20 "ext:go"
+.\seekfs.exe bench-agent -service --json -iterations 100
+```
+
+## Signing
+
+The 0.1.0 artifact is unsigned. Windows may show standard warnings for unsigned
+executables.

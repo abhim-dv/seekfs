@@ -22,5 +22,6 @@ Indexes and benchmark output are not included.
 
 ## Signing
 
-Code signing is deferred unless the first release is distributed beyond local
-trusted users. Unsigned binaries should be documented as such in release notes.
+The 0.1.0 release is unsigned. Document this in release notes and expect normal
+Windows warnings for unsigned binaries. Add Authenticode signing before wider
+distribution beyond trusted local users.

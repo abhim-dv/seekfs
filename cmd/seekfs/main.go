@@ -1448,16 +1448,17 @@ func openPipeClient(pipeName string) (windows.Handle, error) {
 
 func (s *goSearchService) Execute(args []string, r <-chan svc.ChangeRequest, changes chan<- svc.Status) (bool, uint32) {
 	changes <- svc.Status{State: svc.StartPending}
-	if err := s.loadConfiguredIndexes(); err != nil {
-		serviceLog("startup index load error: %v", err)
-		return false, 1
-	}
 	done := make(chan struct{})
 	go func() {
 		s.servePrivileged()
 		close(done)
 	}()
 	changes <- svc.Status{State: svc.Running, Accepts: svc.AcceptStop | svc.AcceptShutdown}
+	go func() {
+		if err := s.loadConfiguredIndexes(); err != nil {
+			serviceLog("startup index load error: %v", err)
+		}
+	}()
 	for req := range r {
 		switch req.Cmd {
 		case svc.Interrogate:
