@@ -1,0 +1,24 @@
+name: Windows CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Go test
+        run: go test ./...
+      - name: Go vet
+        run: go vet ./...
+      - name: Build
+        run: go build -o seekfs.exe ./cmd/seekfs
+      - name: CLI integration test
+        shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File .\test_seekfs_cli.ps1
