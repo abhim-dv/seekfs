@@ -1211,6 +1211,7 @@ type serviceResponse struct {
 	OK      bool     `json:"ok"`
 	Message string   `json:"message,omitempty"`
 	Entries int      `json:"entries,omitempty"`
+	Loading bool     `json:"loading,omitempty"`
 	Count   int      `json:"count,omitempty"`
 	Results []string `json:"results,omitempty"`
 	DBs     []dbInfo `json:"dbs,omitempty"`
@@ -1236,6 +1237,8 @@ type goSearchService struct {
 	dbs      []string
 	indexes  []*Index
 	volumes  []*serviceVolumeIndex
+	loading  bool
+	loadErr  string
 	indexMu  sync.RWMutex
 }
 
@@ -1398,7 +1401,7 @@ func cmdLaunch(args []string) error {
 	pipeName := fs.String("pipe", defaultServicePipe, "service named pipe")
 	sddl := fs.String("sddl", defaultServiceSDDL, "pipe security descriptor SDDL")
 	jsonOut := fs.Bool("json", false, "write machine-readable JSON")
-	timeout := fs.Duration("timeout", 30*time.Second, "maximum time to wait for service health")
+	timeout := fs.Duration("timeout", 3*time.Minute, "maximum time to wait for service health")
 	fs.Var(&dbs, "db", "index database path to load for service search; repeatable")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -1852,12 +1855,16 @@ func probeDoctor(pipeName string) doctorResponse {
 		resp.PipeReachable = true
 		resp.Entries = info.Entries
 	}
+	if err == nil && info.Loading {
+		resp.PipeReachable = true
+		resp.Message = "seekfs service is loading indexes"
+	}
 	searchResp, searchErr := callService(pipeName, serviceRequestFromOptions(queryOptions{Query: "ext:go", MatchPath: true, Limit: 1}, false))
 	if searchErr == nil && searchResp.OK {
 		resp.QueryOK = true
 	}
 	resp.OK = resp.Installed && resp.Running && resp.PipeReachable && resp.Entries > 0 && resp.QueryOK
-	if !resp.OK {
+	if !resp.OK && resp.Message == "" {
 		resp.Message = "seekfs service is not fully healthy"
 	}
 	return resp
@@ -1969,6 +1976,15 @@ func (s *goSearchService) runStandalone() error {
 }
 
 func (s *goSearchService) loadConfiguredIndexes() error {
+	s.indexMu.Lock()
+	s.loading = true
+	s.loadErr = ""
+	s.indexMu.Unlock()
+	defer func() {
+		s.indexMu.Lock()
+		s.loading = false
+		s.indexMu.Unlock()
+	}()
 	if len(s.dbs) == 0 {
 		serviceLog("service started without search databases")
 		return nil
@@ -1976,6 +1992,9 @@ func (s *goSearchService) loadConfiguredIndexes() error {
 	start := time.Now()
 	indexes, err := loadIndexes(s.dbs)
 	if err != nil {
+		s.indexMu.Lock()
+		s.loadErr = err.Error()
+		s.indexMu.Unlock()
 		return err
 	}
 	volumes := make([]*serviceVolumeIndex, 0, len(indexes))
@@ -1995,6 +2014,7 @@ func (s *goSearchService) loadConfiguredIndexes() error {
 	s.indexMu.Lock()
 	s.indexes = indexes
 	s.volumes = volumes
+	s.loadErr = ""
 	s.indexMu.Unlock()
 	for _, vol := range volumes {
 		if vol.state == "ready" && vol.index.Compact && vol.index.Source == "usn" {
@@ -2306,6 +2326,8 @@ func handleServiceConn(conn *os.File, s *goSearchService) {
 	case "info":
 		s.indexMu.RLock()
 		volumes := append([]*serviceVolumeIndex(nil), s.volumes...)
+		loading := s.loading
+		loadErr := s.loadErr
 		s.indexMu.RUnlock()
 		infos := make([]dbInfo, 0, len(volumes))
 		total := 0
@@ -2325,7 +2347,13 @@ func handleServiceConn(conn *os.File, s *goSearchService) {
 				FRNRecords:  len(vol.frnToID),
 			})
 		}
-		_ = json.NewEncoder(conn).Encode(serviceResponse{OK: true, Entries: total, DBs: infos})
+		message := ""
+		if loading {
+			message = "loading indexes"
+		} else if loadErr != "" {
+			message = loadErr
+		}
+		_ = json.NewEncoder(conn).Encode(serviceResponse{OK: loadErr == "", Message: message, Entries: total, Loading: loading, DBs: infos})
 	case "search":
 		s.indexMu.RLock()
 		if len(s.indexes) == 0 {
