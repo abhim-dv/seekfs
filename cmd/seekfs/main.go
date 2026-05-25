@@ -47,6 +47,7 @@ const (
 	serviceName          = "seekfs"
 	defaultServicePipe   = `\\.\pipe\seekfs-service`
 	defaultServiceSDDL   = `D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)`
+	persistDebounce      = 5 * time.Minute
 )
 
 type Entry struct {
@@ -1258,6 +1259,8 @@ type serviceVolumeIndex struct {
 	pathCache   map[int]string
 	termMu      sync.Mutex
 	termCache   map[string][]int
+	dirty       bool
+	lastPersist time.Time
 }
 
 func serviceLog(format string, args ...any) {
@@ -1855,8 +1858,9 @@ func probeDoctor(pipeName string) doctorResponse {
 		resp.Running = status.State == svc.Running
 	} else {
 		resp.ServiceError = err.Error()
-		if serviceInstalledBySC(serviceName) {
+		if installed, running := serviceStatusBySC(serviceName); installed {
 			resp.Installed = true
+			resp.Running = running
 		}
 	}
 	info, err := callService(pipeName, serviceRequest{Command: "info"})
@@ -1883,9 +1887,14 @@ func probeDoctor(pipeName string) doctorResponse {
 	return resp
 }
 
-func serviceInstalledBySC(name string) bool {
+func serviceStatusBySC(name string) (bool, bool) {
 	cmd := exec.Command("sc.exe", "query", name)
-	return cmd.Run() == nil
+	out, err := cmd.Output()
+	if err != nil {
+		return false, false
+	}
+	text := strings.ToUpper(string(out))
+	return true, strings.Contains(text, "RUNNING")
 }
 
 func waitForDoctor(pipeName string, timeout time.Duration) doctorResponse {
@@ -2037,6 +2046,7 @@ func (s *goSearchService) loadConfiguredIndexes() error {
 	for _, vol := range volumes {
 		if vol.state == "ready" && vol.index.Compact && vol.index.Source == "usn" {
 			go s.replayVolumeLoop(vol)
+			go s.persistVolumeLoop(vol)
 		}
 	}
 	serviceLog("loaded %d dbs entries=%d elapsed=%s", len(indexes), total, time.Since(start).Round(time.Millisecond))
@@ -2045,13 +2055,14 @@ func (s *goSearchService) loadConfiguredIndexes() error {
 
 func newServiceVolumeIndex(dbPath string, idx *Index) *serviceVolumeIndex {
 	vol := &serviceVolumeIndex{
-		dbPath:     dbPath,
-		index:      idx,
-		volume:     idx.Volume,
-		journalID:  idx.JournalID,
-		checkpoint: idx.Checkpoint,
-		state:      "ready",
-		pathCache:  make(map[int]string),
+		dbPath:      dbPath,
+		index:       idx,
+		volume:      idx.Volume,
+		journalID:   idx.JournalID,
+		checkpoint:  idx.Checkpoint,
+		state:       "ready",
+		pathCache:   make(map[int]string),
+		lastPersist: time.Now(),
 	}
 	if idx.Compact && idx.Source == "usn" {
 		vol.frnToID = make(map[uint64]int, len(idx.Records))
@@ -2169,9 +2180,50 @@ func (s *goSearchService) replayVolumeOnce(vol *serviceVolumeIndex, buffer []byt
 	vol.index.Checkpoint = nextUSN
 	vol.state = "ready"
 	vol.staleReason = ""
-	err = saveIndex(vol.dbPath, vol.index)
+	vol.dirty = true
 	s.indexMu.Unlock()
-	return err
+	return nil
+}
+
+func (s *goSearchService) persistVolumeLoop(vol *serviceVolumeIndex) {
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.stop:
+			s.persistVolumeIfDue(vol, true)
+			return
+		case <-ticker.C:
+			s.persistVolumeIfDue(vol, false)
+		}
+	}
+}
+
+func (s *goSearchService) persistVolumeIfDue(vol *serviceVolumeIndex, force bool) {
+	if vol.dbPath == "" {
+		return
+	}
+	s.indexMu.RLock()
+	dirty := vol.dirty
+	due := force || time.Since(vol.lastPersist) >= persistDebounce
+	s.indexMu.RUnlock()
+	if !dirty || !due {
+		return
+	}
+	s.indexMu.Lock()
+	if !vol.dirty || (!force && time.Since(vol.lastPersist) < persistDebounce) {
+		s.indexMu.Unlock()
+		return
+	}
+	if err := saveIndex(vol.dbPath, vol.index); err != nil {
+		vol.state = "stale"
+		vol.staleReason = err.Error()
+		serviceLog("background persist error volume=%s db=%s err=%v", vol.volume, vol.dbPath, err)
+	} else {
+		vol.dirty = false
+		vol.lastPersist = time.Now()
+	}
+	s.indexMu.Unlock()
 }
 
 func queryUSNJournal(handle windows.Handle) (usnJournalDataV0, error) {

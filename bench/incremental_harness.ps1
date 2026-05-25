@@ -1,6 +1,7 @@
 param(
   [string]$Seekfs = ".\seekfs.exe",
   [string]$Es = "",
+  [string]$EsInstance = "",
   [string]$Root = "F:\seekfs_bench_sandbox\incremental",
   [string]$OutDir = "F:\seekfs_bench_results\incremental",
   [int]$Iterations = 25,
@@ -33,10 +34,10 @@ function New-Stats {
 }
 
 function Invoke-Json {
-  param([string]$Exe, [string[]]$Args)
-  $out = & $Exe @Args
+  param([string]$Exe, [string[]]$ToolArgs)
+  $out = & $Exe @ToolArgs
   if ($LASTEXITCODE -ne 0) {
-    throw "$Exe failed: $($Args -join ' ')"
+    throw "$Exe failed: $($ToolArgs -join ' ')"
   }
   return $out | ConvertFrom-Json
 }
@@ -62,7 +63,7 @@ function Wait-EsCount {
   }
   $sw = [Diagnostics.Stopwatch]::StartNew()
   do {
-    $out = & $Es -get-result-count $Query
+    $out = & $Es @esArgs -get-result-count $Query
     if ($LASTEXITCODE -eq 0 -and [int]$out -eq $Expected) {
       $sw.Stop()
       return $sw.Elapsed.TotalMilliseconds
@@ -80,6 +81,10 @@ $seekfsDelete = New-Object System.Collections.Generic.List[double]
 $everythingCreate = New-Object System.Collections.Generic.List[double]
 $everythingDelete = New-Object System.Collections.Generic.List[double]
 $failures = 0
+$esArgs = @()
+if ($EsInstance -ne "") {
+  $esArgs += @("-instance", $EsInstance)
+}
 
 for ($i = 0; $i -lt $Iterations; $i++) {
   $needle = "seekfs_inc_" + [guid]::NewGuid().ToString("N")
