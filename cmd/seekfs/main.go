@@ -369,6 +369,7 @@ func printUsage(w io.Writer) {
 
 Agent starting points:
   seekfs agent
+  seekfs search -service --json -n 20 "gh.exe"
   seekfs search -service --json -path -n 20 "ext:go dir:cmd main"
   seekfs count  -service --json -path "type:file ext:go"`)
 }
@@ -401,6 +402,7 @@ Query filters:
   type:dir          Only directories.
 
 Examples:
+  seekfs search -service --json -n 20 "gh.exe"
   seekfs search -service --json -path -n 20 "ext:go dir:cmd main"
   seekfs search -service --json -path --under F:\git\seekfs "type:file glob:*.md"
   seekfs search -service --json -path --exists --recent 24h "ext:go"
@@ -412,6 +414,13 @@ Not implemented yet:
   quoted phrase parsing beyond the shell's normal argument grouping
   date macros such as today or lastweek
   ranking compatible with Everything
+
+Performance notes:
+  Prefer filename-only search when you know the file name or executable name.
+  Example: use "gh.exe" without -path to find the GitHub CLI binary.
+  Use -path only when the query includes directory/path terms, dir:, --under,
+  regex over full paths, or when path context is required. Full-path broad
+  searches can be much slower on very large indexes.
 `)
 }
 
@@ -424,6 +433,7 @@ Purpose:
 
 Recommended commands:
   seekfs loaded --json
+  seekfs search -service --json -n 20 "gh.exe"
   seekfs search -service --json -path -n 20 "ext:go dir:cmd main"
   seekfs count  -service --json -path "type:file ext:go"
   seekfs launch -db F:\seekfs_c.gsi -db F:\seekfs_f.gsi
@@ -450,7 +460,7 @@ JSON result shape:
 Useful search controls:
   --json              Required for robust automation.
   -service            Query the installed resident service.
-  -path               Match full paths, not just names.
+  -path               Match full paths, not just names. Use only when needed.
   -n 20               Keep result sets bounded.
   --under <path>      Constrain search to a workspace.
   --exists            Filter stale index entries.
@@ -459,6 +469,12 @@ Useful search controls:
 
 Query filters:
   ext:go, dir:src, glob:*.py, regex:<pattern>, case:, type:file, type:dir
+
+Performance guidance:
+  Start with filename-only search for exact names and executables:
+    seekfs search -service --json -n 20 "gh.exe"
+  Add -path only for path-aware queries:
+    seekfs search -service --json -path -n 20 "ext:go dir:cmd main"
 
 Config:
   seekfs reads seekfs.toml from the current directory or user config dir.

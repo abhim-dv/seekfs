@@ -10,6 +10,20 @@ Requests and responses are newline-delimited JSON objects encoded as UTF-8.
 
 ## Search Request
 
+For fast executable or exact filename lookup, leave `match_path` false:
+
+```json
+{
+  "command": "search",
+  "query": "gh.exe",
+  "match_path": false,
+  "limit": 20,
+  "count_only": false
+}
+```
+
+Set `match_path` to true only when path context is required.
+
 ```json
 {
   "command": "search",

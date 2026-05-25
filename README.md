@@ -55,6 +55,7 @@ Reinstall the service with the indexes it should keep resident:
 Query through the service:
 
 ```powershell
+.\seekfs.exe search -service -n 20 "gh.exe"
 .\seekfs.exe search -service -path -n 20 "ext:go dir:cmd main"
 .\seekfs.exe count  -service -path "ext:go dir:cmd main"
 ```
@@ -65,6 +66,7 @@ Search file names:
 
 ```powershell
 .\seekfs.exe search -service -n 50 main
+.\seekfs.exe search -service -n 20 "gh.exe"
 ```
 
 Search full paths:
@@ -81,6 +83,11 @@ Agent-friendly filters:
 .\seekfs.exe search -service -path --exists --recent 24h "ext:go"
 .\seekfs.exe bench -service --json -iterations 100
 ```
+
+Performance note for agents: prefer filename-only search when looking for a
+known file or executable name. Use `-path` only when the query needs directory
+terms, `dir:`, `--under`, regex over full paths, or path context. Broad
+full-path searches can be much slower on very large indexes.
 
 Inspect an index:
 
