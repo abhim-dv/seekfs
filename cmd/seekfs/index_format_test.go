@@ -2,6 +2,9 @@ package main
 
 import (
 	"bytes"
+	"fmt"
+	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -199,4 +202,86 @@ func TestServiceVolumeIndexBuildsFRNMap(t *testing.T) {
 	if got := vol.frnToID[101]; got != 1 {
 		t.Fatalf("frnToID[101] = %d, want 1", got)
 	}
+}
+
+func BenchmarkSearchCompactBroadPathQuery(b *testing.B) {
+	idx := syntheticCompactIndex(100_000)
+	opts := queryOptions{Query: "needle", MatchPath: true, Limit: 20}
+	cache := make(map[int]string)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		matches, err := searchCompactWithCache(idx, opts, false, cache, nil)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if len(matches) != 20 {
+			b.Fatalf("matches = %d, want 20", len(matches))
+		}
+	}
+}
+
+func BenchmarkSearchCompactExtPrecheck(b *testing.B) {
+	idx := syntheticCompactIndex(100_000)
+	opts := queryOptions{Query: "ext:go", MatchPath: true, Limit: 20}
+	cache := make(map[int]string)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		matches, err := searchCompactWithCache(idx, opts, false, cache, nil)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if len(matches) != 20 {
+			b.Fatalf("matches = %d, want 20", len(matches))
+		}
+	}
+}
+
+func BenchmarkSearchCompactNameTokenPathQuery(b *testing.B) {
+	idx := syntheticCompactIndex(100_000)
+	vol := newServiceVolumeIndex("bench.gsi", idx)
+	opts := queryOptions{Query: "source", MatchPath: true, Limit: 20}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		matches, err := searchCompactWithCache(idx, opts, false, vol.pathCache, vol.nameTermCandidates)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if len(matches) != 20 {
+			b.Fatalf("matches = %d, want 20", len(matches))
+		}
+	}
+}
+
+func syntheticCompactIndex(n int) *Index {
+	idx := &Index{
+		Source:  "usn",
+		Volume:  "F:",
+		Compact: true,
+		Records: make([]CompactRecord, 0, n+2),
+	}
+	idx.Records = append(idx.Records,
+		CompactRecord{FRN: 1, ParentFRN: 1, Parent: -1, Name: ".", LowerName: ".", Mode: uint32(os.ModeDir)},
+		CompactRecord{FRN: 2, ParentFRN: 1, Parent: 0, Name: "needle-root", LowerName: "needle-root", Mode: uint32(os.ModeDir)},
+	)
+	for i := 0; i < n; i++ {
+		parent := int32(0)
+		parentFRN := uint64(1)
+		if i%10 == 0 {
+			parent = 1
+			parentFRN = 2
+		}
+		name := fmt.Sprintf("file-%06d.txt", i)
+		if i%37 == 0 {
+			name = fmt.Sprintf("source-%06d.go", i)
+		}
+		idx.Records = append(idx.Records, CompactRecord{
+			FRN:       uint64(i + 10),
+			ParentFRN: parentFRN,
+			Parent:    parent,
+			Name:      name,
+			LowerName: strings.ToLower(name),
+		})
+	}
+	buildOrders(idx)
+	return idx
 }

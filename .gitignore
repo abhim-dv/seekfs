@@ -11,6 +11,7 @@
 *.summary.json
 bench-results/
 benchmark-results/
+tmp-admin-logs/
 server_*.out
 server_*.err
 __pycache__/

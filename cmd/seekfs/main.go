@@ -1248,6 +1248,9 @@ type serviceVolumeIndex struct {
 	state       string
 	staleReason string
 	frnToID     map[uint64]int
+	pathCache   map[int]string
+	termMu      sync.Mutex
+	termCache   map[string][]int
 }
 
 func serviceLog(format string, args ...any) {
@@ -2010,6 +2013,7 @@ func newServiceVolumeIndex(dbPath string, idx *Index) *serviceVolumeIndex {
 		journalID:  idx.JournalID,
 		checkpoint: idx.Checkpoint,
 		state:      "ready",
+		pathCache:  make(map[int]string),
 	}
 	if idx.Compact && idx.Source == "usn" {
 		vol.frnToID = make(map[uint64]int, len(idx.Records))
@@ -2205,6 +2209,10 @@ func (vol *serviceVolumeIndex) applyUSNChanges(changes []usnChange) {
 		}
 	}
 	vol.index.Checkpoint = vol.checkpoint
+	vol.pathCache = make(map[int]string)
+	vol.termMu.Lock()
+	vol.termCache = nil
+	vol.termMu.Unlock()
 	vol.index.CompactNameOrder = make([]int, len(vol.index.Records))
 	for i := range vol.index.CompactNameOrder {
 		vol.index.CompactNameOrder[i] = i
@@ -2325,7 +2333,14 @@ func handleServiceConn(conn *os.File, s *goSearchService) {
 			_ = json.NewEncoder(conn).Encode(serviceResponse{OK: false, Message: "service has no search indexes loaded"})
 			return
 		}
-		matches, err := searchAll(s.indexes, requestToOptionsFromService(req), req.CountOnly)
+		opts := requestToOptionsFromService(req)
+		var matches []Entry
+		var err error
+		if len(s.volumes) == len(s.indexes) {
+			matches, err = searchServiceVolumes(s.volumes, opts, req.CountOnly)
+		} else {
+			matches, err = searchAll(s.indexes, opts, req.CountOnly)
+		}
 		s.indexMu.RUnlock()
 		if err != nil {
 			_ = json.NewEncoder(conn).Encode(serviceResponse{OK: false, Message: err.Error()})
@@ -2545,7 +2560,36 @@ func searchAll(indexes []*Index, opts queryOptions, countOnly bool) ([]Entry, er
 	return results, nil
 }
 
+func searchServiceVolumes(volumes []*serviceVolumeIndex, opts queryOptions, countOnly bool) ([]Entry, error) {
+	if len(volumes) == 1 {
+		return searchCompactWithCache(volumes[0].index, opts, countOnly, volumes[0].pathCache, volumes[0].nameTermCandidates)
+	}
+	limit := normalizedLimit(opts.Limit, countOnly)
+	results := make([]Entry, 0, min(limit, 1024))
+	for _, vol := range volumes {
+		perIndexLimit := limit
+		if !countOnly && limit > 0 {
+			perIndexLimit = limit - len(results)
+			if perIndexLimit <= 0 {
+				break
+			}
+		}
+		childOpts := opts
+		childOpts.Limit = perIndexLimit
+		matches, err := searchCompactWithCache(vol.index, childOpts, countOnly, vol.pathCache, vol.nameTermCandidates)
+		if err != nil {
+			return nil, err
+		}
+		results = append(results, matches...)
+	}
+	return results, nil
+}
+
 func searchCompact(idx *Index, opts queryOptions, countOnly bool) ([]Entry, error) {
+	return searchCompactWithCache(idx, opts, countOnly, nil, nil)
+}
+
+func searchCompactWithCache(idx *Index, opts queryOptions, countOnly bool, pathCache map[int]string, candidateFn func(parsedQuery) ([]int, bool)) ([]Entry, error) {
 	pq, err := parseQuery(opts)
 	if err != nil {
 		return nil, err
@@ -2558,14 +2602,29 @@ func searchCompact(idx *Index, opts queryOptions, countOnly bool) ([]Entry, erro
 			order[i] = i
 		}
 	}
+	if opts.MatchPath && !countOnly {
+		if candidateFn != nil {
+			if candidates, ok := candidateFn(pq); ok {
+				order = candidates
+			}
+		}
+	}
 	if pq.RootBias != "" || pq.CWDBias != "" {
 		order = idx.biasOrderCompact(order, firstNonEmpty(pq.CWDBias, pq.RootBias))
 	}
 	results := make([]Entry, 0, min(limit, 1024))
-	pathCache := make(map[int]string)
+	if pathCache == nil {
+		pathCache = make(map[int]string)
+	}
 	for _, recIndex := range order {
 		rec := idx.Records[recIndex]
 		if rec.Deleted {
+			continue
+		}
+		if !compactRecordPrecheck(rec, pq, opts.MatchPath) {
+			continue
+		}
+		if opts.MatchPath && len(pq.Terms) > 0 && !idx.compactPathContainsAll(recIndex, pq.Terms) {
 			continue
 		}
 		path := idx.reconstructCompactPathCached(recIndex, pathCache)
@@ -2596,6 +2655,101 @@ func searchCompact(idx *Index, opts queryOptions, countOnly bool) ([]Entry, erro
 		}
 	}
 	return results, nil
+}
+
+func compactRecordPrecheck(rec CompactRecord, pq parsedQuery, matchPath bool) bool {
+	name := rec.Name
+	cmpName := normalizeCase(name, pq.CaseSensitive)
+	if !matchPath && !containsAll(cmpName, pq.Terms) {
+		return false
+	}
+	if pq.Type == "file" && rec.Mode&uint32(os.ModeDir) != 0 {
+		return false
+	}
+	if pq.Type == "dir" && rec.Mode&uint32(os.ModeDir) == 0 {
+		return false
+	}
+	if pq.HasModAfter {
+		if rec.ModUnix == 0 || !time.Unix(0, rec.ModUnix).After(pq.ModifiedAfter) {
+			return false
+		}
+	}
+	for _, ext := range pq.Exts {
+		actual := strings.TrimPrefix(filepath.Ext(name), ".")
+		if normalizeCase(actual, pq.CaseSensitive) != ext {
+			return false
+		}
+	}
+	for _, glob := range pq.Globs {
+		ok, err := filepath.Match(glob, cmpName)
+		if err != nil || !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func (vol *serviceVolumeIndex) nameTermCandidates(pq parsedQuery) ([]int, bool) {
+	if vol == nil || vol.index == nil || len(pq.Terms) == 0 || len(pq.Dirs) > 0 || len(pq.Regexps) > 0 || pq.Under != "" {
+		return nil, false
+	}
+	lists := make([][]int, 0, len(pq.Terms))
+	for _, term := range pq.Terms {
+		list := vol.nameTermPosting(term)
+		if len(list) == 0 {
+			return nil, false
+		}
+		lists = append(lists, list)
+	}
+	sort.Slice(lists, func(i, j int) bool { return len(lists[i]) < len(lists[j]) })
+	candidates := append([]int(nil), lists[0]...)
+	for _, list := range lists[1:] {
+		candidates = intersectSortedInts(candidates, list)
+		if len(candidates) == 0 {
+			break
+		}
+	}
+	return candidates, len(candidates) > 0
+}
+
+func (vol *serviceVolumeIndex) nameTermPosting(term string) []int {
+	vol.termMu.Lock()
+	defer vol.termMu.Unlock()
+	if vol.termCache == nil {
+		vol.termCache = make(map[string][]int)
+	}
+	if list, ok := vol.termCache[term]; ok {
+		return list
+	}
+	list := make([]int, 0, 64)
+	for i, rec := range vol.index.Records {
+		if rec.Deleted {
+			continue
+		}
+		if strings.Contains(rec.LowerName, term) {
+			list = append(list, i)
+		}
+	}
+	vol.termCache[term] = list
+	return list
+}
+
+func intersectSortedInts(a, b []int) []int {
+	out := a[:0]
+	i, j := 0, 0
+	for i < len(a) && j < len(b) {
+		switch {
+		case a[i] == b[j]:
+			out = append(out, a[i])
+			i++
+			j++
+		case a[i] < b[j]:
+			i++
+		default:
+			j++
+		}
+	}
+	return out
 }
 
 func (idx *Index) compactPathContainsAll(i int, terms []string) bool {
