@@ -23,11 +23,11 @@ Download `seekfs-windows-amd64.zip`, extract it, and run:
 ## Service Setup
 
 ```powershell
-.\seekfs.exe install-service
-Start-Service seekfs
+.\seekfs.exe setup-service -no-start
+.\seekfs.exe start-service
 .\seekfs.exe service-index-usn -volume C: -db F:\seekfs_c.gsi
 .\seekfs.exe service-index-usn -volume F: -db F:\seekfs_f.gsi
-.\install_seekfs_service.ps1 -Db F:\seekfs_c.gsi,F:\seekfs_f.gsi
+.\seekfs.exe setup-service -db F:\seekfs_c.gsi -db F:\seekfs_f.gsi
 ```
 
 ## Smoke Test
@@ -36,6 +36,7 @@ Start-Service seekfs
 .\seekfs.exe service-info --json
 .\seekfs.exe search -service --json -path -n 20 "ext:go"
 .\seekfs.exe bench-agent -service --json -iterations 100
+.\seekfs.exe doctor --json
 ```
 
 ## Signing

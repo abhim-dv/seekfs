@@ -95,6 +95,17 @@ type jsonInfoResponse struct {
 	ContentHash string   `json:"content_hash,omitempty"`
 }
 
+type doctorResponse struct {
+	OK            bool   `json:"ok"`
+	ServiceName   string `json:"service_name"`
+	Installed     bool   `json:"installed"`
+	Running       bool   `json:"running"`
+	PipeReachable bool   `json:"pipe_reachable"`
+	Entries       int    `json:"entries,omitempty"`
+	QueryOK       bool   `json:"query_ok"`
+	Message       string `json:"message,omitempty"`
+}
+
 type benchSummary struct {
 	OK         bool               `json:"ok"`
 	Mode       string             `json:"mode"`
@@ -255,8 +266,18 @@ func run(args []string) error {
 		return cmdService(args[1:])
 	case "install-service":
 		return cmdInstallService(args[1:])
+	case "setup-service":
+		return cmdSetupService(args[1:])
+	case "start-service":
+		return cmdControlService(args[1:], "start")
+	case "stop-service":
+		return cmdControlService(args[1:], "stop")
+	case "restart-service":
+		return cmdControlService(args[1:], "restart")
 	case "uninstall-service":
 		return cmdUninstallService(args[1:])
+	case "doctor":
+		return cmdDoctor(args[1:])
 	case "service-index-usn":
 		return cmdServiceIndexUSN(args[1:])
 	case "service-monitor-start":
@@ -309,7 +330,10 @@ func printUsage(w io.Writer) {
   seekfs index-usn -volume C: [-db seekfs.db]
   seekfs service [-pipe \\.\pipe\seekfs-service] [-sddl <sddl>] [-db index.gsi...]
   seekfs install-service [-pipe \\.\pipe\seekfs-service] [-sddl <sddl>] [-db index.gsi...]
+  seekfs setup-service [-db index.gsi...] [-no-start]
+  seekfs start-service|stop-service|restart-service
   seekfs uninstall-service
+  seekfs doctor [--json]
   seekfs service-index-usn -volume C: -db seekfs.gsi [-pipe \\.\pipe\seekfs-service]
   seekfs service-monitor-start -volume C:
   seekfs service-monitor-stop -volume C:
@@ -1291,6 +1315,69 @@ func cmdInstallService(args []string) error {
 	return nil
 }
 
+func cmdSetupService(args []string) error {
+	var dbs stringList
+	fs := flag.NewFlagSet("setup-service", flag.ContinueOnError)
+	configPath := fs.String("config", "", "optional seekfs.toml config path")
+	pipeName := fs.String("pipe", defaultServicePipe, "service named pipe")
+	sddl := fs.String("sddl", defaultServiceSDDL, "pipe security descriptor SDDL")
+	noStart := fs.Bool("no-start", false, "install but do not start the service")
+	fs.Var(&dbs, "db", "index database path to load for service search; repeatable")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	cfg, err := loadConfig(*configPath)
+	if err != nil {
+		return err
+	}
+	if len(dbs) == 0 && len(cfg.DBs) > 0 {
+		dbs = append(dbs, cfg.DBs...)
+	}
+	if *pipeName == defaultServicePipe && cfg.ServicePipe != "" {
+		*pipeName = cfg.ServicePipe
+	}
+	if err := stopServiceIfExists(); err != nil {
+		return err
+	}
+	if err := deleteServiceIfExists(); err != nil {
+		return err
+	}
+	installArgs := []string{"-pipe", *pipeName, "-sddl", *sddl}
+	for _, db := range dbs {
+		installArgs = append(installArgs, "-db", db)
+	}
+	if err := cmdInstallService(installArgs); err != nil {
+		return err
+	}
+	if !*noStart {
+		if err := startWindowsService(); err != nil {
+			return err
+		}
+		fmt.Println("started service", serviceName)
+	}
+	return nil
+}
+
+func cmdControlService(args []string, action string) error {
+	fs := flag.NewFlagSet(action+"-service", flag.ContinueOnError)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	switch action {
+	case "start":
+		return startWindowsService()
+	case "stop":
+		return stopWindowsService()
+	case "restart":
+		if err := stopServiceIfExists(); err != nil {
+			return err
+		}
+		return startWindowsService()
+	default:
+		return errors.New("unknown service action")
+	}
+}
+
 func cmdUninstallService(args []string) error {
 	fs := flag.NewFlagSet("uninstall-service", flag.ContinueOnError)
 	if err := fs.Parse(args); err != nil {
@@ -1311,6 +1398,68 @@ func cmdUninstallService(args []string) error {
 	}
 	fmt.Println("uninstalled service", serviceName)
 	return nil
+}
+
+func startWindowsService() error {
+	m, err := mgr.Connect()
+	if err != nil {
+		return err
+	}
+	defer m.Disconnect()
+	s, err := m.OpenService(serviceName)
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+	return s.Start()
+}
+
+func stopWindowsService() error {
+	m, err := mgr.Connect()
+	if err != nil {
+		return err
+	}
+	defer m.Disconnect()
+	s, err := m.OpenService(serviceName)
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+	status, err := s.Control(svc.Stop)
+	if err != nil {
+		return err
+	}
+	deadline := time.Now().Add(15 * time.Second)
+	for status.State != svc.Stopped && time.Now().Before(deadline) {
+		time.Sleep(300 * time.Millisecond)
+		status, err = s.Query()
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func stopServiceIfExists() error {
+	err := stopWindowsService()
+	if err == nil || strings.Contains(strings.ToLower(err.Error()), "does not exist") {
+		return nil
+	}
+	return nil
+}
+
+func deleteServiceIfExists() error {
+	m, err := mgr.Connect()
+	if err != nil {
+		return err
+	}
+	defer m.Disconnect()
+	s, err := m.OpenService(serviceName)
+	if err != nil {
+		return nil
+	}
+	defer s.Close()
+	return s.Delete()
 }
 
 func cmdServiceIndexUSN(args []string) error {
@@ -1401,6 +1550,69 @@ func cmdServiceInfo(args []string) error {
 		fmt.Printf("%s entries=%d source=%s volume=%s built_at=%s checkpoint=%d\n", db.Path, db.Entries, db.Source, db.Volume, db.BuiltAt, db.Checkpoint)
 	}
 	return nil
+}
+
+func cmdDoctor(args []string) error {
+	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
+	configPath := fs.String("config", "", "optional seekfs.toml config path")
+	pipeName := fs.String("pipe", defaultServicePipe, "service named pipe")
+	jsonOut := fs.Bool("json", false, "write machine-readable JSON")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	cfg, err := loadConfig(*configPath)
+	if err != nil {
+		return err
+	}
+	if *pipeName == defaultServicePipe && cfg.ServicePipe != "" {
+		*pipeName = cfg.ServicePipe
+	}
+	resp := doctorResponse{ServiceName: serviceName}
+	if status, err := queryWindowsService(); err == nil {
+		resp.Installed = true
+		resp.Running = status.State == svc.Running
+	}
+	info, err := callService(*pipeName, serviceRequest{Command: "info"})
+	if err == nil && info.OK {
+		resp.PipeReachable = true
+		resp.Entries = info.Entries
+	}
+	searchResp, searchErr := callService(*pipeName, serviceRequestFromOptions(queryOptions{Query: "ext:go", MatchPath: true, Limit: 1}, false))
+	if searchErr == nil && searchResp.OK {
+		resp.QueryOK = true
+	}
+	resp.OK = resp.Installed && resp.Running && resp.PipeReachable && resp.Entries > 0 && resp.QueryOK
+	if !resp.OK {
+		resp.Message = "seekfs service is not fully healthy"
+	}
+	if *jsonOut {
+		if err := writeJSON(os.Stdout, resp); err != nil {
+			return err
+		}
+		if !resp.OK {
+			return errors.New(resp.Message)
+		}
+		return nil
+	}
+	fmt.Printf("installed: %t\nrunning: %t\npipe_reachable: %t\nentries: %d\nquery_ok: %t\n", resp.Installed, resp.Running, resp.PipeReachable, resp.Entries, resp.QueryOK)
+	if !resp.OK {
+		return errors.New(resp.Message)
+	}
+	return nil
+}
+
+func queryWindowsService() (svc.Status, error) {
+	m, err := mgr.Connect()
+	if err != nil {
+		return svc.Status{}, err
+	}
+	defer m.Disconnect()
+	s, err := m.OpenService(serviceName)
+	if err != nil {
+		return svc.Status{}, err
+	}
+	defer s.Close()
+	return s.Query()
 }
 
 func callService(pipeName string, req serviceRequest) (serviceResponse, error) {

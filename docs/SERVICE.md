@@ -12,7 +12,7 @@ Install the service:
 
 ```powershell
 .\seekfs.exe install-service
-Start-Service seekfs
+.\seekfs.exe start-service
 ```
 
 ## Build Indexes
@@ -27,10 +27,7 @@ Start-Service seekfs
 Reinstall the service with the DB paths it should keep loaded:
 
 ```powershell
-Stop-Service seekfs -ErrorAction SilentlyContinue
-.\seekfs.exe uninstall-service
-.\seekfs.exe install-service -db F:\seekfs_c.gsi -db F:\seekfs_f.gsi
-Start-Service seekfs
+.\seekfs.exe setup-service -db F:\seekfs_c.gsi -db F:\seekfs_f.gsi
 ```
 
 Or use:
@@ -43,15 +40,13 @@ Or use:
 
 1. Build or unpack the new `seekfs.exe`.
 2. Record current DB paths.
-3. Stop the service.
-4. Reinstall with the same `-db` arguments.
-5. Start the service.
-6. Run `seekfs service-status` and a smoke search.
+3. Run `seekfs setup-service` with the same `-db` arguments.
+4. Run `seekfs doctor`.
 
 ## Uninstall
 
 ```powershell
-Stop-Service seekfs -ErrorAction SilentlyContinue
+.\seekfs.exe stop-service
 .\seekfs.exe uninstall-service
 ```
 

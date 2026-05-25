@@ -36,8 +36,8 @@ Create a small fallback index:
 Use the service for full-volume NTFS/USN indexing and resident search.
 
 ```powershell
-.\seekfs.exe install-service
-Start-Service seekfs
+.\seekfs.exe setup-service -no-start
+.\seekfs.exe start-service
 .\seekfs.exe service-index-usn -volume C: -db F:\seekfs_c.gsi
 .\seekfs.exe service-index-usn -volume F: -db F:\seekfs_f.gsi
 ```
@@ -45,7 +45,8 @@ Start-Service seekfs
 Reinstall the service with the indexes it should keep resident:
 
 ```powershell
-.\install_seekfs_service.ps1 -Db F:\seekfs_c.gsi,F:\seekfs_f.gsi
+.\seekfs.exe setup-service -db F:\seekfs_c.gsi -db F:\seekfs_f.gsi
+.\seekfs.exe doctor
 ```
 
 Query through the service:
