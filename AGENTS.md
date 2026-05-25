@@ -7,3 +7,7 @@
   Prefer `seekfs search`/`seekfs count` for finding files by name or path, using
   the resident service. Use `rg` as the fallback for text-content search,
   precise line matches, or when the local seekfs service/binary is unavailable.
+- When seekfs gives a bad result, misses a file, or is noticeably slow, append a
+  one-line JSON object to `.seekfs-dogfood.jsonl` with the query, command,
+  elapsed_ms if known, expected behavior, and fallback used. Do not commit this
+  log file.
