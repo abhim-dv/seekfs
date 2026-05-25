@@ -24,9 +24,9 @@ import (
 	"golang.org/x/sys/windows/svc/mgr"
 )
 
-const indexVersion = 7
+const indexVersion = 8
 
-var indexMagic = [8]byte{'G', 'O', 'S', 'R', 'C', 'H', '0', '7'}
+var indexMagic = [8]byte{'G', 'O', 'S', 'R', 'C', 'H', '0', '8'}
 
 var (
 	version = "dev"
@@ -37,7 +37,12 @@ var (
 const (
 	fsctlEnumUSNData     = 0x000900b3
 	fsctlQueryUSNJournal = 0x000900f4
+	fsctlReadUSNJournal  = 0x000900bb
 	fileAttributeDir     = 0x10
+	usnReasonFileCreate  = 0x00000100
+	usnReasonFileDelete  = 0x00000200
+	usnReasonRenameOld   = 0x00001000
+	usnReasonRenameNew   = 0x00002000
 	serviceName          = "seekfs"
 	defaultServicePipe   = `\\.\pipe\seekfs-service`
 	defaultServiceSDDL   = `D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)`
@@ -169,6 +174,8 @@ type parsedQuery struct {
 }
 
 type CompactRecord struct {
+	FRN       uint64
+	ParentFRN uint64
 	Parent    int32
 	Name      string
 	LowerName string
@@ -177,6 +184,7 @@ type CompactRecord struct {
 	Mode      uint32
 	Size      int64
 	ModUnix   int64
+	Deleted   bool
 }
 
 type usnJournalDataV0 struct {
@@ -195,11 +203,29 @@ type mftEnumDataV0 struct {
 	HighUsn                  int64
 }
 
+type readUSNJournalDataV0 struct {
+	StartUsn          int64
+	ReasonMask        uint32
+	ReturnOnlyOnClose uint32
+	Timeout           uint64
+	BytesToWaitFor    uint64
+	UsnJournalID      uint64
+}
+
 type usnNode struct {
 	frn       uint64
 	parentFRN uint64
 	name      string
 	attr      uint32
+}
+
+type usnChange struct {
+	FRN       uint64
+	ParentFRN uint64
+	USN       int64
+	Reason    uint32
+	Attr      uint32
+	Name      string
 }
 
 type stringList []string
@@ -582,18 +608,8 @@ func indexUSNVolume(volume string) (*Index, error) {
 	}
 	defer windows.CloseHandle(handle)
 
-	var journal usnJournalDataV0
-	var bytesReturned uint32
-	if err := windows.DeviceIoControl(
-		handle,
-		fsctlQueryUSNJournal,
-		nil,
-		0,
-		(*byte)(unsafe.Pointer(&journal)),
-		uint32(unsafe.Sizeof(journal)),
-		&bytesReturned,
-		nil,
-	); err != nil {
+	journal, err := queryUSNJournal(handle)
+	if err != nil {
 		return nil, fmt.Errorf("query USN journal for %s: %w; run elevated or use a service helper for raw volume access", vol, err)
 	}
 
@@ -630,6 +646,8 @@ func indexUSNVolume(volume string) (*Index, error) {
 			parent = int32(p)
 		}
 		idx.Records = append(idx.Records, CompactRecord{
+			FRN:       frn,
+			ParentFRN: node.parentFRN,
 			Parent:    parent,
 			Name:      node.name,
 			LowerName: strings.ToLower(node.name),
@@ -719,6 +737,80 @@ func enumUSN(handle windows.Handle, highUSN int64) (map[uint64]usnNode, error) {
 		}
 	}
 	return nodes, nil
+}
+
+func readUSNChanges(handle windows.Handle, journalID uint64, startUSN int64, buffer []byte) (int64, []usnChange, error) {
+	if len(buffer) < 4096 {
+		buffer = make([]byte, 4096)
+	}
+	req := readUSNJournalDataV0{
+		StartUsn:          startUSN,
+		ReasonMask:        0xffffffff,
+		ReturnOnlyOnClose: 0,
+		Timeout:           0,
+		BytesToWaitFor:    0,
+		UsnJournalID:      journalID,
+	}
+	var bytesReturned uint32
+	err := windows.DeviceIoControl(
+		handle,
+		fsctlReadUSNJournal,
+		(*byte)(unsafe.Pointer(&req)),
+		uint32(unsafe.Sizeof(req)),
+		&buffer[0],
+		uint32(len(buffer)),
+		&bytesReturned,
+		nil,
+	)
+	if err != nil {
+		if err == windows.ERROR_HANDLE_EOF {
+			return startUSN, nil, nil
+		}
+		return startUSN, nil, err
+	}
+	return parseUSNChangeBuffer(buffer[:bytesReturned])
+}
+
+func parseUSNChangeBuffer(buffer []byte) (int64, []usnChange, error) {
+	if len(buffer) < 8 {
+		return 0, nil, errors.New("USN change buffer too small")
+	}
+	nextUSN := int64(binary.LittleEndian.Uint64(buffer[:8]))
+	changes, err := parseUSNRecords(buffer[8:])
+	return nextUSN, changes, err
+}
+
+func parseUSNRecords(buffer []byte) ([]usnChange, error) {
+	changes := make([]usnChange, 0, 128)
+	for pos := uint32(0); pos < uint32(len(buffer)); {
+		if uint32(len(buffer))-pos < 60 {
+			break
+		}
+		record := buffer[pos:]
+		recordLen := binary.LittleEndian.Uint32(record[0:4])
+		if recordLen < 60 || pos+recordLen > uint32(len(buffer)) {
+			return nil, errors.New("invalid USN record length")
+		}
+		major := binary.LittleEndian.Uint16(record[4:6])
+		if major == 2 || major == 3 {
+			nameLen := binary.LittleEndian.Uint16(record[56:58])
+			nameOff := binary.LittleEndian.Uint16(record[58:60])
+			if uint32(nameOff)+uint32(nameLen) > recordLen {
+				return nil, errors.New("invalid USN record name")
+			}
+			nameBytes := record[nameOff : uint32(nameOff)+uint32(nameLen)]
+			changes = append(changes, usnChange{
+				FRN:       binary.LittleEndian.Uint64(record[8:16]),
+				ParentFRN: binary.LittleEndian.Uint64(record[16:24]),
+				USN:       int64(binary.LittleEndian.Uint64(record[24:32])),
+				Reason:    binary.LittleEndian.Uint32(record[40:44]),
+				Attr:      binary.LittleEndian.Uint32(record[52:56]),
+				Name:      windows.UTF16ToString(bytesToUTF16(nameBytes)),
+			})
+		}
+		pos += recordLen
+	}
+	return changes, nil
 }
 
 func bytesToUTF16(b []byte) []uint16 {
@@ -1125,13 +1217,16 @@ type serviceResponse struct {
 }
 
 type dbInfo struct {
-	Path       string `json:"path"`
-	Entries    int    `json:"entries"`
-	Source     string `json:"source"`
-	BuiltAt    string `json:"built_at"`
-	Volume     string `json:"volume,omitempty"`
-	JournalID  uint64 `json:"journal_id,omitempty"`
-	Checkpoint int64  `json:"checkpoint_usn,omitempty"`
+	Path        string `json:"path"`
+	Entries     int    `json:"entries"`
+	Source      string `json:"source"`
+	BuiltAt     string `json:"built_at"`
+	Volume      string `json:"volume,omitempty"`
+	JournalID   uint64 `json:"journal_id,omitempty"`
+	Checkpoint  int64  `json:"checkpoint_usn,omitempty"`
+	State       string `json:"state,omitempty"`
+	StaleReason string `json:"stale_reason,omitempty"`
+	FRNRecords  int    `json:"frn_records,omitempty"`
 }
 
 type goSearchService struct {
@@ -1140,7 +1235,19 @@ type goSearchService struct {
 	stop     chan struct{}
 	dbs      []string
 	indexes  []*Index
+	volumes  []*serviceVolumeIndex
 	indexMu  sync.RWMutex
+}
+
+type serviceVolumeIndex struct {
+	dbPath      string
+	index       *Index
+	volume      string
+	journalID   uint64
+	checkpoint  int64
+	state       string
+	staleReason string
+	frnToID     map[uint64]int
 }
 
 func serviceLog(format string, args ...any) {
@@ -1868,15 +1975,240 @@ func (s *goSearchService) loadConfiguredIndexes() error {
 	if err != nil {
 		return err
 	}
+	volumes := make([]*serviceVolumeIndex, 0, len(indexes))
 	total := 0
-	for _, idx := range indexes {
+	for i, idx := range indexes {
 		total += idx.entryCount()
+		dbPath := ""
+		if i < len(s.dbs) {
+			dbPath = s.dbs[i]
+		}
+		vol := newServiceVolumeIndex(dbPath, idx)
+		if err := catchUpServiceVolume(vol); err != nil {
+			serviceLog("startup catch-up skipped volume=%s db=%s err=%v", vol.volume, vol.dbPath, err)
+		}
+		volumes = append(volumes, vol)
 	}
 	s.indexMu.Lock()
 	s.indexes = indexes
+	s.volumes = volumes
 	s.indexMu.Unlock()
+	for _, vol := range volumes {
+		if vol.state == "ready" && vol.index.Compact && vol.index.Source == "usn" {
+			go s.replayVolumeLoop(vol)
+		}
+	}
 	serviceLog("loaded %d dbs entries=%d elapsed=%s", len(indexes), total, time.Since(start).Round(time.Millisecond))
 	return nil
+}
+
+func newServiceVolumeIndex(dbPath string, idx *Index) *serviceVolumeIndex {
+	vol := &serviceVolumeIndex{
+		dbPath:     dbPath,
+		index:      idx,
+		volume:     idx.Volume,
+		journalID:  idx.JournalID,
+		checkpoint: idx.Checkpoint,
+		state:      "ready",
+	}
+	if idx.Compact && idx.Source == "usn" {
+		vol.frnToID = make(map[uint64]int, len(idx.Records))
+		for i, rec := range idx.Records {
+			if rec.FRN != 0 {
+				vol.frnToID[rec.FRN] = i
+			}
+		}
+	}
+	return vol
+}
+
+func catchUpServiceVolume(vol *serviceVolumeIndex) error {
+	if vol.index == nil || !vol.index.Compact || vol.index.Source != "usn" || vol.volume == "" {
+		return nil
+	}
+	handle, err := openVolume(vol.volume)
+	if err != nil {
+		vol.state = "stale"
+		vol.staleReason = err.Error()
+		return err
+	}
+	defer windows.CloseHandle(handle)
+
+	journal, err := queryUSNJournal(handle)
+	if err != nil {
+		vol.state = "stale"
+		vol.staleReason = err.Error()
+		return err
+	}
+	if err := validateUSNCheckpoint(vol, journal); err != nil {
+		vol.state = "stale"
+		vol.staleReason = err.Error()
+		return err
+	}
+	if vol.checkpoint >= journal.NextUsn {
+		vol.state = "ready"
+		return nil
+	}
+	vol.state = "replaying"
+	buffer := make([]byte, 4*1024*1024)
+	for vol.checkpoint < journal.NextUsn {
+		nextUSN, changes, err := readUSNChanges(handle, journal.UsnJournalID, vol.checkpoint, buffer)
+		if err != nil {
+			vol.state = "stale"
+			vol.staleReason = err.Error()
+			return err
+		}
+		if nextUSN <= vol.checkpoint {
+			break
+		}
+		vol.applyUSNChanges(changes)
+		vol.checkpoint = nextUSN
+		vol.index.Checkpoint = nextUSN
+	}
+	if vol.dbPath != "" {
+		if err := saveIndex(vol.dbPath, vol.index); err != nil {
+			vol.state = "stale"
+			vol.staleReason = err.Error()
+			return err
+		}
+	}
+	vol.state = "ready"
+	vol.staleReason = ""
+	return nil
+}
+
+func (s *goSearchService) replayVolumeLoop(vol *serviceVolumeIndex) {
+	buffer := make([]byte, 4*1024*1024)
+	for {
+		select {
+		case <-s.stop:
+			return
+		default:
+		}
+		if err := s.replayVolumeOnce(vol, buffer); err != nil {
+			serviceLog("background replay error volume=%s db=%s err=%v", vol.volume, vol.dbPath, err)
+			s.indexMu.Lock()
+			vol.state = "stale"
+			vol.staleReason = err.Error()
+			s.indexMu.Unlock()
+			time.Sleep(5 * time.Second)
+			continue
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
+func (s *goSearchService) replayVolumeOnce(vol *serviceVolumeIndex, buffer []byte) error {
+	handle, err := openVolume(vol.volume)
+	if err != nil {
+		return err
+	}
+	defer windows.CloseHandle(handle)
+
+	s.indexMu.RLock()
+	startUSN := vol.checkpoint
+	journalID := vol.journalID
+	s.indexMu.RUnlock()
+
+	nextUSN, changes, err := readUSNChanges(handle, journalID, startUSN, buffer)
+	if err != nil {
+		return err
+	}
+	if nextUSN <= startUSN {
+		return nil
+	}
+	s.indexMu.Lock()
+	vol.applyUSNChanges(changes)
+	vol.checkpoint = nextUSN
+	vol.index.Checkpoint = nextUSN
+	vol.state = "ready"
+	vol.staleReason = ""
+	err = saveIndex(vol.dbPath, vol.index)
+	s.indexMu.Unlock()
+	return err
+}
+
+func queryUSNJournal(handle windows.Handle) (usnJournalDataV0, error) {
+	var journal usnJournalDataV0
+	var bytesReturned uint32
+	err := windows.DeviceIoControl(
+		handle,
+		fsctlQueryUSNJournal,
+		nil,
+		0,
+		(*byte)(unsafe.Pointer(&journal)),
+		uint32(unsafe.Sizeof(journal)),
+		&bytesReturned,
+		nil,
+	)
+	return journal, err
+}
+
+func validateUSNCheckpoint(vol *serviceVolumeIndex, journal usnJournalDataV0) error {
+	if vol.journalID != 0 && vol.journalID != journal.UsnJournalID {
+		return fmt.Errorf("journal id changed from %d to %d", vol.journalID, journal.UsnJournalID)
+	}
+	firstValid := journal.FirstUsn
+	if journal.LowestValidUsn > firstValid {
+		firstValid = journal.LowestValidUsn
+	}
+	if vol.checkpoint < firstValid {
+		return fmt.Errorf("checkpoint %d is before first valid USN %d", vol.checkpoint, firstValid)
+	}
+	if vol.checkpoint > journal.NextUsn {
+		return fmt.Errorf("checkpoint %d is after journal next USN %d", vol.checkpoint, journal.NextUsn)
+	}
+	return nil
+}
+
+func (vol *serviceVolumeIndex) applyUSNChanges(changes []usnChange) {
+	if vol.frnToID == nil {
+		vol.frnToID = make(map[uint64]int)
+	}
+	for _, change := range changes {
+		if change.FRN == 0 {
+			continue
+		}
+		if change.Reason&usnReasonRenameOld != 0 && change.Reason&usnReasonRenameNew == 0 {
+			continue
+		}
+		if change.Reason&usnReasonFileDelete != 0 {
+			if id, ok := vol.frnToID[change.FRN]; ok {
+				vol.index.Records[id].Deleted = true
+			}
+			if change.USN > vol.checkpoint {
+				vol.checkpoint = change.USN
+			}
+			continue
+		}
+		id, ok := vol.frnToID[change.FRN]
+		if !ok {
+			id = len(vol.index.Records)
+			vol.frnToID[change.FRN] = id
+			vol.index.Records = append(vol.index.Records, CompactRecord{FRN: change.FRN})
+		}
+		rec := &vol.index.Records[id]
+		rec.FRN = change.FRN
+		rec.ParentFRN = change.ParentFRN
+		rec.Parent = -1
+		if parentID, ok := vol.frnToID[change.ParentFRN]; ok && parentID != id {
+			rec.Parent = int32(parentID)
+		}
+		if change.Name != "" {
+			rec.Name = change.Name
+			rec.LowerName = strings.ToLower(change.Name)
+		}
+		rec.Mode = modeFromAttrs(change.Attr)
+		rec.Deleted = false
+		if change.USN > vol.checkpoint {
+			vol.checkpoint = change.USN
+		}
+	}
+	vol.index.Checkpoint = vol.checkpoint
+	vol.index.CompactNameOrder = make([]int, len(vol.index.Records))
+	for i := range vol.index.CompactNameOrder {
+		vol.index.CompactNameOrder[i] = i
+	}
 }
 
 func (s *goSearchService) servePrivileged() {
@@ -1965,37 +2297,36 @@ func handleServiceConn(conn *os.File, s *goSearchService) {
 	switch req.Command {
 	case "info":
 		s.indexMu.RLock()
-		indexes := append([]*Index(nil), s.indexes...)
-		dbs := append([]string(nil), s.dbs...)
+		volumes := append([]*serviceVolumeIndex(nil), s.volumes...)
 		s.indexMu.RUnlock()
-		infos := make([]dbInfo, 0, len(indexes))
+		infos := make([]dbInfo, 0, len(volumes))
 		total := 0
-		for i, idx := range indexes {
-			path := ""
-			if i < len(dbs) {
-				path = dbs[i]
-			}
+		for _, vol := range volumes {
+			idx := vol.index
 			total += idx.entryCount()
 			infos = append(infos, dbInfo{
-				Path:       path,
-				Entries:    idx.entryCount(),
-				Source:     idx.Source,
-				BuiltAt:    idx.BuiltAt.Format(time.RFC3339Nano),
-				Volume:     idx.Volume,
-				JournalID:  idx.JournalID,
-				Checkpoint: idx.Checkpoint,
+				Path:        vol.dbPath,
+				Entries:     idx.entryCount(),
+				Source:      idx.Source,
+				BuiltAt:     idx.BuiltAt.Format(time.RFC3339Nano),
+				Volume:      vol.volume,
+				JournalID:   vol.journalID,
+				Checkpoint:  vol.checkpoint,
+				State:       vol.state,
+				StaleReason: vol.staleReason,
+				FRNRecords:  len(vol.frnToID),
 			})
 		}
 		_ = json.NewEncoder(conn).Encode(serviceResponse{OK: true, Entries: total, DBs: infos})
 	case "search":
 		s.indexMu.RLock()
-		indexes := append([]*Index(nil), s.indexes...)
-		s.indexMu.RUnlock()
-		if len(indexes) == 0 {
+		if len(s.indexes) == 0 {
+			s.indexMu.RUnlock()
 			_ = json.NewEncoder(conn).Encode(serviceResponse{OK: false, Message: "service has no search indexes loaded"})
 			return
 		}
-		matches, err := searchAll(indexes, requestToOptionsFromService(req), req.CountOnly)
+		matches, err := searchAll(s.indexes, requestToOptionsFromService(req), req.CountOnly)
+		s.indexMu.RUnlock()
 		if err != nil {
 			_ = json.NewEncoder(conn).Encode(serviceResponse{OK: false, Message: err.Error()})
 			return
@@ -2234,6 +2565,9 @@ func searchCompact(idx *Index, opts queryOptions, countOnly bool) ([]Entry, erro
 	pathCache := make(map[int]string)
 	for _, recIndex := range order {
 		rec := idx.Records[recIndex]
+		if rec.Deleted {
+			continue
+		}
 		path := idx.reconstructCompactPathCached(recIndex, pathCache)
 		entry := Entry{
 			Path:        path,
@@ -2663,10 +2997,32 @@ func writeIndex(w io.Writer, idx *Index) error {
 			if parent > 0xFFFFFF || rec.NameOff > 0xFFFFFF {
 				return errors.New("compact index too large for packed record format")
 			}
+			if err := binary.Write(w, binary.LittleEndian, rec.FRN); err != nil {
+				return err
+			}
+			if err := binary.Write(w, binary.LittleEndian, rec.ParentFRN); err != nil {
+				return err
+			}
 			if err := writeUint24(w, parent); err != nil {
 				return err
 			}
 			if err := writeUint24(w, rec.NameOff); err != nil {
+				return err
+			}
+			if err := binary.Write(w, binary.LittleEndian, rec.Mode); err != nil {
+				return err
+			}
+			if err := binary.Write(w, binary.LittleEndian, rec.Size); err != nil {
+				return err
+			}
+			if err := binary.Write(w, binary.LittleEndian, rec.ModUnix); err != nil {
+				return err
+			}
+			deleted := uint8(0)
+			if rec.Deleted {
+				deleted = 1
+			}
+			if err := binary.Write(w, binary.LittleEndian, deleted); err != nil {
 				return err
 			}
 		}
@@ -2751,6 +3107,12 @@ func readIndex(r io.Reader) (*Index, error) {
 		idx.Records = make([]CompactRecord, int(header.EntryCount))
 		for i := range idx.Records {
 			rec := &idx.Records[i]
+			if err := binary.Read(r, binary.LittleEndian, &rec.FRN); err != nil {
+				return nil, err
+			}
+			if err := binary.Read(r, binary.LittleEndian, &rec.ParentFRN); err != nil {
+				return nil, err
+			}
 			parent, err := readUint24(r)
 			if err != nil {
 				return nil, err
@@ -2774,6 +3136,20 @@ func readIndex(r io.Reader) (*Index, error) {
 			}
 			rec.Name = string(idx.NameBlob[int(off):end])
 			rec.LowerName = strings.ToLower(rec.Name)
+			if err := binary.Read(r, binary.LittleEndian, &rec.Mode); err != nil {
+				return nil, err
+			}
+			if err := binary.Read(r, binary.LittleEndian, &rec.Size); err != nil {
+				return nil, err
+			}
+			if err := binary.Read(r, binary.LittleEndian, &rec.ModUnix); err != nil {
+				return nil, err
+			}
+			var deleted uint8
+			if err := binary.Read(r, binary.LittleEndian, &deleted); err != nil {
+				return nil, err
+			}
+			rec.Deleted = deleted != 0
 		}
 		idx.CompactNameOrder = make([]int, len(idx.Records))
 		for i := range idx.CompactNameOrder {

@@ -24,15 +24,15 @@ correct.
 
 ## Current Limitations
 
-- The compact index stores parent record indexes, not persistent NTFS file
-  reference numbers.
-- The service loads read-optimized `Index` values and does not maintain a
-  mutable FRN map.
-- The service does not replay USN records on startup.
-- The service does not run a per-volume background journal reader.
+- The service now writes v8 USN indexes with persistent FRN and parent FRN
+  metadata, but the mutation model is still early.
+- The service builds a FRN map for loaded USN indexes.
+- The service can validate and replay a saved checkpoint on startup.
+- The service runs a simple per-volume background journal reader.
+- Background replay currently uses coarse locking and saves after applied
+  batches; this favors correctness over peak throughput.
 - `status` does not expose checkpoint lag, stale state, or rebuild state.
-- Persisted DBs do not contain enough metadata to patch records safely after
-  rename, move, delete, and recreate operations.
+- Background full rebuild after journal invalidation is not implemented yet.
 
 ## Design
 
@@ -178,18 +178,18 @@ Initial thresholds:
 
 ## Implementation Checklist
 
-1. Add v8 record metadata for FRN and parent FRN.
-2. Keep v7 reader support and write new USN indexes as v8.
-3. Add mutable volume state in the service.
-4. Convert loaded USN indexes into mutable volume states.
-5. Add USN journal reader for bounded catch-up replay.
-6. Implement USN batch parsing for v2/v3 records.
-7. Implement mutation application for create, delete, rename, move, and metadata.
-8. Rebuild/swap search snapshots safely after applied batches.
-9. Add background continuous reader goroutines per volume.
-10. Add periodic atomic flush with checkpoint persistence.
-11. Add journal invalidation detection and background rebuild fallback.
-12. Extend `status` and `loaded --json` with freshness, lag, stale, and rebuild fields.
-13. Add integration tests for live updates and restart catch-up.
-14. Add benchmark scripts for update latency and query latency under update load.
-15. Update service, benchmark, and security docs.
+1. Done: add v8 record metadata for FRN and parent FRN.
+2. Done: write new USN indexes as v8.
+3. Done: add mutable volume state in the service.
+4. Done: convert loaded USN indexes into mutable volume states.
+5. Done: add USN journal reader for bounded catch-up replay.
+6. Done: implement USN batch parsing for v2/v3 records.
+7. Partial: implement mutation application for create, delete, rename, and move.
+8. Partial: hold service search locks while batches apply.
+9. Done: add background continuous reader goroutines per volume.
+10. Partial: flush after applied batches with checkpoint persistence.
+11. Todo: add journal invalidation detection and background rebuild fallback.
+12. Partial: extend `loaded --json` with state and FRN record counts.
+13. Todo: add service integration tests for live updates and restart catch-up.
+14. Partial: add benchmark scripts for update latency and query latency under update load.
+15. Todo: update service, benchmark, and security docs after full rebuild fallback lands.
