@@ -16,13 +16,12 @@
   `type:file`, and `type:dir`.
 - Agent search flags: `--under`, `--exists`, `--cwd-bias`, `--root-bias`,
   `--recent`, and `--modified-after`.
-- `bench-agent` JSON benchmark mode.
+- `bench` JSON benchmark mode.
 - Release build script for `seekfs-windows-amd64.zip`.
 
 ### Known Limitations
 
 - Windows and NTFS are the primary target.
-- Live USN monitor events are not yet applied to the resident index.
 - Result ranking is simple and not Everything-compatible.
 - Some Everything-style filters are not implemented, including `dm:`, `size:`,
   `attrib:`, `parent:`, OR, and NOT.

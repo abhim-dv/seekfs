@@ -25,7 +25,7 @@ New-Item -ItemType Directory -Force -Path $Target | Out-Null
 $LdFlags = "-s -w -X main.version=$Version -X main.commit=$Commit -X main.date=$Date"
 go build -trimpath -ldflags $LdFlags -o (Join-Path $Target "seekfs.exe") ./cmd/seekfs
 
-Copy-Item README.md,LICENSE,NOTICE.md,install_seekfs_service.ps1,restart_seekfs_service.ps1 -Destination $Target
+Copy-Item README.md,LICENSE,NOTICE.md -Destination $Target
 Copy-Item docs -Destination $Target -Recurse
 
 $Zip = Join-Path $OutDir "seekfs-windows-amd64.zip"

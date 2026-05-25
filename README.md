@@ -79,19 +79,13 @@ Agent-friendly filters:
 .\seekfs.exe search -service -path --json "ext:go dir:cmd main"
 .\seekfs.exe search -service -path --under F:\git\seekfs "type:file glob:*.md"
 .\seekfs.exe search -service -path --exists --recent 24h "ext:go"
-.\seekfs.exe bench-agent -service --json -iterations 100
+.\seekfs.exe bench -service --json -iterations 100
 ```
 
 Inspect an index:
 
 ```powershell
 .\seekfs.exe info -db F:\seekfs_c.gsi
-```
-
-Compare with Everything through `es.exe`:
-
-```powershell
-.\seekfs.exe compare-es -db F:\seekfs_c.gsi -es .\extracted\es.exe -instance 1.5a -path -n 20 "src cmd"
 ```
 
 ## Current Benchmark Snapshot
@@ -125,10 +119,9 @@ failures: 0
 ## Limitations
 
 - Windows and NTFS are the primary target.
-- Live USN monitor events are not yet applied to the resident index.
 - Result ranking is simple and not Everything-compatible.
-- Advanced query syntax such as `ext:`, `glob:`, and `regex:` is planned but not
-  complete.
+- Some Everything-style filters are not implemented, including `dm:`, `size:`,
+  `attrib:`, `parent:`, OR, and NOT.
 - Index files contain local path names and should be treated as sensitive local
   metadata.
 
@@ -139,8 +132,6 @@ failures: 0
 - [Service pipe protocol](docs/OPEN_PROTOCOL.md)
 - [Benchmarks](docs/BENCHMARKS.md)
 - [Security notes](SECURITY.md)
-- [Production readiness](production-readiness.md)
-- [Release TODO](RELEASE_TODO.md)
 
 ## Config Shortcuts
 
@@ -168,5 +159,5 @@ The initial release artifact is an unsigned zip:
 seekfs-windows-amd64.zip
 ```
 
-It contains `seekfs.exe`, service scripts, README, license, notice, and docs.
-Windows may warn about unsigned executables until code signing is added.
+It contains `seekfs.exe`, README, license, notice, and docs. Windows may warn
+about unsigned executables until code signing is added.

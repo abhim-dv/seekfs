@@ -9,9 +9,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
-	"net"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime/debug"
@@ -29,7 +27,6 @@ import (
 const indexVersion = 7
 
 var indexMagic = [8]byte{'G', 'O', 'S', 'R', 'C', 'H', '0', '7'}
-var tokenSidecarMagic = [8]byte{'G', 'S', 'T', 'O', 'K', '0', '0', '1'}
 
 var (
 	version = "dev"
@@ -40,7 +37,6 @@ var (
 const (
 	fsctlEnumUSNData     = 0x000900b3
 	fsctlQueryUSNJournal = 0x000900f4
-	fsctlReadUSNJournal  = 0x000900bb
 	fileAttributeDir     = 0x10
 	serviceName          = "seekfs"
 	defaultServicePipe   = `\\.\pipe\seekfs-service`
@@ -131,7 +127,6 @@ type Index struct {
 	Records          []CompactRecord
 	CompactNameOrder []int
 	NameBlob         []byte
-	PathTokenIndex   map[string][]int
 	DBPath           string
 }
 
@@ -200,30 +195,11 @@ type mftEnumDataV0 struct {
 	HighUsn                  int64
 }
 
-type readUSNJournalDataV0 struct {
-	StartUsn          int64
-	ReasonMask        uint32
-	ReturnOnlyOnClose uint32
-	Timeout           uint64
-	BytesToWaitFor    uint64
-	UsnJournalID      uint64
-}
-
 type usnNode struct {
 	frn       uint64
 	parentFRN uint64
 	name      string
 	attr      uint32
-}
-
-type volumeMonitor struct {
-	volume    string
-	cancel    chan struct{}
-	lastUSN   int64
-	journalID uint64
-	events    uint64
-	lastError string
-	running   bool
 }
 
 type stringList []string
@@ -267,17 +243,15 @@ func run(args []string) error {
 		return cmdIndexVolumes(args[1:])
 	case "service":
 		return cmdService(args[1:])
-	case "install-service":
+	case "install":
 		return cmdInstallService(args[1:])
-	case "setup-service":
-		return cmdSetupService(args[1:])
 	case "launch":
 		return cmdLaunch(args[1:])
-	case "start-service", "start":
+	case "start":
 		return cmdControlService(args[1:], "start")
-	case "stop-service", "stop":
+	case "stop":
 		return cmdControlService(args[1:], "stop")
-	case "restart-service", "restart":
+	case "restart":
 		return cmdControlService(args[1:], "restart")
 	case "status":
 		return cmdServiceSimple(args[1:], "status")
@@ -285,34 +259,22 @@ func run(args []string) error {
 		return cmdConfig(args[1:])
 	case "defaults":
 		return cmdDefaults(args[1:])
-	case "uninstall-service":
+	case "uninstall":
 		return cmdUninstallService(args[1:])
 	case "doctor":
 		return cmdDoctor(args[1:])
 	case "service-index-usn":
 		return cmdServiceIndexUSN(args[1:])
-	case "service-monitor-start":
-		return cmdServiceSimple(args[1:], "monitor-start")
-	case "service-monitor-stop":
-		return cmdServiceSimple(args[1:], "monitor-stop")
-	case "service-status":
-		return cmdServiceSimple(args[1:], "status")
-	case "service-info":
+	case "loaded":
 		return cmdServiceInfo(args[1:])
-	case "token-sidecar":
-		return cmdTokenSidecar(args[1:])
-	case "bench-agent":
+	case "bench":
 		return cmdBenchAgent(args[1:])
-	case "compare-es":
-		return cmdCompareES(args[1:])
 	case "info":
 		return cmdInfo(args[1:])
 	case "search":
 		return cmdSearch(args[1:], false)
 	case "count":
 		return cmdSearch(args[1:], true)
-	case "serve":
-		return cmdServe(args[1:])
 	case "version":
 		fmt.Printf("seekfs %s commit=%s date=%s\n", version, commit, date)
 		return nil
@@ -322,11 +284,8 @@ func run(args []string) error {
 	case "agent":
 		printAgentHelp()
 		return nil
-	case "help-search":
+	case "syntax":
 		printSearchHelp()
-		return nil
-	case "help-agent":
-		printAgentHelp()
 		return nil
 	default:
 		return usage()
@@ -343,34 +302,26 @@ func printUsage(w io.Writer) {
   seekfs index -root <path> [-root <path>...] [-db seekfs.db]
   seekfs index-usn -volume C: [-db seekfs.db]
   seekfs index-volumes [-volume C:] [-volume F:] [-index-dir path] [-launch]
-  seekfs service [-pipe \\.\pipe\seekfs-service] [-sddl <sddl>] [-db index.gsi...]
-  seekfs install-service [-pipe \\.\pipe\seekfs-service] [-sddl <sddl>] [-db index.gsi...]
-  seekfs setup-service [-db index.gsi...] [-no-start]
   seekfs launch [-db index.gsi...] [--json]
+  seekfs install [-pipe \\.\pipe\seekfs-service] [-sddl <sddl>] [-db index.gsi...]
   seekfs start|stop|restart
-  seekfs uninstall-service
+  seekfs uninstall
   seekfs doctor [--json]
   seekfs status [--json]
+  seekfs loaded [--json]
   seekfs defaults [--json]
   seekfs config path|show|get|set
   seekfs service-index-usn -volume C: -db seekfs.gsi [-pipe \\.\pipe\seekfs-service]
-  seekfs service-monitor-start -volume C:
-  seekfs service-monitor-stop -volume C:
-  seekfs service-status [--json]
-  seekfs service-info [--json]
-  seekfs token-sidecar -db seekfs.gsi [-out seekfs.gsi.tok] [-query "term term"] [-term term]
-  seekfs bench-agent [-db index.gsi...] [-service] [--json] [-iterations 100]
-  seekfs compare-es -es path\to\es.exe [-instance 1.5a] [-db seekfs.gsi] [-n 100] <query>
+  seekfs bench [-db index.gsi...] [-service] [--json] [-iterations 100]
   seekfs info [-db seekfs.gsi] [--json]
-  seekfs help-search
-  seekfs help-agent
-  seekfs search [-db seekfs.db...] [-tokens seekfs.db.tok] [-addr 127.0.0.1:47832] [-service] [--json] [-n 100] [-path] <query>
-  seekfs count [-db seekfs.db...] [-tokens seekfs.db.tok] [-addr 127.0.0.1:47832] [-service] [--json] [-path] <query>
-  seekfs serve [-db seekfs.db] [-tokens seekfs.db.tok] [-addr 127.0.0.1:47832]
+  seekfs syntax
+  seekfs agent
+  seekfs search [-db seekfs.db...] [-service] [--json] [-n 100] [-path] <query>
+  seekfs count [-db seekfs.db...] [-service] [--json] [-path] <query>
   seekfs version
 
 Agent starting points:
-  seekfs help-agent
+  seekfs agent
   seekfs search -service --json -path -n 20 "ext:go dir:cmd main"
   seekfs count  -service --json -path "type:file ext:go"`)
 }
@@ -425,12 +376,12 @@ Purpose:
   for low latency; it avoids loading large indexes on each CLI invocation.
 
 Recommended commands:
-  seekfs service-info --json
+  seekfs loaded --json
   seekfs search -service --json -path -n 20 "ext:go dir:cmd main"
   seekfs count  -service --json -path "type:file ext:go"
   seekfs launch -db F:\seekfs_c.gsi -db F:\seekfs_f.gsi
   seekfs config set output_format json
-  seekfs bench-agent -service --json -iterations 100
+  seekfs bench -service --json -iterations 100
 
 JSON result shape:
   {
@@ -465,7 +416,7 @@ Query filters:
 Config:
   seekfs reads seekfs.toml from the current directory or user config dir.
   Supported keys: dbs, db, db_paths, db_path, volumes, volume, service_pipe,
-  default_limit.
+  default_limit, output_format.
 
 Errors:
   With --json, errors are written to stderr as:
@@ -891,8 +842,6 @@ func cmdSearch(args []string, countOnly bool) error {
 	var dbs stringList
 	configPath := fs.String("config", "", "optional seekfs.toml config path")
 	fs.Var(&dbs, "db", "index database path; repeatable")
-	tokens := fs.String("tokens", "", "optional path-token sidecar; defaults to <db>.tok when present")
-	addr := fs.String("addr", "", "resident server address")
 	useService := fs.Bool("service", false, "query the installed seekfs service over its named pipe")
 	pipeName := fs.String("pipe", defaultServicePipe, "service named pipe")
 	jsonOut := fs.Bool("json", false, "write machine-readable JSON")
@@ -946,16 +895,13 @@ func cmdSearch(args []string, countOnly bool) error {
 		}
 		opts.CWDBias = cwd
 	}
-	if *addr != "" {
-		return searchRemote(*addr, opts, countOnly, *jsonOut)
-	}
 	if *useService {
 		return searchService(*pipeName, opts, countOnly, *jsonOut)
 	}
 	if len(dbs) == 0 {
 		dbs = append(dbs, defaultDB())
 	}
-	indexes, err := loadIndexes(dbs, *tokens)
+	indexes, err := loadIndexes(dbs)
 	if err != nil {
 		return err
 	}
@@ -1034,130 +980,8 @@ func (idx *Index) entryCount() int {
 	return len(idx.Entries)
 }
 
-func cmdCompareES(args []string) error {
-	fs := flag.NewFlagSet("compare-es", flag.ContinueOnError)
-	db := fs.String("db", defaultDB(), "index database path")
-	es := fs.String("es", filepath.Join("extracted", "es.exe"), "path to es.exe")
-	instance := fs.String("instance", "", "Everything instance")
-	limit := fs.Int("n", 100, "maximum results")
-	matchPath := fs.Bool("path", false, "match full path")
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-	query := strings.TrimSpace(strings.Join(fs.Args(), " "))
-	if query == "" {
-		return errors.New("query required")
-	}
-	idx, err := loadIndex(*db)
-	if err != nil {
-		return err
-	}
-	ours, err := search(idx, queryOptions{Query: query, MatchPath: *matchPath, Limit: *limit}, false)
-	if err != nil {
-		return err
-	}
-	esArgs := []string{}
-	if *instance != "" {
-		esArgs = append(esArgs, "-instance", *instance)
-	}
-	if *matchPath {
-		esArgs = append(esArgs, "-match-path")
-	}
-	esArgs = append(esArgs, "-n", fmt.Sprint(*limit), query)
-	out, err := exec.Command(*es, esArgs...).Output()
-	if err != nil {
-		return err
-	}
-	theirs := splitLines(string(out))
-	ourPaths := make([]string, len(ours))
-	for i, entry := range ours {
-		ourPaths[i] = entry.Path
-	}
-	agreement := 0
-	max := min(len(ourPaths), len(theirs))
-	for i := 0; i < max; i++ {
-		if strings.EqualFold(ourPaths[i], theirs[i]) {
-			agreement++
-		}
-	}
-	fmt.Printf("query: %s\n", query)
-	fmt.Printf("mode: %s\n", map[bool]string{true: "path", false: "name"}[*matchPath])
-	fmt.Printf("seekfs_results: %d\n", len(ourPaths))
-	fmt.Printf("es_results: %d\n", len(theirs))
-	fmt.Printf("same_position_top_%d: %d\n", max, agreement)
-	if max > 0 && agreement != max {
-		fmt.Println("first_difference:")
-		for i := 0; i < max; i++ {
-			if !strings.EqualFold(ourPaths[i], theirs[i]) {
-				fmt.Printf("  rank: %d\n  seekfs: %s\n  es: %s\n", i+1, ourPaths[i], theirs[i])
-				break
-			}
-		}
-	}
-	return nil
-}
-
-func cmdTokenSidecar(args []string) error {
-	var terms stringList
-	fs := flag.NewFlagSet("token-sidecar", flag.ContinueOnError)
-	db := fs.String("db", defaultDB(), "index database path")
-	out := fs.String("out", "", "sidecar output path")
-	query := fs.String("query", "", "whitespace-separated terms to index")
-	fs.Var(&terms, "term", "term to index; repeatable")
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-	for _, term := range strings.Fields(strings.ToLower(*query)) {
-		terms = append(terms, term)
-	}
-	if len(terms) == 0 {
-		return errors.New("token-sidecar requires -query or at least one -term")
-	}
-	if *out == "" {
-		*out = *db + ".tok"
-	}
-	idx, err := loadIndex(*db)
-	if err != nil {
-		return err
-	}
-	if !idx.Compact {
-		return errors.New("token-sidecar currently requires a compact USN index")
-	}
-	start := time.Now()
-	tokenSet := make(map[string]struct{}, len(terms))
-	for _, term := range terms {
-		term = strings.ToLower(strings.TrimSpace(term))
-		if term != "" {
-			tokenSet[term] = struct{}{}
-		}
-	}
-	postings := make(map[string][]int, len(tokenSet))
-	pathCache := make(map[int]string)
-	for i := range idx.Records {
-		path := strings.ToLower(idx.reconstructCompactPathCached(i, pathCache))
-		for term := range tokenSet {
-			if strings.Contains(path, term) {
-				postings[term] = append(postings[term], i)
-			}
-		}
-	}
-	for token := range postings {
-		sort.Ints(postings[token])
-	}
-	if err := saveTokenSidecar(*out, postings); err != nil {
-		return err
-	}
-	info, _ := os.Stat(*out)
-	size := int64(0)
-	if info != nil {
-		size = info.Size()
-	}
-	fmt.Printf("wrote %d token postings to %s (%d bytes) in %s\n", len(postings), *out, size, time.Since(start).Round(time.Millisecond))
-	return nil
-}
-
 func cmdBenchAgent(args []string) error {
-	fs := flag.NewFlagSet("bench-agent", flag.ContinueOnError)
+	fs := flag.NewFlagSet("bench", flag.ContinueOnError)
 	var dbs stringList
 	configPath := fs.String("config", "", "optional seekfs.toml config path")
 	fs.Var(&dbs, "db", "index database path; repeatable")
@@ -1194,7 +1018,7 @@ func cmdBenchAgent(args []string) error {
 		if len(dbs) == 0 {
 			dbs = append(dbs, defaultDB())
 		}
-		indexes, err = loadIndexes(dbs, "")
+		indexes, err = loadIndexes(dbs)
 		if err != nil {
 			return err
 		}
@@ -1274,38 +1098,6 @@ func percentile(sorted []float64, p float64) float64 {
 	return sorted[i]
 }
 
-func splitLines(s string) []string {
-	lines := strings.Split(strings.ReplaceAll(s, "\r\n", "\n"), "\n")
-	out := lines[:0]
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line != "" {
-			out = append(out, line)
-		}
-	}
-	return out
-}
-
-type request struct {
-	Query         string `json:"query"`
-	MatchPath     bool   `json:"match_path"`
-	Limit         int    `json:"limit"`
-	CountOnly     bool   `json:"count_only"`
-	Under         string `json:"under,omitempty"`
-	Exists        bool   `json:"exists,omitempty"`
-	CWDBias       string `json:"cwd_bias,omitempty"`
-	RootBias      string `json:"root_bias,omitempty"`
-	Recent        string `json:"recent,omitempty"`
-	ModifiedAfter string `json:"modified_after,omitempty"`
-	CaseSensitive bool   `json:"case_sensitive,omitempty"`
-}
-
-type response struct {
-	Count   int      `json:"count"`
-	Results []string `json:"results,omitempty"`
-	Error   string   `json:"error,omitempty"`
-}
-
 type serviceRequest struct {
 	Command       string `json:"command"`
 	Volume        string `json:"volume,omitempty"`
@@ -1346,7 +1138,6 @@ type goSearchService struct {
 	pipeName string
 	sddl     string
 	stop     chan struct{}
-	monitors map[string]*volumeMonitor
 	dbs      []string
 	indexes  []*Index
 	indexMu  sync.RWMutex
@@ -1390,7 +1181,7 @@ func cmdService(args []string) error {
 	if err != nil {
 		return err
 	}
-	handler := &goSearchService{pipeName: *pipeName, sddl: *sddl, stop: make(chan struct{}), monitors: make(map[string]*volumeMonitor), dbs: dbs}
+	handler := &goSearchService{pipeName: *pipeName, sddl: *sddl, stop: make(chan struct{}), dbs: dbs}
 	if isService {
 		return svc.Run(serviceName, handler)
 	}
@@ -1399,7 +1190,7 @@ func cmdService(args []string) error {
 
 func cmdInstallService(args []string) error {
 	var dbs stringList
-	fs := flag.NewFlagSet("install-service", flag.ContinueOnError)
+	fs := flag.NewFlagSet("install", flag.ContinueOnError)
 	configPath := fs.String("config", "", "optional seekfs.toml config path")
 	pipeName := fs.String("pipe", defaultServicePipe, "service named pipe")
 	sddl := fs.String("sddl", defaultServiceSDDL, "pipe security descriptor SDDL")
@@ -1563,7 +1354,7 @@ func cmdControlService(args []string, action string) error {
 }
 
 func cmdUninstallService(args []string) error {
-	fs := flag.NewFlagSet("uninstall-service", flag.ContinueOnError)
+	fs := flag.NewFlagSet("uninstall", flag.ContinueOnError)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -1708,7 +1499,7 @@ func cmdServiceSimple(args []string, command string) error {
 }
 
 func cmdServiceInfo(args []string) error {
-	fs := flag.NewFlagSet("service-info", flag.ContinueOnError)
+	fs := flag.NewFlagSet("loaded", flag.ContinueOnError)
 	configPath := fs.String("config", "", "optional seekfs.toml config path")
 	pipeName := fs.String("pipe", defaultServicePipe, "service named pipe")
 	jsonOut := fs.Bool("json", false, "write machine-readable JSON")
@@ -2073,7 +1864,7 @@ func (s *goSearchService) loadConfiguredIndexes() error {
 		return nil
 	}
 	start := time.Now()
-	indexes, err := loadIndexes(s.dbs, "")
+	indexes, err := loadIndexes(s.dbs)
 	if err != nil {
 		return err
 	}
@@ -2235,221 +2026,11 @@ func handleServiceConn(conn *os.File, s *goSearchService) {
 		}
 		serviceLog("index-usn complete volume=%s entries=%d", req.Volume, idx.entryCount())
 		_ = json.NewEncoder(conn).Encode(serviceResponse{OK: true, Message: "indexed", Entries: idx.entryCount()})
-	case "monitor-start":
-		volume := normalizeVolume(req.Volume)
-		if mon, ok := s.monitors[volume]; ok && mon.running {
-			_ = json.NewEncoder(conn).Encode(serviceResponse{OK: true, Message: "monitor already running for " + volume})
-			return
-		}
-		mon := &volumeMonitor{volume: volume, cancel: make(chan struct{}), running: true}
-		s.monitors[volume] = mon
-		go runUSNMonitor(mon)
-		_ = json.NewEncoder(conn).Encode(serviceResponse{OK: true, Message: "monitor started for " + volume})
-	case "monitor-stop":
-		volume := normalizeVolume(req.Volume)
-		if mon, ok := s.monitors[volume]; ok {
-			close(mon.cancel)
-			delete(s.monitors, volume)
-		}
-		_ = json.NewEncoder(conn).Encode(serviceResponse{OK: true, Message: "monitor stopped for " + volume})
 	case "status":
-		volumes := make([]string, 0, len(s.monitors))
-		for volume, mon := range s.monitors {
-			state := volume
-			if mon.lastError != "" {
-				state += "(error: " + mon.lastError + ")"
-			} else {
-				state += fmt.Sprintf("(usn:%d events:%d)", mon.lastUSN, mon.events)
-			}
-			volumes = append(volumes, state)
-		}
-		sort.Strings(volumes)
-		msg := "service running"
-		if len(volumes) > 0 {
-			msg += "; monitors: " + strings.Join(volumes, ",")
-		}
-		_ = json.NewEncoder(conn).Encode(serviceResponse{OK: true, Message: msg})
+		_ = json.NewEncoder(conn).Encode(serviceResponse{OK: true, Message: "service running"})
 	default:
 		_ = json.NewEncoder(conn).Encode(serviceResponse{OK: false, Message: "unknown command"})
 	}
-}
-
-func runUSNMonitor(mon *volumeMonitor) {
-	handle, err := openVolume(mon.volume)
-	if err != nil {
-		mon.lastError = err.Error()
-		mon.running = false
-		return
-	}
-	defer windows.CloseHandle(handle)
-	var journal usnJournalDataV0
-	var bytesReturned uint32
-	if err := windows.DeviceIoControl(
-		handle,
-		fsctlQueryUSNJournal,
-		nil,
-		0,
-		(*byte)(unsafe.Pointer(&journal)),
-		uint32(unsafe.Sizeof(journal)),
-		&bytesReturned,
-		nil,
-	); err != nil {
-		mon.lastError = err.Error()
-		mon.running = false
-		return
-	}
-	mon.journalID = journal.UsnJournalID
-	mon.lastUSN = journal.NextUsn
-	buffer := make([]byte, 1024*1024)
-	for {
-		select {
-		case <-mon.cancel:
-			mon.running = false
-			return
-		default:
-		}
-		req := readUSNJournalDataV0{
-			StartUsn:       mon.lastUSN,
-			ReasonMask:     0xffffffff,
-			Timeout:        1,
-			BytesToWaitFor: 0,
-			UsnJournalID:   mon.journalID,
-		}
-		err := windows.DeviceIoControl(
-			handle,
-			fsctlReadUSNJournal,
-			(*byte)(unsafe.Pointer(&req)),
-			uint32(unsafe.Sizeof(req)),
-			&buffer[0],
-			uint32(len(buffer)),
-			&bytesReturned,
-			nil,
-		)
-		if err != nil {
-			mon.lastError = err.Error()
-			time.Sleep(time.Second)
-			continue
-		}
-		mon.lastError = ""
-		if bytesReturned <= 8 {
-			time.Sleep(200 * time.Millisecond)
-			continue
-		}
-		mon.lastUSN = int64(binary.LittleEndian.Uint64(buffer[:8]))
-		pos := uint32(8)
-		for pos+60 <= bytesReturned {
-			recordLen := binary.LittleEndian.Uint32(buffer[pos : pos+4])
-			if recordLen < 60 || pos+recordLen > bytesReturned {
-				break
-			}
-			mon.events++
-			pos += recordLen
-		}
-	}
-}
-
-func cmdServe(args []string) error {
-	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
-	var dbs stringList
-	configPath := fs.String("config", "", "optional seekfs.toml config path")
-	fs.Var(&dbs, "db", "index database path; repeatable")
-	tokens := fs.String("tokens", "", "optional path-token sidecar; defaults to <db>.tok when present")
-	addr := fs.String("addr", "127.0.0.1:47832", "listen address")
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-	cfg, err := loadConfig(*configPath)
-	if err != nil {
-		return err
-	}
-	if len(dbs) == 0 && len(cfg.DBs) > 0 {
-		dbs = append(dbs, cfg.DBs...)
-	}
-	if len(dbs) == 0 {
-		dbs = append(dbs, defaultDB())
-	}
-	indexes, err := loadIndexes(dbs, *tokens)
-	if err != nil {
-		return err
-	}
-	ln, err := net.Listen("tcp", *addr)
-	if err != nil {
-		return err
-	}
-	total := 0
-	for _, idx := range indexes {
-		total += idx.entryCount()
-	}
-	fmt.Fprintf(os.Stderr, "seekfs server listening on %s with %d entries\n", ln.Addr(), total)
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			return err
-		}
-		go handleConn(conn, indexes)
-	}
-}
-
-func handleConn(conn net.Conn, indexes []*Index) {
-	defer conn.Close()
-	var req request
-	if err := json.NewDecoder(conn).Decode(&req); err != nil {
-		_ = json.NewEncoder(conn).Encode(response{Error: err.Error()})
-		return
-	}
-	matches, err := searchAll(indexes, requestToOptions(req), req.CountOnly)
-	if err != nil {
-		_ = json.NewEncoder(conn).Encode(response{Error: err.Error()})
-		return
-	}
-	resp := response{Count: len(matches)}
-	if !req.CountOnly {
-		resp.Results = make([]string, len(matches))
-		for i, entry := range matches {
-			resp.Results[i] = entry.Path
-		}
-	}
-	_ = json.NewEncoder(conn).Encode(resp)
-}
-
-func searchRemote(addr string, opts queryOptions, countOnly bool, jsonOut bool) error {
-	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-	req := optionsToRequest(opts, countOnly)
-	if err := json.NewEncoder(conn).Encode(req); err != nil {
-		return err
-	}
-	var resp response
-	if err := json.NewDecoder(conn).Decode(&resp); err != nil {
-		return err
-	}
-	if resp.Error != "" {
-		return errors.New(resp.Error)
-	}
-	if jsonOut {
-		jsonResp := jsonSearchResponse{
-			OK:    true,
-			Query: opts.Query,
-			Count: resp.Count,
-			Limit: opts.Limit,
-		}
-		if !countOnly {
-			jsonResp.Results = pathsToJSON(resp.Results)
-		}
-		return writeJSON(os.Stdout, jsonResp)
-	}
-	if countOnly {
-		fmt.Println(resp.Count)
-		return nil
-	}
-	w := bufio.NewWriter(os.Stdout)
-	for _, result := range resp.Results {
-		fmt.Fprintln(w, result)
-	}
-	return w.Flush()
 }
 
 func searchService(pipeName string, opts queryOptions, countOnly bool, jsonOut bool) error {
@@ -2481,37 +2062,6 @@ func searchService(pipeName string, opts queryOptions, countOnly bool, jsonOut b
 		fmt.Fprintln(w, result)
 	}
 	return w.Flush()
-}
-
-func optionsToRequest(opts queryOptions, countOnly bool) request {
-	return request{
-		Query:         opts.Query,
-		MatchPath:     opts.MatchPath,
-		Limit:         opts.Limit,
-		CountOnly:     countOnly,
-		Under:         opts.Under,
-		Exists:        opts.Exists,
-		CWDBias:       opts.CWDBias,
-		RootBias:      opts.RootBias,
-		Recent:        opts.Recent,
-		ModifiedAfter: opts.ModifiedAfter,
-		CaseSensitive: opts.CaseSensitive,
-	}
-}
-
-func requestToOptions(req request) queryOptions {
-	return queryOptions{
-		Query:         req.Query,
-		MatchPath:     req.MatchPath,
-		Limit:         req.Limit,
-		Under:         req.Under,
-		Exists:        req.Exists,
-		CWDBias:       req.CWDBias,
-		RootBias:      req.RootBias,
-		Recent:        req.Recent,
-		ModifiedAfter: req.ModifiedAfter,
-		CaseSensitive: req.CaseSensitive,
-	}
 }
 
 func serviceRequestFromOptions(opts queryOptions, countOnly bool) serviceRequest {
@@ -2671,11 +2221,6 @@ func searchCompact(idx *Index, opts queryOptions, countOnly bool) ([]Entry, erro
 	}
 	limit := normalizedLimit(opts.Limit, countOnly)
 	order := idx.CompactNameOrder
-	if opts.MatchPath && len(pq.Terms) > 0 {
-		if candidates, ok := idx.pathCandidates(pq.Terms); ok {
-			order = candidates
-		}
-	}
 	if order == nil {
 		order = make([]int, len(idx.Records))
 		for i := range order {
@@ -2946,46 +2491,6 @@ func (idx *Index) biasOrderCompact(order []int, root string) []int {
 	return out
 }
 
-func (idx *Index) pathCandidates(terms []string) ([]int, bool) {
-	if len(idx.PathTokenIndex) == 0 || len(terms) == 0 {
-		return nil, false
-	}
-	var lists [][]int
-	for _, term := range terms {
-		list, ok := idx.PathTokenIndex[term]
-		if !ok {
-			return []int{}, true
-		}
-		lists = append(lists, list)
-	}
-	sort.Slice(lists, func(i, j int) bool { return len(lists[i]) < len(lists[j]) })
-	candidates := append([]int(nil), lists[0]...)
-	for _, list := range lists[1:] {
-		candidates = intersectSorted(candidates, list)
-		if len(candidates) == 0 {
-			break
-		}
-	}
-	return candidates, true
-}
-
-func intersectSorted(a, b []int) []int {
-	out := a[:0]
-	i, j := 0, 0
-	for i < len(a) && j < len(b) {
-		if a[i] == b[j] {
-			out = append(out, a[i])
-			i++
-			j++
-		} else if a[i] < b[j] {
-			i++
-		} else {
-			j++
-		}
-	}
-	return out
-}
-
 func (idx *Index) compactPathContainsTerm(i int, term string) bool {
 	if idx.Volume != "" && strings.Contains(strings.ToLower(idx.Volume), term) {
 		return true
@@ -3071,49 +2576,6 @@ func containsAll(s string, terms []string) bool {
 		}
 	}
 	return true
-}
-
-func buildPathTokenIndex(idx *Index) {
-	idx.PathTokenIndex = make(map[string][]int, len(idx.Records)/4)
-	pathCache := make(map[int]string)
-	for i := range idx.Records {
-		path := strings.ToLower(idx.reconstructCompactPathCached(i, pathCache))
-		tokens := tokenizePath(path)
-		for token := range tokens {
-			idx.PathTokenIndex[token] = append(idx.PathTokenIndex[token], i)
-		}
-	}
-	for token := range idx.PathTokenIndex {
-		sort.Ints(idx.PathTokenIndex[token])
-	}
-}
-
-func tokenizePath(path string) map[string]struct{} {
-	out := make(map[string]struct{}, 8)
-	start := -1
-	for i, r := range path {
-		ok := (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9')
-		if ok {
-			if start < 0 {
-				start = i
-			}
-			continue
-		}
-		if start >= 0 {
-			addTokenParts(out, path[start:i])
-			start = -1
-		}
-	}
-	if start >= 0 {
-		addTokenParts(out, path[start:])
-	}
-	return out
-}
-
-func addTokenParts(out map[string]struct{}, token string) {
-	if len(token) >= 2 {
-		out[token] = struct{}{}
-	}
 }
 
 type diskHeader struct {
@@ -3585,7 +3047,7 @@ func parseTOMLStringArray(value string) []string {
 	return out
 }
 
-func loadIndexes(paths []string, tokenPath string) ([]*Index, error) {
+func loadIndexes(paths []string) ([]*Index, error) {
 	indexes := make([]*Index, 0, len(paths))
 	for _, path := range paths {
 		idx, err := loadIndex(path)
@@ -3593,142 +3055,9 @@ func loadIndexes(paths []string, tokenPath string) ([]*Index, error) {
 			return nil, err
 		}
 		idx.DBPath = path
-		if err := loadOptionalTokenSidecar(idx, path, tokenPath); err != nil {
-			return nil, err
-		}
 		indexes = append(indexes, idx)
 	}
 	return indexes, nil
-}
-
-func loadOptionalTokenSidecar(idx *Index, dbPath, tokenPath string) error {
-	if tokenPath == "" {
-		tokenPath = dbPath + ".tok"
-		if _, err := os.Stat(tokenPath); errors.Is(err, os.ErrNotExist) {
-			return nil
-		}
-	}
-	postings, err := loadTokenSidecar(tokenPath)
-	if err != nil {
-		return err
-	}
-	idx.PathTokenIndex = postings
-	return nil
-}
-
-func saveTokenSidecar(path string, postings map[string][]int) error {
-	tmp := path + ".tmp"
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
-	f, err := os.Create(tmp)
-	if err != nil {
-		return err
-	}
-	bw := bufio.NewWriterSize(f, 4*1024*1024)
-	err = writeTokenSidecar(bw, postings)
-	if flushErr := bw.Flush(); err == nil {
-		err = flushErr
-	}
-	closeErr := f.Close()
-	if err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	if closeErr != nil {
-		_ = os.Remove(tmp)
-		return closeErr
-	}
-	_ = os.Remove(path)
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	return nil
-}
-
-func writeTokenSidecar(w io.Writer, postings map[string][]int) error {
-	if err := binary.Write(w, binary.LittleEndian, tokenSidecarMagic); err != nil {
-		return err
-	}
-	tokens := make([]string, 0, len(postings))
-	for token := range postings {
-		tokens = append(tokens, token)
-	}
-	sort.Strings(tokens)
-	if err := binary.Write(w, binary.LittleEndian, uint32(len(tokens))); err != nil {
-		return err
-	}
-	var buf [binary.MaxVarintLen64]byte
-	for _, token := range tokens {
-		if err := writeString(w, token); err != nil {
-			return err
-		}
-		list := postings[token]
-		if err := binary.Write(w, binary.LittleEndian, uint32(len(list))); err != nil {
-			return err
-		}
-		prev := 0
-		for i, value := range list {
-			delta := value
-			if i > 0 {
-				delta = value - prev
-			}
-			n := binary.PutUvarint(buf[:], uint64(delta))
-			if _, err := w.Write(buf[:n]); err != nil {
-				return err
-			}
-			prev = value
-		}
-	}
-	return nil
-}
-
-func loadTokenSidecar(path string) (map[string][]int, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	br := bufio.NewReaderSize(f, 4*1024*1024)
-	var magic [8]byte
-	if err := binary.Read(br, binary.LittleEndian, &magic); err != nil {
-		return nil, err
-	}
-	if magic != tokenSidecarMagic {
-		return nil, errors.New("unsupported token sidecar format")
-	}
-	var count uint32
-	if err := binary.Read(br, binary.LittleEndian, &count); err != nil {
-		return nil, err
-	}
-	postings := make(map[string][]int, int(count))
-	for i := uint32(0); i < count; i++ {
-		token, err := readString(br)
-		if err != nil {
-			return nil, err
-		}
-		var n uint32
-		if err := binary.Read(br, binary.LittleEndian, &n); err != nil {
-			return nil, err
-		}
-		list := make([]int, int(n))
-		prev := 0
-		for j := range list {
-			delta, err := binary.ReadUvarint(br)
-			if err != nil {
-				return nil, err
-			}
-			value := int(delta)
-			if j > 0 {
-				value += prev
-			}
-			list[j] = value
-			prev = value
-		}
-		postings[token] = list
-	}
-	return postings, nil
 }
 
 func defaultDB() string {

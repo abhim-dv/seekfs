@@ -29,9 +29,9 @@ Download `seekfs-windows-amd64.zip`, extract it, and run:
 ## Smoke Test
 
 ```powershell
-.\seekfs.exe service-info --json
+.\seekfs.exe loaded --json
 .\seekfs.exe search -service --json -path -n 20 "ext:go"
-.\seekfs.exe bench-agent -service --json -iterations 100
+.\seekfs.exe bench -service --json -iterations 100
 .\seekfs.exe doctor --json
 ```
 

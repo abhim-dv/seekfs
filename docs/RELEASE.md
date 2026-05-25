@@ -14,8 +14,6 @@ Contents:
 - `README.md`
 - `LICENSE`
 - `NOTICE.md`
-- `install_seekfs_service.ps1`
-- `restart_seekfs_service.ps1`
 - `docs/`
 
 Indexes and benchmark output are not included.

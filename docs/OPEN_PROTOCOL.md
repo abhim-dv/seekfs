@@ -13,7 +13,7 @@ Requests and responses are newline-delimited JSON objects encoded as UTF-8.
 ```json
 {
   "command": "search",
-  "query": "linkmerge w6 full e10",
+  "query": "ext:go dir:cmd main",
   "match_path": true,
   "limit": 20,
   "count_only": false
@@ -57,8 +57,7 @@ Current service commands:
 
 - `search`
 - `index-usn`
-- `monitor-start`
-- `monitor-stop`
+- `info`
 - `status`
 
 The protocol is not yet frozen. Public automation should prefer the CLI until a

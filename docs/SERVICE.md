@@ -11,7 +11,7 @@ go build -o seekfs.exe ./cmd/seekfs
 Install the service:
 
 ```powershell
-.\seekfs.exe install-service
+.\seekfs.exe install
 .\seekfs.exe start
 ```
 
@@ -40,12 +40,6 @@ Launch the service with the DB paths it should keep loaded:
 `launch` installs or reinstalls the service, starts it, waits for the named pipe,
 and runs the same health checks as `doctor`.
 
-Or use:
-
-```powershell
-.\install_seekfs_service.ps1 -Db F:\seekfs_c.gsi,F:\seekfs_f.gsi
-```
-
 ## Upgrade
 
 1. Build or unpack the new `seekfs.exe`.
@@ -56,7 +50,7 @@ Or use:
 
 ```powershell
 .\seekfs.exe stop
-.\seekfs.exe uninstall-service
+.\seekfs.exe uninstall
 ```
 
 Remove index files manually only if you no longer need them.
