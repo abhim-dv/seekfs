@@ -7,3 +7,4 @@ dbs = ["F:\\seekfs_c.gsi", "F:\\seekfs_f.gsi"]
 volumes = ["C:", "F:"]
 service_pipe = "\\\\.\\pipe\\seekfs-service"
 default_limit = 100
+output_format = "text"

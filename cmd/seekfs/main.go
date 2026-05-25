@@ -140,6 +140,7 @@ type appConfig struct {
 	Volumes      []string
 	ServicePipe  string
 	DefaultLimit int
+	OutputFormat string
 }
 
 type queryOptions struct {
@@ -272,12 +273,18 @@ func run(args []string) error {
 		return cmdSetupService(args[1:])
 	case "launch":
 		return cmdLaunch(args[1:])
-	case "start-service":
+	case "start-service", "start":
 		return cmdControlService(args[1:], "start")
-	case "stop-service":
+	case "stop-service", "stop":
 		return cmdControlService(args[1:], "stop")
-	case "restart-service":
+	case "restart-service", "restart":
 		return cmdControlService(args[1:], "restart")
+	case "status":
+		return cmdServiceSimple(args[1:], "status")
+	case "config":
+		return cmdConfig(args[1:])
+	case "defaults":
+		return cmdDefaults(args[1:])
 	case "uninstall-service":
 		return cmdUninstallService(args[1:])
 	case "doctor":
@@ -312,6 +319,9 @@ func run(args []string) error {
 	case "help", "-h", "--help":
 		printUsage(os.Stdout)
 		return nil
+	case "agent":
+		printAgentHelp()
+		return nil
 	case "help-search":
 		printSearchHelp()
 		return nil
@@ -337,9 +347,12 @@ func printUsage(w io.Writer) {
   seekfs install-service [-pipe \\.\pipe\seekfs-service] [-sddl <sddl>] [-db index.gsi...]
   seekfs setup-service [-db index.gsi...] [-no-start]
   seekfs launch [-db index.gsi...] [--json]
-  seekfs start-service|stop-service|restart-service
+  seekfs start|stop|restart
   seekfs uninstall-service
   seekfs doctor [--json]
+  seekfs status [--json]
+  seekfs defaults [--json]
+  seekfs config path|show|get|set
   seekfs service-index-usn -volume C: -db seekfs.gsi [-pipe \\.\pipe\seekfs-service]
   seekfs service-monitor-start -volume C:
   seekfs service-monitor-stop -volume C:
@@ -416,6 +429,7 @@ Recommended commands:
   seekfs search -service --json -path -n 20 "ext:go dir:cmd main"
   seekfs count  -service --json -path "type:file ext:go"
   seekfs launch -db F:\seekfs_c.gsi -db F:\seekfs_f.gsi
+  seekfs config set output_format json
   seekfs bench-agent -service --json -iterations 100
 
 JSON result shape:
@@ -514,6 +528,7 @@ func cmdIndexVolumes(args []string) error {
 	pipeName := fs.String("pipe", defaultServicePipe, "service named pipe")
 	indexDir := fs.String("index-dir", defaultIndexDir(), "directory for generated .gsi files")
 	launch := fs.Bool("launch", false, "launch resident service with the built indexes")
+	dryRun := fs.Bool("dry-run", false, "show planned index paths without indexing")
 	jsonOut := fs.Bool("json", false, "write machine-readable JSON")
 	fs.Var(&volumes, "volume", "NTFS volume to index; repeatable")
 	if err := fs.Parse(args); err != nil {
@@ -532,16 +547,18 @@ func cmdIndexVolumes(args []string) error {
 	if *pipeName == defaultServicePipe && cfg.ServicePipe != "" {
 		*pipeName = cfg.ServicePipe
 	}
-	if _, err := callService(*pipeName, serviceRequest{Command: "status"}); err != nil {
-		if setupErr := cmdSetupService([]string{"-pipe", *pipeName, "-no-start"}); setupErr != nil {
-			return fmt.Errorf("service unavailable and setup failed: %w", setupErr)
-		}
-		if startErr := startWindowsService(); startErr != nil {
-			return fmt.Errorf("service unavailable and start failed: %w", startErr)
-		}
+	if cfg.OutputFormat == "json" {
+		*jsonOut = true
 	}
-	if err := os.MkdirAll(*indexDir, 0o755); err != nil {
-		return err
+	if !*dryRun {
+		if _, err := callService(*pipeName, serviceRequest{Command: "status"}); err != nil {
+			if setupErr := cmdSetupService([]string{"-pipe", *pipeName, "-no-start"}); setupErr != nil {
+				return fmt.Errorf("service unavailable and setup failed: %w", setupErr)
+			}
+			if startErr := startWindowsService(); startErr != nil {
+				return fmt.Errorf("service unavailable and start failed: %w", startErr)
+			}
+		}
 	}
 	type result struct {
 		Volume  string `json:"volume"`
@@ -554,6 +571,14 @@ func cmdIndexVolumes(args []string) error {
 	for _, volume := range volumes {
 		vol := normalizeVolume(volume)
 		db := defaultVolumeDB(*indexDir, vol)
+		if *dryRun {
+			results = append(results, result{Volume: vol, DB: db})
+			dbs = append(dbs, db)
+			continue
+		}
+		if err := os.MkdirAll(*indexDir, 0o755); err != nil {
+			return err
+		}
 		resp, err := callService(*pipeName, serviceRequest{Command: "index-usn", Volume: vol, DB: db})
 		r := result{Volume: vol, DB: db}
 		if err != nil {
@@ -570,7 +595,7 @@ func cmdIndexVolumes(args []string) error {
 		results = append(results, r)
 		dbs = append(dbs, db)
 	}
-	if *launch && len(dbs) > 0 {
+	if *launch && len(dbs) > 0 && !*dryRun {
 		launchArgs := []string{"-pipe", *pipeName}
 		for _, db := range dbs {
 			launchArgs = append(launchArgs, "-db", db)
@@ -893,6 +918,9 @@ func cmdSearch(args []string, countOnly bool) error {
 	if *pipeName == defaultServicePipe && cfg.ServicePipe != "" {
 		*pipeName = cfg.ServicePipe
 	}
+	if cfg.OutputFormat == "json" {
+		*jsonOut = true
+	}
 	if *limit == 100 && cfg.DefaultLimit > 0 {
 		*limit = cfg.DefaultLimit
 	}
@@ -972,6 +1000,9 @@ func cmdInfo(args []string) error {
 	}
 	if *db == defaultDB() && len(cfg.DBs) > 0 {
 		*db = cfg.DBs[0]
+	}
+	if cfg.OutputFormat == "json" {
+		*jsonOut = true
 	}
 	idx, err := loadIndex(*db)
 	if err != nil {
@@ -1147,6 +1178,9 @@ func cmdBenchAgent(args []string) error {
 	}
 	if *pipeName == defaultServicePipe && cfg.ServicePipe != "" {
 		*pipeName = cfg.ServicePipe
+	}
+	if cfg.OutputFormat == "json" {
+		*jsonOut = true
 	}
 	queries := fs.Args()
 	if len(queries) == 0 {
@@ -1481,6 +1515,9 @@ func cmdLaunch(args []string) error {
 	if *pipeName == defaultServicePipe && cfg.ServicePipe != "" {
 		*pipeName = cfg.ServicePipe
 	}
+	if cfg.OutputFormat == "json" {
+		*jsonOut = true
+	}
 	setupArgs := []string{"-pipe", *pipeName, "-sddl", *sddl}
 	for _, db := range dbs {
 		setupArgs = append(setupArgs, "-db", db)
@@ -1653,6 +1690,9 @@ func cmdServiceSimple(args []string, command string) error {
 	if *pipeName == defaultServicePipe && cfg.ServicePipe != "" {
 		*pipeName = cfg.ServicePipe
 	}
+	if cfg.OutputFormat == "json" {
+		*jsonOut = true
+	}
 	resp, err := callService(*pipeName, serviceRequest{Command: command, Volume: *volume})
 	if err != nil {
 		return err
@@ -1681,6 +1721,9 @@ func cmdServiceInfo(args []string) error {
 	}
 	if *pipeName == defaultServicePipe && cfg.ServicePipe != "" {
 		*pipeName = cfg.ServicePipe
+	}
+	if cfg.OutputFormat == "json" {
+		*jsonOut = true
 	}
 	resp, err := callService(*pipeName, serviceRequest{Command: "info"})
 	if err != nil {
@@ -1714,6 +1757,9 @@ func cmdDoctor(args []string) error {
 	if *pipeName == defaultServicePipe && cfg.ServicePipe != "" {
 		*pipeName = cfg.ServicePipe
 	}
+	if cfg.OutputFormat == "json" {
+		*jsonOut = true
+	}
 	resp := probeDoctor(*pipeName)
 	if *jsonOut {
 		if err := writeJSON(os.Stdout, resp); err != nil {
@@ -1729,6 +1775,169 @@ func cmdDoctor(args []string) error {
 		return errors.New(resp.Message)
 	}
 	return nil
+}
+
+func cmdDefaults(args []string) error {
+	fs := flag.NewFlagSet("defaults", flag.ContinueOnError)
+	jsonOut := fs.Bool("json", false, "write machine-readable JSON")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	type dbDefault struct {
+		Volume string `json:"volume"`
+		DB     string `json:"db"`
+		Exists bool   `json:"exists"`
+	}
+	indexDir := defaultIndexDir()
+	volumes := defaultIndexVolumes()
+	dbs := make([]dbDefault, 0, len(volumes))
+	for _, volume := range volumes {
+		db := defaultVolumeDB(indexDir, normalizeVolume(volume))
+		_, err := os.Stat(db)
+		dbs = append(dbs, dbDefault{Volume: normalizeVolume(volume), DB: db, Exists: err == nil})
+	}
+	resp := struct {
+		OK          bool        `json:"ok"`
+		ConfigPath  string      `json:"config_path"`
+		IndexDir    string      `json:"index_dir"`
+		ServicePipe string      `json:"service_pipe"`
+		Volumes     []string    `json:"volumes"`
+		DBs         []dbDefault `json:"dbs"`
+	}{OK: true, ConfigPath: defaultConfigPath(), IndexDir: indexDir, ServicePipe: defaultServicePipe, Volumes: volumes, DBs: dbs}
+	cfg, _ := loadConfig("")
+	if cfg.OutputFormat == "json" {
+		*jsonOut = true
+	}
+	if *jsonOut {
+		return writeJSON(os.Stdout, resp)
+	}
+	fmt.Printf("config: %s\nindex_dir: %s\nservice_pipe: %s\n", resp.ConfigPath, resp.IndexDir, resp.ServicePipe)
+	for _, db := range dbs {
+		fmt.Printf("%s -> %s exists=%t\n", db.Volume, db.DB, db.Exists)
+	}
+	return nil
+}
+
+func cmdConfig(args []string) error {
+	if len(args) == 0 {
+		return cmdConfig([]string{"show"})
+	}
+	switch args[0] {
+	case "path":
+		fmt.Println(defaultConfigPath())
+		return nil
+	case "show":
+		path := defaultConfigPath()
+		data, err := os.ReadFile(path)
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		fmt.Print(string(data))
+		return nil
+	case "get":
+		if len(args) < 2 {
+			return errors.New("config get requires a key")
+		}
+		cfg, err := loadConfig(defaultConfigPath())
+		if err != nil {
+			return err
+		}
+		return printConfigKey(cfg, args[1])
+	case "set":
+		if len(args) < 3 {
+			return errors.New(`config set requires a key and value, for example: seekfs config set output_format json`)
+		}
+		key := args[1]
+		value := strings.TrimSpace(strings.Join(args[2:], " "))
+		value = strings.TrimSpace(strings.TrimPrefix(value, "="))
+		return setConfigKey(defaultConfigPath(), key, value)
+	default:
+		return errors.New("unknown config command; use path, show, get, or set")
+	}
+}
+
+func printConfigKey(cfg appConfig, key string) error {
+	switch key {
+	case "dbs", "db_paths":
+		fmt.Println(formatStringArray(cfg.DBs))
+	case "volumes":
+		fmt.Println(formatStringArray(cfg.Volumes))
+	case "service_pipe":
+		fmt.Println(cfg.ServicePipe)
+	case "default_limit":
+		fmt.Println(cfg.DefaultLimit)
+	case "output_format":
+		fmt.Println(cfg.OutputFormat)
+	default:
+		return fmt.Errorf("unknown config key %q", key)
+	}
+	return nil
+}
+
+func setConfigKey(path, key, value string) error {
+	allowed := map[string]bool{"dbs": true, "db_paths": true, "volumes": true, "service_pipe": true, "default_limit": true, "output_format": true}
+	if !allowed[key] {
+		return fmt.Errorf("unknown config key %q", key)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	lines := []string{}
+	if data, err := os.ReadFile(path); err == nil {
+		lines = strings.Split(strings.ReplaceAll(string(data), "\r\n", "\n"), "\n")
+	}
+	formatted := formatConfigValue(key, value)
+	replaced := false
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, key+" ") || strings.HasPrefix(trimmed, key+"=") {
+			lines[i] = key + " = " + formatted
+			replaced = true
+		}
+	}
+	if !replaced {
+		lines = append(lines, key+" = "+formatted)
+	}
+	out := strings.TrimRight(strings.Join(lines, "\n"), "\n") + "\n"
+	return os.WriteFile(path, []byte(out), 0o644)
+}
+
+func formatConfigValue(key, value string) string {
+	value = strings.TrimSpace(value)
+	if key == "dbs" || key == "db_paths" || key == "volumes" {
+		if strings.HasPrefix(value, "[") {
+			return formatStringArray(parseTOMLStringArray(value))
+		}
+		parts := strings.Split(value, ",")
+		items := make([]string, 0, len(parts))
+		for _, part := range parts {
+			part = strings.Trim(strings.TrimSpace(part), `"'`)
+			if part != "" {
+				items = append(items, strconvQuote(part))
+			}
+		}
+		return "[" + strings.Join(items, ", ") + "]"
+	}
+	if key == "default_limit" {
+		return value
+	}
+	return strconvQuote(strings.Trim(value, `"'`))
+}
+
+func formatStringArray(values []string) string {
+	items := make([]string, len(values))
+	for i, value := range values {
+		items[i] = strconvQuote(value)
+	}
+	return "[" + strings.Join(items, ", ") + "]"
+}
+
+func strconvQuote(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b)
 }
 
 func probeDoctor(pipeName string) doctorResponse {
@@ -3321,6 +3530,8 @@ func loadConfig(path string) (appConfig, error) {
 			cfg.Volumes = append(cfg.Volumes, parseTOMLStringArray(value)...)
 		case "service_pipe":
 			cfg.ServicePipe = parseTOMLString(value)
+		case "output_format":
+			cfg.OutputFormat = strings.ToLower(parseTOMLString(value))
 		case "default_limit":
 			var n int
 			if _, err := fmt.Sscanf(value, "%d", &n); err == nil {
@@ -3333,15 +3544,20 @@ func loadConfig(path string) (appConfig, error) {
 
 func findDefaultConfig() string {
 	candidates := []string{"seekfs.toml"}
-	if dir, err := os.UserConfigDir(); err == nil {
-		candidates = append(candidates, filepath.Join(dir, "seekfs", "seekfs.toml"))
-	}
+	candidates = append(candidates, defaultConfigPath())
 	for _, path := range candidates {
 		if _, err := os.Stat(path); err == nil {
 			return path
 		}
 	}
 	return ""
+}
+
+func defaultConfigPath() string {
+	if dir, err := os.UserConfigDir(); err == nil {
+		return filepath.Join(dir, "seekfs", "seekfs.toml")
+	}
+	return "seekfs.toml"
 }
 
 func parseTOMLString(value string) string {

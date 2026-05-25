@@ -39,6 +39,13 @@ Use the service for full-volume NTFS/USN indexing and resident search.
 .\seekfs.exe index-volumes -volume C: -volume F: -launch
 ```
 
+Preview defaults before indexing:
+
+```powershell
+.\seekfs.exe defaults --json
+.\seekfs.exe index-volumes --dry-run --json
+```
+
 Reinstall the service with the indexes it should keep resident:
 
 ```powershell
@@ -134,6 +141,15 @@ failures: 0
 - [Security notes](SECURITY.md)
 - [Production readiness](production-readiness.md)
 - [Release TODO](RELEASE_TODO.md)
+
+## Config Shortcuts
+
+```powershell
+.\seekfs.exe config path
+.\seekfs.exe config set output_format json
+.\seekfs.exe config set dbs = '["F:\\seekfs_c.gsi", "F:\\seekfs_f.gsi"]'
+.\seekfs.exe defaults --json
+```
 
 ## Development
 

@@ -12,13 +12,14 @@ Install the service:
 
 ```powershell
 .\seekfs.exe install-service
-.\seekfs.exe start-service
+.\seekfs.exe start
 ```
 
 ## Build Indexes
 
 ```powershell
 .\seekfs.exe index-volumes -volume C: -volume F:
+.\seekfs.exe index-volumes --dry-run --json
 ```
 
 Without `-volume`, `index-volumes` indexes fixed local drives by default and
@@ -54,7 +55,7 @@ Or use:
 ## Uninstall
 
 ```powershell
-.\seekfs.exe stop-service
+.\seekfs.exe stop
 .\seekfs.exe uninstall-service
 ```
 
