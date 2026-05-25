@@ -42,6 +42,36 @@ Requests and responses are newline-delimited JSON objects encoded as UTF-8.
 }
 ```
 
+## Info Response
+
+`info` is what `seekfs loaded --json` uses. It reports the process serving the
+pipe plus each loaded database and its incremental state.
+
+```json
+{
+  "ok": true,
+  "pid": 45668,
+  "entries": 22499191,
+  "dbs": [
+    {
+      "path": "C:\\ProgramData\\seekfs\\indexes\\seekfs_c.gsi",
+      "entries": 8166043,
+      "source": "usn",
+      "built_at": "2026-05-25T11:33:15.3230812-07:00",
+      "volume": "C:",
+      "journal_id": 133234659009607417,
+      "checkpoint_usn": 903307872656,
+      "state": "ready",
+      "frn_records": 8166043
+    }
+  ]
+}
+```
+
+`state` is `ready` when journal replay is active. It is `stale` when the
+service can still answer from the loaded index but could not validate or read
+the NTFS journal; `stale_reason` contains the failure.
+
 ## Error Response
 
 ```json

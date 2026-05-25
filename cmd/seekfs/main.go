@@ -10,6 +10,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime/debug"
@@ -101,6 +102,7 @@ type doctorResponse struct {
 	ServiceName   string `json:"service_name"`
 	Installed     bool   `json:"installed"`
 	Running       bool   `json:"running"`
+	ServiceError  string `json:"service_error,omitempty"`
 	PipeReachable bool   `json:"pipe_reachable"`
 	Entries       int    `json:"entries,omitempty"`
 	QueryOK       bool   `json:"query_ok"`
@@ -280,7 +282,7 @@ func run(args []string) error {
 	case "restart":
 		return cmdControlService(args[1:], "restart")
 	case "status":
-		return cmdServiceSimple(args[1:], "status")
+		return cmdDoctor(args[1:])
 	case "config":
 		return cmdConfig(args[1:])
 	case "defaults":
@@ -1210,6 +1212,7 @@ type serviceRequest struct {
 type serviceResponse struct {
 	OK      bool     `json:"ok"`
 	Message string   `json:"message,omitempty"`
+	PID     int      `json:"pid,omitempty"`
 	Entries int      `json:"entries,omitempty"`
 	Loading bool     `json:"loading,omitempty"`
 	Count   int      `json:"count,omitempty"`
@@ -1251,6 +1254,7 @@ type serviceVolumeIndex struct {
 	state       string
 	staleReason string
 	frnToID     map[uint64]int
+	children    map[uint64]map[int]struct{}
 	pathCache   map[int]string
 	termMu      sync.Mutex
 	termCache   map[string][]int
@@ -1849,6 +1853,11 @@ func probeDoctor(pipeName string) doctorResponse {
 	if status, err := queryWindowsService(); err == nil {
 		resp.Installed = true
 		resp.Running = status.State == svc.Running
+	} else {
+		resp.ServiceError = err.Error()
+		if serviceInstalledBySC(serviceName) {
+			resp.Installed = true
+		}
 	}
 	info, err := callService(pipeName, serviceRequest{Command: "info"})
 	if err == nil && info.OK {
@@ -1865,9 +1874,18 @@ func probeDoctor(pipeName string) doctorResponse {
 	}
 	resp.OK = resp.Installed && resp.Running && resp.PipeReachable && resp.Entries > 0 && resp.QueryOK
 	if !resp.OK && resp.Message == "" {
-		resp.Message = "seekfs service is not fully healthy"
+		if resp.PipeReachable && !resp.Running {
+			resp.Message = "seekfs pipe is reachable but the Windows service is not running"
+		} else {
+			resp.Message = "seekfs service is not fully healthy"
+		}
 	}
 	return resp
+}
+
+func serviceInstalledBySC(name string) bool {
+	cmd := exec.Command("sc.exe", "query", name)
+	return cmd.Run() == nil
 }
 
 func waitForDoctor(pipeName string, timeout time.Duration) doctorResponse {
@@ -2037,9 +2055,13 @@ func newServiceVolumeIndex(dbPath string, idx *Index) *serviceVolumeIndex {
 	}
 	if idx.Compact && idx.Source == "usn" {
 		vol.frnToID = make(map[uint64]int, len(idx.Records))
+		vol.children = make(map[uint64]map[int]struct{}, len(idx.Records))
 		for i, rec := range idx.Records {
 			if rec.FRN != 0 {
 				vol.frnToID[rec.FRN] = i
+			}
+			if rec.ParentFRN != 0 && rec.ParentFRN != rec.FRN {
+				vol.addChild(rec.ParentFRN, i)
 			}
 		}
 	}
@@ -2189,6 +2211,9 @@ func (vol *serviceVolumeIndex) applyUSNChanges(changes []usnChange) {
 	if vol.frnToID == nil {
 		vol.frnToID = make(map[uint64]int)
 	}
+	if vol.children == nil {
+		vol.rebuildChildren()
+	}
 	for _, change := range changes {
 		if change.FRN == 0 {
 			continue
@@ -2198,7 +2223,7 @@ func (vol *serviceVolumeIndex) applyUSNChanges(changes []usnChange) {
 		}
 		if change.Reason&usnReasonFileDelete != 0 {
 			if id, ok := vol.frnToID[change.FRN]; ok {
-				vol.index.Records[id].Deleted = true
+				vol.markDeleted(id)
 			}
 			if change.USN > vol.checkpoint {
 				vol.checkpoint = change.USN
@@ -2212,12 +2237,19 @@ func (vol *serviceVolumeIndex) applyUSNChanges(changes []usnChange) {
 			vol.index.Records = append(vol.index.Records, CompactRecord{FRN: change.FRN})
 		}
 		rec := &vol.index.Records[id]
+		if rec.ParentFRN != 0 && rec.ParentFRN != change.ParentFRN {
+			vol.removeChild(rec.ParentFRN, id)
+		}
 		rec.FRN = change.FRN
 		rec.ParentFRN = change.ParentFRN
 		rec.Parent = -1
 		if parentID, ok := vol.frnToID[change.ParentFRN]; ok && parentID != id {
 			rec.Parent = int32(parentID)
 		}
+		if change.ParentFRN != 0 && change.ParentFRN != change.FRN {
+			vol.addChild(change.ParentFRN, id)
+		}
+		vol.repairChildren(change.FRN, id)
 		if change.Name != "" {
 			rec.Name = change.Name
 			rec.LowerName = strings.ToLower(change.Name)
@@ -2236,6 +2268,70 @@ func (vol *serviceVolumeIndex) applyUSNChanges(changes []usnChange) {
 	vol.index.CompactNameOrder = make([]int, len(vol.index.Records))
 	for i := range vol.index.CompactNameOrder {
 		vol.index.CompactNameOrder[i] = i
+	}
+}
+
+func (vol *serviceVolumeIndex) rebuildChildren() {
+	vol.children = make(map[uint64]map[int]struct{}, len(vol.index.Records))
+	for i, rec := range vol.index.Records {
+		if rec.ParentFRN != 0 && rec.ParentFRN != rec.FRN {
+			vol.addChild(rec.ParentFRN, i)
+		}
+	}
+}
+
+func (vol *serviceVolumeIndex) addChild(parentFRN uint64, id int) {
+	if parentFRN == 0 {
+		return
+	}
+	kids := vol.children[parentFRN]
+	if kids == nil {
+		kids = make(map[int]struct{})
+		vol.children[parentFRN] = kids
+	}
+	kids[id] = struct{}{}
+}
+
+func (vol *serviceVolumeIndex) removeChild(parentFRN uint64, id int) {
+	if parentFRN == 0 || vol.children == nil {
+		return
+	}
+	kids := vol.children[parentFRN]
+	if kids == nil {
+		return
+	}
+	delete(kids, id)
+	if len(kids) == 0 {
+		delete(vol.children, parentFRN)
+	}
+}
+
+func (vol *serviceVolumeIndex) repairChildren(parentFRN uint64, parentID int) {
+	for childID := range vol.children[parentFRN] {
+		if childID == parentID || childID < 0 || childID >= len(vol.index.Records) {
+			continue
+		}
+		vol.index.Records[childID].Parent = int32(parentID)
+	}
+}
+
+func (vol *serviceVolumeIndex) markDeleted(id int) {
+	if id < 0 || id >= len(vol.index.Records) {
+		return
+	}
+	stack := []int{id}
+	for len(stack) > 0 {
+		last := len(stack) - 1
+		cur := stack[last]
+		stack = stack[:last]
+		if cur < 0 || cur >= len(vol.index.Records) || vol.index.Records[cur].Deleted {
+			continue
+		}
+		rec := &vol.index.Records[cur]
+		rec.Deleted = true
+		for childID := range vol.children[rec.FRN] {
+			stack = append(stack, childID)
+		}
 	}
 }
 
@@ -2353,7 +2449,7 @@ func handleServiceConn(conn *os.File, s *goSearchService) {
 		} else if loadErr != "" {
 			message = loadErr
 		}
-		_ = json.NewEncoder(conn).Encode(serviceResponse{OK: loadErr == "", Message: message, Entries: total, Loading: loading, DBs: infos})
+		_ = json.NewEncoder(conn).Encode(serviceResponse{OK: loadErr == "", Message: message, PID: os.Getpid(), Entries: total, Loading: loading, DBs: infos})
 	case "search":
 		s.indexMu.RLock()
 		if len(s.indexes) == 0 {
@@ -2401,7 +2497,7 @@ func handleServiceConn(conn *os.File, s *goSearchService) {
 		serviceLog("index-usn complete volume=%s entries=%d", req.Volume, idx.entryCount())
 		_ = json.NewEncoder(conn).Encode(serviceResponse{OK: true, Message: "indexed", Entries: idx.entryCount()})
 	case "status":
-		_ = json.NewEncoder(conn).Encode(serviceResponse{OK: true, Message: "service running"})
+		_ = json.NewEncoder(conn).Encode(serviceResponse{OK: true, Message: "service running", PID: os.Getpid()})
 	default:
 		_ = json.NewEncoder(conn).Encode(serviceResponse{OK: false, Message: "unknown command"})
 	}

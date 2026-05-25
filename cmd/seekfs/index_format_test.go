@@ -133,6 +133,68 @@ func TestServiceVolumeIndexAppliesUSNMutations(t *testing.T) {
 	}
 }
 
+func TestServiceVolumeIndexRepairsOutOfOrderParents(t *testing.T) {
+	idx := &Index{
+		Source:  "usn",
+		Volume:  "F:",
+		Compact: true,
+		Records: []CompactRecord{
+			{FRN: 100, ParentFRN: 100, Parent: -1, Name: ".", LowerName: "."},
+		},
+	}
+	vol := newServiceVolumeIndex(`F:\seekfs_f.gsi`, idx)
+
+	vol.applyUSNChanges([]usnChange{{
+		FRN:       201,
+		ParentFRN: 200,
+		USN:       10,
+		Reason:    usnReasonFileCreate,
+		Name:      "child.txt",
+	}, {
+		FRN:       200,
+		ParentFRN: 100,
+		USN:       11,
+		Reason:    usnReasonFileCreate,
+		Attr:      fileAttributeDir,
+		Name:      "parent",
+	}})
+
+	if len(idx.Records) != 3 {
+		t.Fatalf("records = %d, want 3", len(idx.Records))
+	}
+	child := idx.Records[1]
+	if child.Parent != 2 {
+		t.Fatalf("child parent = %d, want parent record 2: %+v", child.Parent, child)
+	}
+	if got := idx.reconstructCompactPath(1); got != `F:\.\parent\child.txt` {
+		t.Fatalf("path = %q", got)
+	}
+}
+
+func TestServiceVolumeIndexDeletesDirectorySubtree(t *testing.T) {
+	idx := &Index{
+		Source:  "usn",
+		Volume:  "F:",
+		Compact: true,
+		Records: []CompactRecord{
+			{FRN: 100, ParentFRN: 100, Parent: -1, Name: ".", LowerName: "."},
+			{FRN: 200, ParentFRN: 100, Parent: 0, Name: "dir", LowerName: "dir"},
+			{FRN: 201, ParentFRN: 200, Parent: 1, Name: "child.txt", LowerName: "child.txt"},
+		},
+	}
+	vol := newServiceVolumeIndex(`F:\seekfs_f.gsi`, idx)
+
+	vol.applyUSNChanges([]usnChange{{
+		FRN:    200,
+		USN:    12,
+		Reason: usnReasonFileDelete,
+	}})
+
+	if !idx.Records[1].Deleted || !idx.Records[2].Deleted {
+		t.Fatalf("directory subtree was not tombstoned: dir=%+v child=%+v", idx.Records[1], idx.Records[2])
+	}
+}
+
 func TestValidateUSNCheckpoint(t *testing.T) {
 	vol := &serviceVolumeIndex{journalID: 10, checkpoint: 50}
 	journal := usnJournalDataV0{UsnJournalID: 10, FirstUsn: 20, LowestValidUsn: 30, NextUsn: 100}
