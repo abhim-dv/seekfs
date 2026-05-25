@@ -55,6 +55,26 @@ Check health:
 serving the pipe and the loaded DB state. If a DB reports `state: "stale"`, the
 service is answering from the index but journal replay is not active.
 
+## Incremental Durability
+
+The service keeps recent USN updates in memory for low search latency and
+debounces full `.gsi` rewrites. Before applying each replay batch, it appends the
+batch to a sidecar file beside the index:
+
+```text
+seekfs_c.gsi.wal
+```
+
+On service startup, seekfs replays the sidecar before reading newer NTFS journal
+changes. A successful full index save removes the sidecar. Keep `.gsi.wal` files
+with their matching `.gsi` files when copying or backing up a live index.
+
+Use `info --json` to inspect index layout and size contributors:
+
+```powershell
+.\seekfs.exe info -db C:\ProgramData\seekfs\indexes\seekfs_c.gsi --json
+```
+
 ## Upgrade
 
 1. Build or unpack the new `seekfs.exe`.

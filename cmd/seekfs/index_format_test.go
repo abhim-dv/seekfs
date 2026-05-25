@@ -2,8 +2,10 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -192,6 +194,48 @@ func TestServiceVolumeIndexDeletesDirectorySubtree(t *testing.T) {
 
 	if !idx.Records[1].Deleted || !idx.Records[2].Deleted {
 		t.Fatalf("directory subtree was not tombstoned: dir=%+v child=%+v", idx.Records[1], idx.Records[2])
+	}
+}
+
+func TestServiceVolumeIndexReplaysWAL(t *testing.T) {
+	dir := t.TempDir()
+	db := filepath.Join(dir, "test.gsi")
+	if err := appendWAL(db, 11, []usnChange{{
+		FRN:       101,
+		ParentFRN: 100,
+		USN:       11,
+		Reason:    usnReasonFileCreate,
+		Name:      "wal-created.txt",
+	}}); err != nil {
+		t.Fatalf("appendWAL: %v", err)
+	}
+
+	reloaded := newServiceVolumeIndex(db, &Index{
+		Source:     "usn",
+		Volume:     "F:",
+		Compact:    true,
+		Checkpoint: 10,
+		Records: []CompactRecord{
+			{FRN: 100, ParentFRN: 100, Parent: -1, Name: ".", LowerName: "."},
+		},
+	})
+	if err := reloaded.replayWAL(); err != nil {
+		t.Fatalf("replayWAL: %v", err)
+	}
+	if reloaded.checkpoint != 11 || reloaded.index.Checkpoint != 11 || !reloaded.dirty {
+		t.Fatalf("wal checkpoint/dirty mismatch: vol=%d idx=%d dirty=%v", reloaded.checkpoint, reloaded.index.Checkpoint, reloaded.dirty)
+	}
+	if len(reloaded.index.Records) != 2 || reloaded.index.Records[1].Name != "wal-created.txt" {
+		t.Fatalf("wal record not replayed: %+v", reloaded.index.Records)
+	}
+	if _, err := os.Stat(walPath(db)); err != nil {
+		t.Fatalf("wal missing before cleanup: %v", err)
+	}
+	if err := removeWAL(db); err != nil {
+		t.Fatalf("removeWAL: %v", err)
+	}
+	if _, err := os.Stat(walPath(db)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("wal still exists after cleanup: %v", err)
 	}
 }
 

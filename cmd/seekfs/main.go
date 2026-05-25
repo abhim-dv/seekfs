@@ -36,18 +36,19 @@ var (
 )
 
 const (
-	fsctlEnumUSNData     = 0x000900b3
-	fsctlQueryUSNJournal = 0x000900f4
-	fsctlReadUSNJournal  = 0x000900bb
-	fileAttributeDir     = 0x10
-	usnReasonFileCreate  = 0x00000100
-	usnReasonFileDelete  = 0x00000200
-	usnReasonRenameOld   = 0x00001000
-	usnReasonRenameNew   = 0x00002000
-	serviceName          = "seekfs"
-	defaultServicePipe   = `\\.\pipe\seekfs-service`
-	defaultServiceSDDL   = `D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)`
-	persistDebounce      = 5 * time.Minute
+	fsctlEnumUSNData       = 0x000900b3
+	fsctlQueryUSNJournal   = 0x000900f4
+	fsctlReadUSNJournal    = 0x000900bb
+	fileAttributeDir       = 0x10
+	usnReasonFileCreate    = 0x00000100
+	usnReasonFileDelete    = 0x00000200
+	usnReasonRenameOld     = 0x00001000
+	usnReasonRenameNew     = 0x00002000
+	serviceName            = "seekfs"
+	defaultServicePipe     = `\\.\pipe\seekfs-service`
+	defaultServiceSDDL     = `D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)`
+	persistDebounce        = 5 * time.Minute
+	compactDiskRecordBytes = 43
 )
 
 type Entry struct {
@@ -86,16 +87,28 @@ type jsonSearchResponse struct {
 }
 
 type jsonInfoResponse struct {
-	OK          bool     `json:"ok"`
-	Version     int      `json:"version"`
-	Source      string   `json:"source"`
-	BuiltAt     string   `json:"built_at"`
-	Entries     int      `json:"entries"`
-	Roots       []string `json:"roots"`
-	Volume      string   `json:"volume,omitempty"`
-	JournalID   uint64   `json:"journal_id,omitempty"`
-	Checkpoint  int64    `json:"checkpoint_usn,omitempty"`
-	ContentHash string   `json:"content_hash,omitempty"`
+	OK          bool         `json:"ok"`
+	Version     int          `json:"version"`
+	Source      string       `json:"source"`
+	BuiltAt     string       `json:"built_at"`
+	Entries     int          `json:"entries"`
+	Roots       []string     `json:"roots"`
+	Volume      string       `json:"volume,omitempty"`
+	JournalID   uint64       `json:"journal_id,omitempty"`
+	Checkpoint  int64        `json:"checkpoint_usn,omitempty"`
+	ContentHash string       `json:"content_hash,omitempty"`
+	Layout      *indexLayout `json:"layout,omitempty"`
+}
+
+type indexLayout struct {
+	FileBytes      int64   `json:"file_bytes,omitempty"`
+	RecordBytes    int64   `json:"record_bytes,omitempty"`
+	NameBlobBytes  int64   `json:"name_blob_bytes,omitempty"`
+	NameTableBytes int64   `json:"name_table_bytes,omitempty"`
+	OtherBytes     int64   `json:"other_bytes,omitempty"`
+	RecordCount    int     `json:"record_count,omitempty"`
+	UniqueNames    int     `json:"unique_names,omitempty"`
+	BytesPerRecord float64 `json:"bytes_per_record,omitempty"`
 }
 
 type doctorResponse struct {
@@ -229,6 +242,11 @@ type usnChange struct {
 	Reason    uint32
 	Attr      uint32
 	Name      string
+}
+
+type walBatch struct {
+	NextUSN int64       `json:"next_usn"`
+	Changes []usnChange `json:"changes"`
 }
 
 type stringList []string
@@ -1076,7 +1094,7 @@ func cmdInfo(args []string) error {
 		return err
 	}
 	if *jsonOut {
-		return writeJSON(os.Stdout, indexInfoToJSON(idx))
+		return writeJSON(os.Stdout, indexInfoToJSON(idx, *db))
 	}
 	fmt.Printf("version: %d\n", idx.Version)
 	fmt.Printf("source: %s\n", idx.Source)
@@ -1090,6 +1108,13 @@ func cmdInfo(args []string) error {
 	}
 	if idx.ContentHash != "" {
 		fmt.Printf("content_hash: %s\n", idx.ContentHash)
+	}
+	if layout := estimateIndexLayout(idx, *db); layout != nil {
+		fmt.Printf("file_bytes: %d\n", layout.FileBytes)
+		fmt.Printf("record_bytes: %d\n", layout.RecordBytes)
+		fmt.Printf("name_blob_bytes: %d\n", layout.NameBlobBytes)
+		fmt.Printf("name_table_bytes: %d\n", layout.NameTableBytes)
+		fmt.Printf("bytes_per_record: %.2f\n", layout.BytesPerRecord)
 	}
 	return nil
 }
@@ -2060,6 +2085,11 @@ func (s *goSearchService) loadConfiguredIndexes() error {
 			dbPath = s.dbs[i]
 		}
 		vol := newServiceVolumeIndex(dbPath, idx)
+		if err := vol.replayWAL(); err != nil {
+			serviceLog("startup wal replay skipped volume=%s db=%s err=%v", vol.volume, vol.dbPath, err)
+			vol.state = "stale"
+			vol.staleReason = err.Error()
+		}
 		if err := catchUpServiceVolume(vol); err != nil {
 			serviceLog("startup catch-up skipped volume=%s db=%s err=%v", vol.volume, vol.dbPath, err)
 		}
@@ -2156,6 +2186,9 @@ func catchUpServiceVolume(vol *serviceVolumeIndex) error {
 			vol.staleReason = err.Error()
 			return err
 		}
+		if err := removeWAL(vol.dbPath); err != nil {
+			serviceLog("wal cleanup error volume=%s db=%s err=%v", vol.volume, vol.dbPath, err)
+		}
 	}
 	vol.state = "ready"
 	vol.staleReason = ""
@@ -2203,6 +2236,12 @@ func (s *goSearchService) replayVolumeOnce(vol *serviceVolumeIndex, buffer []byt
 		return nil
 	}
 	s.indexMu.Lock()
+	if err := appendWAL(vol.dbPath, nextUSN, changes); err != nil {
+		vol.state = "stale"
+		vol.staleReason = err.Error()
+		s.indexMu.Unlock()
+		return err
+	}
 	vol.applyUSNChanges(changes)
 	vol.checkpoint = nextUSN
 	vol.index.Checkpoint = nextUSN
@@ -2248,6 +2287,9 @@ func (s *goSearchService) persistVolumeIfDue(vol *serviceVolumeIndex, force bool
 		vol.staleReason = err.Error()
 		serviceLog("background persist error volume=%s db=%s err=%v", vol.volume, vol.dbPath, err)
 	} else {
+		if err := removeWAL(vol.dbPath); err != nil {
+			serviceLog("wal cleanup error volume=%s db=%s err=%v", vol.volume, vol.dbPath, err)
+		}
 		vol.dirty = false
 		vol.lastPersist = time.Now()
 	}
@@ -2349,6 +2391,80 @@ func (vol *serviceVolumeIndex) applyUSNChanges(changes []usnChange) {
 	vol.termMu.Lock()
 	vol.termCache = nil
 	vol.termMu.Unlock()
+}
+
+func (vol *serviceVolumeIndex) replayWAL() error {
+	if vol == nil || vol.dbPath == "" {
+		return nil
+	}
+	f, err := os.Open(walPath(vol.dbPath))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	defer f.Close()
+	dec := json.NewDecoder(bufio.NewReaderSize(f, 1024*1024))
+	applied := 0
+	for {
+		var batch walBatch
+		if err := dec.Decode(&batch); err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			return err
+		}
+		if batch.NextUSN <= vol.checkpoint {
+			continue
+		}
+		vol.applyUSNChanges(batch.Changes)
+		vol.checkpoint = batch.NextUSN
+		vol.index.Checkpoint = batch.NextUSN
+		vol.dirty = true
+		applied++
+	}
+	if applied > 0 {
+		serviceLog("replayed wal volume=%s db=%s batches=%d checkpoint=%d", vol.volume, vol.dbPath, applied, vol.checkpoint)
+	}
+	return nil
+}
+
+func walPath(dbPath string) string {
+	return dbPath + ".wal"
+}
+
+func appendWAL(dbPath string, nextUSN int64, changes []usnChange) error {
+	if dbPath == "" || len(changes) == 0 {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(walPath(dbPath), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return err
+	}
+	enc := json.NewEncoder(f)
+	err = enc.Encode(walBatch{NextUSN: nextUSN, Changes: changes})
+	if syncErr := f.Sync(); err == nil {
+		err = syncErr
+	}
+	if closeErr := f.Close(); err == nil {
+		err = closeErr
+	}
+	return err
+}
+
+func removeWAL(dbPath string) error {
+	if dbPath == "" {
+		return nil
+	}
+	err := os.Remove(walPath(dbPath))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return err
 }
 
 func (vol *serviceVolumeIndex) rebuildChildren() {
@@ -2682,7 +2798,7 @@ func writeJSON(w io.Writer, v any) error {
 	return enc.Encode(v)
 }
 
-func indexInfoToJSON(idx *Index) jsonInfoResponse {
+func indexInfoToJSON(idx *Index, path string) jsonInfoResponse {
 	return jsonInfoResponse{
 		OK:          true,
 		Version:     idx.Version,
@@ -2694,7 +2810,36 @@ func indexInfoToJSON(idx *Index) jsonInfoResponse {
 		JournalID:   idx.JournalID,
 		Checkpoint:  idx.Checkpoint,
 		ContentHash: idx.ContentHash,
+		Layout:      estimateIndexLayout(idx, path),
 	}
+}
+
+func estimateIndexLayout(idx *Index, path string) *indexLayout {
+	if idx == nil || !idx.Compact {
+		return nil
+	}
+	layout := &indexLayout{RecordCount: len(idx.Records)}
+	if info, err := os.Stat(path); err == nil {
+		layout.FileBytes = info.Size()
+	}
+	unique := make(map[string]struct{}, len(idx.Records)/2)
+	var nameBlobBytes int64
+	for _, rec := range idx.Records {
+		if _, ok := unique[rec.Name]; ok {
+			continue
+		}
+		unique[rec.Name] = struct{}{}
+		nameBlobBytes += int64(len(rec.Name))
+	}
+	layout.UniqueNames = len(unique)
+	layout.NameBlobBytes = nameBlobBytes
+	layout.NameTableBytes = int64(layout.UniqueNames * 6)
+	layout.RecordBytes = int64(layout.RecordCount * compactDiskRecordBytes)
+	if layout.FileBytes > 0 {
+		layout.OtherBytes = layout.FileBytes - layout.RecordBytes - layout.NameBlobBytes - layout.NameTableBytes
+		layout.BytesPerRecord = float64(layout.FileBytes) / float64(max(layout.RecordCount, 1))
+	}
+	return layout
 }
 
 func entriesToJSON(entries []Entry) []jsonResult {
