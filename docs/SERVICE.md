@@ -18,8 +18,14 @@ Install the service:
 ## Build Indexes
 
 ```powershell
-.\seekfs.exe service-index-usn -volume C: -db F:\seekfs_c.gsi
-.\seekfs.exe service-index-usn -volume F: -db F:\seekfs_f.gsi
+.\seekfs.exe index-volumes -volume C: -volume F:
+```
+
+Without `-volume`, `index-volumes` indexes fixed local drives by default and
+stores generated indexes under:
+
+```text
+%ProgramData%\seekfs\indexes
 ```
 
 ## Configure Resident Search

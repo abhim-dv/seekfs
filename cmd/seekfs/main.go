@@ -262,6 +262,8 @@ func run(args []string) error {
 		return cmdIndex(args[1:])
 	case "index-usn":
 		return cmdIndexUSN(args[1:])
+	case "index-volumes":
+		return cmdIndexVolumes(args[1:])
 	case "service":
 		return cmdService(args[1:])
 	case "install-service":
@@ -330,6 +332,7 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, `Usage:
   seekfs index -root <path> [-root <path>...] [-db seekfs.db]
   seekfs index-usn -volume C: [-db seekfs.db]
+  seekfs index-volumes [-volume C:] [-volume F:] [-index-dir path] [-launch]
   seekfs service [-pipe \\.\pipe\seekfs-service] [-sddl <sddl>] [-db index.gsi...]
   seekfs install-service [-pipe \\.\pipe\seekfs-service] [-sddl <sddl>] [-db index.gsi...]
   seekfs setup-service [-db index.gsi...] [-no-start]
@@ -501,6 +504,97 @@ func cmdIndexUSN(args []string) error {
 		return err
 	}
 	fmt.Printf("indexed %d entries from %s via USN in %s\n", len(idx.Entries), *volume, time.Since(start).Round(time.Millisecond))
+	return nil
+}
+
+func cmdIndexVolumes(args []string) error {
+	var volumes stringList
+	fs := flag.NewFlagSet("index-volumes", flag.ContinueOnError)
+	configPath := fs.String("config", "", "optional seekfs.toml config path")
+	pipeName := fs.String("pipe", defaultServicePipe, "service named pipe")
+	indexDir := fs.String("index-dir", defaultIndexDir(), "directory for generated .gsi files")
+	launch := fs.Bool("launch", false, "launch resident service with the built indexes")
+	jsonOut := fs.Bool("json", false, "write machine-readable JSON")
+	fs.Var(&volumes, "volume", "NTFS volume to index; repeatable")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	cfg, err := loadConfig(*configPath)
+	if err != nil {
+		return err
+	}
+	if len(volumes) == 0 && len(cfg.Volumes) > 0 {
+		volumes = append(volumes, cfg.Volumes...)
+	}
+	if len(volumes) == 0 {
+		volumes = defaultIndexVolumes()
+	}
+	if *pipeName == defaultServicePipe && cfg.ServicePipe != "" {
+		*pipeName = cfg.ServicePipe
+	}
+	if _, err := callService(*pipeName, serviceRequest{Command: "status"}); err != nil {
+		if setupErr := cmdSetupService([]string{"-pipe", *pipeName, "-no-start"}); setupErr != nil {
+			return fmt.Errorf("service unavailable and setup failed: %w", setupErr)
+		}
+		if startErr := startWindowsService(); startErr != nil {
+			return fmt.Errorf("service unavailable and start failed: %w", startErr)
+		}
+	}
+	if err := os.MkdirAll(*indexDir, 0o755); err != nil {
+		return err
+	}
+	type result struct {
+		Volume  string `json:"volume"`
+		DB      string `json:"db"`
+		Entries int    `json:"entries"`
+		Error   string `json:"error,omitempty"`
+	}
+	results := make([]result, 0, len(volumes))
+	dbs := make([]string, 0, len(volumes))
+	for _, volume := range volumes {
+		vol := normalizeVolume(volume)
+		db := defaultVolumeDB(*indexDir, vol)
+		resp, err := callService(*pipeName, serviceRequest{Command: "index-usn", Volume: vol, DB: db})
+		r := result{Volume: vol, DB: db}
+		if err != nil {
+			r.Error = err.Error()
+			results = append(results, r)
+			continue
+		}
+		if !resp.OK {
+			r.Error = resp.Message
+			results = append(results, r)
+			continue
+		}
+		r.Entries = resp.Entries
+		results = append(results, r)
+		dbs = append(dbs, db)
+	}
+	if *launch && len(dbs) > 0 {
+		launchArgs := []string{"-pipe", *pipeName}
+		for _, db := range dbs {
+			launchArgs = append(launchArgs, "-db", db)
+		}
+		if err := cmdLaunch(launchArgs); err != nil {
+			return err
+		}
+	}
+	if *jsonOut {
+		return writeJSON(os.Stdout, struct {
+			OK      bool     `json:"ok"`
+			Results []result `json:"results"`
+		}{OK: len(dbs) == len(volumes), Results: results})
+	}
+	for _, r := range results {
+		if r.Error != "" {
+			fmt.Printf("%s -> %s error=%s\n", r.Volume, r.DB, r.Error)
+		} else {
+			fmt.Printf("%s -> %s entries=%d\n", r.Volume, r.DB, r.Entries)
+		}
+	}
+	if len(dbs) != len(volumes) {
+		return errors.New("one or more volumes failed to index")
+	}
 	return nil
 }
 
@@ -3430,6 +3524,42 @@ func defaultDB() string {
 		return "seekfs.db"
 	}
 	return filepath.Join(dir, "seekfs", "index.gsi")
+}
+
+func defaultIndexDir() string {
+	base := os.Getenv("ProgramData")
+	if base == "" {
+		if dir, err := os.UserCacheDir(); err == nil {
+			base = dir
+		}
+	}
+	if base == "" {
+		return "."
+	}
+	return filepath.Join(base, "seekfs", "indexes")
+}
+
+func defaultVolumeDB(indexDir, volume string) string {
+	letter := strings.ToLower(strings.TrimSuffix(strings.TrimRight(volume, `\`), ":"))
+	if letter == "" {
+		letter = "volume"
+	}
+	return filepath.Join(indexDir, "seekfs_"+letter+".gsi")
+}
+
+func defaultIndexVolumes() []string {
+	var volumes []string
+	for letter := 'C'; letter <= 'Z'; letter++ {
+		root := fmt.Sprintf("%c:\\", letter)
+		driveType := windows.GetDriveType(windows.StringToUTF16Ptr(root))
+		if driveType == windows.DRIVE_FIXED {
+			volumes = append(volumes, fmt.Sprintf("%c:", letter))
+		}
+	}
+	if len(volumes) == 0 {
+		return []string{"C:"}
+	}
+	return volumes
 }
 
 func min(a, b int) int {
