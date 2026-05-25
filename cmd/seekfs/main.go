@@ -912,6 +912,13 @@ func buildOrders(idx *Index) {
 		for i := range idx.Records {
 			idx.CompactNameOrder[i] = i
 		}
+		sort.Slice(idx.CompactNameOrder, func(i, j int) bool {
+			a, b := idx.Records[idx.CompactNameOrder[i]], idx.Records[idx.CompactNameOrder[j]]
+			if a.LowerName == b.LowerName {
+				return idx.CompactNameOrder[i] < idx.CompactNameOrder[j]
+			}
+			return a.LowerName < b.LowerName
+		})
 		return
 	}
 	idx.NameOrder = make([]int, len(idx.Entries))
@@ -929,6 +936,25 @@ func buildOrders(idx *Index) {
 	})
 	sort.Slice(idx.PathOrder, func(i, j int) bool {
 		return idx.Entries[idx.PathOrder[i]].LowerPath < idx.Entries[idx.PathOrder[j]].LowerPath
+	})
+}
+
+func ensureCompactNameOrderSorted(idx *Index) {
+	if idx == nil || !idx.Compact {
+		return
+	}
+	if len(idx.CompactNameOrder) != len(idx.Records) {
+		idx.CompactNameOrder = make([]int, len(idx.Records))
+		for i := range idx.CompactNameOrder {
+			idx.CompactNameOrder[i] = i
+		}
+	}
+	sort.Slice(idx.CompactNameOrder, func(i, j int) bool {
+		a, b := idx.Records[idx.CompactNameOrder[i]], idx.Records[idx.CompactNameOrder[j]]
+		if a.LowerName == b.LowerName {
+			return idx.CompactNameOrder[i] < idx.CompactNameOrder[j]
+		}
+		return a.LowerName < b.LowerName
 	})
 }
 
@@ -1259,6 +1285,7 @@ type serviceVolumeIndex struct {
 	pathCache   map[int]string
 	termMu      sync.Mutex
 	termCache   map[string][]int
+	recentIDs   map[int]struct{}
 	dirty       bool
 	lastPersist time.Time
 }
@@ -2065,6 +2092,7 @@ func newServiceVolumeIndex(dbPath string, idx *Index) *serviceVolumeIndex {
 		lastPersist: time.Now(),
 	}
 	if idx.Compact && idx.Source == "usn" {
+		ensureCompactNameOrderSorted(idx)
 		vol.frnToID = make(map[uint64]int, len(idx.Records))
 		vol.children = make(map[uint64]map[int]struct{}, len(idx.Records))
 		for i, rec := range idx.Records {
@@ -2288,6 +2316,10 @@ func (vol *serviceVolumeIndex) applyUSNChanges(changes []usnChange) {
 			vol.frnToID[change.FRN] = id
 			vol.index.Records = append(vol.index.Records, CompactRecord{FRN: change.FRN})
 		}
+		if vol.recentIDs == nil {
+			vol.recentIDs = make(map[int]struct{})
+		}
+		vol.recentIDs[id] = struct{}{}
 		rec := &vol.index.Records[id]
 		if rec.ParentFRN != 0 && rec.ParentFRN != change.ParentFRN {
 			vol.removeChild(rec.ParentFRN, id)
@@ -2317,10 +2349,6 @@ func (vol *serviceVolumeIndex) applyUSNChanges(changes []usnChange) {
 	vol.termMu.Lock()
 	vol.termCache = nil
 	vol.termMu.Unlock()
-	vol.index.CompactNameOrder = make([]int, len(vol.index.Records))
-	for i := range vol.index.CompactNameOrder {
-		vol.index.CompactNameOrder[i] = i
-	}
 }
 
 func (vol *serviceVolumeIndex) rebuildChildren() {
@@ -2785,6 +2813,13 @@ func searchCompactWithCache(idx *Index, opts queryOptions, countOnly bool, pathC
 			}
 		}
 	}
+	if opts.MatchPath && countOnly {
+		if candidateFn != nil {
+			if candidates, ok := candidateFn(pq); ok {
+				order = candidates
+			}
+		}
+	}
 	if pq.RootBias != "" || pq.CWDBias != "" {
 		order = idx.biasOrderCompact(order, firstNonEmpty(pq.CWDBias, pq.RootBias))
 	}
@@ -2866,6 +2901,9 @@ func compactRecordPrecheck(rec CompactRecord, pq parsedQuery, matchPath bool) bo
 }
 
 func (vol *serviceVolumeIndex) nameTermCandidates(pq parsedQuery) ([]int, bool) {
+	if candidates, ok := vol.namePrefixCandidates(pq); ok {
+		return candidates, true
+	}
 	if vol == nil || vol.index == nil || len(pq.Terms) == 0 || len(pq.Dirs) > 0 || len(pq.Regexps) > 0 || pq.Under != "" {
 		return nil, false
 	}
@@ -2886,6 +2924,46 @@ func (vol *serviceVolumeIndex) nameTermCandidates(pq parsedQuery) ([]int, bool) 
 		}
 	}
 	return candidates, len(candidates) > 0
+}
+
+func (vol *serviceVolumeIndex) namePrefixCandidates(pq parsedQuery) ([]int, bool) {
+	if vol == nil || vol.index == nil || len(pq.Terms) != 1 || len(pq.Dirs) > 0 || len(pq.Regexps) > 0 || pq.Under != "" || len(pq.Exts) > 0 || len(pq.Globs) > 0 || pq.Type != "" || pq.HasModAfter || pq.Exists || pq.CaseSensitive {
+		return nil, false
+	}
+	term := pq.Terms[0]
+	if len(term) < 8 || strings.ContainsAny(term, `\/*?[]:`) {
+		return nil, false
+	}
+	order := vol.index.CompactNameOrder
+	if len(order) == 0 {
+		return nil, false
+	}
+	start := sort.Search(len(order), func(i int) bool {
+		return vol.index.Records[order[i]].LowerName >= term
+	})
+	out := make([]int, 0, 8)
+	seen := make(map[int]struct{})
+	for i := start; i < len(order); i++ {
+		id := order[i]
+		rec := vol.index.Records[id]
+		if !strings.HasPrefix(rec.LowerName, term) {
+			break
+		}
+		if !rec.Deleted {
+			out = append(out, id)
+			seen[id] = struct{}{}
+		}
+	}
+	for id := range vol.recentIDs {
+		if _, ok := seen[id]; ok || id < 0 || id >= len(vol.index.Records) {
+			continue
+		}
+		rec := vol.index.Records[id]
+		if !rec.Deleted && strings.HasPrefix(rec.LowerName, term) {
+			out = append(out, id)
+		}
+	}
+	return out, true
 }
 
 func (vol *serviceVolumeIndex) nameTermPosting(term string) []int {
