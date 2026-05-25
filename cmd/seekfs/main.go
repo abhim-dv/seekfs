@@ -1323,6 +1323,7 @@ type serviceVolumeIndex struct {
 	staleReason string
 	frnToID     map[uint64]int
 	children    map[uint64]map[int]struct{}
+	exactNames  map[string][]int
 	pathCache   map[int]string
 	termMu      sync.Mutex
 	termCache   map[string][]int
@@ -2141,12 +2142,16 @@ func newServiceVolumeIndex(dbPath string, idx *Index) *serviceVolumeIndex {
 		ensureCompactNameOrderSorted(idx)
 		vol.frnToID = make(map[uint64]int, len(idx.Records))
 		vol.children = make(map[uint64]map[int]struct{}, len(idx.Records))
+		vol.exactNames = make(map[string][]int, len(idx.Records)/2)
 		for i, rec := range idx.Records {
 			if rec.FRN != 0 {
 				vol.frnToID[rec.FRN] = i
 			}
 			if rec.ParentFRN != 0 && rec.ParentFRN != rec.FRN {
 				vol.addChild(rec.ParentFRN, i)
+			}
+			if !rec.Deleted && rec.LowerName != "" {
+				vol.exactNames[rec.LowerName] = append(vol.exactNames[rec.LowerName], i)
 			}
 		}
 	}
@@ -2361,6 +2366,7 @@ func (vol *serviceVolumeIndex) applyUSNChanges(changes []usnChange) {
 		}
 		if change.Reason&usnReasonFileDelete != 0 {
 			if id, ok := vol.frnToID[change.FRN]; ok {
+				vol.removeExactName(id)
 				vol.markDeleted(id)
 			}
 			if change.USN > vol.checkpoint {
@@ -2382,6 +2388,7 @@ func (vol *serviceVolumeIndex) applyUSNChanges(changes []usnChange) {
 		if rec.ParentFRN != 0 && rec.ParentFRN != change.ParentFRN {
 			vol.removeChild(rec.ParentFRN, id)
 		}
+		vol.removeExactName(id)
 		rec.FRN = change.FRN
 		rec.ParentFRN = change.ParentFRN
 		rec.Parent = -1
@@ -2398,6 +2405,7 @@ func (vol *serviceVolumeIndex) applyUSNChanges(changes []usnChange) {
 		}
 		rec.Mode = modeFromAttrs(change.Attr)
 		rec.Deleted = false
+		vol.addExactName(id)
 		if change.USN > vol.checkpoint {
 			vol.checkpoint = change.USN
 		}
@@ -2489,6 +2497,42 @@ func (vol *serviceVolumeIndex) rebuildChildren() {
 		if rec.ParentFRN != 0 && rec.ParentFRN != rec.FRN {
 			vol.addChild(rec.ParentFRN, i)
 		}
+	}
+}
+
+func (vol *serviceVolumeIndex) addExactName(id int) {
+	if id < 0 || id >= len(vol.index.Records) {
+		return
+	}
+	rec := vol.index.Records[id]
+	if rec.Deleted || rec.LowerName == "" {
+		return
+	}
+	if vol.exactNames == nil {
+		vol.exactNames = make(map[string][]int)
+	}
+	vol.exactNames[rec.LowerName] = append(vol.exactNames[rec.LowerName], id)
+}
+
+func (vol *serviceVolumeIndex) removeExactName(id int) {
+	if id < 0 || id >= len(vol.index.Records) || vol.exactNames == nil {
+		return
+	}
+	name := vol.index.Records[id].LowerName
+	if name == "" {
+		return
+	}
+	list := vol.exactNames[name]
+	for i, value := range list {
+		if value == id {
+			list = append(list[:i], list[i+1:]...)
+			break
+		}
+	}
+	if len(list) == 0 {
+		delete(vol.exactNames, name)
+	} else {
+		vol.exactNames[name] = list
 	}
 }
 
@@ -2967,18 +3011,9 @@ func searchCompactWithCache(idx *Index, opts queryOptions, countOnly bool, pathC
 			order[i] = i
 		}
 	}
-	if opts.MatchPath && !countOnly {
-		if candidateFn != nil {
-			if candidates, ok := candidateFn(pq); ok {
-				order = candidates
-			}
-		}
-	}
-	if opts.MatchPath && countOnly {
-		if candidateFn != nil {
-			if candidates, ok := candidateFn(pq); ok {
-				order = candidates
-			}
+	if candidateFn != nil {
+		if candidates, ok := candidateFn(pq); ok {
+			order = candidates
 		}
 	}
 	if pq.RootBias != "" || pq.CWDBias != "" {
@@ -3062,6 +3097,9 @@ func compactRecordPrecheck(rec CompactRecord, pq parsedQuery, matchPath bool) bo
 }
 
 func (vol *serviceVolumeIndex) nameTermCandidates(pq parsedQuery) ([]int, bool) {
+	if candidates, ok := vol.exactNameCandidates(pq); ok {
+		return candidates, true
+	}
 	if candidates, ok := vol.namePrefixCandidates(pq); ok {
 		return candidates, true
 	}
@@ -3085,6 +3123,24 @@ func (vol *serviceVolumeIndex) nameTermCandidates(pq parsedQuery) ([]int, bool) 
 		}
 	}
 	return candidates, len(candidates) > 0
+}
+
+func (vol *serviceVolumeIndex) exactNameCandidates(pq parsedQuery) ([]int, bool) {
+	if vol == nil || vol.index == nil || len(pq.Terms) != 1 || len(pq.Dirs) > 0 || len(pq.Regexps) > 0 || pq.Under != "" || len(pq.Exts) > 0 || len(pq.Globs) > 0 || pq.Type != "" || pq.HasModAfter || pq.Exists || pq.CaseSensitive {
+		return nil, false
+	}
+	term := pq.Terms[0]
+	if !strings.Contains(term, ".") || vol.exactNames == nil {
+		return nil, false
+	}
+	list := vol.exactNames[term]
+	out := make([]int, 0, len(list))
+	for _, id := range list {
+		if id >= 0 && id < len(vol.index.Records) && !vol.index.Records[id].Deleted {
+			out = append(out, id)
+		}
+	}
+	return out, true
 }
 
 func (vol *serviceVolumeIndex) namePrefixCandidates(pq parsedQuery) ([]int, bool) {
