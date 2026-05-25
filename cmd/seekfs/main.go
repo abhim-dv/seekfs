@@ -175,6 +175,7 @@ type queryOptions struct {
 type parsedQuery struct {
 	Raw           string
 	Terms         []string
+	MatchPath     bool
 	CaseSensitive bool
 	Exts          []string
 	Dirs          []string
@@ -1323,22 +1324,23 @@ type goSearchService struct {
 }
 
 type serviceVolumeIndex struct {
-	dbPath      string
-	index       *Index
-	volume      string
-	journalID   uint64
-	checkpoint  int64
-	state       string
-	staleReason string
-	frnToID     map[uint64]int
-	children    map[uint64]map[int]struct{}
-	exactNames  map[string][]int
-	pathCache   map[int]string
-	termMu      sync.Mutex
-	termCache   map[string][]int
-	recentIDs   map[int]struct{}
-	dirty       bool
-	lastPersist time.Time
+	dbPath        string
+	index         *Index
+	volume        string
+	journalID     uint64
+	checkpoint    int64
+	state         string
+	staleReason   string
+	frnToID       map[uint64]int
+	children      map[uint64]map[int]struct{}
+	exactNames    map[string][]int
+	pathCache     map[int]string
+	termMu        sync.Mutex
+	termCache     map[string][]int
+	pathTermCache map[string][]int
+	recentIDs     map[int]struct{}
+	dirty         bool
+	lastPersist   time.Time
 }
 
 func serviceLog(format string, args ...any) {
@@ -3109,6 +3111,9 @@ func (vol *serviceVolumeIndex) nameTermCandidates(pq parsedQuery) ([]int, bool) 
 	if candidates, ok := vol.underCandidates(pq); ok {
 		return candidates, true
 	}
+	if candidates, ok := vol.pathTermSubtreeCandidates(pq); ok {
+		return candidates, true
+	}
 	if candidates, ok := vol.exactNameCandidates(pq); ok {
 		return candidates, true
 	}
@@ -3122,7 +3127,7 @@ func (vol *serviceVolumeIndex) nameTermCandidates(pq parsedQuery) ([]int, bool) 
 	for _, term := range pq.Terms {
 		list := vol.nameTermPosting(term)
 		if len(list) == 0 {
-			return nil, false
+			return []int{}, true
 		}
 		lists = append(lists, list)
 	}
@@ -3134,7 +3139,7 @@ func (vol *serviceVolumeIndex) nameTermCandidates(pq parsedQuery) ([]int, bool) 
 			break
 		}
 	}
-	return candidates, len(candidates) > 0
+	return candidates, true
 }
 
 func (vol *serviceVolumeIndex) underCandidates(pq parsedQuery) ([]int, bool) {
@@ -3172,7 +3177,7 @@ func (vol *serviceVolumeIndex) underCandidates(pq parsedQuery) ([]int, bool) {
 				continue
 			}
 			seen[id] = struct{}{}
-			if !vol.index.Records[id].Deleted {
+			if !vol.index.Records[id].Deleted && compactRecordPrecheck(vol.index.Records[id], pq, true) {
 				out = append(out, id)
 			}
 			for childID := range vol.children[vol.index.Records[id].FRN] {
@@ -3182,6 +3187,50 @@ func (vol *serviceVolumeIndex) underCandidates(pq parsedQuery) ([]int, bool) {
 	}
 	sort.Ints(out)
 	return out, true
+}
+
+func (vol *serviceVolumeIndex) pathTermSubtreeCandidates(pq parsedQuery) ([]int, bool) {
+	if vol == nil || vol.index == nil || !pq.MatchPath || len(pq.Terms) < 2 || len(pq.Dirs) > 0 || len(pq.Regexps) > 0 || pq.Under != "" || pq.CaseSensitive {
+		return nil, false
+	}
+	lists := make([][]int, 0, len(pq.Terms))
+	for _, term := range pq.Terms {
+		list := vol.pathTermPosting(term)
+		if len(list) == 0 {
+			return []int{}, true
+		}
+		lists = append(lists, list)
+	}
+	sort.Slice(lists, func(i, j int) bool { return len(lists[i]) < len(lists[j]) })
+	candidates := append([]int(nil), lists[0]...)
+	for _, list := range lists[1:] {
+		candidates = intersectSortedInts(candidates, list)
+		if len(candidates) == 0 {
+			break
+		}
+	}
+	if len(candidates) > 4096 {
+		if nameList, ok := vol.unionNamePostings(pq.Terms); ok {
+			candidates = intersectSortedInts(candidates, nameList)
+		}
+	}
+	return candidates, true
+}
+
+func (vol *serviceVolumeIndex) unionNamePostings(terms []string) ([]int, bool) {
+	seen := make(map[int]struct{}, 64)
+	out := make([]int, 0, 64)
+	for _, term := range terms {
+		for _, id := range vol.nameTermPosting(term) {
+			if _, ok := seen[id]; ok {
+				continue
+			}
+			seen[id] = struct{}{}
+			out = append(out, id)
+		}
+	}
+	sort.Ints(out)
+	return out, len(out) > 0
 }
 
 func (vol *serviceVolumeIndex) exactNameCandidates(pq parsedQuery) ([]int, bool) {
@@ -3264,6 +3313,62 @@ func (vol *serviceVolumeIndex) nameTermPosting(term string) []int {
 	return list
 }
 
+func (vol *serviceVolumeIndex) pathTermPosting(term string) []int {
+	vol.termMu.Lock()
+	if vol.pathTermCache == nil {
+		vol.pathTermCache = make(map[string][]int)
+	}
+	if list, ok := vol.pathTermCache[term]; ok {
+		vol.termMu.Unlock()
+		return list
+	}
+	vol.termMu.Unlock()
+
+	seen := make(map[int]struct{}, 64)
+	out := make([]int, 0, 64)
+	for _, id := range vol.nameTermPosting(term) {
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	if vol.exactNames != nil && !strings.ContainsAny(term, `\/*?[]:`) {
+		traversed := make(map[int]struct{}, 64)
+		for _, rootID := range vol.exactNames[term] {
+			if rootID < 0 || rootID >= len(vol.index.Records) {
+				continue
+			}
+			root := vol.index.Records[rootID]
+			if root.Deleted || root.Mode&uint32(os.ModeDir) == 0 {
+				continue
+			}
+			stack := []int{rootID}
+			for len(stack) > 0 {
+				last := len(stack) - 1
+				id := stack[last]
+				stack = stack[:last]
+				if _, ok := traversed[id]; ok || id < 0 || id >= len(vol.index.Records) {
+					continue
+				}
+				traversed[id] = struct{}{}
+				rec := vol.index.Records[id]
+				if !rec.Deleted {
+					if _, ok := seen[id]; !ok {
+						seen[id] = struct{}{}
+						out = append(out, id)
+					}
+				}
+				for childID := range vol.children[rec.FRN] {
+					stack = append(stack, childID)
+				}
+			}
+		}
+	}
+	sort.Ints(out)
+	vol.termMu.Lock()
+	vol.pathTermCache[term] = out
+	vol.termMu.Unlock()
+	return out
+}
+
 func intersectSortedInts(a, b []int) []int {
 	out := a[:0]
 	i, j := 0, 0
@@ -3294,6 +3399,7 @@ func (idx *Index) compactPathContainsAll(i int, terms []string) bool {
 func parseQuery(opts queryOptions) (parsedQuery, error) {
 	pq := parsedQuery{
 		Raw:           opts.Query,
+		MatchPath:     opts.MatchPath,
 		CaseSensitive: opts.CaseSensitive,
 		Under:         normalizeFilterPath(opts.Under),
 		Exists:        opts.Exists,
