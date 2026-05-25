@@ -22,6 +22,18 @@ default_limit = 100
 output_format = "json"
 ```
 
+With `output_format = "json"` and `default_limit` set, agent calls can stay
+short:
+
+```powershell
+.\seekfs.exe search "gh.exe"
+.\seekfs.exe search -path "ext:go dir:cmd main"
+```
+
+When no `-db` is supplied, `search` and `count` use the resident service by
+default. Pass `-local` to skip the service and load the configured/default DB
+from disk.
+
 Single-value aliases are also accepted:
 
 ```toml
@@ -42,6 +54,7 @@ Use `seekfs config` so agents and users do not need to locate the file manually:
 .\seekfs.exe config path
 .\seekfs.exe config show
 .\seekfs.exe config set output_format json
+.\seekfs.exe config set default_limit 20
 .\seekfs.exe config set dbs = '["F:\\seekfs_c.gsi", "F:\\seekfs_f.gsi"]'
 .\seekfs.exe config get dbs
 ```

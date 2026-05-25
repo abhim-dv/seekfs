@@ -55,32 +55,37 @@ Reinstall the service with the indexes it should keep resident:
 Query through the service:
 
 ```powershell
-.\seekfs.exe search -service -n 20 "gh.exe"
-.\seekfs.exe search -service -path -n 20 "ext:go dir:cmd main"
-.\seekfs.exe count  -service -path "ext:go dir:cmd main"
+.\seekfs.exe config set output_format json
+.\seekfs.exe config set default_limit 20
+.\seekfs.exe search "gh.exe"
+.\seekfs.exe search -path "ext:go dir:cmd main"
+.\seekfs.exe count  -path "ext:go dir:cmd main"
 ```
+
+When no `-db` is supplied, `search` and `count` use the resident service by
+default. Use `-local` to skip the service and read a local DB file instead.
 
 ## Examples
 
 Search file names:
 
 ```powershell
-.\seekfs.exe search -service -n 50 main
-.\seekfs.exe search -service -n 20 "gh.exe"
+.\seekfs.exe search main
+.\seekfs.exe search "gh.exe"
 ```
 
 Search full paths:
 
 ```powershell
-.\seekfs.exe search -service -path -n 50 "src cmd"
+.\seekfs.exe search -path "src cmd"
 ```
 
 Agent-friendly filters:
 
 ```powershell
-.\seekfs.exe search -service -path --json "ext:go dir:cmd main"
-.\seekfs.exe search -service -path --under F:\git\seekfs "type:file glob:*.md"
-.\seekfs.exe search -service -path --exists --recent 24h "ext:go"
+.\seekfs.exe search -path "ext:go dir:cmd main"
+.\seekfs.exe search -path --under F:\git\seekfs "type:file glob:*.md"
+.\seekfs.exe search -path --exists --recent 24h "ext:go"
 .\seekfs.exe bench -service --json -iterations 100
 ```
 

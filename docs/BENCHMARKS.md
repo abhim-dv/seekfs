@@ -30,14 +30,14 @@ Filename-only searches are the fastest path for exact names and executable
 names:
 
 ```powershell
-.\seekfs.exe search -service --json -n 20 "gh.exe"
+.\seekfs.exe search "gh.exe"
 ```
 
 Use full-path matching only when the query needs path context:
 
 ```powershell
-.\seekfs.exe search -service --json -path -n 20 "ext:go dir:cmd main"
-.\seekfs.exe search -service --json -path --under F:\git\seekfs "type:file glob:*.md"
+.\seekfs.exe search -path "ext:go dir:cmd main"
+.\seekfs.exe search -path --under F:\git\seekfs "type:file glob:*.md"
 ```
 
 On very large indexes, broad `-path` searches can be much slower than

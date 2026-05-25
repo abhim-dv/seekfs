@@ -12,6 +12,12 @@ Requests and responses are newline-delimited JSON objects encoded as UTF-8.
 
 For fast executable or exact filename lookup, leave `match_path` false:
 
+CLI equivalent:
+
+```powershell
+.\seekfs.exe search "gh.exe"
+```
+
 ```json
 {
   "command": "search",

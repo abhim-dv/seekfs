@@ -363,15 +363,17 @@ func printUsage(w io.Writer) {
   seekfs info [-db seekfs.gsi] [--json]
   seekfs syntax
   seekfs agent
-  seekfs search [-db seekfs.db...] [-service] [--json] [-n 100] [-path] <query>
-  seekfs count [-db seekfs.db...] [-service] [--json] [-path] <query>
+  seekfs search [-db seekfs.db...] [--json] [-n 100] [-path] <query>
+  seekfs count [-db seekfs.db...] [--json] [-path] <query>
   seekfs version
 
 Agent starting points:
   seekfs agent
-  seekfs search -service --json -n 20 "gh.exe"
-  seekfs search -service --json -path -n 20 "ext:go dir:cmd main"
-  seekfs count  -service --json -path "type:file ext:go"`)
+  seekfs config set output_format json
+  seekfs config set default_limit 20
+  seekfs search "gh.exe"
+  seekfs search -path "ext:go dir:cmd main"
+  seekfs count -path "type:file ext:go"`)
 }
 
 func printSearchHelp() {
@@ -402,11 +404,11 @@ Query filters:
   type:dir          Only directories.
 
 Examples:
-  seekfs search -service --json -n 20 "gh.exe"
-  seekfs search -service --json -path -n 20 "ext:go dir:cmd main"
-  seekfs search -service --json -path --under F:\git\seekfs "type:file glob:*.md"
-  seekfs search -service --json -path --exists --recent 24h "ext:go"
-  seekfs count  -service --json -path "type:dir docs"
+  seekfs search "gh.exe"
+  seekfs search -path "ext:go dir:cmd main"
+  seekfs search -path --under F:\git\seekfs "type:file glob:*.md"
+  seekfs search -path --exists --recent 24h "ext:go"
+  seekfs count -path "type:dir docs"
 
 Not implemented yet:
   Everything filters such as dm:, size:, attrib:, parent:
@@ -433,9 +435,11 @@ Purpose:
 
 Recommended commands:
   seekfs loaded --json
-  seekfs search -service --json -n 20 "gh.exe"
-  seekfs search -service --json -path -n 20 "ext:go dir:cmd main"
-  seekfs count  -service --json -path "type:file ext:go"
+  seekfs config set output_format json
+  seekfs config set default_limit 20
+  seekfs search "gh.exe"
+  seekfs search -path "ext:go dir:cmd main"
+  seekfs count -path "type:file ext:go"
   seekfs launch -db F:\seekfs_c.gsi -db F:\seekfs_f.gsi
   seekfs config set output_format json
   seekfs bench -service --json -iterations 100
@@ -459,7 +463,8 @@ JSON result shape:
 
 Useful search controls:
   --json              Required for robust automation.
-  -service            Query the installed resident service.
+  -service            Query the installed resident service; default when no -db is passed.
+  -local              Do not auto-query the resident service.
   -path               Match full paths, not just names. Use only when needed.
   -n 20               Keep result sets bounded.
   --under <path>      Constrain search to a workspace.
@@ -472,9 +477,9 @@ Query filters:
 
 Performance guidance:
   Start with filename-only search for exact names and executables:
-    seekfs search -service --json -n 20 "gh.exe"
+    seekfs search "gh.exe"
   Add -path only for path-aware queries:
-    seekfs search -service --json -path -n 20 "ext:go dir:cmd main"
+    seekfs search -path "ext:go dir:cmd main"
 
 Config:
   seekfs reads seekfs.toml from the current directory or user config dir.
@@ -998,6 +1003,7 @@ func cmdSearch(args []string, countOnly bool) error {
 	configPath := fs.String("config", "", "optional seekfs.toml config path")
 	fs.Var(&dbs, "db", "index database path; repeatable")
 	useService := fs.Bool("service", false, "query the installed seekfs service over its named pipe")
+	forceLocal := fs.Bool("local", false, "do not auto-query the resident service")
 	pipeName := fs.String("pipe", defaultServicePipe, "service named pipe")
 	jsonOut := fs.Bool("json", false, "write machine-readable JSON")
 	limit := fs.Int("n", 100, "maximum results")
@@ -1027,6 +1033,9 @@ func cmdSearch(args []string, countOnly bool) error {
 	}
 	if *limit == 100 && cfg.DefaultLimit > 0 {
 		*limit = cfg.DefaultLimit
+	}
+	if len(dbs) == 0 && !*forceLocal {
+		*useService = true
 	}
 	query := strings.TrimSpace(strings.Join(fs.Args(), " "))
 	if query == "" {
