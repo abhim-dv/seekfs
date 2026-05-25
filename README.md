@@ -51,8 +51,8 @@ Reinstall the service with the indexes it should keep resident:
 Query through the service:
 
 ```powershell
-.\seekfs.exe search -service -path -n 20 "linkmerge w6 full e10"
-.\seekfs.exe count  -service -path "linkmerge w6 full e10"
+.\seekfs.exe search -service -path -n 20 "ext:go dir:cmd main"
+.\seekfs.exe count  -service -path "ext:go dir:cmd main"
 ```
 
 ## Examples
@@ -106,7 +106,7 @@ Service startup loaded both DBs in `4.633s`.
 For:
 
 ```powershell
-.\seekfs.exe search -service -path -n 20 "linkmerge w6 full e10"
+.\seekfs.exe search -service -path -n 20 "ext:go dir:cmd main"
 ```
 
 Measured over 30 runs:
