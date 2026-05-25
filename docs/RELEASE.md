@@ -2,7 +2,7 @@
 
 ## Artifact
 
-Initial GitHub release artifact:
+GitHub release artifact:
 
 ```text
 seekfs-windows-amd64.zip
@@ -18,8 +18,18 @@ Contents:
 
 Indexes and benchmark output are not included.
 
+## Current Release
+
+Current release: `v0.2.0`.
+
+Release notes:
+
+```text
+docs/RELEASE_NOTES_0.2.0.md
+```
+
 ## Signing
 
-The 0.1.0 release is unsigned. Document this in release notes and expect normal
-Windows warnings for unsigned binaries. Add Authenticode signing before wider
-distribution beyond trusted local users.
+The release artifact is unsigned. Document this in release notes and expect
+normal Windows warnings for unsigned binaries. Add Authenticode signing before
+wider distribution beyond trusted local users.
