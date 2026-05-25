@@ -3106,6 +3106,9 @@ func compactRecordPrecheck(rec CompactRecord, pq parsedQuery, matchPath bool) bo
 }
 
 func (vol *serviceVolumeIndex) nameTermCandidates(pq parsedQuery) ([]int, bool) {
+	if candidates, ok := vol.underCandidates(pq); ok {
+		return candidates, true
+	}
 	if candidates, ok := vol.exactNameCandidates(pq); ok {
 		return candidates, true
 	}
@@ -3132,6 +3135,53 @@ func (vol *serviceVolumeIndex) nameTermCandidates(pq parsedQuery) ([]int, bool) 
 		}
 	}
 	return candidates, len(candidates) > 0
+}
+
+func (vol *serviceVolumeIndex) underCandidates(pq parsedQuery) ([]int, bool) {
+	if vol == nil || vol.index == nil || pq.Under == "" || vol.exactNames == nil {
+		return nil, false
+	}
+	under := filepath.Clean(pq.Under)
+	if vol.index.Volume != "" && !strings.EqualFold(filepath.VolumeName(under), vol.index.Volume) {
+		return []int{}, true
+	}
+	base := strings.ToLower(filepath.Base(under))
+	if base == "." || base == string(filepath.Separator) || base == "" {
+		return nil, false
+	}
+	roots := vol.exactNames[base]
+	if len(roots) == 0 {
+		return []int{}, true
+	}
+	out := make([]int, 0, 256)
+	seen := make(map[int]struct{}, 256)
+	for _, rootID := range roots {
+		if rootID < 0 || rootID >= len(vol.index.Records) || vol.index.Records[rootID].Deleted {
+			continue
+		}
+		rootPath := vol.index.reconstructCompactPathCached(rootID, vol.pathCache)
+		if !strings.EqualFold(filepath.Clean(rootPath), under) {
+			continue
+		}
+		stack := []int{rootID}
+		for len(stack) > 0 {
+			last := len(stack) - 1
+			id := stack[last]
+			stack = stack[:last]
+			if _, ok := seen[id]; ok || id < 0 || id >= len(vol.index.Records) {
+				continue
+			}
+			seen[id] = struct{}{}
+			if !vol.index.Records[id].Deleted {
+				out = append(out, id)
+			}
+			for childID := range vol.children[vol.index.Records[id].FRN] {
+				stack = append(stack, childID)
+			}
+		}
+	}
+	sort.Ints(out)
+	return out, true
 }
 
 func (vol *serviceVolumeIndex) exactNameCandidates(pq parsedQuery) ([]int, bool) {
