@@ -131,6 +131,7 @@ failures: 0
 - [Configuration](docs/CONFIG.md)
 - [Service pipe protocol](docs/OPEN_PROTOCOL.md)
 - [Benchmarks](docs/BENCHMARKS.md)
+- [Incremental updates plan](docs/INCREMENTAL_UPDATES.md)
 - [Security notes](SECURITY.md)
 
 ## Config Shortcuts
