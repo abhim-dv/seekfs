@@ -24,11 +24,14 @@ Install the service:
 
 ## Configure Resident Search
 
-Reinstall the service with the DB paths it should keep loaded:
+Launch the service with the DB paths it should keep loaded:
 
 ```powershell
-.\seekfs.exe setup-service -db F:\seekfs_c.gsi -db F:\seekfs_f.gsi
+.\seekfs.exe launch -db F:\seekfs_c.gsi -db F:\seekfs_f.gsi
 ```
+
+`launch` installs or reinstalls the service, starts it, waits for the named pipe,
+and runs the same health checks as `doctor`.
 
 Or use:
 
@@ -40,8 +43,7 @@ Or use:
 
 1. Build or unpack the new `seekfs.exe`.
 2. Record current DB paths.
-3. Run `seekfs setup-service` with the same `-db` arguments.
-4. Run `seekfs doctor`.
+3. Run `seekfs launch` with the same `-db` arguments.
 
 ## Uninstall
 

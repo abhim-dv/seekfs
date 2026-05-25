@@ -27,7 +27,7 @@ Download `seekfs-windows-amd64.zip`, extract it, and run:
 .\seekfs.exe start-service
 .\seekfs.exe service-index-usn -volume C: -db F:\seekfs_c.gsi
 .\seekfs.exe service-index-usn -volume F: -db F:\seekfs_f.gsi
-.\seekfs.exe setup-service -db F:\seekfs_c.gsi -db F:\seekfs_f.gsi
+.\seekfs.exe launch -db F:\seekfs_c.gsi -db F:\seekfs_f.gsi
 ```
 
 ## Smoke Test

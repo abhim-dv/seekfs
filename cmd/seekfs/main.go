@@ -268,6 +268,8 @@ func run(args []string) error {
 		return cmdInstallService(args[1:])
 	case "setup-service":
 		return cmdSetupService(args[1:])
+	case "launch":
+		return cmdLaunch(args[1:])
 	case "start-service":
 		return cmdControlService(args[1:], "start")
 	case "stop-service":
@@ -331,6 +333,7 @@ func printUsage(w io.Writer) {
   seekfs service [-pipe \\.\pipe\seekfs-service] [-sddl <sddl>] [-db index.gsi...]
   seekfs install-service [-pipe \\.\pipe\seekfs-service] [-sddl <sddl>] [-db index.gsi...]
   seekfs setup-service [-db index.gsi...] [-no-start]
+  seekfs launch [-db index.gsi...] [--json]
   seekfs start-service|stop-service|restart-service
   seekfs uninstall-service
   seekfs doctor [--json]
@@ -409,6 +412,7 @@ Recommended commands:
   seekfs service-info --json
   seekfs search -service --json -path -n 20 "ext:go dir:cmd main"
   seekfs count  -service --json -path "type:file ext:go"
+  seekfs launch -db F:\seekfs_c.gsi -db F:\seekfs_f.gsi
   seekfs bench-agent -service --json -iterations 100
 
 JSON result shape:
@@ -1358,6 +1362,55 @@ func cmdSetupService(args []string) error {
 	return nil
 }
 
+func cmdLaunch(args []string) error {
+	var dbs stringList
+	fs := flag.NewFlagSet("launch", flag.ContinueOnError)
+	configPath := fs.String("config", "", "optional seekfs.toml config path")
+	pipeName := fs.String("pipe", defaultServicePipe, "service named pipe")
+	sddl := fs.String("sddl", defaultServiceSDDL, "pipe security descriptor SDDL")
+	jsonOut := fs.Bool("json", false, "write machine-readable JSON")
+	timeout := fs.Duration("timeout", 30*time.Second, "maximum time to wait for service health")
+	fs.Var(&dbs, "db", "index database path to load for service search; repeatable")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	cfg, err := loadConfig(*configPath)
+	if err != nil {
+		return err
+	}
+	if len(dbs) == 0 && len(cfg.DBs) > 0 {
+		dbs = append(dbs, cfg.DBs...)
+	}
+	if len(dbs) == 0 {
+		return errors.New("launch requires at least one -db or configured dbs")
+	}
+	if *pipeName == defaultServicePipe && cfg.ServicePipe != "" {
+		*pipeName = cfg.ServicePipe
+	}
+	setupArgs := []string{"-pipe", *pipeName, "-sddl", *sddl}
+	for _, db := range dbs {
+		setupArgs = append(setupArgs, "-db", db)
+	}
+	if err := cmdSetupService(setupArgs); err != nil {
+		return err
+	}
+	resp := waitForDoctor(*pipeName, *timeout)
+	if *jsonOut {
+		if err := writeJSON(os.Stdout, resp); err != nil {
+			return err
+		}
+		if !resp.OK {
+			return errors.New(resp.Message)
+		}
+		return nil
+	}
+	fmt.Printf("installed: %t\nrunning: %t\npipe_reachable: %t\nentries: %d\nquery_ok: %t\n", resp.Installed, resp.Running, resp.PipeReachable, resp.Entries, resp.QueryOK)
+	if !resp.OK {
+		return errors.New(resp.Message)
+	}
+	return nil
+}
+
 func cmdControlService(args []string, action string) error {
 	fs := flag.NewFlagSet(action+"-service", flag.ContinueOnError)
 	if err := fs.Parse(args); err != nil {
@@ -1567,24 +1620,7 @@ func cmdDoctor(args []string) error {
 	if *pipeName == defaultServicePipe && cfg.ServicePipe != "" {
 		*pipeName = cfg.ServicePipe
 	}
-	resp := doctorResponse{ServiceName: serviceName}
-	if status, err := queryWindowsService(); err == nil {
-		resp.Installed = true
-		resp.Running = status.State == svc.Running
-	}
-	info, err := callService(*pipeName, serviceRequest{Command: "info"})
-	if err == nil && info.OK {
-		resp.PipeReachable = true
-		resp.Entries = info.Entries
-	}
-	searchResp, searchErr := callService(*pipeName, serviceRequestFromOptions(queryOptions{Query: "ext:go", MatchPath: true, Limit: 1}, false))
-	if searchErr == nil && searchResp.OK {
-		resp.QueryOK = true
-	}
-	resp.OK = resp.Installed && resp.Running && resp.PipeReachable && resp.Entries > 0 && resp.QueryOK
-	if !resp.OK {
-		resp.Message = "seekfs service is not fully healthy"
-	}
+	resp := probeDoctor(*pipeName)
 	if *jsonOut {
 		if err := writeJSON(os.Stdout, resp); err != nil {
 			return err
@@ -1599,6 +1635,40 @@ func cmdDoctor(args []string) error {
 		return errors.New(resp.Message)
 	}
 	return nil
+}
+
+func probeDoctor(pipeName string) doctorResponse {
+	resp := doctorResponse{ServiceName: serviceName}
+	if status, err := queryWindowsService(); err == nil {
+		resp.Installed = true
+		resp.Running = status.State == svc.Running
+	}
+	info, err := callService(pipeName, serviceRequest{Command: "info"})
+	if err == nil && info.OK {
+		resp.PipeReachable = true
+		resp.Entries = info.Entries
+	}
+	searchResp, searchErr := callService(pipeName, serviceRequestFromOptions(queryOptions{Query: "ext:go", MatchPath: true, Limit: 1}, false))
+	if searchErr == nil && searchResp.OK {
+		resp.QueryOK = true
+	}
+	resp.OK = resp.Installed && resp.Running && resp.PipeReachable && resp.Entries > 0 && resp.QueryOK
+	if !resp.OK {
+		resp.Message = "seekfs service is not fully healthy"
+	}
+	return resp
+}
+
+func waitForDoctor(pipeName string, timeout time.Duration) doctorResponse {
+	deadline := time.Now().Add(timeout)
+	var resp doctorResponse
+	for {
+		resp = probeDoctor(pipeName)
+		if resp.OK || time.Now().After(deadline) {
+			return resp
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
 }
 
 func queryWindowsService() (svc.Status, error) {

@@ -45,8 +45,7 @@ Use the service for full-volume NTFS/USN indexing and resident search.
 Reinstall the service with the indexes it should keep resident:
 
 ```powershell
-.\seekfs.exe setup-service -db F:\seekfs_c.gsi -db F:\seekfs_f.gsi
-.\seekfs.exe doctor
+.\seekfs.exe launch -db F:\seekfs_c.gsi -db F:\seekfs_f.gsi
 ```
 
 Query through the service:

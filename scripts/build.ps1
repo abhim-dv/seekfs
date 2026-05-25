@@ -17,6 +17,9 @@ try {
 $Date = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
 $Target = Join-Path $OutDir "seekfs-windows-amd64"
 
+if (Test-Path $Target) {
+    Remove-Item $Target -Recurse -Force
+}
 New-Item -ItemType Directory -Force -Path $Target | Out-Null
 
 $LdFlags = "-s -w -X main.version=$Version -X main.commit=$Commit -X main.date=$Date"
