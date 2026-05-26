@@ -84,6 +84,46 @@ func TestNewPackedRecordsDeduplicatesNameBlob(t *testing.T) {
 	}
 }
 
+func TestPackedRecordsAvoidsRedundantOptionalArrays(t *testing.T) {
+	packed := newPackedRecords([]CompactRecord{
+		{FRN: 1, Name: "lower.txt"},
+		{FRN: 2, Name: "also-lower.go"},
+	})
+	if len(packed.LowerBlob) != 0 {
+		t.Fatalf("LowerBlob len = %d, want 0 for already-lowercase names", len(packed.LowerBlob))
+	}
+	if packed.Sizes != nil {
+		t.Fatalf("Sizes allocated for zero sizes")
+	}
+	if packed.ModUnix != nil {
+		t.Fatalf("ModUnix allocated for zero modified times")
+	}
+	packed.Set(0, CompactRecord{FRN: 1, Name: "Mixed.TXT", Size: 42, ModUnix: 99})
+	if got := packed.At(0); got.Name != "Mixed.TXT" || got.Size != 42 || got.ModUnix != 99 {
+		t.Fatalf("At(0) = %+v, want updated optional fields", got)
+	}
+	if got := packed.lowerNameAt(0); got != "mixed.txt" {
+		t.Fatalf("lowerNameAt(0) = %q, want mixed.txt", got)
+	}
+}
+
+func TestPackedRecordsDerivesParentFRN(t *testing.T) {
+	packed := newPackedRecords([]CompactRecord{
+		{FRN: 10, ParentFRN: 10, Parent: -1, Name: "."},
+		{FRN: 11, ParentFRN: 10, Parent: 0, Name: "child"},
+		{FRN: 12, ParentFRN: 99, Parent: -1, Name: "pending-parent"},
+	})
+	if got := packed.At(1); got.ParentFRN != 10 {
+		t.Fatalf("derived child ParentFRN = %d, want 10", got.ParentFRN)
+	}
+	if got := packed.At(2); got.ParentFRN != 99 {
+		t.Fatalf("extra ParentFRN = %d, want 99", got.ParentFRN)
+	}
+	if len(packed.ParentFRNExtras) != 1 {
+		t.Fatalf("ParentFRNExtras len = %d, want 1", len(packed.ParentFRNExtras))
+	}
+}
+
 func TestPackedRecordsAtBounds(t *testing.T) {
 	var nilPacked *PackedRecords
 	if got := nilPacked.At(0); got != (CompactRecord{}) {

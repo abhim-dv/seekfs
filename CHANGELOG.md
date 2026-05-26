@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.7.0 - Resident Memory and Agent Guidance
+
+### Added
+
+- Resident memory accounting in `loaded --json` for record blobs, postings,
+  child ranges, and sorted resident views.
+- Regression coverage for large-index fallback searches when sorted name views
+  or child-range views are intentionally skipped.
+- Agent-facing help text clarifying that seekfs searches indexed file names and
+  paths, not file contents or symbols.
+- Repo-scoped agent guidance for `--under <repo>` and PATH fallback guidance for
+  shells that cannot resolve `seekfs`.
+
+### Changed
+
+- Reduced resident memory for large indexes by skipping full sorted name-order
+  and child-range views above configured record-count thresholds.
+- Removed the resident all-files posting list; `type:file` queries now need an
+  additional narrowing posting such as an extension.
+- Compact packed records now avoid redundant lowercase-name bytes for names that
+  are already lowercase.
+- Packed records now allocate size and modified-time arrays only when nonzero
+  metadata is present.
+- Parent FRNs are derived from parent record IDs where possible, with sparse
+  storage only for exceptional parent values.
+
+### Known Limitations
+
+- Large indexes may use scan fallback for some broad path-term queries when
+  resident child ranges are skipped.
+- Windows and NTFS remain the primary target.
+- Release artifacts are unsigned.
+
 ## 0.1.0 - Initial Release
 
 ### Added
