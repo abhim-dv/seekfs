@@ -7,7 +7,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strings"
 	"testing"
 	"time"
 )
@@ -30,7 +29,6 @@ func TestCompactIndexV8RoundTripKeepsFRNMetadata(t *testing.T) {
 				ParentFRN: 10,
 				Parent:    -1,
 				Name:      ".",
-				LowerName: ".",
 				Mode:      uint32(1 << 31),
 				Size:      0,
 				ModUnix:   modified.UnixNano(),
@@ -40,7 +38,6 @@ func TestCompactIndexV8RoundTripKeepsFRNMetadata(t *testing.T) {
 				ParentFRN: 10,
 				Parent:    0,
 				Name:      "main.go",
-				LowerName: "main.go",
 				Mode:      0,
 				Size:      1234,
 				ModUnix:   modified.Add(time.Second).UnixNano(),
@@ -87,7 +84,7 @@ func TestServiceVolumeIndexAppliesUSNMutations(t *testing.T) {
 		Volume:  "F:",
 		Compact: true,
 		Records: []CompactRecord{
-			{FRN: 100, ParentFRN: 100, Parent: -1, Name: ".", LowerName: "."},
+			{FRN: 100, ParentFRN: 100, Parent: -1, Name: "."},
 		},
 	}
 	vol := newServiceVolumeIndex(`F:\seekfs_f.gsi`, idx)
@@ -119,7 +116,7 @@ func TestServiceVolumeIndexAppliesUSNMutations(t *testing.T) {
 		Reason:    usnReasonRenameNew,
 		Name:      "new.txt",
 	}})
-	if idx.Records[1].Name != "new.txt" || idx.Records[1].LowerName != "new.txt" || idx.Records[1].Deleted {
+	if idx.Records[1].Name != "new.txt" || idx.Records[1].Deleted {
 		t.Fatalf("renamed record mismatch: %+v", idx.Records[1])
 	}
 
@@ -142,7 +139,7 @@ func TestServiceVolumeIndexRepairsOutOfOrderParents(t *testing.T) {
 		Volume:  "F:",
 		Compact: true,
 		Records: []CompactRecord{
-			{FRN: 100, ParentFRN: 100, Parent: -1, Name: ".", LowerName: "."},
+			{FRN: 100, ParentFRN: 100, Parent: -1, Name: "."},
 		},
 	}
 	vol := newServiceVolumeIndex(`F:\seekfs_f.gsi`, idx)
@@ -180,9 +177,9 @@ func TestServiceVolumeIndexDeletesDirectorySubtree(t *testing.T) {
 		Volume:  "F:",
 		Compact: true,
 		Records: []CompactRecord{
-			{FRN: 100, ParentFRN: 100, Parent: -1, Name: ".", LowerName: "."},
-			{FRN: 200, ParentFRN: 100, Parent: 0, Name: "dir", LowerName: "dir"},
-			{FRN: 201, ParentFRN: 200, Parent: 1, Name: "child.txt", LowerName: "child.txt"},
+			{FRN: 100, ParentFRN: 100, Parent: -1, Name: "."},
+			{FRN: 200, ParentFRN: 100, Parent: 0, Name: "dir"},
+			{FRN: 201, ParentFRN: 200, Parent: 1, Name: "child.txt"},
 		},
 	}
 	vol := newServiceVolumeIndex(`F:\seekfs_f.gsi`, idx)
@@ -217,7 +214,7 @@ func TestServiceVolumeIndexReplaysWAL(t *testing.T) {
 		Compact:    true,
 		Checkpoint: 10,
 		Records: []CompactRecord{
-			{FRN: 100, ParentFRN: 100, Parent: -1, Name: ".", LowerName: "."},
+			{FRN: 100, ParentFRN: 100, Parent: -1, Name: "."},
 		},
 	})
 	if err := reloaded.replayWAL(); err != nil {
@@ -270,9 +267,9 @@ func TestSearchCompactSkipsDeletedRecords(t *testing.T) {
 		Volume:  "F:",
 		Compact: true,
 		Records: []CompactRecord{
-			{FRN: 100, ParentFRN: 100, Parent: -1, Name: ".", LowerName: "."},
-			{FRN: 101, ParentFRN: 100, Parent: 0, Name: "gone.txt", LowerName: "gone.txt", Deleted: true},
-			{FRN: 102, ParentFRN: 100, Parent: 0, Name: "live.txt", LowerName: "live.txt"},
+			{FRN: 100, ParentFRN: 100, Parent: -1, Name: "."},
+			{FRN: 101, ParentFRN: 100, Parent: 0, Name: "gone.txt", Deleted: true},
+			{FRN: 102, ParentFRN: 100, Parent: 0, Name: "live.txt"},
 		},
 	}
 	buildOrders(idx)
@@ -303,11 +300,11 @@ func TestServiceVolumeIndexBuildsFRNMap(t *testing.T) {
 	if vol.dbPath != `F:\seekfs_f.gsi` || vol.volume != "F:" || vol.journalID != 7 || vol.checkpoint != 12 || vol.state != "ready" {
 		t.Fatalf("volume metadata mismatch: %+v", vol)
 	}
-	if len(vol.frnToID) != 2 {
-		t.Fatalf("frn map size = %d, want 2", len(vol.frnToID))
+	if vol.frnRecordCount() != 2 {
+		t.Fatalf("frn record count = %d, want 2", vol.frnRecordCount())
 	}
-	if got := vol.frnToID[101]; got != 1 {
-		t.Fatalf("frnToID[101] = %d, want 1", got)
+	if got, ok := vol.idForFRN(101); !ok || got != 1 {
+		t.Fatalf("idForFRN(101) = %d, %v; want 1, true", got, ok)
 	}
 }
 
@@ -332,6 +329,16 @@ func TestCommonSearchQuerySemantics(t *testing.T) {
 			name:      "path substring and dotted filename substring",
 			opts:      queryOptions{Query: "project .bin", MatchPath: true, Limit: 20},
 			wantNames: []string{"volume.bin"},
+		},
+		{
+			name:      "drive token",
+			opts:      queryOptions{Query: "c: .bin", MatchPath: true, Limit: 20},
+			wantNames: []string{"volume.bin"},
+		},
+		{
+			name:      "compound dotted suffix",
+			opts:      queryOptions{Query: ".tar.gz", MatchPath: true, Limit: 20},
+			wantNames: []string{"archive.tar.gz"},
 		},
 		{
 			name:      "extension filter",
@@ -365,8 +372,13 @@ func TestCommonSearchQuerySemantics(t *testing.T) {
 		},
 		{
 			name:      "under filter",
-			opts:      queryOptions{Query: "ext:nrrd", MatchPath: true, Under: `C:\Users\abhism12\Downloads`, Limit: 20},
+			opts:      queryOptions{Query: "ext:nrrd", MatchPath: true, Under: `C:\fixture\workspace\Downloads`, Limit: 20},
 			wantNames: []string{"scan.nrrd"},
+		},
+		{
+			name:      "under excludes sibling prefix",
+			opts:      queryOptions{Query: "ext:nrrd", MatchPath: true, Under: `C:\fixture\workspace\Down`, Limit: 20},
+			wantNames: nil,
 		},
 		{
 			name:      "case sensitive",
@@ -394,7 +406,9 @@ func TestServiceCandidatesMatchFullCompactSearchForCommonQueries(t *testing.T) {
 	cases := []queryOptions{
 		{Query: "downloads nrrd", MatchPath: true, Limit: 20},
 		{Query: "project .bin", MatchPath: true, Limit: 20},
-		{Query: "ext:nrrd", MatchPath: true, Under: `C:\Users\abhism12\Downloads`, Limit: 20},
+		{Query: "c: .bin", MatchPath: true, Limit: 20},
+		{Query: ".tar.gz", MatchPath: true, Limit: 20},
+		{Query: "ext:nrrd", MatchPath: true, Under: `C:\fixture\workspace\Downloads`, Limit: 20},
 		{Query: "src go", MatchPath: true, Limit: 20},
 		{Query: "ext:go dir:src", MatchPath: true, Limit: 20},
 		{Query: "glob:*_test.go", MatchPath: true, Limit: 20},
@@ -474,8 +488,8 @@ func syntheticCompactIndex(n int) *Index {
 		Records: make([]CompactRecord, 0, n+2),
 	}
 	idx.Records = append(idx.Records,
-		CompactRecord{FRN: 1, ParentFRN: 1, Parent: -1, Name: ".", LowerName: ".", Mode: uint32(os.ModeDir)},
-		CompactRecord{FRN: 2, ParentFRN: 1, Parent: 0, Name: "needle-root", LowerName: "needle-root", Mode: uint32(os.ModeDir)},
+		CompactRecord{FRN: 1, ParentFRN: 1, Parent: -1, Name: ".", Mode: uint32(os.ModeDir)},
+		CompactRecord{FRN: 2, ParentFRN: 1, Parent: 0, Name: "needle-root", Mode: uint32(os.ModeDir)},
 	)
 	for i := 0; i < n; i++ {
 		parent := int32(0)
@@ -493,7 +507,6 @@ func syntheticCompactIndex(n int) *Index {
 			ParentFRN: parentFRN,
 			Parent:    parent,
 			Name:      name,
-			LowerName: strings.ToLower(name),
 		})
 	}
 	buildOrders(idx)
@@ -512,14 +525,13 @@ func commonSearchFixture() *Index {
 			ParentFRN: parentFRN,
 			Parent:    parent,
 			Name:      name,
-			LowerName: strings.ToLower(name),
 			Mode:      mode,
 			ModUnix:   time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC).UnixNano(),
 		})
 	}
 	add(1, 1, -1, ".", uint32(os.ModeDir))
-	add(2, 1, 0, "Users", uint32(os.ModeDir))
-	add(3, 2, 1, "abhism12", uint32(os.ModeDir))
+	add(2, 1, 0, "fixture", uint32(os.ModeDir))
+	add(3, 2, 1, "workspace", uint32(os.ModeDir))
 	add(4, 3, 2, "Downloads", uint32(os.ModeDir))
 	add(5, 4, 3, "scan.nrrd", 0)
 	add(6, 4, 3, "notes.txt", 0)
@@ -530,6 +542,9 @@ func commonSearchFixture() *Index {
 	add(11, 3, 2, "readme.md", 0)
 	add(12, 3, 2, "project-data-worktree", uint32(os.ModeDir))
 	add(13, 12, 11, "volume.bin", 0)
+	add(14, 3, 2, "archive.tar.gz", 0)
+	add(15, 3, 2, "Downstream", uint32(os.ModeDir))
+	add(16, 15, 14, "sibling.nrrd", 0)
 	buildOrders(idx)
 	return idx
 }
