@@ -131,6 +131,17 @@ func TestServiceVolumeIndexFastPostingCountDeclinesUnsafeQuery(t *testing.T) {
 	}
 }
 
+func TestServiceVolumeIndexFastPostingCountDeclinesBareFileType(t *testing.T) {
+	vol := syntheticServiceVolumeIndexForCacheTests()
+	pq, err := parseQuery(queryOptions{Query: "type:file"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := vol.fastPostingCount(pq); ok {
+		t.Fatal("fastPostingCount accepted bare type:file without a narrowing posting")
+	}
+}
+
 func TestServiceVolumeIndexMultiNameTermCandidatesWarmsEachTerm(t *testing.T) {
 	vol := syntheticServiceVolumeIndexForCacheTests()
 	vol.index.appendCompactRecord(CompactRecord{FRN: 4, ParentFRN: 1, Parent: 0, Name: "alpha_report.txt"})
@@ -149,6 +160,44 @@ func TestServiceVolumeIndexMultiNameTermCandidatesWarmsEachTerm(t *testing.T) {
 	}
 	if len(cached) != 1 || cached[0] != 3 {
 		t.Fatalf("cached candidates = %v, want [3]", cached)
+	}
+}
+
+func TestServiceVolumeIndexPathTermPostingFallsBackWithoutChildRanges(t *testing.T) {
+	vol := syntheticServiceVolumeIndexForCacheTests()
+	vol.children = nil
+	vol.childOffsets = nil
+	vol.childIDs = nil
+
+	got := vol.pathTermPosting("main")
+	if len(got) != 1 || got[0] != 2 {
+		t.Fatalf("pathTermPosting fallback = %v, want [2]", got)
+	}
+}
+
+func TestServiceVolumeIndexResidentMemoryInfoReflectsSkippedViews(t *testing.T) {
+	vol := syntheticServiceVolumeIndexForCacheTests()
+	vol.index.packCompactRecords(true)
+	vol.queryIndex.nameOrder = nil
+	vol.children = nil
+	vol.childOffsets = nil
+	vol.childIDs = nil
+
+	info := vol.residentMemoryInfo()
+	if info == nil {
+		t.Fatal("residentMemoryInfo returned nil")
+	}
+	if info.Records != vol.index.compactRecordCount() {
+		t.Fatalf("records = %d, want %d", info.Records, vol.index.compactRecordCount())
+	}
+	if info.NameBlobBytes == 0 || info.RecordBytes == 0 {
+		t.Fatalf("expected record memory fields to be populated: %+v", info)
+	}
+	if info.NameOrderBytes != 0 || info.ChildBytes != 0 {
+		t.Fatalf("skipped resident views still reported memory: %+v", info)
+	}
+	if info.ExtPostBytes == 0 {
+		t.Fatalf("expected extension posting memory field: %+v", info)
 	}
 }
 

@@ -432,6 +432,36 @@ func TestServiceCandidatesMatchFullCompactSearchForCommonQueries(t *testing.T) {
 	}
 }
 
+func TestServiceCandidatesMatchFullSearchWithoutResidentSortedViews(t *testing.T) {
+	idx := commonSearchFixture()
+	vol := newServiceVolumeIndex("fixture.gsi", idx)
+	vol.queryIndex.nameOrder = nil
+	vol.children = nil
+	vol.childOffsets = nil
+	vol.childIDs = nil
+
+	cases := []queryOptions{
+		{Query: "assets dat", MatchPath: true, Limit: 20},
+		{Query: "ext:dat", MatchPath: true, Under: `C:\fixture\workspace\Assets`, Limit: 20},
+		{Query: "src go", MatchPath: true, Limit: 20},
+	}
+	for _, opts := range cases {
+		t.Run(opts.Query, func(t *testing.T) {
+			full, err := searchCompactWithCache(idx, opts, false, make(map[int]string), nil)
+			if err != nil {
+				t.Fatalf("full search: %v", err)
+			}
+			fast, err := searchCompactWithCache(idx, opts, false, vol.pathCache, vol.nameTermCandidates)
+			if err != nil {
+				t.Fatalf("candidate search: %v", err)
+			}
+			if !sameStringSet(namesOf(fast), namesOf(full)) {
+				t.Fatalf("candidate names = %v, full names = %v", namesOf(fast), namesOf(full))
+			}
+		})
+	}
+}
+
 func BenchmarkSearchCompactBroadPathQuery(b *testing.B) {
 	idx := syntheticCompactIndex(100_000)
 	opts := queryOptions{Query: "needle", MatchPath: true, Limit: 20}

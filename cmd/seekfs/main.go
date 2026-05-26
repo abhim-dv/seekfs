@@ -31,6 +31,8 @@ const servicePathCacheLimit = 25_000
 const serviceTermCacheLimit = 64
 const serviceCachedPostingMaxIDs = 50_000
 const serviceRecentRebuildThreshold = 100_000
+const serviceResidentNameOrderMaxRecords = 2_000_000
+const serviceResidentChildRangeMaxRecords = 2_000_000
 
 var indexMagic = [8]byte{'G', 'O', 'S', 'R', 'C', 'H', '0', '8'}
 
@@ -39,6 +41,8 @@ var (
 	commit  = "unknown"
 	date    = "unknown"
 )
+
+const packedLowerSameAsName = ^uint32(0)
 
 const (
 	fsctlEnumUSNData       = 0x000900b3
@@ -221,19 +225,18 @@ type CompactRecord struct {
 }
 
 type PackedRecords struct {
-	FRNs       []uint64
-	ParentFRNs []uint64
-	Parents    []int32
-	NameOffs   []uint32
-	NameLens   []uint16
-	LowerOffs  []uint32
-	LowerLens  []uint16
-	Modes      []uint32
-	Sizes      []int64
-	ModUnix    []int64
-	Deleted    []bool
-	NameBlob   []byte
-	LowerBlob  []byte
+	FRNs            []uint64
+	ParentFRNExtras map[int]uint64
+	Parents         []int32
+	NameOffs        []uint32
+	NameLens        []uint16
+	LowerOffs       []uint32
+	Modes           []uint32
+	Sizes           []int64
+	ModUnix         []int64
+	Deleted         []bool
+	NameBlob        []byte
+	LowerBlob       []byte
 }
 
 type usnJournalDataV0 struct {
@@ -400,11 +403,19 @@ func printUsage(w io.Writer) {
   seekfs count [-db seekfs.db...] [--json] [-path] <query>
   seekfs version
 
+Agent use:
+  seekfs is for indexed file-name and path discovery, preferably through the
+  resident service. It is not a content/symbol search tool; use rg for text
+  matches. Use --under <repo> for repo-scoped file discovery and run
+  seekfs agent for automation guidance.
+
 Agent starting points:
   seekfs agent
+  F:\git\seekfs\seekfs.exe agent
   seekfs config set output_format json
   seekfs config set default_limit 20
   seekfs search "gh.exe"
+  seekfs search --under F:\git\seekfs "main.go"
   seekfs search -path "ext:go dir:cmd main"
   seekfs count -path "type:file ext:go"`)
 }
@@ -471,6 +482,7 @@ Recommended commands:
   seekfs config set output_format json
   seekfs config set default_limit 20
   seekfs search "gh.exe"
+  seekfs search --under F:\git\seekfs "main.go"
   seekfs search -path "ext:go dir:cmd main"
   seekfs count -path "type:file ext:go"
   seekfs launch -db F:\seekfs_c.gsi -db F:\seekfs_f.gsi
@@ -507,6 +519,17 @@ Useful search controls:
 
 Query filters:
   ext:go, dir:src, glob:*.py, regex:<pattern>, case:, type:file, type:dir
+
+Agent usage rules:
+  seekfs searches indexed file names and paths, not file contents or symbols.
+  Use rg for text-content search, definitions, import references, and line matches.
+  For repo-local discovery, pass --under <repo> instead of relying on global ranking:
+    seekfs search --under F:\git\seekfs "main.go"
+    seekfs search -path --under F:\git\seekfs "ext:go dir:cmd main"
+  Do not use -path with only a directory name when you want to list a tree.
+  Add a file term/filter too, or use --under with a filename query.
+  If seekfs is not on PATH, try the installed/repo binary directly:
+    F:\git\seekfs\seekfs.exe search "gh.exe"
 
 Performance guidance:
   Start with filename-only search for exact names and executables:
@@ -1399,27 +1422,38 @@ type serviceResponse struct {
 }
 
 type dbInfo struct {
-	Path         string `json:"path"`
-	Entries      int    `json:"entries"`
-	Source       string `json:"source"`
-	BuiltAt      string `json:"built_at"`
-	Volume       string `json:"volume,omitempty"`
-	JournalID    uint64 `json:"journal_id,omitempty"`
-	Checkpoint   int64  `json:"checkpoint_usn,omitempty"`
-	State        string `json:"state,omitempty"`
-	StaleReason  string `json:"stale_reason,omitempty"`
-	FRNRecords   int    `json:"frn_records,omitempty"`
-	Recent       int    `json:"recent,omitempty"`
-	PathCache    int    `json:"path_cache,omitempty"`
-	TermCache    int    `json:"term_cache,omitempty"`
-	PathTerms    int    `json:"path_term_cache,omitempty"`
-	ExtCache     int    `json:"ext_cache,omitempty"`
-	RecentSeq    uint64 `json:"recent_seq,omitempty"`
-	Dirty        bool   `json:"dirty,omitempty"`
-	LastPersist  string `json:"last_persist,omitempty"`
-	QueryExtKeys int    `json:"query_ext_keys,omitempty"`
-	QueryFiles   int    `json:"query_files,omitempty"`
-	QueryDirs    int    `json:"query_dirs,omitempty"`
+	Path         string              `json:"path"`
+	Entries      int                 `json:"entries"`
+	Source       string              `json:"source"`
+	BuiltAt      string              `json:"built_at"`
+	Volume       string              `json:"volume,omitempty"`
+	JournalID    uint64              `json:"journal_id,omitempty"`
+	Checkpoint   int64               `json:"checkpoint_usn,omitempty"`
+	State        string              `json:"state,omitempty"`
+	StaleReason  string              `json:"stale_reason,omitempty"`
+	FRNRecords   int                 `json:"frn_records,omitempty"`
+	Recent       int                 `json:"recent,omitempty"`
+	PathCache    int                 `json:"path_cache,omitempty"`
+	TermCache    int                 `json:"term_cache,omitempty"`
+	PathTerms    int                 `json:"path_term_cache,omitempty"`
+	ExtCache     int                 `json:"ext_cache,omitempty"`
+	RecentSeq    uint64              `json:"recent_seq,omitempty"`
+	Dirty        bool                `json:"dirty,omitempty"`
+	LastPersist  string              `json:"last_persist,omitempty"`
+	QueryExtKeys int                 `json:"query_ext_keys,omitempty"`
+	QueryDirs    int                 `json:"query_dirs,omitempty"`
+	Memory       *residentMemoryInfo `json:"memory,omitempty"`
+}
+
+type residentMemoryInfo struct {
+	Records        int   `json:"records"`
+	NameBlobBytes  int   `json:"name_blob_bytes,omitempty"`
+	LowerBlobBytes int   `json:"lower_blob_bytes,omitempty"`
+	RecordBytes    int64 `json:"record_bytes,omitempty"`
+	NameOrderBytes int   `json:"name_order_bytes,omitempty"`
+	ExtPostBytes   int   `json:"ext_posting_bytes,omitempty"`
+	TypePostBytes  int   `json:"type_posting_bytes,omitempty"`
+	ChildBytes     int   `json:"child_bytes,omitempty"`
 }
 
 type goSearchService struct {
@@ -1468,7 +1502,6 @@ type serviceVolumeIndex struct {
 type residentQueryIndex struct {
 	ext       map[string][]uint32
 	nameOrder []uint32
-	files     []uint32
 	dirs      []uint32
 }
 
@@ -2260,7 +2293,7 @@ func (s *goSearchService) loadConfiguredIndexes() error {
 			serviceLog("startup catch-up skipped volume=%s db=%s err=%v", vol.volume, vol.dbPath, err)
 		}
 		vol.queryIndex = buildResidentQueryIndex(vol)
-		if vol.children == nil && vol.index != nil && vol.index.Compact && vol.index.Source == "usn" {
+		if vol.children == nil && vol.index != nil && vol.index.Compact && vol.index.Source == "usn" && vol.index.compactRecordCount() <= serviceResidentChildRangeMaxRecords {
 			vol.buildCompactChildren()
 		}
 		volumes = append(volumes, vol)
@@ -2321,7 +2354,7 @@ func newServiceVolumeIndex(dbPath string, idx *Index) *serviceVolumeIndex {
 		}
 		sort.Slice(vol.frnIDs, func(i, j int) bool { return vol.frnIDs[i].frn < vol.frnIDs[j].frn })
 		vol.queryIndex = buildResidentQueryIndex(vol)
-		if largeResident {
+		if largeResident && recordCount <= serviceResidentChildRangeMaxRecords {
 			vol.buildCompactChildren()
 		}
 	}
@@ -2530,7 +2563,7 @@ func (s *goSearchService) persistVolumeIfDue(vol *serviceVolumeIndex, force bool
 
 func (vol *serviceVolumeIndex) afterPersist() {
 	vol.queryIndex = buildResidentQueryIndex(vol)
-	if vol.children == nil && vol.index != nil && vol.index.Compact && vol.index.Source == "usn" {
+	if vol.children == nil && vol.index != nil && vol.index.Compact && vol.index.Source == "usn" && vol.index.compactRecordCount() <= serviceResidentChildRangeMaxRecords {
 		vol.buildCompactChildren()
 	}
 	vol.recentIDs = nil
@@ -2876,21 +2909,22 @@ func (vol *serviceVolumeIndex) childIDsForRecord(id int) []uint32 {
 func buildResidentQueryIndex(vol *serviceVolumeIndex) *residentQueryIndex {
 	recordCount := vol.index.compactRecordCount()
 	qi := &residentQueryIndex{
-		ext:       make(map[string][]uint32),
-		nameOrder: make([]uint32, 0, recordCount),
-		files:     make([]uint32, 0, recordCount),
-		dirs:      make([]uint32, 0, recordCount/8),
+		ext:  make(map[string][]uint32),
+		dirs: make([]uint32, 0, recordCount/8),
+	}
+	if recordCount <= serviceResidentNameOrderMaxRecords {
+		qi.nameOrder = make([]uint32, 0, recordCount)
 	}
 	for id := 0; id < recordCount; id++ {
 		rec := vol.index.compactRecord(id)
 		if rec.Deleted {
 			continue
 		}
-		qi.nameOrder = append(qi.nameOrder, uint32(id))
+		if qi.nameOrder != nil {
+			qi.nameOrder = append(qi.nameOrder, uint32(id))
+		}
 		if rec.Mode&uint32(os.ModeDir) != 0 {
 			qi.dirs = append(qi.dirs, uint32(id))
-		} else {
-			qi.files = append(qi.files, uint32(id))
 		}
 		actualExt := strings.TrimPrefix(filepath.Ext(rec.Name), ".")
 		if actualExt != "" {
@@ -2899,16 +2933,17 @@ func buildResidentQueryIndex(vol *serviceVolumeIndex) *residentQueryIndex {
 		}
 	}
 	sortResidentPostings(qi.ext)
-	sortUint32s(qi.files)
 	sortUint32s(qi.dirs)
-	sort.Slice(qi.nameOrder, func(i, j int) bool {
-		a, b := int(qi.nameOrder[i]), int(qi.nameOrder[j])
-		an, bn := vol.index.compactLowerNameAt(a), vol.index.compactLowerNameAt(b)
-		if an == bn {
-			return a < b
-		}
-		return an < bn
-	})
+	if len(qi.nameOrder) > 0 {
+		sort.Slice(qi.nameOrder, func(i, j int) bool {
+			a, b := int(qi.nameOrder[i]), int(qi.nameOrder[j])
+			an, bn := vol.index.compactLowerNameAt(a), vol.index.compactLowerNameAt(b)
+			if an == bn {
+				return a < b
+			}
+			return an < bn
+		})
+	}
 	return qi
 }
 
@@ -2940,6 +2975,37 @@ func (vol *serviceVolumeIndex) trimSearchCachesLocked() {
 	}
 }
 
+func (vol *serviceVolumeIndex) residentMemoryInfo() *residentMemoryInfo {
+	if vol == nil || vol.index == nil {
+		return nil
+	}
+	recordCount := vol.index.compactRecordCount()
+	info := &residentMemoryInfo{Records: recordCount}
+	if p := vol.index.PackedRecords; p != nil {
+		info.NameBlobBytes = len(p.NameBlob)
+		info.LowerBlobBytes = len(p.LowerBlob)
+		info.RecordBytes = int64(len(p.FRNs))*8 +
+			int64(len(p.ParentFRNExtras))*16 +
+			int64(len(p.Parents))*4 +
+			int64(len(p.NameOffs))*4 +
+			int64(len(p.NameLens))*2 +
+			int64(len(p.LowerOffs))*4 +
+			int64(len(p.Modes))*4 +
+			int64(len(p.Sizes))*8 +
+			int64(len(p.ModUnix))*8 +
+			int64(len(p.Deleted))
+	}
+	if vol.queryIndex != nil {
+		info.NameOrderBytes = len(vol.queryIndex.nameOrder) * 4
+		info.TypePostBytes = len(vol.queryIndex.dirs) * 4
+		for _, list := range vol.queryIndex.ext {
+			info.ExtPostBytes += len(list) * 4
+		}
+	}
+	info.ChildBytes = (len(vol.childOffsets) + len(vol.childIDs)) * 4
+	return info
+}
+
 func sortResidentPostings(postings map[string][]uint32) {
 	for key, list := range postings {
 		sortUint32s(list)
@@ -2955,20 +3021,32 @@ func newPackedRecords(records []CompactRecord) *PackedRecords {
 	if len(records) == 0 {
 		return nil
 	}
+	hasSize := false
+	hasModUnix := false
+	for _, rec := range records {
+		if rec.Size != 0 {
+			hasSize = true
+		}
+		if rec.ModUnix != 0 {
+			hasModUnix = true
+		}
+	}
 	p := &PackedRecords{
-		FRNs:       make([]uint64, len(records)),
-		ParentFRNs: make([]uint64, len(records)),
-		Parents:    make([]int32, len(records)),
-		NameOffs:   make([]uint32, len(records)),
-		NameLens:   make([]uint16, len(records)),
-		LowerOffs:  make([]uint32, len(records)),
-		LowerLens:  make([]uint16, len(records)),
-		Modes:      make([]uint32, len(records)),
-		Sizes:      make([]int64, len(records)),
-		ModUnix:    make([]int64, len(records)),
-		Deleted:    make([]bool, len(records)),
-		NameBlob:   make([]byte, 0, len(records)*16),
-		LowerBlob:  make([]byte, 0, len(records)*16),
+		FRNs:      make([]uint64, len(records)),
+		Parents:   make([]int32, len(records)),
+		NameOffs:  make([]uint32, len(records)),
+		NameLens:  make([]uint16, len(records)),
+		LowerOffs: make([]uint32, len(records)),
+		Modes:     make([]uint32, len(records)),
+		Deleted:   make([]bool, len(records)),
+		NameBlob:  make([]byte, 0, len(records)*16),
+		LowerBlob: make([]byte, 0, len(records)*16),
+	}
+	if hasSize {
+		p.Sizes = make([]int64, len(records))
+	}
+	if hasModUnix {
+		p.ModUnix = make([]int64, len(records))
 	}
 	nameRefs := make(map[string]struct {
 		off uint32
@@ -2980,14 +3058,20 @@ func newPackedRecords(records []CompactRecord) *PackedRecords {
 	}, len(records)/2)
 	for i, rec := range records {
 		p.FRNs[i] = rec.FRN
-		p.ParentFRNs[i] = rec.ParentFRN
 		p.Parents[i] = rec.Parent
 		p.setNameDedup(i, rec.Name, nameRefs)
 		p.setLowerNameDedup(i, rec.Name, lowerRefs)
 		p.Modes[i] = rec.Mode
-		p.Sizes[i] = rec.Size
-		p.ModUnix[i] = rec.ModUnix
+		if p.Sizes != nil {
+			p.Sizes[i] = rec.Size
+		}
+		if p.ModUnix != nil {
+			p.ModUnix[i] = rec.ModUnix
+		}
 		p.Deleted[i] = rec.Deleted
+	}
+	for i, rec := range records {
+		p.setParentFRN(i, rec.ParentFRN)
 	}
 	return p
 }
@@ -3017,14 +3101,14 @@ func (p *PackedRecords) At(i int) CompactRecord {
 	name := p.nameAt(i)
 	return CompactRecord{
 		FRN:       p.FRNs[i],
-		ParentFRN: p.ParentFRNs[i],
+		ParentFRN: p.parentFRNAt(i),
 		Parent:    p.Parents[i],
 		Name:      name,
 		NameOff:   p.NameOffs[i],
 		NameLen:   p.NameLens[i],
 		Mode:      p.Modes[i],
-		Size:      p.Sizes[i],
-		ModUnix:   p.ModUnix[i],
+		Size:      p.sizeAt(i),
+		ModUnix:   p.modUnixAt(i),
 		Deleted:   p.Deleted[i],
 	}
 }
@@ -3034,13 +3118,13 @@ func (p *PackedRecords) Set(i int, rec CompactRecord) {
 		return
 	}
 	p.FRNs[i] = rec.FRN
-	p.ParentFRNs[i] = rec.ParentFRN
 	p.Parents[i] = rec.Parent
+	p.setParentFRN(i, rec.ParentFRN)
 	p.setName(i, rec.Name)
 	p.setLowerName(i, rec.Name)
 	p.Modes[i] = rec.Mode
-	p.Sizes[i] = rec.Size
-	p.ModUnix[i] = rec.ModUnix
+	p.setSize(i, rec.Size)
+	p.setModUnix(i, rec.ModUnix)
 	p.Deleted[i] = rec.Deleted
 }
 
@@ -3049,18 +3133,104 @@ func (p *PackedRecords) Append(rec CompactRecord) {
 		return
 	}
 	p.FRNs = append(p.FRNs, rec.FRN)
-	p.ParentFRNs = append(p.ParentFRNs, rec.ParentFRN)
 	p.Parents = append(p.Parents, rec.Parent)
 	p.NameOffs = append(p.NameOffs, 0)
 	p.NameLens = append(p.NameLens, 0)
 	p.LowerOffs = append(p.LowerOffs, 0)
-	p.LowerLens = append(p.LowerLens, 0)
 	p.Modes = append(p.Modes, rec.Mode)
-	p.Sizes = append(p.Sizes, rec.Size)
-	p.ModUnix = append(p.ModUnix, rec.ModUnix)
+	if p.Sizes != nil {
+		p.Sizes = append(p.Sizes, rec.Size)
+	} else if rec.Size != 0 {
+		p.Sizes = make([]int64, len(p.FRNs))
+		p.Sizes[len(p.Sizes)-1] = rec.Size
+	}
+	if p.ModUnix != nil {
+		p.ModUnix = append(p.ModUnix, rec.ModUnix)
+	} else if rec.ModUnix != 0 {
+		p.ModUnix = make([]int64, len(p.FRNs))
+		p.ModUnix[len(p.ModUnix)-1] = rec.ModUnix
+	}
 	p.Deleted = append(p.Deleted, rec.Deleted)
 	p.setName(len(p.FRNs)-1, rec.Name)
 	p.setLowerName(len(p.FRNs)-1, rec.Name)
+	p.setParentFRN(len(p.FRNs)-1, rec.ParentFRN)
+}
+
+func (p *PackedRecords) parentFRNAt(i int) uint64 {
+	if p == nil || i < 0 || i >= len(p.FRNs) {
+		return 0
+	}
+	if value, ok := p.ParentFRNExtras[i]; ok {
+		return value
+	}
+	parent := int(p.Parents[i])
+	if parent >= 0 && parent < len(p.FRNs) {
+		return p.FRNs[parent]
+	}
+	return p.FRNs[i]
+}
+
+func (p *PackedRecords) setParentFRN(i int, parentFRN uint64) {
+	if p == nil || i < 0 || i >= len(p.FRNs) {
+		return
+	}
+	parent := int(p.Parents[i])
+	derived := uint64(0)
+	if parent >= 0 && parent < len(p.FRNs) {
+		derived = p.FRNs[parent]
+	} else {
+		derived = p.FRNs[i]
+	}
+	if parentFRN == derived {
+		if p.ParentFRNExtras != nil {
+			delete(p.ParentFRNExtras, i)
+		}
+		return
+	}
+	if p.ParentFRNExtras == nil {
+		p.ParentFRNExtras = make(map[int]uint64, 4)
+	}
+	p.ParentFRNExtras[i] = parentFRN
+}
+
+func (p *PackedRecords) sizeAt(i int) int64 {
+	if p == nil || i < 0 || i >= len(p.Sizes) {
+		return 0
+	}
+	return p.Sizes[i]
+}
+
+func (p *PackedRecords) modUnixAt(i int) int64 {
+	if p == nil || i < 0 || i >= len(p.ModUnix) {
+		return 0
+	}
+	return p.ModUnix[i]
+}
+
+func (p *PackedRecords) setSize(i int, value int64) {
+	if p == nil || i < 0 || i >= len(p.FRNs) {
+		return
+	}
+	if p.Sizes == nil {
+		if value == 0 {
+			return
+		}
+		p.Sizes = make([]int64, len(p.FRNs))
+	}
+	p.Sizes[i] = value
+}
+
+func (p *PackedRecords) setModUnix(i int, value int64) {
+	if p == nil || i < 0 || i >= len(p.FRNs) {
+		return
+	}
+	if p.ModUnix == nil {
+		if value == 0 {
+			return
+		}
+		p.ModUnix = make([]int64, len(p.FRNs))
+	}
+	p.ModUnix[i] = value
 }
 
 func (p *PackedRecords) nameAt(i int) string {
@@ -3081,7 +3251,10 @@ func (p *PackedRecords) lowerNameAt(i int) string {
 		return ""
 	}
 	off := p.LowerOffs[i]
-	length := p.LowerLens[i]
+	if off == packedLowerSameAsName {
+		return p.nameAt(i)
+	}
+	length := p.NameLens[i]
 	end := int(off) + int(length)
 	if end < int(off) || end > len(p.LowerBlob) {
 		return strings.ToLower(p.nameAt(i))
@@ -3109,8 +3282,11 @@ func (p *PackedRecords) setLowerName(i int, name string) {
 	if len(lower) > int(^uint16(0)) {
 		lower = lower[:int(^uint16(0))]
 	}
+	if lower == name {
+		p.LowerOffs[i] = packedLowerSameAsName
+		return
+	}
 	p.LowerOffs[i] = uint32(len(p.LowerBlob))
-	p.LowerLens[i] = uint16(len(lower))
 	p.LowerBlob = append(p.LowerBlob, lower...)
 }
 
@@ -3150,9 +3326,12 @@ func (p *PackedRecords) setLowerNameDedup(i int, name string, refs map[string]st
 	if len(lower) > int(^uint16(0)) {
 		lower = lower[:int(^uint16(0))]
 	}
+	if lower == name {
+		p.LowerOffs[i] = packedLowerSameAsName
+		return
+	}
 	if ref, ok := refs[lower]; ok {
 		p.LowerOffs[i] = ref.off
-		p.LowerLens[i] = ref.len
 		return
 	}
 	ref := struct {
@@ -3161,7 +3340,6 @@ func (p *PackedRecords) setLowerNameDedup(i int, name string, refs map[string]st
 	}{off: uint32(len(p.LowerBlob)), len: uint16(len(lower))}
 	refs[lower] = ref
 	p.LowerOffs[i] = ref.off
-	p.LowerLens[i] = ref.len
 	p.LowerBlob = append(p.LowerBlob, lower...)
 }
 
@@ -3335,9 +3513,9 @@ func handleServiceConn(conn *os.File, s *goSearchService) {
 			}
 			if vol.queryIndex != nil {
 				info.QueryExtKeys = len(vol.queryIndex.ext)
-				info.QueryFiles = len(vol.queryIndex.files)
 				info.QueryDirs = len(vol.queryIndex.dirs)
 			}
+			info.Memory = vol.residentMemoryInfo()
 			infos = append(infos, info)
 		}
 		message := ""
@@ -3697,7 +3875,9 @@ func (vol *serviceVolumeIndex) fastPostingCount(pq parsedQuery) (int, bool) {
 	switch pq.Type {
 	case "":
 	case "file":
-		lists = append(lists, vol.queryIndex.files)
+		if len(lists) == 0 {
+			return 0, false
+		}
 	case "dir":
 		lists = append(lists, vol.queryIndex.dirs)
 	default:
@@ -4058,9 +4238,7 @@ func (vol *serviceVolumeIndex) plannerCandidates(pq parsedQuery) ([]int, bool) {
 			addStrong(list)
 		}
 	}
-	if pq.Type == "file" {
-		addStrong(qi.files)
-	} else if pq.Type == "dir" {
+	if pq.Type == "dir" {
 		addStrong(qi.dirs)
 	}
 	for _, term := range pq.Terms {
@@ -4156,7 +4334,7 @@ func (vol *serviceVolumeIndex) underCandidates(pq parsedQuery) ([]int, bool) {
 	if base == "." || base == string(filepath.Separator) || base == "" {
 		return nil, false
 	}
-	roots := vol.exactNameIDs(base)
+	roots := vol.underRootIDs(under)
 	if len(roots) == 0 {
 		return []int{}, true
 	}
@@ -4164,10 +4342,6 @@ func (vol *serviceVolumeIndex) underCandidates(pq parsedQuery) ([]int, bool) {
 	prefilter := vol.underPrefilter(pq)
 	for _, rootID := range roots {
 		if rootID < 0 || rootID >= vol.index.compactRecordCount() || vol.index.compactRecord(rootID).Deleted {
-			continue
-		}
-		rootPath := vol.index.reconstructCompactPathCached(rootID, vol.pathCache)
-		if !strings.EqualFold(filepath.Clean(rootPath), under) {
 			continue
 		}
 		if prefilter != nil {
@@ -4203,6 +4377,79 @@ func (vol *serviceVolumeIndex) underCandidates(pq parsedQuery) ([]int, bool) {
 	}
 	sort.Ints(out)
 	return out, true
+}
+
+func (vol *serviceVolumeIndex) underRootIDs(under string) []int {
+	if vol == nil || vol.index == nil {
+		return nil
+	}
+	if vol.queryIndex != nil && len(vol.queryIndex.nameOrder) > 0 {
+		base := strings.ToLower(filepath.Base(under))
+		roots := vol.exactNameIDs(base)
+		out := make([]int, 0, len(roots))
+		for _, rootID := range roots {
+			if rootID < 0 || rootID >= vol.index.compactRecordCount() || vol.index.compactRecord(rootID).Deleted {
+				continue
+			}
+			rootPath := vol.index.reconstructCompactPathCached(rootID, vol.pathCache)
+			if strings.EqualFold(filepath.Clean(rootPath), under) {
+				out = append(out, rootID)
+			}
+		}
+		return out
+	}
+	volume := filepath.VolumeName(under)
+	rest := strings.TrimPrefix(under, volume)
+	rest = strings.Trim(rest, `\/`)
+	if rest == "" {
+		return []int{0}
+	}
+	if len(vol.childOffsets) == 0 && vol.children == nil {
+		out := make([]int, 0, 1)
+		cleanUnder := filepath.Clean(under)
+		cache := make(map[int]string)
+		for id := 0; id < vol.index.compactRecordCount(); id++ {
+			rec := vol.index.compactRecord(id)
+			if rec.Deleted {
+				continue
+			}
+			path := vol.index.reconstructCompactPathCached(id, cache)
+			if strings.EqualFold(filepath.Clean(path), cleanUnder) {
+				out = append(out, id)
+			}
+		}
+		return out
+	}
+	parts := strings.FieldsFunc(rest, func(r rune) bool { return r == '\\' || r == '/' })
+	candidates := make([]int, 0, 4)
+	recordCount := vol.index.compactRecordCount()
+	for id := 0; id < recordCount; id++ {
+		rec := vol.index.compactRecord(id)
+		if rec.Parent < 0 && !rec.Deleted {
+			candidates = append(candidates, id)
+		}
+	}
+	for _, part := range parts {
+		want := strings.ToLower(part)
+		next := make([]int, 0, 4)
+		for _, parentID := range candidates {
+			for _, childID32 := range vol.childIDsForRecord(parentID) {
+				childID := int(childID32)
+				if childID < 0 || childID >= recordCount {
+					continue
+				}
+				rec := vol.index.compactRecord(childID)
+				if !rec.Deleted && strings.EqualFold(vol.index.compactLowerNameAt(childID), want) {
+					next = append(next, childID)
+				}
+			}
+		}
+		if len(next) == 0 {
+			return nil
+		}
+		candidates = next
+	}
+	return candidates
 }
 
 func (vol *serviceVolumeIndex) isDescendantOrSelf(id, rootID int) bool {
@@ -4747,9 +4994,60 @@ func (vol *serviceVolumeIndex) pathTermPosting(term string) []int {
 				}
 			}
 		}
+	} else if !strings.ContainsAny(term, `\/*?[]:`) {
+		for _, id := range vol.scanPathTermPosting(term) {
+			if _, ok := seen[id]; ok {
+				continue
+			}
+			seen[id] = struct{}{}
+			out = append(out, id)
+		}
 	}
 	sort.Ints(out)
 	vol.cachePathPosting(term, out)
+	return out
+}
+
+func (vol *serviceVolumeIndex) scanPathTermPosting(term string) []int {
+	recordCount := vol.index.compactRecordCount()
+	workers := min(runtime.GOMAXPROCS(0), max(1, recordCount/250_000))
+	if workers <= 1 {
+		out := make([]int, 0, 64)
+		for i := 0; i < recordCount; i++ {
+			rec := vol.index.compactRecord(i)
+			if !rec.Deleted && vol.index.compactPathContainsTerm(i, term) {
+				out = append(out, i)
+			}
+		}
+		return out
+	}
+	parts := make([][]int, workers)
+	var wg sync.WaitGroup
+	for worker := 0; worker < workers; worker++ {
+		start := worker * recordCount / workers
+		end := (worker + 1) * recordCount / workers
+		wg.Add(1)
+		go func(worker, start, end int) {
+			defer wg.Done()
+			local := make([]int, 0, 64)
+			for i := start; i < end; i++ {
+				rec := vol.index.compactRecord(i)
+				if !rec.Deleted && vol.index.compactPathContainsTerm(i, term) {
+					local = append(local, i)
+				}
+			}
+			parts[worker] = local
+		}(worker, start, end)
+	}
+	wg.Wait()
+	total := 0
+	for _, part := range parts {
+		total += len(part)
+	}
+	out := make([]int, 0, total)
+	for _, part := range parts {
+		out = append(out, part...)
+	}
 	return out
 }
 

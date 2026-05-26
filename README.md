@@ -58,6 +58,7 @@ Query through the service:
 .\seekfs.exe config set output_format json
 .\seekfs.exe config set default_limit 20
 .\seekfs.exe search "gh.exe"
+.\seekfs.exe search --under F:\git\seekfs "main.go"
 .\seekfs.exe search -path "ext:go dir:cmd main"
 .\seekfs.exe count  -path "ext:go dir:cmd main"
 ```
@@ -93,6 +94,12 @@ Performance note for agents: prefer filename-only search when looking for a
 known file or executable name. Use `-path` only when the query needs directory
 terms, `dir:`, `--under`, regex over full paths, or path context. Broad
 full-path searches can be much slower on very large indexes.
+
+Agent usage note: `seekfs` searches indexed file names and paths, not file
+contents or symbols. Use `rg` for text-content search, definitions, import
+references, and line matches. For repo-local file discovery, use `--under` to
+avoid unrelated machine-wide results. If `seekfs` is not on PATH in a fresh
+agent shell, call the binary directly, for example `F:\git\seekfs\seekfs.exe`.
 
 Inspect an index:
 
