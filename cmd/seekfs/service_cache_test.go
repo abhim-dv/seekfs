@@ -1,0 +1,171 @@
+package main
+
+import "testing"
+
+func TestServiceVolumeIndexAfterPersistClearsRecentAndSearchCaches(t *testing.T) {
+	vol := syntheticServiceVolumeIndexForCacheTests()
+	vol.recentIDs = map[int]struct{}{1: {}, 2: {}}
+	vol.pathCache = map[int]string{1: "cached-path"}
+	vol.termCache = map[string][]int{"one": {1}}
+	vol.pathTermCache = map[string][]int{"fixture": {1}}
+	vol.extCache = map[string][]int{".txt": {1}}
+	vol.termSeq = map[string]uint64{"one": 1}
+	vol.pathTermSeq = map[string]uint64{"fixture": 1}
+	vol.extSeq = map[string]uint64{".txt": 1}
+
+	vol.afterPersist()
+
+	if vol.recentIDs != nil {
+		t.Fatalf("recentIDs = %#v, want nil", vol.recentIDs)
+	}
+	if len(vol.pathCache) != 0 {
+		t.Fatalf("pathCache len = %d, want 0", len(vol.pathCache))
+	}
+	if vol.termCache != nil || vol.pathTermCache != nil || vol.extCache != nil {
+		t.Fatalf("term caches were not cleared: term=%v pathTerm=%v ext=%v", vol.termCache, vol.pathTermCache, vol.extCache)
+	}
+	if vol.termSeq != nil || vol.pathTermSeq != nil || vol.extSeq != nil {
+		t.Fatalf("term cache sequences were not cleared: term=%v pathTerm=%v ext=%v", vol.termSeq, vol.pathTermSeq, vol.extSeq)
+	}
+	if vol.recentSeq != 1 {
+		t.Fatalf("recentSeq = %d, want 1", vol.recentSeq)
+	}
+}
+
+func TestServiceVolumeIndexTrimSearchCachesLockedClearsOversizedCaches(t *testing.T) {
+	vol := syntheticServiceVolumeIndexForCacheTests()
+	for i := 0; i <= servicePathCacheLimit; i++ {
+		vol.pathCache[i] = "cached-path"
+	}
+	for i := 0; i <= serviceTermCacheLimit; i++ {
+		key := string(rune('a'+i%26)) + string(rune('a'+(i/26)%26))
+		vol.termCache[key] = []int{i}
+	}
+	vol.pathTermCache = map[string][]int{"path": {1}}
+	vol.extCache = map[string][]int{".txt": {1}}
+	vol.termSeq = map[string]uint64{"term": 1}
+	vol.pathTermSeq = map[string]uint64{"path": 1}
+	vol.extSeq = map[string]uint64{".txt": 1}
+
+	vol.trimSearchCachesLocked()
+
+	if len(vol.pathCache) != 0 {
+		t.Fatalf("pathCache len = %d, want 0", len(vol.pathCache))
+	}
+	if vol.termCache != nil || vol.pathTermCache != nil || vol.extCache != nil {
+		t.Fatalf("term caches were not cleared: term=%v pathTerm=%v ext=%v", vol.termCache, vol.pathTermCache, vol.extCache)
+	}
+	if vol.termSeq != nil || vol.pathTermSeq != nil || vol.extSeq != nil {
+		t.Fatalf("term cache sequences were not cleared: term=%v pathTerm=%v ext=%v", vol.termSeq, vol.pathTermSeq, vol.extSeq)
+	}
+}
+
+func TestServiceVolumeIndexFastPostingCount(t *testing.T) {
+	vol := syntheticServiceVolumeIndexForCacheTests()
+	pq, err := parseQuery(queryOptions{Query: "type:file ext:go c:", MatchPath: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	count, ok := vol.fastPostingCount(pq)
+	if !ok {
+		t.Fatal("fastPostingCount declined safe posting query")
+	}
+	if count != 1 {
+		t.Fatalf("count = %d, want 1", count)
+	}
+}
+
+func TestServiceVolumeIndexFastPostingCountUsesSimpleExtensionGlob(t *testing.T) {
+	vol := syntheticServiceVolumeIndexForCacheTests()
+	pq, err := parseQuery(queryOptions{Query: "type:file glob:*.go"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	count, ok := vol.fastPostingCount(pq)
+	if !ok {
+		t.Fatal("fastPostingCount declined simple extension glob")
+	}
+	if count != 1 {
+		t.Fatalf("count = %d, want 1", count)
+	}
+}
+
+func TestSimpleGlobExtsDeclinesComplexGlobs(t *testing.T) {
+	if got, ok := simpleGlobExts([]string{"*.go", "*.md"}); !ok || len(got) != 2 || got[0] != "go" || got[1] != "md" {
+		t.Fatalf("simpleGlobExts = %v, %v; want [go md], true", got, ok)
+	}
+	if _, ok := simpleGlobExts([]string{"*test*.go"}); ok {
+		t.Fatal("simpleGlobExts accepted complex wildcard glob")
+	}
+}
+
+func TestServiceVolumeIndexFastPostingCountIncludesRecentAndDeleted(t *testing.T) {
+	vol := syntheticServiceVolumeIndexForCacheTests()
+	vol.recentIDs = map[int]struct{}{1: {}, 3: {}}
+	rec := vol.index.compactRecord(1)
+	rec.Deleted = true
+	vol.index.setCompactRecord(1, rec)
+	vol.index.appendCompactRecord(CompactRecord{FRN: 4, ParentFRN: 1, Parent: 0, Name: "new.go"})
+
+	pq, err := parseQuery(queryOptions{Query: "type:file ext:go c:", MatchPath: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	count, ok := vol.fastPostingCount(pq)
+	if !ok {
+		t.Fatal("fastPostingCount declined safe posting query")
+	}
+	if count != 2 {
+		t.Fatalf("count = %d, want 2", count)
+	}
+}
+
+func TestServiceVolumeIndexFastPostingCountDeclinesUnsafeQuery(t *testing.T) {
+	vol := syntheticServiceVolumeIndexForCacheTests()
+	pq, err := parseQuery(queryOptions{Query: "dir:src ext:go", MatchPath: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := vol.fastPostingCount(pq); ok {
+		t.Fatal("fastPostingCount accepted query that needs normal filtering")
+	}
+}
+
+func TestServiceVolumeIndexMultiNameTermCandidatesWarmsEachTerm(t *testing.T) {
+	vol := syntheticServiceVolumeIndexForCacheTests()
+	vol.index.appendCompactRecord(CompactRecord{FRN: 4, ParentFRN: 1, Parent: 0, Name: "alpha_report.txt"})
+	vol.queryIndex = buildResidentQueryIndex(vol)
+
+	got := vol.multiNameTermCandidates([]string{"alpha", "report"})
+	if len(got) != 1 || got[0] != 3 {
+		t.Fatalf("candidates = %v, want [3]", got)
+	}
+	if len(vol.termCache["alpha"]) != 1 || len(vol.termCache["report"]) != 1 {
+		t.Fatalf("term cache not warmed for both terms: %#v", vol.termCache)
+	}
+	cached, ok := vol.cachedMultiNameTermCandidates([]string{"alpha", "report"})
+	if !ok {
+		t.Fatal("cachedMultiNameTermCandidates missed warmed terms")
+	}
+	if len(cached) != 1 || cached[0] != 3 {
+		t.Fatalf("cached candidates = %v, want [3]", cached)
+	}
+}
+
+func syntheticServiceVolumeIndexForCacheTests() *serviceVolumeIndex {
+	idx := &Index{
+		Source:  "usn",
+		Volume:  "C:",
+		Compact: true,
+		Records: []CompactRecord{
+			{FRN: 1, ParentFRN: 1, Parent: -1, Name: "."},
+			{FRN: 2, ParentFRN: 1, Parent: 0, Name: "one.txt"},
+			{FRN: 3, ParentFRN: 1, Parent: 0, Name: "main.go"},
+		},
+	}
+	vol := newServiceVolumeIndex("fixture.gsi", idx)
+	vol.termCache = make(map[string][]int)
+	vol.pathTermCache = make(map[string][]int)
+	vol.extCache = make(map[string][]int)
+	return vol
+}

@@ -1,0 +1,9 @@
+# Generic benchmark queries for full-path search behavior.
+# Keep this file free of machine-specific paths, names, and private terms.
+src test
+dir:src ext:go
+docs readme
+type:file ext:md
+type:dir docs
+regex:README\.(md|txt)$
+regex:^.*\.(go|rs|py|js)$
