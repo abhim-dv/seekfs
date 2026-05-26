@@ -2269,12 +2269,19 @@ func (s *goSearchService) replayVolumeOnce(vol *serviceVolumeIndex, buffer []byt
 	if nextUSN <= startUSN {
 		return nil
 	}
-	s.indexMu.Lock()
 	if err := appendWAL(vol.dbPath, nextUSN, changes); err != nil {
+		s.indexMu.Lock()
 		vol.state = "stale"
 		vol.staleReason = err.Error()
 		s.indexMu.Unlock()
 		return err
+	}
+	if !s.indexMu.TryLock() {
+		return nil
+	}
+	if vol.checkpoint != startUSN {
+		s.indexMu.Unlock()
+		return nil
 	}
 	vol.applyUSNChanges(changes)
 	vol.checkpoint = nextUSN
@@ -2425,11 +2432,6 @@ func (vol *serviceVolumeIndex) applyUSNChanges(changes []usnChange) {
 	}
 	vol.index.Checkpoint = vol.checkpoint
 	vol.pathCache = make(map[int]string)
-	vol.termMu.Lock()
-	vol.termCache = nil
-	vol.pathTermCache = nil
-	vol.extCache = nil
-	vol.termMu.Unlock()
 }
 
 func (vol *serviceVolumeIndex) replayWAL() error {
@@ -2607,6 +2609,20 @@ func (vol *serviceVolumeIndex) markDeleted(id int) {
 }
 
 func (s *goSearchService) servePrivileged() {
+	var wg sync.WaitGroup
+	const listeners = 8
+	for i := 0; i < listeners; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s.servePipeListener()
+		}()
+	}
+	<-s.stop
+	wg.Wait()
+}
+
+func (s *goSearchService) servePipeListener() {
 	for {
 		select {
 		case <-s.stop:
@@ -3393,12 +3409,14 @@ func (vol *serviceVolumeIndex) namePrefixCandidates(pq parsedQuery) ([]int, bool
 
 func (vol *serviceVolumeIndex) nameTermPosting(term string) []int {
 	vol.termMu.Lock()
-	defer vol.termMu.Unlock()
 	if vol.termCache == nil {
 		vol.termCache = make(map[string][]int)
 	}
 	if list, ok := vol.termCache[term]; ok {
-		return list
+		vol.termMu.Unlock()
+		return vol.withRecentCandidates(list, func(rec CompactRecord) bool {
+			return strings.Contains(rec.LowerName, term)
+		})
 	}
 	list := make([]int, 0, 64)
 	for i, rec := range vol.index.Records {
@@ -3410,6 +3428,7 @@ func (vol *serviceVolumeIndex) nameTermPosting(term string) []int {
 		}
 	}
 	vol.termCache[term] = list
+	vol.termMu.Unlock()
 	return list
 }
 
@@ -3420,7 +3439,9 @@ func (vol *serviceVolumeIndex) pathTermPosting(term string) []int {
 	}
 	if list, ok := vol.pathTermCache[term]; ok {
 		vol.termMu.Unlock()
-		return list
+		return vol.withRecentCandidates(list, func(rec CompactRecord) bool {
+			return vol.index.compactPathContainsTerm(int(vol.frnToID[rec.FRN]), term)
+		})
 	}
 	vol.termMu.Unlock()
 
@@ -3476,7 +3497,10 @@ func (vol *serviceVolumeIndex) extPosting(ext string) []int {
 	}
 	if list, ok := vol.extCache[ext]; ok {
 		vol.termMu.Unlock()
-		return list
+		return vol.withRecentCandidates(list, func(rec CompactRecord) bool {
+			actual := strings.TrimPrefix(filepath.Ext(rec.Name), ".")
+			return strings.EqualFold(actual, ext)
+		})
 	}
 	vol.termMu.Unlock()
 
@@ -3494,6 +3518,28 @@ func (vol *serviceVolumeIndex) extPosting(ext string) []int {
 	vol.extCache[ext] = list
 	vol.termMu.Unlock()
 	return list
+}
+
+func (vol *serviceVolumeIndex) withRecentCandidates(base []int, keep func(CompactRecord) bool) []int {
+	if len(vol.recentIDs) == 0 {
+		return base
+	}
+	out := append([]int(nil), base...)
+	seen := make(map[int]struct{}, len(out))
+	for _, id := range out {
+		seen[id] = struct{}{}
+	}
+	for id := range vol.recentIDs {
+		if _, ok := seen[id]; ok || id < 0 || id >= len(vol.index.Records) {
+			continue
+		}
+		rec := vol.index.Records[id]
+		if !rec.Deleted && keep(rec) {
+			out = append(out, id)
+		}
+	}
+	sort.Ints(out)
+	return out
 }
 
 func intersectSortedInts(a, b []int) []int {
