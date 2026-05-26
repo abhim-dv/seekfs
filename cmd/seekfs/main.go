@@ -181,6 +181,7 @@ type parsedQuery struct {
 	Dirs          []string
 	Globs         []string
 	Regexps       []*regexp.Regexp
+	RegexTerms    []string
 	Type          string
 	Under         string
 	Exists        bool
@@ -1338,6 +1339,7 @@ type serviceVolumeIndex struct {
 	termMu        sync.Mutex
 	termCache     map[string][]int
 	pathTermCache map[string][]int
+	extCache      map[string][]int
 	recentIDs     map[int]struct{}
 	dirty         bool
 	lastPersist   time.Time
@@ -2425,6 +2427,8 @@ func (vol *serviceVolumeIndex) applyUSNChanges(changes []usnChange) {
 	vol.pathCache = make(map[int]string)
 	vol.termMu.Lock()
 	vol.termCache = nil
+	vol.pathTermCache = nil
+	vol.extCache = nil
 	vol.termMu.Unlock()
 }
 
@@ -3111,7 +3115,16 @@ func (vol *serviceVolumeIndex) nameTermCandidates(pq parsedQuery) ([]int, bool) 
 	if candidates, ok := vol.underCandidates(pq); ok {
 		return candidates, true
 	}
+	if candidates, ok := vol.filterCandidates(pq); ok {
+		return candidates, true
+	}
 	if candidates, ok := vol.pathTermSubtreeCandidates(pq); ok {
+		return candidates, true
+	}
+	if candidates, ok := vol.regexLiteralCandidates(pq); ok {
+		return candidates, true
+	}
+	if candidates, ok := vol.exactDirCandidates(pq); ok {
 		return candidates, true
 	}
 	if candidates, ok := vol.exactNameCandidates(pq); ok {
@@ -3186,6 +3199,93 @@ func (vol *serviceVolumeIndex) underCandidates(pq parsedQuery) ([]int, bool) {
 		}
 	}
 	sort.Ints(out)
+	return out, true
+}
+
+func (vol *serviceVolumeIndex) filterCandidates(pq parsedQuery) ([]int, bool) {
+	if vol == nil || vol.index == nil || len(pq.Regexps) > 0 || pq.Under != "" || pq.CaseSensitive {
+		return nil, false
+	}
+	if len(pq.Exts) == 0 && len(pq.Dirs) == 0 {
+		return nil, false
+	}
+	lists := make([][]int, 0, len(pq.Exts)+len(pq.Dirs)+len(pq.Terms))
+	for _, ext := range pq.Exts {
+		list := vol.extPosting(ext)
+		if len(list) == 0 {
+			return []int{}, true
+		}
+		lists = append(lists, list)
+	}
+	for _, dir := range pq.Dirs {
+		list := vol.pathTermPosting(dir)
+		if len(list) == 0 {
+			return []int{}, true
+		}
+		lists = append(lists, list)
+	}
+	for _, term := range pq.Terms {
+		list := vol.nameTermPosting(term)
+		if pq.MatchPath {
+			list = vol.pathTermPosting(term)
+		}
+		if len(list) == 0 {
+			return []int{}, true
+		}
+		lists = append(lists, list)
+	}
+	if len(lists) == 0 {
+		return nil, false
+	}
+	sort.Slice(lists, func(i, j int) bool { return len(lists[i]) < len(lists[j]) })
+	candidates := append([]int(nil), lists[0]...)
+	for _, list := range lists[1:] {
+		candidates = intersectSortedInts(candidates, list)
+		if len(candidates) == 0 {
+			break
+		}
+	}
+	return candidates, true
+}
+
+func (vol *serviceVolumeIndex) regexLiteralCandidates(pq parsedQuery) ([]int, bool) {
+	if vol == nil || vol.index == nil || !pq.MatchPath || len(pq.Regexps) == 0 || len(pq.RegexTerms) == 0 || pq.CaseSensitive {
+		return nil, false
+	}
+	lists := make([][]int, 0, len(pq.RegexTerms))
+	for _, term := range pq.RegexTerms {
+		list := vol.pathTermPosting(term)
+		if len(list) == 0 {
+			return []int{}, true
+		}
+		lists = append(lists, list)
+	}
+	sort.Slice(lists, func(i, j int) bool { return len(lists[i]) < len(lists[j]) })
+	candidates := append([]int(nil), lists[0]...)
+	for _, list := range lists[1:] {
+		candidates = intersectSortedInts(candidates, list)
+		if len(candidates) == 0 {
+			break
+		}
+	}
+	return candidates, true
+}
+
+func (vol *serviceVolumeIndex) exactDirCandidates(pq parsedQuery) ([]int, bool) {
+	if vol == nil || vol.index == nil || len(pq.Terms) != 1 || pq.Type != "dir" || len(pq.Dirs) > 0 || len(pq.Regexps) > 0 || pq.Under != "" || len(pq.Exts) > 0 || len(pq.Globs) > 0 || pq.HasModAfter || pq.Exists || pq.CaseSensitive || vol.exactNames == nil {
+		return nil, false
+	}
+	list := vol.exactNames[pq.Terms[0]]
+	out := make([]int, 0, len(list))
+	for _, id := range list {
+		if id < 0 || id >= len(vol.index.Records) {
+			continue
+		}
+		rec := vol.index.Records[id]
+		if !rec.Deleted && rec.Mode&uint32(os.ModeDir) != 0 {
+			out = append(out, id)
+		}
+	}
 	return out, true
 }
 
@@ -3369,6 +3469,33 @@ func (vol *serviceVolumeIndex) pathTermPosting(term string) []int {
 	return out
 }
 
+func (vol *serviceVolumeIndex) extPosting(ext string) []int {
+	vol.termMu.Lock()
+	if vol.extCache == nil {
+		vol.extCache = make(map[string][]int)
+	}
+	if list, ok := vol.extCache[ext]; ok {
+		vol.termMu.Unlock()
+		return list
+	}
+	vol.termMu.Unlock()
+
+	list := make([]int, 0, 64)
+	for i, rec := range vol.index.Records {
+		if rec.Deleted {
+			continue
+		}
+		actual := strings.TrimPrefix(filepath.Ext(rec.Name), ".")
+		if strings.EqualFold(actual, ext) {
+			list = append(list, i)
+		}
+	}
+	vol.termMu.Lock()
+	vol.extCache[ext] = list
+	vol.termMu.Unlock()
+	return list
+}
+
 func intersectSortedInts(a, b []int) []int {
 	out := a[:0]
 	i, j := 0, 0
@@ -3445,6 +3572,7 @@ func parseQuery(opts queryOptions) (parsedQuery, error) {
 			if pat == "" {
 				continue
 			}
+			pq.RegexTerms = appendRegexLiteralTerms(pq.RegexTerms, pat, pq.CaseSensitive)
 			if !pq.CaseSensitive {
 				pat = "(?i)" + pat
 			}
@@ -3467,6 +3595,43 @@ func parseQuery(opts queryOptions) (parsedQuery, error) {
 		return pq, errors.New("query has no searchable terms or filters")
 	}
 	return pq, nil
+}
+
+func appendRegexLiteralTerms(out []string, pattern string, caseSensitive bool) []string {
+	var b strings.Builder
+	flush := func() {
+		if b.Len() >= 3 {
+			out = append(out, normalizeCase(b.String(), caseSensitive))
+		}
+		b.Reset()
+	}
+	escaped := false
+	for _, r := range pattern {
+		if escaped {
+			if isRegexLiteralRune(r) {
+				b.WriteRune(r)
+			} else {
+				flush()
+			}
+			escaped = false
+			continue
+		}
+		if r == '\\' {
+			escaped = true
+			continue
+		}
+		if isRegexLiteralRune(r) {
+			b.WriteRune(r)
+			continue
+		}
+		flush()
+	}
+	flush()
+	return out
+}
+
+func isRegexLiteralRune(r rune) bool {
+	return r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_' || r == '-'
 }
 
 func entryMatches(entry Entry, pq parsedQuery, matchPath bool) bool {

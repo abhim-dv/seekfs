@@ -392,6 +392,8 @@ func TestServiceCandidatesMatchFullCompactSearchForCommonQueries(t *testing.T) {
 		{Query: "src go", MatchPath: true, Limit: 20},
 		{Query: "ext:go dir:src", MatchPath: true, Limit: 20},
 		{Query: "glob:*_test.go", MatchPath: true, Limit: 20},
+		{Query: `regex:Downloads.*\.nrrd$`, MatchPath: true, Limit: 20},
+		{Query: "type:dir Downloads", MatchPath: true, Limit: 20},
 	}
 	for _, opts := range cases {
 		t.Run(opts.Query, func(t *testing.T) {
