@@ -329,6 +329,11 @@ func TestCommonSearchQuerySemantics(t *testing.T) {
 			wantNames: []string{"scan.nrrd"},
 		},
 		{
+			name:      "path substring and dotted filename substring",
+			opts:      queryOptions{Query: "hadespy .raw", MatchPath: true, Limit: 20},
+			wantNames: []string{"volume.raw"},
+		},
+		{
 			name:      "extension filter",
 			opts:      queryOptions{Query: "ext:go", MatchPath: true, Limit: 20},
 			wantNames: []string{"main.go", "search_test.go"},
@@ -388,6 +393,7 @@ func TestServiceCandidatesMatchFullCompactSearchForCommonQueries(t *testing.T) {
 	vol := newServiceVolumeIndex("fixture.gsi", idx)
 	cases := []queryOptions{
 		{Query: "downloads nrrd", MatchPath: true, Limit: 20},
+		{Query: "hadespy .raw", MatchPath: true, Limit: 20},
 		{Query: "ext:nrrd", MatchPath: true, Under: `C:\Users\abhism12\Downloads`, Limit: 20},
 		{Query: "src go", MatchPath: true, Limit: 20},
 		{Query: "ext:go dir:src", MatchPath: true, Limit: 20},
@@ -522,6 +528,8 @@ func commonSearchFixture() *Index {
 	add(9, 7, 6, "search_test.go", 0)
 	add(10, 3, 2, "README.md", 0)
 	add(11, 3, 2, "readme.md", 0)
+	add(12, 3, 2, "hadespy-dev-ff", uint32(os.ModeDir))
+	add(13, 12, 11, "volume.raw", 0)
 	buildOrders(idx)
 	return idx
 }
