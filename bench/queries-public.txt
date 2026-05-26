@@ -1,0 +1,22 @@
+# Generic benchmark queries for broad local-file search behavior.
+# Keep this file free of machine-specific paths, names, and private terms.
+main
+readme
+README
+config
+test
+src go
+ext:md
+type:file ext:go
+type:dir src
+type:dir docs
+glob:*.md
+glob:*.json
+glob:*.config
+glob:*test*.*
+ext:exe
+.dll
+case: README
+regex:.*test.*
+regex:README\.(md|txt)$
+regex:^.*\.(go|rs|py|js)$

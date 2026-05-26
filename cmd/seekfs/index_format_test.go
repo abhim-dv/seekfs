@@ -322,8 +322,8 @@ func TestCommonSearchQuerySemantics(t *testing.T) {
 		},
 		{
 			name:      "full path terms",
-			opts:      queryOptions{Query: "downloads nrrd", MatchPath: true, Limit: 20},
-			wantNames: []string{"scan.nrrd"},
+			opts:      queryOptions{Query: "assets dat", MatchPath: true, Limit: 20},
+			wantNames: []string{"sample.dat"},
 		},
 		{
 			name:      "path substring and dotted filename substring",
@@ -357,27 +357,27 @@ func TestCommonSearchQuerySemantics(t *testing.T) {
 		},
 		{
 			name:      "regex filter",
-			opts:      queryOptions{Query: `regex:Downloads.*\.nrrd$`, MatchPath: true, Limit: 20},
-			wantNames: []string{"scan.nrrd"},
+			opts:      queryOptions{Query: `regex:Assets.*\.dat$`, MatchPath: true, Limit: 20},
+			wantNames: []string{"sample.dat"},
 		},
 		{
 			name:      "type file",
-			opts:      queryOptions{Query: "type:file downloads", MatchPath: true, Limit: 20},
-			wantNames: []string{"scan.nrrd", "notes.txt"},
+			opts:      queryOptions{Query: "type:file assets", MatchPath: true, Limit: 20},
+			wantNames: []string{"sample.dat", "notes.txt"},
 		},
 		{
 			name:      "type directory",
-			opts:      queryOptions{Query: "type:dir downloads", MatchPath: true, Limit: 20},
-			wantNames: []string{"Downloads"},
+			opts:      queryOptions{Query: "type:dir assets", MatchPath: true, Limit: 20},
+			wantNames: []string{"Assets"},
 		},
 		{
 			name:      "under filter",
-			opts:      queryOptions{Query: "ext:nrrd", MatchPath: true, Under: `C:\fixture\workspace\Downloads`, Limit: 20},
-			wantNames: []string{"scan.nrrd"},
+			opts:      queryOptions{Query: "ext:dat", MatchPath: true, Under: `C:\fixture\workspace\Assets`, Limit: 20},
+			wantNames: []string{"sample.dat"},
 		},
 		{
 			name:      "under excludes sibling prefix",
-			opts:      queryOptions{Query: "ext:nrrd", MatchPath: true, Under: `C:\fixture\workspace\Down`, Limit: 20},
+			opts:      queryOptions{Query: "ext:dat", MatchPath: true, Under: `C:\fixture\workspace\Down`, Limit: 20},
 			wantNames: nil,
 		},
 		{
@@ -404,16 +404,16 @@ func TestServiceCandidatesMatchFullCompactSearchForCommonQueries(t *testing.T) {
 	idx := commonSearchFixture()
 	vol := newServiceVolumeIndex("fixture.gsi", idx)
 	cases := []queryOptions{
-		{Query: "downloads nrrd", MatchPath: true, Limit: 20},
+		{Query: "assets dat", MatchPath: true, Limit: 20},
 		{Query: "project .bin", MatchPath: true, Limit: 20},
 		{Query: "c: .bin", MatchPath: true, Limit: 20},
 		{Query: ".tar.gz", MatchPath: true, Limit: 20},
-		{Query: "ext:nrrd", MatchPath: true, Under: `C:\fixture\workspace\Downloads`, Limit: 20},
+		{Query: "ext:dat", MatchPath: true, Under: `C:\fixture\workspace\Assets`, Limit: 20},
 		{Query: "src go", MatchPath: true, Limit: 20},
 		{Query: "ext:go dir:src", MatchPath: true, Limit: 20},
 		{Query: "glob:*_test.go", MatchPath: true, Limit: 20},
-		{Query: `regex:Downloads.*\.nrrd$`, MatchPath: true, Limit: 20},
-		{Query: "type:dir Downloads", MatchPath: true, Limit: 20},
+		{Query: `regex:Assets.*\.dat$`, MatchPath: true, Limit: 20},
+		{Query: "type:dir Assets", MatchPath: true, Limit: 20},
 	}
 	for _, opts := range cases {
 		t.Run(opts.Query, func(t *testing.T) {
@@ -532,8 +532,8 @@ func commonSearchFixture() *Index {
 	add(1, 1, -1, ".", uint32(os.ModeDir))
 	add(2, 1, 0, "fixture", uint32(os.ModeDir))
 	add(3, 2, 1, "workspace", uint32(os.ModeDir))
-	add(4, 3, 2, "Downloads", uint32(os.ModeDir))
-	add(5, 4, 3, "scan.nrrd", 0)
+	add(4, 3, 2, "Assets", uint32(os.ModeDir))
+	add(5, 4, 3, "sample.dat", 0)
 	add(6, 4, 3, "notes.txt", 0)
 	add(7, 3, 2, "src", uint32(os.ModeDir))
 	add(8, 7, 6, "main.go", 0)
@@ -544,7 +544,7 @@ func commonSearchFixture() *Index {
 	add(13, 12, 11, "volume.bin", 0)
 	add(14, 3, 2, "archive.tar.gz", 0)
 	add(15, 3, 2, "Downstream", uint32(os.ModeDir))
-	add(16, 15, 14, "sibling.nrrd", 0)
+	add(16, 15, 14, "sibling.dat", 0)
 	buildOrders(idx)
 	return idx
 }

@@ -21,8 +21,22 @@ You can pass explicit benchmark queries after the flags:
 .\seekfs.exe bench -service --json -iterations 100 "ext:go" "type:dir docs" "glob:*.md"
 ```
 
-The JSON summary includes iteration count, query count, failure count, and
-latency stats in milliseconds: min, median, p90, p95, and max.
+You can also keep benchmark queries in a text file, one query per line:
+
+```powershell
+.\seekfs.exe bench -service --json -iterations 100 -query-file .\bench\queries-public.txt
+```
+
+By default, `bench` uses filename matching like `seekfs search`. Add `-path`
+when measuring full-path behavior:
+
+```powershell
+.\seekfs.exe bench -service -path --json -iterations 100 "src test" "dir:src ext:go"
+```
+
+The JSON summary includes iteration count, query count, failure count, aggregate
+latency stats, and per-query latency stats in milliseconds: min, median, p90,
+p95, and max.
 
 ## Query Shape Matters
 

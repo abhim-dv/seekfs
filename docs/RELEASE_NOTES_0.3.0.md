@@ -22,8 +22,8 @@ Measured on the development machine against full C: + F: indexes with the
 installed service after warmup:
 
 ```text
-seekfs search -path "Downloads nrrd"                 ~50 ms
-seekfs search -path "regex:Downloads.*\.nrrd$"        ~50 ms
+seekfs search -path "assets dat"                 ~50 ms
+seekfs search -path "regex:Assets.*\.dat$"        ~50 ms
 seekfs search -path "ext:go"                          ~50 ms
 seekfs search -path "dir:cmd ext:go"                  ~50 ms
 seekfs search -path --under F:\git\seekfs "glob:*.md" ~50 ms
