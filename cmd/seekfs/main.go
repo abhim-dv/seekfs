@@ -196,7 +196,6 @@ type CompactRecord struct {
 	ParentFRN uint64
 	Parent    int32
 	Name      string
-	LowerName string
 	NameOff   uint32
 	NameLen   uint16
 	Mode      uint32
@@ -694,7 +693,6 @@ func indexUSNVolume(volume string) (*Index, error) {
 			ParentFRN: node.parentFRN,
 			Parent:    parent,
 			Name:      node.name,
-			LowerName: strings.ToLower(node.name),
 			Mode:      modeFromAttrs(node.attr),
 		})
 	}
@@ -955,10 +953,11 @@ func buildOrders(idx *Index) {
 		}
 		sort.Slice(idx.CompactNameOrder, func(i, j int) bool {
 			a, b := idx.Records[idx.CompactNameOrder[i]], idx.Records[idx.CompactNameOrder[j]]
-			if a.LowerName == b.LowerName {
+			aName, bName := compactLowerName(a), compactLowerName(b)
+			if aName == bName {
 				return idx.CompactNameOrder[i] < idx.CompactNameOrder[j]
 			}
-			return a.LowerName < b.LowerName
+			return aName < bName
 		})
 		return
 	}
@@ -992,10 +991,11 @@ func ensureCompactNameOrderSorted(idx *Index) {
 	}
 	sort.Slice(idx.CompactNameOrder, func(i, j int) bool {
 		a, b := idx.Records[idx.CompactNameOrder[i]], idx.Records[idx.CompactNameOrder[j]]
-		if a.LowerName == b.LowerName {
+		aName, bName := compactLowerName(a), compactLowerName(b)
+		if aName == bName {
 			return idx.CompactNameOrder[i] < idx.CompactNameOrder[j]
 		}
-		return a.LowerName < b.LowerName
+		return aName < bName
 	})
 }
 
@@ -1350,9 +1350,12 @@ type serviceVolumeIndex struct {
 	state         string
 	staleReason   string
 	frnToID       map[uint64]int
+	frnIDs        []frnIndexEntry
 	children      map[uint64]map[int]struct{}
 	exactNames    map[string][]int
 	pathCache     map[int]string
+	queryIndex    *residentQueryIndex
+	searchMu      sync.Mutex
 	termMu        sync.Mutex
 	termCache     map[string][]int
 	pathTermCache map[string][]int
@@ -1364,6 +1367,18 @@ type serviceVolumeIndex struct {
 	extSeq        map[string]uint64
 	dirty         bool
 	lastPersist   time.Time
+}
+
+type residentQueryIndex struct {
+	ext    map[string][]int
+	volume map[string][]int
+	files  []int
+	dirs   []int
+}
+
+type frnIndexEntry struct {
+	frn uint64
+	id  int32
 }
 
 func serviceLog(format string, args ...any) {
@@ -2144,6 +2159,7 @@ func (s *goSearchService) loadConfiguredIndexes() error {
 		if err := catchUpServiceVolume(vol); err != nil {
 			serviceLog("startup catch-up skipped volume=%s db=%s err=%v", vol.volume, vol.dbPath, err)
 		}
+		vol.queryIndex = buildResidentQueryIndex(vol)
 		volumes = append(volumes, vol)
 	}
 	s.indexMu.Lock()
@@ -2151,6 +2167,7 @@ func (s *goSearchService) loadConfiguredIndexes() error {
 	s.volumes = volumes
 	s.loadErr = ""
 	s.indexMu.Unlock()
+	debug.FreeOSMemory()
 	for _, vol := range volumes {
 		if vol.state == "ready" && vol.index.Compact && vol.index.Source == "usn" {
 			go s.replayVolumeLoop(vol)
@@ -2173,21 +2190,29 @@ func newServiceVolumeIndex(dbPath string, idx *Index) *serviceVolumeIndex {
 		lastPersist: time.Now(),
 	}
 	if idx.Compact && idx.Source == "usn" {
-		ensureCompactNameOrderSorted(idx)
-		vol.frnToID = make(map[uint64]int, len(idx.Records))
-		vol.children = make(map[uint64]map[int]struct{}, len(idx.Records))
-		vol.exactNames = make(map[string][]int, len(idx.Records)/2)
+		if len(idx.Records) < 1_000_000 {
+			ensureCompactNameOrderSorted(idx)
+		} else {
+			idx.CompactNameOrder = nil
+		}
+		vol.frnIDs = make([]frnIndexEntry, 0, len(idx.Records))
+		if len(idx.Records) < 1_000_000 {
+			vol.children = make(map[uint64]map[int]struct{}, len(idx.Records))
+			vol.exactNames = make(map[string][]int, len(idx.Records)/2)
+		}
 		for i, rec := range idx.Records {
 			if rec.FRN != 0 {
-				vol.frnToID[rec.FRN] = i
+				vol.frnIDs = append(vol.frnIDs, frnIndexEntry{frn: rec.FRN, id: int32(i)})
 			}
-			if rec.ParentFRN != 0 && rec.ParentFRN != rec.FRN {
+			if vol.children != nil && rec.ParentFRN != 0 && rec.ParentFRN != rec.FRN {
 				vol.addChild(rec.ParentFRN, i)
 			}
-			if !rec.Deleted && rec.LowerName != "" {
-				vol.exactNames[rec.LowerName] = append(vol.exactNames[rec.LowerName], i)
+			if name := compactLowerName(rec); vol.exactNames != nil && !rec.Deleted && name != "" {
+				vol.exactNames[name] = append(vol.exactNames[name], i)
 			}
 		}
+		sort.Slice(vol.frnIDs, func(i, j int) bool { return vol.frnIDs[i].frn < vol.frnIDs[j].frn })
+		vol.queryIndex = buildResidentQueryIndex(vol)
 	}
 	return vol
 }
@@ -2248,6 +2273,39 @@ func catchUpServiceVolume(vol *serviceVolumeIndex) error {
 	vol.state = "ready"
 	vol.staleReason = ""
 	return nil
+}
+
+func (vol *serviceVolumeIndex) idForFRN(frn uint64) (int, bool) {
+	if frn == 0 {
+		return 0, false
+	}
+	if vol.frnToID != nil {
+		if id, ok := vol.frnToID[frn]; ok {
+			return id, true
+		}
+	}
+	i := sort.Search(len(vol.frnIDs), func(i int) bool { return vol.frnIDs[i].frn >= frn })
+	if i < len(vol.frnIDs) && vol.frnIDs[i].frn == frn {
+		return int(vol.frnIDs[i].id), true
+	}
+	return 0, false
+}
+
+func (vol *serviceVolumeIndex) addFRNID(frn uint64, id int) {
+	if frn == 0 {
+		return
+	}
+	if _, ok := vol.idForFRN(frn); ok {
+		return
+	}
+	if vol.frnToID == nil {
+		vol.frnToID = make(map[uint64]int)
+	}
+	vol.frnToID[frn] = id
+}
+
+func (vol *serviceVolumeIndex) frnRecordCount() int {
+	return len(vol.frnIDs) + len(vol.frnToID)
 }
 
 func (s *goSearchService) replayVolumeLoop(vol *serviceVolumeIndex) {
@@ -2392,12 +2450,6 @@ func validateUSNCheckpoint(vol *serviceVolumeIndex, journal usnJournalDataV0) er
 }
 
 func (vol *serviceVolumeIndex) applyUSNChanges(changes []usnChange) {
-	if vol.frnToID == nil {
-		vol.frnToID = make(map[uint64]int)
-	}
-	if vol.children == nil {
-		vol.rebuildChildren()
-	}
 	for _, change := range changes {
 		if change.FRN == 0 {
 			continue
@@ -2406,7 +2458,7 @@ func (vol *serviceVolumeIndex) applyUSNChanges(changes []usnChange) {
 			continue
 		}
 		if change.Reason&usnReasonFileDelete != 0 {
-			if id, ok := vol.frnToID[change.FRN]; ok {
+			if id, ok := vol.idForFRN(change.FRN); ok {
 				vol.removeExactName(id)
 				vol.markDeleted(id)
 			}
@@ -2415,10 +2467,10 @@ func (vol *serviceVolumeIndex) applyUSNChanges(changes []usnChange) {
 			}
 			continue
 		}
-		id, ok := vol.frnToID[change.FRN]
+		id, ok := vol.idForFRN(change.FRN)
 		if !ok {
 			id = len(vol.index.Records)
-			vol.frnToID[change.FRN] = id
+			vol.addFRNID(change.FRN, id)
 			vol.index.Records = append(vol.index.Records, CompactRecord{FRN: change.FRN})
 		}
 		if vol.recentIDs == nil {
@@ -2434,7 +2486,7 @@ func (vol *serviceVolumeIndex) applyUSNChanges(changes []usnChange) {
 		rec.FRN = change.FRN
 		rec.ParentFRN = change.ParentFRN
 		rec.Parent = -1
-		if parentID, ok := vol.frnToID[change.ParentFRN]; ok && parentID != id {
+		if parentID, ok := vol.idForFRN(change.ParentFRN); ok && parentID != id {
 			rec.Parent = int32(parentID)
 		}
 		if change.ParentFRN != 0 && change.ParentFRN != change.FRN {
@@ -2443,7 +2495,6 @@ func (vol *serviceVolumeIndex) applyUSNChanges(changes []usnChange) {
 		vol.repairChildren(change.FRN, id)
 		if change.Name != "" {
 			rec.Name = change.Name
-			rec.LowerName = strings.ToLower(change.Name)
 		}
 		rec.Mode = modeFromAttrs(change.Attr)
 		rec.Deleted = false
@@ -2544,20 +2595,21 @@ func (vol *serviceVolumeIndex) addExactName(id int) {
 		return
 	}
 	rec := vol.index.Records[id]
-	if rec.Deleted || rec.LowerName == "" {
+	name := compactLowerName(rec)
+	if rec.Deleted || name == "" {
 		return
 	}
 	if vol.exactNames == nil {
 		vol.exactNames = make(map[string][]int)
 	}
-	vol.exactNames[rec.LowerName] = append(vol.exactNames[rec.LowerName], id)
+	vol.exactNames[name] = append(vol.exactNames[name], id)
 }
 
 func (vol *serviceVolumeIndex) removeExactName(id int) {
 	if id < 0 || id >= len(vol.index.Records) || vol.exactNames == nil {
 		return
 	}
-	name := vol.index.Records[id].LowerName
+	name := compactLowerName(vol.index.Records[id])
 	if name == "" {
 		return
 	}
@@ -2577,6 +2629,9 @@ func (vol *serviceVolumeIndex) removeExactName(id int) {
 
 func (vol *serviceVolumeIndex) addChild(parentFRN uint64, id int) {
 	if parentFRN == 0 {
+		return
+	}
+	if vol.children == nil {
 		return
 	}
 	kids := vol.children[parentFRN]
@@ -2602,6 +2657,9 @@ func (vol *serviceVolumeIndex) removeChild(parentFRN uint64, id int) {
 }
 
 func (vol *serviceVolumeIndex) repairChildren(parentFRN uint64, parentID int) {
+	if vol.children == nil {
+		return
+	}
 	for childID := range vol.children[parentFRN] {
 		if childID == parentID || childID < 0 || childID >= len(vol.index.Records) {
 			continue
@@ -2610,8 +2668,62 @@ func (vol *serviceVolumeIndex) repairChildren(parentFRN uint64, parentID int) {
 	}
 }
 
+func buildResidentQueryIndex(vol *serviceVolumeIndex) *residentQueryIndex {
+	qi := &residentQueryIndex{
+		ext:    make(map[string][]int),
+		volume: make(map[string][]int),
+		files:  make([]int, 0, len(vol.index.Records)),
+		dirs:   make([]int, 0, len(vol.index.Records)/8),
+	}
+	volume := strings.ToLower(vol.index.Volume)
+	for id, rec := range vol.index.Records {
+		if rec.Deleted {
+			continue
+		}
+		if rec.Mode&uint32(os.ModeDir) != 0 {
+			qi.dirs = append(qi.dirs, id)
+		} else {
+			qi.files = append(qi.files, id)
+		}
+		if volume != "" {
+			qi.volume[volume] = append(qi.volume[volume], id)
+		}
+		actualExt := strings.TrimPrefix(filepath.Ext(rec.Name), ".")
+		if actualExt != "" {
+			qi.ext[strings.ToLower(actualExt)] = append(qi.ext[strings.ToLower(actualExt)], id)
+		}
+	}
+	sortResidentPostings(qi.ext)
+	sortResidentPostings(qi.volume)
+	sort.Ints(qi.files)
+	sort.Ints(qi.dirs)
+	return qi
+}
+
+func sortResidentPostings(postings map[string][]int) {
+	for key, list := range postings {
+		sort.Ints(list)
+		postings[key] = uniqueSortedInts(list)
+	}
+}
+
+func compactLowerName(rec CompactRecord) string {
+	return strings.ToLower(rec.Name)
+}
+
+func stringView(b []byte) string {
+	if len(b) == 0 {
+		return ""
+	}
+	return unsafe.String(unsafe.SliceData(b), len(b))
+}
+
 func (vol *serviceVolumeIndex) markDeleted(id int) {
 	if id < 0 || id >= len(vol.index.Records) {
+		return
+	}
+	if vol.children == nil {
+		vol.index.Records[id].Deleted = true
 		return
 	}
 	stack := []int{id}
@@ -2749,7 +2861,7 @@ func handleServiceConn(conn *os.File, s *goSearchService) {
 				Checkpoint:  vol.checkpoint,
 				State:       vol.state,
 				StaleReason: vol.staleReason,
-				FRNRecords:  len(vol.frnToID),
+				FRNRecords:  vol.frnRecordCount(),
 			})
 		}
 		message := ""
@@ -3024,7 +3136,10 @@ func searchAll(indexes []*Index, opts queryOptions, countOnly bool) ([]Entry, er
 
 func searchServiceVolumes(volumes []*serviceVolumeIndex, opts queryOptions, countOnly bool) ([]Entry, error) {
 	if len(volumes) == 1 {
-		return searchCompactWithCache(volumes[0].index, opts, countOnly, volumes[0].pathCache, volumes[0].nameTermCandidates)
+		vol := volumes[0]
+		vol.searchMu.Lock()
+		defer vol.searchMu.Unlock()
+		return searchCompactWithCache(vol.index, opts, countOnly, vol.pathCache, vol.nameTermCandidates)
 	}
 	limit := normalizedLimit(opts.Limit, countOnly)
 	results := make([]Entry, 0, min(limit, 1024))
@@ -3038,7 +3153,9 @@ func searchServiceVolumes(volumes []*serviceVolumeIndex, opts queryOptions, coun
 		}
 		childOpts := opts
 		childOpts.Limit = perIndexLimit
+		vol.searchMu.Lock()
 		matches, err := searchCompactWithCache(vol.index, childOpts, countOnly, vol.pathCache, vol.nameTermCandidates)
+		vol.searchMu.Unlock()
 		if err != nil {
 			return nil, err
 		}
@@ -3051,6 +3168,20 @@ func searchCompact(idx *Index, opts queryOptions, countOnly bool) ([]Entry, erro
 	return searchCompactWithCache(idx, opts, countOnly, nil, nil)
 }
 
+func compactOrderLen(order []int, recordCount int) int {
+	if order == nil {
+		return recordCount
+	}
+	return len(order)
+}
+
+func compactOrderAt(order []int, pos int) int {
+	if order == nil {
+		return pos
+	}
+	return order[pos]
+}
+
 func searchCompactWithCache(idx *Index, opts queryOptions, countOnly bool, pathCache map[int]string, candidateFn func(parsedQuery) ([]int, bool)) ([]Entry, error) {
 	pq, err := parseQuery(opts)
 	if err != nil {
@@ -3058,15 +3189,11 @@ func searchCompactWithCache(idx *Index, opts queryOptions, countOnly bool, pathC
 	}
 	limit := normalizedLimit(opts.Limit, countOnly)
 	order := idx.CompactNameOrder
-	if order == nil {
-		order = make([]int, len(idx.Records))
-		for i := range order {
-			order[i] = i
-		}
-	}
+	usedCandidates := false
 	if candidateFn != nil {
 		if candidates, ok := candidateFn(pq); ok {
 			order = candidates
+			usedCandidates = true
 		}
 	}
 	if pq.RootBias != "" || pq.CWDBias != "" {
@@ -3076,7 +3203,8 @@ func searchCompactWithCache(idx *Index, opts queryOptions, countOnly bool, pathC
 	if pathCache == nil {
 		pathCache = make(map[int]string)
 	}
-	for _, recIndex := range order {
+	for pos := 0; pos < compactOrderLen(order, len(idx.Records)); pos++ {
+		recIndex := compactOrderAt(order, pos)
 		rec := idx.Records[recIndex]
 		if rec.Deleted {
 			continue
@@ -3084,7 +3212,7 @@ func searchCompactWithCache(idx *Index, opts queryOptions, countOnly bool, pathC
 		if !compactRecordPrecheck(rec, pq, opts.MatchPath) {
 			continue
 		}
-		if opts.MatchPath && len(pq.Terms) > 0 && !idx.compactPathContainsAll(recIndex, pq.Terms) {
+		if !usedCandidates && opts.MatchPath && len(pq.Terms) > 0 && !idx.compactPathContainsAll(recIndex, pq.Terms) {
 			continue
 		}
 		path := idx.reconstructCompactPathCached(recIndex, pathCache)
@@ -3092,7 +3220,7 @@ func searchCompactWithCache(idx *Index, opts queryOptions, countOnly bool, pathC
 			Path:        path,
 			Name:        rec.Name,
 			LowerPath:   strings.ToLower(path),
-			LowerName:   rec.LowerName,
+			LowerName:   compactLowerName(rec),
 			Mode:        rec.Mode,
 			Size:        rec.Size,
 			ModUnix:     rec.ModUnix,
@@ -3153,6 +3281,9 @@ func (vol *serviceVolumeIndex) nameTermCandidates(pq parsedQuery) ([]int, bool) 
 	if candidates, ok := vol.underCandidates(pq); ok {
 		return candidates, true
 	}
+	if candidates, ok := vol.plannerCandidates(pq); ok {
+		return candidates, true
+	}
 	if candidates, ok := vol.pathDirFilterCandidates(pq); ok {
 		return candidates, true
 	}
@@ -3192,6 +3323,97 @@ func (vol *serviceVolumeIndex) nameTermCandidates(pq parsedQuery) ([]int, bool) 
 		if len(candidates) == 0 {
 			break
 		}
+	}
+	return candidates, true
+}
+
+func (vol *serviceVolumeIndex) plannerCandidates(pq parsedQuery) ([]int, bool) {
+	if vol == nil || vol.index == nil || vol.queryIndex == nil || pq.CaseSensitive || pq.Under != "" || pq.Exists || pq.HasModAfter || len(pq.Globs) > 0 {
+		return nil, false
+	}
+	strong := make([][]int, 0, len(pq.Terms)+len(pq.Exts)+2)
+	addStrong := func(list []int) bool {
+		if len(list) == 0 {
+			return false
+		}
+		strong = append(strong, list)
+		return true
+	}
+	qi := vol.queryIndex
+	lastBareExt := []int(nil)
+	for _, ext := range pq.Exts {
+		if !addStrong(qi.ext[ext]) {
+			return []int{}, true
+		}
+	}
+	for _, term := range pq.RegexTerms {
+		if list := qi.ext[term]; len(list) > 0 {
+			addStrong(list)
+		}
+	}
+	if pq.Type == "file" {
+		addStrong(qi.files)
+	} else if pq.Type == "dir" {
+		addStrong(qi.dirs)
+	}
+	for _, term := range pq.Terms {
+		if pq.MatchPath {
+			if strings.HasSuffix(term, ":") {
+				if !addStrong(qi.volume[term]) {
+					return []int{}, true
+				}
+				continue
+			}
+			if strings.HasPrefix(term, ".") && len(term) > 1 {
+				if list := qi.ext[strings.TrimPrefix(term, ".")]; len(list) > 0 {
+					addStrong(list)
+					continue
+				}
+			}
+			if list := qi.ext[term]; len(list) > 0 {
+				lastBareExt = list
+			}
+			if ext := strings.TrimPrefix(filepath.Ext(term), "."); ext != "" {
+				if list := qi.ext[ext]; len(list) > 0 {
+					lastBareExt = list
+				}
+			}
+			continue
+		}
+		if strings.HasPrefix(term, ".") && len(term) > 1 {
+			if list := qi.ext[strings.TrimPrefix(term, ".")]; len(list) > 0 {
+				addStrong(list)
+				continue
+			}
+		}
+		if list := qi.ext[term]; len(list) > 0 {
+			lastBareExt = list
+		}
+		if ext := strings.TrimPrefix(filepath.Ext(term), "."); ext != "" {
+			if list := qi.ext[ext]; len(list) > 0 {
+				lastBareExt = list
+			}
+		}
+	}
+	if len(strong) == 0 && len(lastBareExt) > 0 {
+		addStrong(lastBareExt)
+	}
+	if len(strong) == 0 {
+		return nil, false
+	}
+	lists := strong
+	sort.Slice(lists, func(i, j int) bool { return len(lists[i]) < len(lists[j]) })
+	candidates := append([]int(nil), lists[0]...)
+	for _, list := range lists[1:] {
+		candidates = intersectSortedInts(candidates, list)
+		if len(candidates) == 0 {
+			break
+		}
+	}
+	if len(vol.recentIDs) > 0 {
+		candidates = append(candidates, mapKeys(vol.recentIDs)...)
+		sort.Ints(candidates)
+		candidates = uniqueSortedInts(candidates)
 	}
 	return candidates, true
 }
@@ -3532,7 +3754,7 @@ func (vol *serviceVolumeIndex) exactNameCandidates(pq parsedQuery) ([]int, bool)
 			out = append(out, id)
 		}
 	}
-	return out, true
+	return out, len(out) > 0
 }
 
 func (vol *serviceVolumeIndex) namePrefixCandidates(pq parsedQuery) ([]int, bool) {
@@ -3548,14 +3770,14 @@ func (vol *serviceVolumeIndex) namePrefixCandidates(pq parsedQuery) ([]int, bool
 		return nil, false
 	}
 	start := sort.Search(len(order), func(i int) bool {
-		return vol.index.Records[order[i]].LowerName >= term
+		return compactLowerName(vol.index.Records[order[i]]) >= term
 	})
 	out := make([]int, 0, 8)
 	seen := make(map[int]struct{})
 	for i := start; i < len(order); i++ {
 		id := order[i]
 		rec := vol.index.Records[id]
-		if !strings.HasPrefix(rec.LowerName, term) {
+		if !strings.HasPrefix(compactLowerName(rec), term) {
 			break
 		}
 		if !rec.Deleted {
@@ -3568,11 +3790,11 @@ func (vol *serviceVolumeIndex) namePrefixCandidates(pq parsedQuery) ([]int, bool
 			continue
 		}
 		rec := vol.index.Records[id]
-		if !rec.Deleted && strings.HasPrefix(rec.LowerName, term) {
+		if !rec.Deleted && strings.HasPrefix(compactLowerName(rec), term) {
 			out = append(out, id)
 		}
 	}
-	return out, true
+	return out, len(out) > 0
 }
 
 func (vol *serviceVolumeIndex) nameTermPosting(term string) []int {
@@ -3584,7 +3806,7 @@ func (vol *serviceVolumeIndex) nameTermPosting(term string) []int {
 		seq := vol.termSeq[term]
 		vol.termMu.Unlock()
 		return vol.withRecentCandidates(list, seq, func(rec CompactRecord) bool {
-			return strings.Contains(rec.LowerName, term)
+			return strings.Contains(compactLowerName(rec), term)
 		})
 	}
 	list := make([]int, 0, 64)
@@ -3592,7 +3814,7 @@ func (vol *serviceVolumeIndex) nameTermPosting(term string) []int {
 		if rec.Deleted {
 			continue
 		}
-		if strings.Contains(rec.LowerName, term) {
+		if strings.Contains(compactLowerName(rec), term) {
 			list = append(list, i)
 		}
 	}
@@ -3614,7 +3836,8 @@ func (vol *serviceVolumeIndex) pathTermPosting(term string) []int {
 		seq := vol.pathTermSeq[term]
 		vol.termMu.Unlock()
 		return vol.withRecentCandidates(list, seq, func(rec CompactRecord) bool {
-			return vol.index.compactPathContainsTerm(int(vol.frnToID[rec.FRN]), term)
+			id, ok := vol.idForFRN(rec.FRN)
+			return ok && vol.index.compactPathContainsTerm(id, term)
 		})
 	}
 	vol.termMu.Unlock()
@@ -3675,7 +3898,7 @@ func (vol *serviceVolumeIndex) pathTermRootIDs(term string) []int {
 			continue
 		}
 		rec := vol.index.Records[id]
-		if rec.Deleted || rec.Mode&uint32(os.ModeDir) == 0 || rec.LowerName == term {
+		if rec.Deleted || rec.Mode&uint32(os.ModeDir) == 0 || compactLowerName(rec) == term {
 			continue
 		}
 		roots = append(roots, id)
@@ -3754,6 +3977,30 @@ func intersectSortedInts(a, b []int) []int {
 		default:
 			j++
 		}
+	}
+	return out
+}
+
+func uniqueSortedInts(in []int) []int {
+	if len(in) < 2 {
+		return in
+	}
+	out := in[:1]
+	last := in[0]
+	for _, v := range in[1:] {
+		if v == last {
+			continue
+		}
+		out = append(out, v)
+		last = v
+	}
+	return out
+}
+
+func mapKeys(m map[int]struct{}) []int {
+	out := make([]int, 0, len(m))
+	for k := range m {
+		out = append(out, k)
 	}
 	return out
 }
@@ -4039,7 +4286,7 @@ func (idx *Index) compactPathContainsTerm(i int, term string) bool {
 		}
 		seen[cur] = struct{}{}
 		rec := idx.Records[cur]
-		if strings.Contains(rec.LowerName, term) {
+		if strings.Contains(compactLowerName(rec), term) {
 			return true
 		}
 		if rec.Parent < 0 {
@@ -4333,8 +4580,7 @@ func readIndex(r io.Reader) (*Index, error) {
 			if end < int(off) || end > len(idx.NameBlob) {
 				return nil, errors.New("invalid compact name reference")
 			}
-			rec.Name = string(idx.NameBlob[int(off):end])
-			rec.LowerName = strings.ToLower(rec.Name)
+			rec.Name = stringView(idx.NameBlob[int(off):end])
 			if err := binary.Read(r, binary.LittleEndian, &rec.Mode); err != nil {
 				return nil, err
 			}
