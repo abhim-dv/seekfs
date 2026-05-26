@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -310,6 +311,105 @@ func TestServiceVolumeIndexBuildsFRNMap(t *testing.T) {
 	}
 }
 
+func TestCommonSearchQuerySemantics(t *testing.T) {
+	idx := commonSearchFixture()
+	cases := []struct {
+		name      string
+		opts      queryOptions
+		wantNames []string
+	}{
+		{
+			name:      "filename term",
+			opts:      queryOptions{Query: "main", Limit: 20},
+			wantNames: []string{"main.go"},
+		},
+		{
+			name:      "full path terms",
+			opts:      queryOptions{Query: "downloads nrrd", MatchPath: true, Limit: 20},
+			wantNames: []string{"scan.nrrd"},
+		},
+		{
+			name:      "extension filter",
+			opts:      queryOptions{Query: "ext:go", MatchPath: true, Limit: 20},
+			wantNames: []string{"main.go", "search_test.go"},
+		},
+		{
+			name:      "directory filter",
+			opts:      queryOptions{Query: "dir:src ext:go", MatchPath: true, Limit: 20},
+			wantNames: []string{"main.go", "search_test.go"},
+		},
+		{
+			name:      "glob filter",
+			opts:      queryOptions{Query: "glob:*_test.go", MatchPath: true, Limit: 20},
+			wantNames: []string{"search_test.go"},
+		},
+		{
+			name:      "regex filter",
+			opts:      queryOptions{Query: `regex:Downloads.*\.nrrd$`, MatchPath: true, Limit: 20},
+			wantNames: []string{"scan.nrrd"},
+		},
+		{
+			name:      "type file",
+			opts:      queryOptions{Query: "type:file downloads", MatchPath: true, Limit: 20},
+			wantNames: []string{"scan.nrrd", "notes.txt"},
+		},
+		{
+			name:      "type directory",
+			opts:      queryOptions{Query: "type:dir downloads", MatchPath: true, Limit: 20},
+			wantNames: []string{"Downloads"},
+		},
+		{
+			name:      "under filter",
+			opts:      queryOptions{Query: "ext:nrrd", MatchPath: true, Under: `C:\Users\abhism12\Downloads`, Limit: 20},
+			wantNames: []string{"scan.nrrd"},
+		},
+		{
+			name:      "case sensitive",
+			opts:      queryOptions{Query: "case: README", Limit: 20},
+			wantNames: []string{"README.md"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			matches, err := searchCompact(idx, tc.opts, false)
+			if err != nil {
+				t.Fatalf("searchCompact: %v", err)
+			}
+			got := namesOf(matches)
+			if !sameStringSet(got, tc.wantNames) {
+				t.Fatalf("names = %v, want %v", got, tc.wantNames)
+			}
+		})
+	}
+}
+
+func TestServiceCandidatesMatchFullCompactSearchForCommonQueries(t *testing.T) {
+	idx := commonSearchFixture()
+	vol := newServiceVolumeIndex("fixture.gsi", idx)
+	cases := []queryOptions{
+		{Query: "downloads nrrd", MatchPath: true, Limit: 20},
+		{Query: "ext:nrrd", MatchPath: true, Under: `C:\Users\abhism12\Downloads`, Limit: 20},
+		{Query: "src go", MatchPath: true, Limit: 20},
+		{Query: "ext:go dir:src", MatchPath: true, Limit: 20},
+		{Query: "glob:*_test.go", MatchPath: true, Limit: 20},
+	}
+	for _, opts := range cases {
+		t.Run(opts.Query, func(t *testing.T) {
+			full, err := searchCompactWithCache(idx, opts, false, make(map[int]string), nil)
+			if err != nil {
+				t.Fatalf("full search: %v", err)
+			}
+			fast, err := searchCompactWithCache(idx, opts, false, vol.pathCache, vol.nameTermCandidates)
+			if err != nil {
+				t.Fatalf("candidate search: %v", err)
+			}
+			if !sameStringSet(namesOf(fast), namesOf(full)) {
+				t.Fatalf("candidate names = %v, full names = %v", namesOf(fast), namesOf(full))
+			}
+		})
+	}
+}
+
 func BenchmarkSearchCompactBroadPathQuery(b *testing.B) {
 	idx := syntheticCompactIndex(100_000)
 	opts := queryOptions{Query: "needle", MatchPath: true, Limit: 20}
@@ -390,4 +490,61 @@ func syntheticCompactIndex(n int) *Index {
 	}
 	buildOrders(idx)
 	return idx
+}
+
+func commonSearchFixture() *Index {
+	idx := &Index{
+		Source:  "usn",
+		Volume:  "C:",
+		Compact: true,
+	}
+	add := func(frn, parentFRN uint64, parent int32, name string, mode uint32) {
+		idx.Records = append(idx.Records, CompactRecord{
+			FRN:       frn,
+			ParentFRN: parentFRN,
+			Parent:    parent,
+			Name:      name,
+			LowerName: strings.ToLower(name),
+			Mode:      mode,
+			ModUnix:   time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC).UnixNano(),
+		})
+	}
+	add(1, 1, -1, ".", uint32(os.ModeDir))
+	add(2, 1, 0, "Users", uint32(os.ModeDir))
+	add(3, 2, 1, "abhism12", uint32(os.ModeDir))
+	add(4, 3, 2, "Downloads", uint32(os.ModeDir))
+	add(5, 4, 3, "scan.nrrd", 0)
+	add(6, 4, 3, "notes.txt", 0)
+	add(7, 3, 2, "src", uint32(os.ModeDir))
+	add(8, 7, 6, "main.go", 0)
+	add(9, 7, 6, "search_test.go", 0)
+	add(10, 3, 2, "README.md", 0)
+	add(11, 3, 2, "readme.md", 0)
+	buildOrders(idx)
+	return idx
+}
+
+func namesOf(entries []Entry) []string {
+	names := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		names = append(names, entry.Name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func sameStringSet(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	a = append([]string(nil), a...)
+	b = append([]string(nil), b...)
+	sort.Strings(a)
+	sort.Strings(b)
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
