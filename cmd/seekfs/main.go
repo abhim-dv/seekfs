@@ -1039,7 +1039,11 @@ func cmdSearch(args []string, countOnly bool) error {
 	if len(dbs) == 0 && !*forceLocal {
 		*useService = true
 	}
-	query := strings.TrimSpace(strings.Join(fs.Args(), " "))
+	queryArgs := append([]string(nil), fs.Args()...)
+	if *matchPath && *under == "" {
+		queryArgs, *under = extractUnderPathArg(queryArgs)
+	}
+	query := strings.TrimSpace(strings.Join(queryArgs, " "))
 	if query == "" {
 		return errors.New("query required")
 	}
@@ -1144,6 +1148,19 @@ func cmdInfo(args []string) error {
 		fmt.Printf("bytes_per_record: %.2f\n", layout.BytesPerRecord)
 	}
 	return nil
+}
+
+func extractUnderPathArg(args []string) ([]string, string) {
+	for i, arg := range args {
+		if !filepath.IsAbs(arg) {
+			continue
+		}
+		clean := filepath.Clean(arg)
+		rest := append([]string{}, args[:i]...)
+		rest = append(rest, args[i+1:]...)
+		return rest, clean
+	}
+	return args, ""
 }
 
 func (idx *Index) entryCount() int {
@@ -1341,6 +1358,10 @@ type serviceVolumeIndex struct {
 	pathTermCache map[string][]int
 	extCache      map[string][]int
 	recentIDs     map[int]struct{}
+	recentSeq     uint64
+	termSeq       map[string]uint64
+	pathTermSeq   map[string]uint64
+	extSeq        map[string]uint64
 	dirty         bool
 	lastPersist   time.Time
 }
@@ -2404,6 +2425,7 @@ func (vol *serviceVolumeIndex) applyUSNChanges(changes []usnChange) {
 			vol.recentIDs = make(map[int]struct{})
 		}
 		vol.recentIDs[id] = struct{}{}
+		vol.recentSeq++
 		rec := &vol.index.Records[id]
 		if rec.ParentFRN != 0 && rec.ParentFRN != change.ParentFRN {
 			vol.removeChild(rec.ParentFRN, id)
@@ -3131,6 +3153,9 @@ func (vol *serviceVolumeIndex) nameTermCandidates(pq parsedQuery) ([]int, bool) 
 	if candidates, ok := vol.underCandidates(pq); ok {
 		return candidates, true
 	}
+	if candidates, ok := vol.pathDirFilterCandidates(pq); ok {
+		return candidates, true
+	}
 	if candidates, ok := vol.filterCandidates(pq); ok {
 		return candidates, true
 	}
@@ -3188,7 +3213,7 @@ func (vol *serviceVolumeIndex) underCandidates(pq parsedQuery) ([]int, bool) {
 		return []int{}, true
 	}
 	out := make([]int, 0, 256)
-	seen := make(map[int]struct{}, 256)
+	prefilter := vol.underPrefilter(pq)
 	for _, rootID := range roots {
 		if rootID < 0 || rootID >= len(vol.index.Records) || vol.index.Records[rootID].Deleted {
 			continue
@@ -3197,6 +3222,15 @@ func (vol *serviceVolumeIndex) underCandidates(pq parsedQuery) ([]int, bool) {
 		if !strings.EqualFold(filepath.Clean(rootPath), under) {
 			continue
 		}
+		if prefilter != nil {
+			for id := range prefilter {
+				if id >= 0 && id < len(vol.index.Records) && vol.isDescendantOrSelf(id, rootID) && !vol.index.Records[id].Deleted && compactRecordPrecheck(vol.index.Records[id], pq, true) {
+					out = append(out, id)
+				}
+			}
+			continue
+		}
+		seen := make(map[int]struct{}, 256)
 		stack := []int{rootID}
 		for len(stack) > 0 {
 			last := len(stack) - 1
@@ -3216,6 +3250,140 @@ func (vol *serviceVolumeIndex) underCandidates(pq parsedQuery) ([]int, bool) {
 	}
 	sort.Ints(out)
 	return out, true
+}
+
+func (vol *serviceVolumeIndex) isDescendantOrSelf(id, rootID int) bool {
+	seen := make(map[int]struct{}, 16)
+	cur := id
+	for depth := 0; depth < 1024; depth++ {
+		if cur == rootID {
+			return true
+		}
+		if cur < 0 || cur >= len(vol.index.Records) {
+			return false
+		}
+		if _, ok := seen[cur]; ok {
+			return false
+		}
+		seen[cur] = struct{}{}
+		parent := vol.index.Records[cur].Parent
+		if parent < 0 {
+			return false
+		}
+		cur = int(parent)
+	}
+	return false
+}
+
+func (vol *serviceVolumeIndex) underPrefilter(pq parsedQuery) map[int]struct{} {
+	if vol == nil || len(pq.Regexps) > 0 || pq.CaseSensitive || pq.HasModAfter || pq.Exists {
+		return nil
+	}
+	lists := make([][]int, 0, len(pq.Exts)+len(pq.Dirs)+len(pq.Terms))
+	for _, ext := range pq.Exts {
+		list := vol.extPosting(ext)
+		if len(list) == 0 {
+			return map[int]struct{}{}
+		}
+		lists = append(lists, list)
+	}
+	for _, dir := range pq.Dirs {
+		list := vol.pathTermPosting(dir)
+		if len(list) == 0 {
+			return map[int]struct{}{}
+		}
+		lists = append(lists, list)
+	}
+	for _, term := range pq.Terms {
+		list := vol.nameTermPosting(term)
+		if pq.MatchPath {
+			list = vol.pathTermPosting(term)
+		}
+		if len(list) == 0 {
+			return map[int]struct{}{}
+		}
+		lists = append(lists, list)
+	}
+	if len(lists) == 0 {
+		return nil
+	}
+	sort.Slice(lists, func(i, j int) bool { return len(lists[i]) < len(lists[j]) })
+	candidates := append([]int(nil), lists[0]...)
+	for _, list := range lists[1:] {
+		candidates = intersectSortedInts(candidates, list)
+		if len(candidates) == 0 {
+			break
+		}
+	}
+	out := make(map[int]struct{}, len(candidates))
+	for _, id := range candidates {
+		out[id] = struct{}{}
+	}
+	return out
+}
+
+func (vol *serviceVolumeIndex) pathDirFilterCandidates(pq parsedQuery) ([]int, bool) {
+	if vol == nil || vol.index == nil || !pq.MatchPath || len(pq.Terms) == 0 || len(pq.Regexps) > 0 || pq.Under != "" || pq.CaseSensitive || vol.exactNames == nil {
+		return nil, false
+	}
+	if len(pq.Exts) == 0 && len(pq.Dirs) == 0 && len(pq.Globs) == 0 && pq.Type == "" && !pq.HasModAfter {
+		return nil, false
+	}
+	type rootTerm struct {
+		id   int
+		term string
+	}
+	roots := make([]rootTerm, 0, 4)
+	for _, term := range pq.Terms {
+		if strings.ContainsAny(term, `\/*?[]:`) {
+			continue
+		}
+		for _, id := range vol.exactNames[term] {
+			if id < 0 || id >= len(vol.index.Records) {
+				continue
+			}
+			rec := vol.index.Records[id]
+			if !rec.Deleted && rec.Mode&uint32(os.ModeDir) != 0 {
+				roots = append(roots, rootTerm{id: id, term: term})
+			}
+		}
+	}
+	if len(roots) == 0 {
+		return nil, false
+	}
+	prefilter := vol.underPrefilter(pq)
+	if prefilter == nil {
+		return nil, false
+	}
+	out := make([]int, 0, 64)
+	seen := make(map[int]struct{}, 64)
+	for _, root := range roots {
+		for id := range prefilter {
+			if _, ok := seen[id]; ok || id < 0 || id >= len(vol.index.Records) || !vol.isDescendantOrSelf(id, root.id) {
+				continue
+			}
+			rec := vol.index.Records[id]
+			if rec.Deleted || !compactRecordPrecheck(rec, pq, true) || !vol.recordPathContainsRemainingTerms(id, pq.Terms, root.term) {
+				continue
+			}
+			seen[id] = struct{}{}
+			out = append(out, id)
+		}
+	}
+	sort.Ints(out)
+	return out, true
+}
+
+func (vol *serviceVolumeIndex) recordPathContainsRemainingTerms(id int, terms []string, rootTerm string) bool {
+	for _, term := range terms {
+		if term == rootTerm {
+			continue
+		}
+		if !vol.index.compactPathContainsTerm(id, term) {
+			return false
+		}
+	}
+	return true
 }
 
 func (vol *serviceVolumeIndex) filterCandidates(pq parsedQuery) ([]int, bool) {
@@ -3413,8 +3581,9 @@ func (vol *serviceVolumeIndex) nameTermPosting(term string) []int {
 		vol.termCache = make(map[string][]int)
 	}
 	if list, ok := vol.termCache[term]; ok {
+		seq := vol.termSeq[term]
 		vol.termMu.Unlock()
-		return vol.withRecentCandidates(list, func(rec CompactRecord) bool {
+		return vol.withRecentCandidates(list, seq, func(rec CompactRecord) bool {
 			return strings.Contains(rec.LowerName, term)
 		})
 	}
@@ -3428,6 +3597,10 @@ func (vol *serviceVolumeIndex) nameTermPosting(term string) []int {
 		}
 	}
 	vol.termCache[term] = list
+	if vol.termSeq == nil {
+		vol.termSeq = make(map[string]uint64)
+	}
+	vol.termSeq[term] = vol.recentSeq
 	vol.termMu.Unlock()
 	return list
 }
@@ -3438,8 +3611,9 @@ func (vol *serviceVolumeIndex) pathTermPosting(term string) []int {
 		vol.pathTermCache = make(map[string][]int)
 	}
 	if list, ok := vol.pathTermCache[term]; ok {
+		seq := vol.pathTermSeq[term]
 		vol.termMu.Unlock()
-		return vol.withRecentCandidates(list, func(rec CompactRecord) bool {
+		return vol.withRecentCandidates(list, seq, func(rec CompactRecord) bool {
 			return vol.index.compactPathContainsTerm(int(vol.frnToID[rec.FRN]), term)
 		})
 	}
@@ -3453,7 +3627,7 @@ func (vol *serviceVolumeIndex) pathTermPosting(term string) []int {
 	}
 	if vol.exactNames != nil && !strings.ContainsAny(term, `\/*?[]:`) {
 		traversed := make(map[int]struct{}, 64)
-		for _, rootID := range vol.exactNames[term] {
+		for _, rootID := range vol.pathTermRootIDs(term) {
 			if rootID < 0 || rootID >= len(vol.index.Records) {
 				continue
 			}
@@ -3486,8 +3660,27 @@ func (vol *serviceVolumeIndex) pathTermPosting(term string) []int {
 	sort.Ints(out)
 	vol.termMu.Lock()
 	vol.pathTermCache[term] = out
+	if vol.pathTermSeq == nil {
+		vol.pathTermSeq = make(map[string]uint64)
+	}
+	vol.pathTermSeq[term] = vol.recentSeq
 	vol.termMu.Unlock()
 	return out
+}
+
+func (vol *serviceVolumeIndex) pathTermRootIDs(term string) []int {
+	roots := append([]int(nil), vol.exactNames[term]...)
+	for _, id := range vol.nameTermPosting(term) {
+		if id < 0 || id >= len(vol.index.Records) {
+			continue
+		}
+		rec := vol.index.Records[id]
+		if rec.Deleted || rec.Mode&uint32(os.ModeDir) == 0 || rec.LowerName == term {
+			continue
+		}
+		roots = append(roots, id)
+	}
+	return roots
 }
 
 func (vol *serviceVolumeIndex) extPosting(ext string) []int {
@@ -3496,8 +3689,9 @@ func (vol *serviceVolumeIndex) extPosting(ext string) []int {
 		vol.extCache = make(map[string][]int)
 	}
 	if list, ok := vol.extCache[ext]; ok {
+		seq := vol.extSeq[ext]
 		vol.termMu.Unlock()
-		return vol.withRecentCandidates(list, func(rec CompactRecord) bool {
+		return vol.withRecentCandidates(list, seq, func(rec CompactRecord) bool {
 			actual := strings.TrimPrefix(filepath.Ext(rec.Name), ".")
 			return strings.EqualFold(actual, ext)
 		})
@@ -3516,12 +3710,16 @@ func (vol *serviceVolumeIndex) extPosting(ext string) []int {
 	}
 	vol.termMu.Lock()
 	vol.extCache[ext] = list
+	if vol.extSeq == nil {
+		vol.extSeq = make(map[string]uint64)
+	}
+	vol.extSeq[ext] = vol.recentSeq
 	vol.termMu.Unlock()
 	return list
 }
 
-func (vol *serviceVolumeIndex) withRecentCandidates(base []int, keep func(CompactRecord) bool) []int {
-	if len(vol.recentIDs) == 0 {
+func (vol *serviceVolumeIndex) withRecentCandidates(base []int, seq uint64, keep func(CompactRecord) bool) []int {
+	if len(vol.recentIDs) == 0 || seq == vol.recentSeq {
 		return base
 	}
 	out := append([]int(nil), base...)
