@@ -97,6 +97,9 @@ func TestSimpleGlobExtsDeclinesComplexGlobs(t *testing.T) {
 	if _, ok := simpleGlobExts([]string{"*test*.go"}); ok {
 		t.Fatal("simpleGlobExts accepted complex wildcard glob")
 	}
+	if got := complexGlobExts([]string{"*test*.go", "README.*"}); len(got) != 1 || got[0] != "go" {
+		t.Fatalf("complexGlobExts = %v, want [go]", got)
+	}
 }
 
 func TestServiceVolumeIndexFastPostingCountIncludesRecentAndDeleted(t *testing.T) {
@@ -120,14 +123,18 @@ func TestServiceVolumeIndexFastPostingCountIncludesRecentAndDeleted(t *testing.T
 	}
 }
 
-func TestServiceVolumeIndexFastPostingCountDeclinesUnsafeQuery(t *testing.T) {
+func TestServiceVolumeIndexFastPostingCountHandlesDirQueryWithPlanner(t *testing.T) {
 	vol := syntheticServiceVolumeIndexForCacheTests()
 	pq, err := parseQuery(queryOptions{Query: "dir:src ext:go", MatchPath: true})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := vol.fastPostingCount(pq); ok {
-		t.Fatal("fastPostingCount accepted query that needs normal filtering")
+	count, ok := vol.fastPostingCount(pq)
+	if !ok {
+		t.Fatal("fastPostingCount declined planned dir query")
+	}
+	if count != 0 {
+		t.Fatalf("count = %d, want 0", count)
 	}
 }
 

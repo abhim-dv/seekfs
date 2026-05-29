@@ -351,6 +351,26 @@ func TestCommonSearchQuerySemantics(t *testing.T) {
 			wantNames: []string{"main.go", "search_test.go"},
 		},
 		{
+			name:      "path term plus extension",
+			opts:      queryOptions{Query: "workspace ext:go", MatchPath: true, Limit: 20},
+			wantNames: []string{"main.go", "search_test.go"},
+		},
+		{
+			name:      "path term plus dotted literal",
+			opts:      queryOptions{Query: "src main.go", MatchPath: true, Limit: 20},
+			wantNames: []string{"main.go"},
+		},
+		{
+			name:      "path term plus extension and dotted literal",
+			opts:      queryOptions{Query: "src ext:go search_test.go", MatchPath: true, Limit: 20},
+			wantNames: []string{"search_test.go"},
+		},
+		{
+			name:      "sibling path term plus extension",
+			opts:      queryOptions{Query: "downstream ext:dat", MatchPath: true, Limit: 20},
+			wantNames: []string{"sibling.dat"},
+		},
+		{
 			name:      "glob filter",
 			opts:      queryOptions{Query: "glob:*_test.go", MatchPath: true, Limit: 20},
 			wantNames: []string{"search_test.go"},
@@ -411,6 +431,10 @@ func TestServiceCandidatesMatchFullCompactSearchForCommonQueries(t *testing.T) {
 		{Query: "ext:dat", MatchPath: true, Under: `C:\fixture\workspace\Assets`, Limit: 20},
 		{Query: "src go", MatchPath: true, Limit: 20},
 		{Query: "ext:go dir:src", MatchPath: true, Limit: 20},
+		{Query: "workspace ext:go", MatchPath: true, Limit: 20},
+		{Query: "src main.go", MatchPath: true, Limit: 20},
+		{Query: "src ext:go search_test.go", MatchPath: true, Limit: 20},
+		{Query: "downstream ext:dat", MatchPath: true, Limit: 20},
 		{Query: "glob:*_test.go", MatchPath: true, Limit: 20},
 		{Query: `regex:Assets.*\.dat$`, MatchPath: true, Limit: 20},
 		{Query: "type:dir Assets", MatchPath: true, Limit: 20},
@@ -443,7 +467,14 @@ func TestServiceCandidatesMatchFullSearchWithoutResidentSortedViews(t *testing.T
 	cases := []queryOptions{
 		{Query: "assets dat", MatchPath: true, Limit: 20},
 		{Query: "ext:dat", MatchPath: true, Under: `C:\fixture\workspace\Assets`, Limit: 20},
+		{Query: "type:file glob:*.go", MatchPath: true, Under: `C:\fixture\workspace`, Limit: 20},
+		{Query: "glob:*test*.go", MatchPath: true, Under: `C:\fixture\workspace`, Limit: 20},
 		{Query: "src go", MatchPath: true, Limit: 20},
+		{Query: "workspace ext:go", MatchPath: true, Limit: 20},
+		{Query: "src main.go", MatchPath: true, Limit: 20},
+		{Query: "src ext:go search_test.go", MatchPath: true, Limit: 20},
+		{Query: "downstream ext:dat", MatchPath: true, Limit: 20},
+		{Query: `src\main.go`, MatchPath: true, Under: `C:\fixture\workspace`, Limit: 20},
 	}
 	for _, opts := range cases {
 		t.Run(opts.Query, func(t *testing.T) {
@@ -459,6 +490,144 @@ func TestServiceCandidatesMatchFullSearchWithoutResidentSortedViews(t *testing.T
 				t.Fatalf("candidate names = %v, full names = %v", namesOf(fast), namesOf(full))
 			}
 		})
+	}
+}
+
+func TestServiceVolumeIndexUnderRootIDsWithoutResidentChildRanges(t *testing.T) {
+	idx := commonSearchFixture()
+	vol := newServiceVolumeIndex("fixture.gsi", idx)
+	vol.queryIndex.nameOrder = nil
+	vol.children = nil
+	vol.childOffsets = nil
+	vol.childIDs = nil
+
+	got := vol.underRootIDs(`C:\fixture\workspace\Assets`)
+	if len(got) != 1 {
+		t.Fatalf("underRootIDs len = %d, ids = %v; want one root", len(got), got)
+	}
+	if name := idx.compactRecord(got[0]).Name; name != "Assets" {
+		t.Fatalf("underRootIDs root name = %q, want Assets", name)
+	}
+	if got := vol.underRootIDs(`C:\fixture\workspace\Missing`); len(got) != 0 {
+		t.Fatalf("missing underRootIDs = %v, want none", got)
+	}
+}
+
+func TestServiceVolumeIndexUnderRootIDsUsesBasenameFallback(t *testing.T) {
+	idx := commonSearchFixture()
+	vol := newServiceVolumeIndex("fixture.gsi", idx)
+	vol.queryIndex.nameOrder = nil
+	vol.children = nil
+	vol.childOffsets = nil
+	vol.childIDs = nil
+	vol.termCache = make(map[string][]int)
+	vol.termCache["assets"] = []int{4}
+	vol.termSeq = map[string]uint64{"assets": vol.recentSeq}
+
+	got := vol.underRootIDs(`C:\fixture\workspace\Assets`)
+	if len(got) != 1 || got[0] != 3 {
+		t.Fatalf("basename fallback root IDs = %v, want [3]", got)
+	}
+}
+
+func TestServiceVolumeIndexUnderDescendantsCachesWithoutChildRanges(t *testing.T) {
+	idx := commonSearchFixture()
+	vol := newServiceVolumeIndex("fixture.gsi", idx)
+	vol.queryIndex.nameOrder = nil
+	vol.children = nil
+	vol.childOffsets = nil
+	vol.childIDs = nil
+	root := vol.underRootIDs(`C:\fixture\workspace`)[0]
+
+	first := vol.underDescendants(root)
+	if len(first) == 0 {
+		t.Fatal("underDescendants returned no descendants")
+	}
+	if len(vol.underCache[root]) == 0 {
+		t.Fatal("underDescendants did not cache the root")
+	}
+	second := vol.underDescendants(root)
+	if !sameIntSet(first, second) {
+		t.Fatalf("cached descendants = %v, want %v", second, first)
+	}
+}
+
+func TestParseQuerySplitsPathLikeTermsForPathSearch(t *testing.T) {
+	pq, err := parseQuery(queryOptions{Query: `cmd\seekfs\main.go`, MatchPath: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"cmd", "seekfs", "main.go"}
+	if !sameStringSet(pq.Terms, want) {
+		t.Fatalf("terms = %v, want %v", pq.Terms, want)
+	}
+
+	pq, err = parseQuery(queryOptions{Query: `cmd\seekfs\main.go`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pq.Terms) != 1 || pq.Terms[0] != `cmd\seekfs\main.go` {
+		t.Fatalf("filename-mode terms = %v, want unsplit path-like term", pq.Terms)
+	}
+}
+
+func TestExtractUnderPathArgTreatsDriveTokenAsRoot(t *testing.T) {
+	args, under := extractUnderPathArg([]string{"C:", "needle"})
+	if under != `C:\` {
+		t.Fatalf("under = %q, want C:\\", under)
+	}
+	if !sameStringSet(args, []string{"needle"}) {
+		t.Fatalf("args = %v, want [needle]", args)
+	}
+}
+
+func TestSortCandidateIDsPrefersExactFilename(t *testing.T) {
+	idx := &Index{
+		Source:  "usn",
+		Volume:  "C:",
+		Compact: true,
+		Records: []CompactRecord{
+			{FRN: 1, ParentFRN: 1, Parent: -1, Name: ".", Mode: uint32(os.ModeDir)},
+			{FRN: 2, ParentFRN: 1, Parent: 0, Name: "WidgetObserver.cpp"},
+			{FRN: 3, ParentFRN: 1, Parent: 0, Name: "Widget.cpp"},
+		},
+	}
+	buildOrders(idx)
+	pq, err := parseQuery(queryOptions{Query: "Widget.cpp"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := []int{1, 2}
+	sortCandidateIDs(ids, pq, idx)
+	if ids[0] != 2 {
+		t.Fatalf("sorted candidates = %v, want exact Widget.cpp first", ids)
+	}
+}
+
+func TestServiceVolumeIndexExactNameIDsScansWhenNameOrderSkipped(t *testing.T) {
+	idx := &Index{
+		Source:  "usn",
+		Volume:  "C:",
+		Compact: true,
+		Records: []CompactRecord{
+			{FRN: 1, ParentFRN: 1, Parent: -1, Name: ".", Mode: uint32(os.ModeDir)},
+			{FRN: 2, ParentFRN: 1, Parent: 0, Name: "WidgetObserver.cpp"},
+			{FRN: 3, ParentFRN: 1, Parent: 0, Name: "Widget.cpp"},
+		},
+	}
+	vol := newServiceVolumeIndex("fixture.gsi", idx)
+	vol.queryIndex.nameOrder = nil
+	vol.exactNames = nil
+
+	got := vol.exactNameIDs("widget.cpp")
+	if len(got) != 1 || got[0] != 2 {
+		t.Fatalf("exactNameIDs = %v, want [2]", got)
+	}
+	if _, ok := vol.termCache["\x00exact:widget.cpp"]; !ok {
+		t.Fatal("exactNameIDs did not cache scanned exact result")
+	}
+	if got := vol.exactNameIDs("widgetobserver.cpp"); len(got) != 1 || got[0] != 1 {
+		t.Fatalf("cached extension exactNameIDs = %v, want [1]", got)
 	}
 }
 
@@ -550,12 +719,20 @@ func commonSearchFixture() *Index {
 		Compact: true,
 	}
 	add := func(frn, parentFRN uint64, parent int32, name string, mode uint32) {
+		// Give files a non-zero size so the index advertises size capability;
+		// directories keep size 0. The exact value scales with the record index
+		// so size: filters have something to discriminate on.
+		size := int64(0)
+		if mode&uint32(os.ModeDir) == 0 {
+			size = int64(len(idx.Records)+1) * 1024
+		}
 		idx.Records = append(idx.Records, CompactRecord{
 			FRN:       frn,
 			ParentFRN: parentFRN,
 			Parent:    parent,
 			Name:      name,
 			Mode:      mode,
+			Size:      size,
 			ModUnix:   time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC).UnixNano(),
 		})
 	}
@@ -596,6 +773,22 @@ func sameStringSet(a, b []string) bool {
 	b = append([]string(nil), b...)
 	sort.Strings(a)
 	sort.Strings(b)
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func sameIntSet(a, b []int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	a = append([]int(nil), a...)
+	b = append([]int(nil), b...)
+	sort.Ints(a)
+	sort.Ints(b)
 	for i := range a {
 		if a[i] != b[i] {
 			return false

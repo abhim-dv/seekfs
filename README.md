@@ -87,6 +87,10 @@ Agent-friendly filters:
 .\seekfs.exe search -path "ext:go dir:cmd main"
 .\seekfs.exe search -path --under F:\git\seekfs "type:file glob:*.md"
 .\seekfs.exe search -path --exists --recent 24h "ext:go"
+.\seekfs.exe search "ext:png|jpg"
+.\seekfs.exe search "report !draft"
+.\seekfs.exe search "size:>100mb"
+.\seekfs.exe count  "ext:log dm:today"
 .\seekfs.exe bench -service --json -iterations 100
 ```
 
@@ -109,38 +113,32 @@ Inspect an index:
 
 ## Current Benchmark Snapshot
 
-On the development machine, packed v7 C: + F: indexes measured:
+On the development machine, packed v8 C: + F: indexes measured:
 
 ```text
-C: index: 291,622,783 bytes
-F: index: 460,212,392 bytes
-combined: 751,835,175 bytes
-entries: 22,479,440
+C: + F: entries: about 23.7M
+steady service working set: about 3.1 GB after loading
+expanded benchmark-cache working set: about 3.3 GB
 ```
 
-Service startup loaded both DBs in `4.633s`.
+Representative warm service CLI timings:
 
-For:
-
-```powershell
-.\seekfs.exe search -service -path -n 20 "ext:go dir:cmd main"
-```
-
-Measured over 30 runs:
-
-```text
-median: 100.498 ms
-p90: 120.833 ms
-max: 1,207.344 ms
-failures: 0
-```
+- `-path "src main.go"`: about 50-100 ms.
+- `-path "src"`: about 500 ms on the broad scan path.
+- `count ext:md`: about 90-100 ms.
+- Public benchmark query suites ran with zero failures before release.
 
 ## Limitations
 
 - Windows and NTFS are the primary target.
 - Result ranking is simple and not Everything-compatible.
-- Some Everything-style filters are not implemented, including `dm:`, `size:`,
-  `attrib:`, `parent:`, OR, and NOT.
+- Directory sizes are reported as 0 (Everything reports folders at the recursive
+  size of their contents).
+- Some Everything-style filters are not implemented, including `attrib:` and
+  `parent:`.
+- `size:` and `dm:` require an index built with file metadata. NTFS service
+  indexes capture size and modified time from the MFT; older indexes without
+  this metadata return a clear error for these filters.
 - Index files contain local path names and should be treated as sensitive local
   metadata.
 

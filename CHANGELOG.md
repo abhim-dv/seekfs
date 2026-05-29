@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.8.0 - Query Planning and Metadata Filters
+
+### Added
+
+- Always-on compact resident views for large service indexes, including sorted
+  name order, child ranges, subtree intervals, extension postings, and path-term
+  grams.
+- Broad full-path scan planning for queries such as `-path "src"` and
+  `-path "src main"` without rebuilding uncacheable multi-million-id postings.
+- OR and NOT query operators, for example `ext:png|jpg` and `report !draft`.
+- `size:` and `dm:` filters with comparisons, byte units, date macros,
+  durations, and absolute dates.
+- MFT-based NTFS initial indexing with file size and modification-time capture,
+  with USN enumeration retained as fallback.
+- Public Everything comparison helper for release validation.
+- Regression coverage for query planning, OR/NOT parsing, size/date filters,
+  MFT parsing, broad path scans, and service candidate parity.
+
+### Changed
+
+- `--under`, glob, extension, exact-name, and mixed path-term queries now use
+  more selective resident planning paths before falling back to scans.
+- Unsupported `name:`-style filters such as `attrib:` and `parent:` now return
+  clear errors instead of silently producing empty literal searches.
+- Release packaging now copies tracked docs only so local-only notes are not
+  included in release zips.
+- The on-disk index format is v8; rebuild service indexes after upgrading.
+
+### Known Limitations
+
+- Directory sizes are reported as 0; Everything reports folders at recursive
+  size.
+- `size:` and `dm:` require indexes with metadata. Older indexes return a clear
+  capability error.
+- Windows and NTFS remain the primary target.
+- Release artifacts are unsigned.
+
 ## 0.7.0 - Resident Memory and Agent Guidance
 
 ### Added

@@ -26,7 +26,16 @@ $LdFlags = "-s -w -X main.version=$Version -X main.commit=$Commit -X main.date=$
 go build -trimpath -ldflags $LdFlags -o (Join-Path $Target "seekfs.exe") ./cmd/seekfs
 
 Copy-Item README.md,LICENSE,NOTICE.md -Destination $Target
-Copy-Item docs -Destination $Target -Recurse
+
+# Copy only files tracked by git so local research notes, private benchmark
+# data, and other untracked docs cannot leak into release artifacts.
+$DocFiles = git ls-files docs
+foreach ($doc in $DocFiles) {
+    $dest = Join-Path $Target $doc
+    $destDir = Split-Path -Parent $dest
+    New-Item -ItemType Directory -Force -Path $destDir | Out-Null
+    Copy-Item $doc -Destination $dest
+}
 
 $Zip = Join-Path $OutDir "seekfs-windows-amd64.zip"
 if (Test-Path $Zip) {
