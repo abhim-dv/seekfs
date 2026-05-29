@@ -26,7 +26,8 @@
   clear errors instead of silently producing empty literal searches.
 - Release packaging now copies tracked docs only so local-only notes are not
   included in release zips.
-- The on-disk index format is v8; rebuild service indexes after upgrading.
+- The on-disk index format is unchanged (v8); existing indexes load without a
+  rebuild. Rebuild an NTFS service index only to add MFT size/date metadata.
 
 ### Known Limitations
 

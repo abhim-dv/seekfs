@@ -47,10 +47,12 @@ Those numbers are hardware and index dependent; use `seekfs bench -service
 
 ## Compatibility
 
-- The on-disk index format is now v8. Rebuild service indexes after upgrading.
-- `size:`, `dm:`, `--recent`, and `--modified-after` require indexes with file
-  metadata. New NTFS service indexes capture that metadata from the MFT; older
-  indexes return a clear capability error.
+- Existing v8 `.gsi` indexes load without a rebuild; the on-disk format is
+  unchanged from v0.7.0.
+- `size:`, `dm:`, `--recent`, and `--modified-after` require indexes that carry
+  file metadata. Rebuild an NTFS service index with this version to capture size
+  and modification time from the MFT; indexes built without that metadata return
+  a clear capability error for those filters rather than empty results.
 - Directory sizes are reported as 0. Everything reports folders at the recursive
   size of their contents.
 - The release artifact is unsigned.
