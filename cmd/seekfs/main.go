@@ -16,8 +16,10 @@ import (
 	"runtime"
 	"runtime/debug"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -207,8 +209,27 @@ type parsedQuery struct {
 	Exists        bool
 	ModifiedAfter time.Time
 	HasModAfter   bool
+	SizeFilters   []sizeFilter
+	DateFilters   []dateFilter
+	OrGroups      [][]parsedQuery
+	NotGroups     []parsedQuery
 	CWDBias       string
 	RootBias      string
+	Limit         int
+	CountOnly     bool
+}
+
+// sizeFilter expresses a size:<op><bytes> constraint, e.g. size:>100mb.
+type sizeFilter struct {
+	op    string // ">", ">=", "<", "<=", "="
+	bytes int64
+}
+
+// dateFilter expresses a dm:<spec> constraint over modification time. The
+// constraint is satisfied when ModUnix falls within [after, before).
+type dateFilter struct {
+	after  time.Time
+	before time.Time
 }
 
 type CompactRecord struct {
@@ -443,22 +464,29 @@ Query filters:
   dir:src           Match a directory/path segment substring.
   glob:*.py         Match file name glob.
   regex:<pattern>   Match normalized full path regex.
+  size:>100mb       Match file sizes with >, >=, <, <=, = and k/m/g/t units.
+  dm:today          Match modification date macros, durations, or YYYY-MM-DD.
   case:             Enable case-sensitive matching from the query.
   type:file         Only files.
   type:dir          Only directories.
+  a|b               OR alternatives within a term, such as ext:png|jpg.
+  !term, -term      Exclude a term or filter.
 
 Examples:
   seekfs search "gh.exe"
   seekfs search -path "ext:go dir:cmd main"
   seekfs search -path --under F:\git\seekfs "type:file glob:*.md"
   seekfs search -path --exists --recent 24h "ext:go"
+  seekfs search "ext:png|jpg"
+  seekfs search "report !draft"
+  seekfs search "size:>100mb"
+  seekfs count "ext:log dm:today"
   seekfs count -path "type:dir docs"
 
 Not implemented yet:
-  Everything filters such as dm:, size:, attrib:, parent:
-  OR / NOT operators
+  Everything filters such as attrib:, parent:
   quoted phrase parsing beyond the shell's normal argument grouping
-  date macros such as today or lastweek
+  Directory recursive-size semantics
   ranking compatible with Everything
 
 Performance notes:
@@ -711,12 +739,6 @@ func indexUSNVolume(volume string) (*Index, error) {
 		return nil, fmt.Errorf("query USN journal for %s: %w; run elevated or use a service helper for raw volume access", vol, err)
 	}
 
-	nodes, err := enumUSN(handle, journal.NextUsn)
-	if err != nil {
-		return nil, err
-	}
-	serviceLog("enum-usn complete volume=%s nodes=%d next_usn=%d", vol, len(nodes), journal.NextUsn)
-
 	idx := &Index{
 		Version:    indexVersion,
 		Roots:      []string{vol + `\`},
@@ -727,6 +749,25 @@ func indexUSNVolume(volume string) (*Index, error) {
 		Checkpoint: journal.NextUsn,
 	}
 	idx.Compact = true
+
+	// Prefer the MFT for the initial build: it carries name, parent, size, and
+	// modification time in a single bulk read (the same source Everything uses).
+	// Fall back to FSCTL_ENUM_USN_DATA (names only) if the raw MFT read fails.
+	if entries, err := enumMFT(handle); err == nil && len(entries) > 0 {
+		serviceLog("enum-mft complete volume=%s entries=%d", vol, len(entries))
+		buildRecordsFromMFT(idx, entries)
+		serviceLog("compact records complete volume=%s entries=%d source=mft", vol, len(idx.Records))
+		return idx, nil
+	} else if err != nil {
+		serviceLog("enum-mft failed volume=%s err=%v; falling back to USN enum", vol, err)
+	}
+
+	nodes, err := enumUSN(handle, journal.NextUsn)
+	if err != nil {
+		return nil, err
+	}
+	serviceLog("enum-usn complete volume=%s nodes=%d next_usn=%d", vol, len(nodes), journal.NextUsn)
+
 	frns := make([]uint64, 0, len(nodes))
 	for frn := range nodes {
 		frns = append(frns, frn)
@@ -751,8 +792,39 @@ func indexUSNVolume(volume string) (*Index, error) {
 			Mode:      modeFromAttrs(node.attr),
 		})
 	}
-	serviceLog("compact records complete volume=%s entries=%d", vol, len(idx.Records))
+	serviceLog("compact records complete volume=%s entries=%d source=usn", vol, len(idx.Records))
 	return idx, nil
+}
+
+// buildRecordsFromMFT converts MFT entries into compact records with stable
+// parent indexes, populating size and modification time.
+func buildRecordsFromMFT(idx *Index, entries map[uint64]mftEntry) {
+	frns := make([]uint64, 0, len(entries))
+	for frn := range entries {
+		frns = append(frns, frn)
+	}
+	sort.Slice(frns, func(i, j int) bool { return frns[i] < frns[j] })
+	frnToIndex := make(map[uint64]int, len(frns))
+	for i, frn := range frns {
+		frnToIndex[frn] = i
+	}
+	idx.Records = make([]CompactRecord, 0, len(frns))
+	for _, frn := range frns {
+		e := entries[frn]
+		parent := int32(-1)
+		if p, ok := frnToIndex[e.parentFRN]; ok && p != frnToIndex[frn] {
+			parent = int32(p)
+		}
+		idx.Records = append(idx.Records, CompactRecord{
+			FRN:       frn,
+			ParentFRN: e.parentFRN,
+			Parent:    parent,
+			Name:      e.name,
+			Mode:      modeFromAttrs(e.attr),
+			Size:      e.size,
+			ModUnix:   e.modUnix,
+		})
+	}
 }
 
 func normalizeVolume(volume string) string {
@@ -1207,15 +1279,24 @@ func cmdInfo(args []string) error {
 
 func extractUnderPathArg(args []string) ([]string, string) {
 	for i, arg := range args {
-		if !filepath.IsAbs(arg) {
+		under := ""
+		if isDriveToken(arg) {
+			under = strings.ToUpper(arg[:1]) + `:\`
+		} else if filepath.IsAbs(arg) {
+			under = filepath.Clean(arg)
+		}
+		if under == "" {
 			continue
 		}
-		clean := filepath.Clean(arg)
 		rest := append([]string{}, args[:i]...)
 		rest = append(rest, args[i+1:]...)
-		return rest, clean
+		return rest, under
 	}
 	return args, ""
+}
+
+func isDriveToken(arg string) bool {
+	return len(arg) == 2 && arg[1] == ':' && ((arg[0] >= 'A' && arg[0] <= 'Z') || (arg[0] >= 'a' && arg[0] <= 'z'))
 }
 
 func (idx *Index) entryCount() int {
@@ -1469,38 +1550,46 @@ type goSearchService struct {
 }
 
 type serviceVolumeIndex struct {
-	dbPath        string
-	index         *Index
-	volume        string
-	journalID     uint64
-	checkpoint    int64
-	state         string
-	staleReason   string
-	frnToID       map[uint64]int
-	frnIDs        []frnIndexEntry
-	children      map[uint64]map[int]struct{}
-	childOffsets  []uint32
-	childIDs      []uint32
-	exactNames    map[string][]int
-	pathCache     map[int]string
-	queryIndex    *residentQueryIndex
-	searchMu      sync.Mutex
-	termMu        sync.Mutex
-	termCache     map[string][]int
-	pathTermCache map[string][]int
-	extCache      map[string][]int
-	recentIDs     map[int]struct{}
-	recentSeq     uint64
-	termSeq       map[string]uint64
-	pathTermSeq   map[string]uint64
-	extSeq        map[string]uint64
-	dirty         bool
-	lastPersist   time.Time
-	searchCount   uint64
+	dbPath         string
+	index          *Index
+	volume         string
+	journalID      uint64
+	checkpoint     int64
+	state          string
+	staleReason    string
+	frnToID        map[uint64]int
+	frnIDs         []frnIndexEntry
+	children       map[uint64]map[int]struct{}
+	childOffsets   []uint32
+	childIDs       []uint32
+	rootIDs        []uint32
+	subtreeOrder   []uint32
+	subtreeStart   []uint32
+	subtreeEnd     []uint32
+	exactNames     map[string][]int
+	pathCache      map[int]string
+	queryIndex     *residentQueryIndex
+	searchMu       sync.Mutex
+	termMu         sync.Mutex
+	termCache      map[string][]int
+	pathTermCache  map[string][]int
+	extCache       map[string][]int
+	recentIDs      map[int]struct{}
+	recentSeq      uint64
+	termSeq        map[string]uint64
+	pathTermSeq    map[string]uint64
+	extSeq         map[string]uint64
+	underCache     map[int][]int
+	underSeq       map[int]uint64
+	underRootCache map[string][]int
+	dirty          bool
+	lastPersist    time.Time
+	searchCount    uint64
 }
 
 type residentQueryIndex struct {
 	ext       map[string][]uint32
+	pathGrams map[string][]uint32
 	nameOrder []uint32
 	dirs      []uint32
 }
@@ -2293,7 +2382,7 @@ func (s *goSearchService) loadConfiguredIndexes() error {
 			serviceLog("startup catch-up skipped volume=%s db=%s err=%v", vol.volume, vol.dbPath, err)
 		}
 		vol.queryIndex = buildResidentQueryIndex(vol)
-		if vol.children == nil && vol.index != nil && vol.index.Compact && vol.index.Source == "usn" && vol.index.compactRecordCount() <= serviceResidentChildRangeMaxRecords {
+		if vol.children == nil && vol.index != nil && vol.index.Compact && vol.index.Source == "usn" {
 			vol.buildCompactChildren()
 		}
 		volumes = append(volumes, vol)
@@ -2354,7 +2443,7 @@ func newServiceVolumeIndex(dbPath string, idx *Index) *serviceVolumeIndex {
 		}
 		sort.Slice(vol.frnIDs, func(i, j int) bool { return vol.frnIDs[i].frn < vol.frnIDs[j].frn })
 		vol.queryIndex = buildResidentQueryIndex(vol)
-		if largeResident && recordCount <= serviceResidentChildRangeMaxRecords {
+		if largeResident {
 			vol.buildCompactChildren()
 		}
 	}
@@ -2563,7 +2652,7 @@ func (s *goSearchService) persistVolumeIfDue(vol *serviceVolumeIndex, force bool
 
 func (vol *serviceVolumeIndex) afterPersist() {
 	vol.queryIndex = buildResidentQueryIndex(vol)
-	if vol.children == nil && vol.index != nil && vol.index.Compact && vol.index.Source == "usn" && vol.index.compactRecordCount() <= serviceResidentChildRangeMaxRecords {
+	if vol.children == nil && vol.index != nil && vol.index.Compact && vol.index.Source == "usn" {
 		vol.buildCompactChildren()
 	}
 	vol.recentIDs = nil
@@ -2847,16 +2936,21 @@ func (vol *serviceVolumeIndex) buildCompactChildren() {
 	}
 	recordCount := vol.index.compactRecordCount()
 	counts := make([]uint32, recordCount+1)
+	roots := make([]uint32, 0, 16)
 	total := 0
 	for id := 0; id < recordCount; id++ {
 		rec := vol.index.compactRecord(id)
 		parent := int(rec.Parent)
 		if parent < 0 || parent >= recordCount || parent == id {
+			if !rec.Deleted {
+				roots = append(roots, uint32(id))
+			}
 			continue
 		}
 		counts[parent+1]++
 		total++
 	}
+	vol.rootIDs = roots
 	if total == 0 {
 		return
 	}
@@ -2877,6 +2971,7 @@ func (vol *serviceVolumeIndex) buildCompactChildren() {
 	}
 	vol.childOffsets = counts
 	vol.childIDs = childIDs
+	vol.buildSubtreeRanges()
 }
 
 func (vol *serviceVolumeIndex) childIDsForRecord(id int) []uint32 {
@@ -2909,22 +3004,25 @@ func (vol *serviceVolumeIndex) childIDsForRecord(id int) []uint32 {
 func buildResidentQueryIndex(vol *serviceVolumeIndex) *residentQueryIndex {
 	recordCount := vol.index.compactRecordCount()
 	qi := &residentQueryIndex{
-		ext:  make(map[string][]uint32),
-		dirs: make([]uint32, 0, recordCount/8),
+		ext:       make(map[string][]uint32),
+		pathGrams: make(map[string][]uint32),
+		dirs:      make([]uint32, 0, recordCount/8),
 	}
-	if recordCount <= serviceResidentNameOrderMaxRecords {
-		qi.nameOrder = make([]uint32, 0, recordCount)
-	}
+	qi.nameOrder = make([]uint32, 0, recordCount)
 	for id := 0; id < recordCount; id++ {
 		rec := vol.index.compactRecord(id)
 		if rec.Deleted {
 			continue
 		}
-		if qi.nameOrder != nil {
-			qi.nameOrder = append(qi.nameOrder, uint32(id))
-		}
+		qi.nameOrder = append(qi.nameOrder, uint32(id))
+		name := vol.index.compactLowerNameAt(id)
 		if rec.Mode&uint32(os.ModeDir) != 0 {
 			qi.dirs = append(qi.dirs, uint32(id))
+			if name != "" && name != "." {
+				for _, gram := range componentGrams(name) {
+					qi.pathGrams[gram] = append(qi.pathGrams[gram], uint32(id))
+				}
+			}
 		}
 		actualExt := strings.TrimPrefix(filepath.Ext(rec.Name), ".")
 		if actualExt != "" {
@@ -2933,6 +3031,7 @@ func buildResidentQueryIndex(vol *serviceVolumeIndex) *residentQueryIndex {
 		}
 	}
 	sortResidentPostings(qi.ext)
+	sortResidentPostings(qi.pathGrams)
 	sortUint32s(qi.dirs)
 	if len(qi.nameOrder) > 0 {
 		sort.Slice(qi.nameOrder, func(i, j int) bool {
@@ -2955,6 +3054,9 @@ func (vol *serviceVolumeIndex) clearSearchCachesLocked() {
 	vol.termSeq = nil
 	vol.pathTermSeq = nil
 	vol.extSeq = nil
+	vol.underCache = nil
+	vol.underSeq = nil
+	vol.underRootCache = nil
 }
 
 func (vol *serviceVolumeIndex) trimSearchCachesLocked() {
@@ -2968,6 +3070,9 @@ func (vol *serviceVolumeIndex) trimSearchCachesLocked() {
 		vol.termSeq = nil
 		vol.pathTermSeq = nil
 		vol.extSeq = nil
+		vol.underCache = nil
+		vol.underSeq = nil
+		vol.underRootCache = nil
 	}
 	vol.searchCount++
 	if vol.searchCount%16 == 0 {
@@ -3001,8 +3106,11 @@ func (vol *serviceVolumeIndex) residentMemoryInfo() *residentMemoryInfo {
 		for _, list := range vol.queryIndex.ext {
 			info.ExtPostBytes += len(list) * 4
 		}
+		for _, list := range vol.queryIndex.pathGrams {
+			info.ExtPostBytes += len(list) * 4
+		}
 	}
-	info.ChildBytes = (len(vol.childOffsets) + len(vol.childIDs)) * 4
+	info.ChildBytes = (len(vol.childOffsets) + len(vol.childIDs) + len(vol.rootIDs) + len(vol.subtreeOrder) + len(vol.subtreeStart) + len(vol.subtreeEnd)) * 4
 	return info
 }
 
@@ -3011,6 +3119,30 @@ func sortResidentPostings(postings map[string][]uint32) {
 		sortUint32s(list)
 		postings[key] = uniqueSortedUint32s(list)
 	}
+}
+
+func componentGrams(s string) []string {
+	return fixedGrams(s, 3)
+}
+
+func fixedGrams(s string, n int) []string {
+	if n <= 0 {
+		return nil
+	}
+	if len(s) < n {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(s))
+	out := make([]string, 0, len(s)-n+1)
+	for i := 0; i+n <= len(s); i++ {
+		gram := s[i : i+n]
+		if _, ok := seen[gram]; ok {
+			continue
+		}
+		seen[gram] = struct{}{}
+		out = append(out, gram)
+	}
+	return out
 }
 
 func compactLowerName(rec CompactRecord) string {
@@ -3839,6 +3971,14 @@ func countServiceVolumes(volumes []*serviceVolumeIndex, opts queryOptions) (int,
 	if err != nil {
 		return 0, true, err
 	}
+	for _, vol := range volumes {
+		if vol != nil && vol.index != nil {
+			if err := checkQueryCapabilities(pq, vol.index); err != nil {
+				return 0, true, err
+			}
+			break
+		}
+	}
 	total := 0
 	for _, vol := range volumes {
 		vol.searchMu.Lock()
@@ -3853,6 +3993,9 @@ func countServiceVolumes(volumes []*serviceVolumeIndex, opts queryOptions) (int,
 }
 
 func (vol *serviceVolumeIndex) fastPostingCount(pq parsedQuery) (int, bool) {
+	if count, ok := vol.plannedCount(pq); ok {
+		return count, true
+	}
 	globExts, globsOK := simpleGlobExts(pq.Globs)
 	if vol == nil || vol.index == nil || vol.queryIndex == nil || pq.CaseSensitive || pq.Under != "" || pq.Exists || pq.HasModAfter || len(pq.Regexps) > 0 || !globsOK || len(pq.Dirs) > 0 {
 		return 0, false
@@ -3969,6 +4112,35 @@ func (idx *Index) compactRecordCount() int {
 	return len(idx.Records)
 }
 
+// compactHasSize reports whether the index carries per-record file sizes.
+// Older USN-built indexes may not capture sizes; size: filters must error
+// against those indexes rather than silently match nothing.
+func (idx *Index) compactHasSize() bool {
+	if idx.PackedRecords != nil {
+		return idx.PackedRecords.Sizes != nil
+	}
+	for i := range idx.Records {
+		if idx.Records[i].Size != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// compactHasModTime reports whether the index carries per-record modification
+// times. Used to gate dm:, --recent, and --modified-after.
+func (idx *Index) compactHasModTime() bool {
+	if idx.PackedRecords != nil {
+		return idx.PackedRecords.ModUnix != nil
+	}
+	for i := range idx.Records {
+		if idx.Records[i].ModUnix != 0 {
+			return true
+		}
+	}
+	return false
+}
+
 func (idx *Index) compactRecord(i int) CompactRecord {
 	if idx.PackedRecords != nil {
 		return idx.PackedRecords.At(i)
@@ -4011,7 +4183,12 @@ func searchCompactWithCache(idx *Index, opts queryOptions, countOnly bool, pathC
 	if err != nil {
 		return nil, err
 	}
+	if err := checkQueryCapabilities(pq, idx); err != nil {
+		return nil, err
+	}
 	limit := normalizedLimit(opts.Limit, countOnly)
+	pq.Limit = limit
+	pq.CountOnly = countOnly
 	order := idx.CompactNameOrder
 	usedCandidates := false
 	if candidateFn != nil {
@@ -4069,6 +4246,43 @@ func searchCompactWithCache(idx *Index, opts queryOptions, countOnly bool, pathC
 	return results, nil
 }
 
+// checkQueryCapabilities rejects queries whose filters need data the index does
+// not carry. Older indexes can lack file sizes or modification times, so size:,
+// dm:, --recent, and --modified-after would otherwise silently match nothing.
+// Failing loudly is consistent with rejecting unknown filters at parse time.
+func checkQueryCapabilities(pq parsedQuery, idx *Index) error {
+	needsSize, needsMod := queryNeedsSizeOrMod(pq)
+	if needsSize && !idx.compactHasSize() {
+		return errors.New("size: filters require an index with file sizes; the current index has none (rebuild with a size-capable indexer)")
+	}
+	if needsMod && !idx.compactHasModTime() {
+		return errors.New("dm:/--recent/--modified-after require an index with modification times; the current index has none")
+	}
+	return nil
+}
+
+func queryNeedsSizeOrMod(pq parsedQuery) (size bool, mod bool) {
+	if len(pq.SizeFilters) > 0 {
+		size = true
+	}
+	if len(pq.DateFilters) > 0 || pq.HasModAfter {
+		mod = true
+	}
+	for _, group := range pq.OrGroups {
+		for _, alt := range group {
+			s, m := queryNeedsSizeOrMod(alt)
+			size = size || s
+			mod = mod || m
+		}
+	}
+	for _, neg := range pq.NotGroups {
+		s, m := queryNeedsSizeOrMod(neg)
+		size = size || s
+		mod = mod || m
+	}
+	return size, mod
+}
+
 func compactRecordPrecheck(rec CompactRecord, pq parsedQuery, matchPath bool) bool {
 	name := rec.Name
 	cmpName := normalizeCase(name, pq.CaseSensitive)
@@ -4105,6 +4319,12 @@ func (vol *serviceVolumeIndex) nameTermCandidates(pq parsedQuery) ([]int, bool) 
 	if candidates, ok := vol.underCandidates(pq); ok {
 		return candidates, true
 	}
+	if candidates, ok := vol.plannedCandidates(pq); ok {
+		return candidates, true
+	}
+	if candidates, ok := vol.broadPathScanCandidates(pq); ok {
+		return candidates, true
+	}
 	if candidates, ok := vol.plannerCandidates(pq); ok {
 		return candidates, true
 	}
@@ -4112,6 +4332,9 @@ func (vol *serviceVolumeIndex) nameTermCandidates(pq parsedQuery) ([]int, bool) 
 		return candidates, true
 	}
 	if candidates, ok := vol.filterCandidates(pq); ok {
+		return candidates, true
+	}
+	if candidates, ok := vol.pathRootLimitedCandidates(pq); ok {
 		return candidates, true
 	}
 	if candidates, ok := vol.pathTermSubtreeCandidates(pq); ok {
@@ -4338,10 +4561,43 @@ func (vol *serviceVolumeIndex) underCandidates(pq parsedQuery) ([]int, bool) {
 	if len(roots) == 0 {
 		return []int{}, true
 	}
+	if candidates, ok := vol.underLimitedTermCandidates(roots, pq); ok {
+		return candidates, true
+	}
 	out := make([]int, 0, 256)
 	prefilter := vol.underPrefilter(pq)
 	for _, rootID := range roots {
 		if rootID < 0 || rootID >= vol.index.compactRecordCount() || vol.index.compactRecord(rootID).Deleted {
+			continue
+		}
+		if len(vol.childOffsets) == 0 && vol.children == nil {
+			if prefilter != nil {
+				prefilterIDs := make([]int, 0, len(prefilter))
+				for id := range prefilter {
+					prefilterIDs = append(prefilterIDs, id)
+				}
+				sort.Ints(prefilterIDs)
+				for _, id := range prefilterIDs {
+					if id < 0 || id >= vol.index.compactRecordCount() {
+						continue
+					}
+					rec := vol.index.compactRecord(id)
+					if vol.isDescendantOrSelf(id, rootID) && !rec.Deleted && compactRecordPrecheck(rec, pq, true) {
+						out = append(out, id)
+					}
+				}
+				continue
+			}
+			descendants := vol.underDescendants(rootID)
+			for _, id := range descendants {
+				if id < 0 || id >= vol.index.compactRecordCount() {
+					continue
+				}
+				rec := vol.index.compactRecord(id)
+				if !rec.Deleted && compactRecordPrecheck(rec, pq, true) {
+					out = append(out, id)
+				}
+			}
 			continue
 		}
 		if prefilter != nil {
@@ -4375,7 +4631,7 @@ func (vol *serviceVolumeIndex) underCandidates(pq parsedQuery) ([]int, bool) {
 			}
 		}
 	}
-	sort.Ints(out)
+	sortCandidateIDs(out, pq, vol.index)
 	return out, true
 }
 
@@ -4383,51 +4639,53 @@ func (vol *serviceVolumeIndex) underRootIDs(under string) []int {
 	if vol == nil || vol.index == nil {
 		return nil
 	}
-	if vol.queryIndex != nil && len(vol.queryIndex.nameOrder) > 0 {
-		base := strings.ToLower(filepath.Base(under))
-		roots := vol.exactNameIDs(base)
-		out := make([]int, 0, len(roots))
-		for _, rootID := range roots {
-			if rootID < 0 || rootID >= vol.index.compactRecordCount() || vol.index.compactRecord(rootID).Deleted {
-				continue
-			}
-			rootPath := vol.index.reconstructCompactPathCached(rootID, vol.pathCache)
-			if strings.EqualFold(filepath.Clean(rootPath), under) {
-				out = append(out, rootID)
-			}
+	cacheKey := strings.ToLower(filepath.Clean(under))
+	if vol.underRootCache != nil {
+		if roots, ok := vol.underRootCache[cacheKey]; ok {
+			return append([]int(nil), roots...)
 		}
-		return out
 	}
+	var roots []int
 	volume := filepath.VolumeName(under)
 	rest := strings.TrimPrefix(under, volume)
 	rest = strings.Trim(rest, `\/`)
 	if rest == "" {
-		return []int{0}
-	}
-	if len(vol.childOffsets) == 0 && vol.children == nil {
-		out := make([]int, 0, 1)
-		cleanUnder := filepath.Clean(under)
-		cache := make(map[int]string)
-		for id := 0; id < vol.index.compactRecordCount(); id++ {
-			rec := vol.index.compactRecord(id)
-			if rec.Deleted {
-				continue
+		if len(vol.rootIDs) > 0 {
+			roots = make([]int, 0, len(vol.rootIDs))
+			for _, id := range vol.rootIDs {
+				roots = append(roots, int(id))
 			}
-			path := vol.index.reconstructCompactPathCached(id, cache)
-			if strings.EqualFold(filepath.Clean(path), cleanUnder) {
-				out = append(out, id)
-			}
+		} else {
+			roots = []int{0}
 		}
-		return out
+		vol.cacheUnderRoots(cacheKey, roots)
+		return append([]int(nil), roots...)
 	}
 	parts := strings.FieldsFunc(rest, func(r rune) bool { return r == '\\' || r == '/' })
 	candidates := make([]int, 0, 4)
 	recordCount := vol.index.compactRecordCount()
-	for id := 0; id < recordCount; id++ {
-		rec := vol.index.compactRecord(id)
-		if rec.Parent < 0 && !rec.Deleted {
-			candidates = append(candidates, id)
+	if len(vol.rootIDs) > 0 {
+		for _, id := range vol.rootIDs {
+			if int(id) < recordCount {
+				candidates = append(candidates, int(id))
+			}
 		}
+	} else {
+		for id := 0; id < recordCount; id++ {
+			rec := vol.index.compactRecord(id)
+			if rec.Parent < 0 && !rec.Deleted {
+				candidates = append(candidates, id)
+			}
+		}
+	}
+	if len(vol.childOffsets) == 0 && vol.children == nil {
+		if roots := vol.underRootIDsByBasename(under); len(roots) > 0 {
+			vol.cacheUnderRoots(cacheKey, roots)
+			return append([]int(nil), roots...)
+		}
+		roots = vol.underRootIDsByParentScans(candidates, parts)
+		vol.cacheUnderRoots(cacheKey, roots)
+		return append([]int(nil), roots...)
 	}
 	for _, part := range parts {
 		want := strings.ToLower(part)
@@ -4445,6 +4703,237 @@ func (vol *serviceVolumeIndex) underRootIDs(under string) []int {
 			}
 		}
 		if len(next) == 0 {
+			if roots := vol.underRootIDsByBasename(under); len(roots) > 0 {
+				vol.cacheUnderRoots(cacheKey, roots)
+				return append([]int(nil), roots...)
+			}
+			vol.cacheUnderRoots(cacheKey, nil)
+			return nil
+		}
+		candidates = next
+	}
+	vol.cacheUnderRoots(cacheKey, candidates)
+	return append([]int(nil), candidates...)
+}
+
+func (vol *serviceVolumeIndex) cacheUnderRoots(key string, roots []int) {
+	if key == "" {
+		return
+	}
+	if vol.underRootCache == nil {
+		vol.underRootCache = make(map[string][]int)
+	}
+	vol.underRootCache[key] = append([]int(nil), roots...)
+}
+
+func (vol *serviceVolumeIndex) underLimitedTermCandidates(roots []int, pq parsedQuery) ([]int, bool) {
+	if vol == nil || vol.index == nil || pq.CountOnly || pq.Limit <= 0 || len(roots) == 0 || len(pq.Terms) != 1 || len(pq.Exts) > 0 || len(pq.Dirs) > 0 || len(pq.Globs) > 0 || len(pq.Regexps) > 0 || pq.Type != "" || pq.HasModAfter || pq.Exists || pq.CaseSensitive {
+		return nil, false
+	}
+	term := pq.Terms[0]
+	if term == "" || strings.ContainsAny(term, `\/*?[]:`) {
+		return nil, false
+	}
+	if out, ok := vol.scanUnderRootsTermLimited(roots, term, pq.Limit); ok {
+		return out, true
+	}
+	out := make([]int, 0, pq.Limit)
+	seen := make(map[int]struct{}, pq.Limit)
+	for _, rootID := range roots {
+		for _, id := range vol.subtreeIDsInOrder(rootID) {
+			if len(out) >= pq.Limit {
+				sort.Ints(out)
+				return out, true
+			}
+			if _, ok := seen[id]; ok || id < 0 || id >= vol.index.compactRecordCount() {
+				continue
+			}
+			rec := vol.index.compactRecord(id)
+			if rec.Deleted {
+				continue
+			}
+			if strings.Contains(vol.index.compactLowerNameAt(id), term) {
+				seen[id] = struct{}{}
+				out = append(out, id)
+			}
+		}
+	}
+	sort.Ints(out)
+	return out, true
+}
+
+func (vol *serviceVolumeIndex) scanUnderRootsTermLimited(roots []int, term string, limit int) ([]int, bool) {
+	if len(roots) == 0 {
+		return nil, false
+	}
+	intervals := make([]interval, 0, len(roots))
+	for _, rootID := range roots {
+		if rootID < 0 || rootID >= vol.index.compactRecordCount() || rootID >= len(vol.subtreeStart) || rootID >= len(vol.subtreeEnd) {
+			continue
+		}
+		start, end := vol.subtreeStart[rootID], vol.subtreeEnd[rootID]
+		if start == ^uint32(0) || start > end || int(end) > len(vol.subtreeOrder) {
+			continue
+		}
+		intervals = append(intervals, interval{start: int(start), end: int(end)})
+	}
+	if len(intervals) == 0 {
+		return nil, false
+	}
+	return vol.scanIntervalsTermLimited(intervals, term, limit), true
+}
+
+func (vol *serviceVolumeIndex) scanUnderTermLimited(rootID int, term string, limit int) ([]int, bool) {
+	if vol == nil || vol.index == nil || limit <= 0 || rootID < 0 || rootID >= vol.index.compactRecordCount() {
+		return nil, false
+	}
+	start, end := vol.subtreeStart[rootID], vol.subtreeEnd[rootID]
+	if start == ^uint32(0) || start > end || int(end) > len(vol.subtreeOrder) {
+		return nil, false
+	}
+	return vol.scanIntervalsTermLimited([]interval{{start: int(start), end: int(end)}}, term, limit), true
+}
+
+type interval struct {
+	start int
+	end   int
+}
+
+func (vol *serviceVolumeIndex) scanIntervalsTermLimited(intervals []interval, term string, limit int) []int {
+	total := 0
+	for _, iv := range intervals {
+		if iv.end > iv.start {
+			total += iv.end - iv.start
+		}
+	}
+	n := total
+	if n == 0 {
+		return nil
+	}
+	workers := min(runtime.GOMAXPROCS(0), max(1, n/100_000))
+	out := make([]int, 0, limit)
+	var mu sync.Mutex
+	var found atomic.Int32
+	var wg sync.WaitGroup
+	for worker := 0; worker < workers; worker++ {
+		a := worker * n / workers
+		b := (worker + 1) * n / workers
+		wg.Add(1)
+		go func(a, b int) {
+			defer wg.Done()
+			local := make([]int, 0, 8)
+			for logical := a; logical < b && int(found.Load()) < limit; logical++ {
+				pos := intervalPosition(intervals, logical)
+				if pos < 0 {
+					continue
+				}
+				id := int(vol.subtreeOrder[pos])
+				if id < 0 || id >= vol.index.compactRecordCount() {
+					continue
+				}
+				rec := vol.index.compactRecord(id)
+				if rec.Deleted {
+					continue
+				}
+				if strings.Contains(vol.index.compactLowerNameAt(id), term) {
+					if found.Add(1) <= int32(limit) {
+						local = append(local, id)
+					}
+				}
+			}
+			if len(local) > 0 {
+				mu.Lock()
+				out = append(out, local...)
+				mu.Unlock()
+			}
+		}(a, b)
+	}
+	wg.Wait()
+	sort.Ints(out)
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out
+}
+
+func intervalPosition(intervals []interval, logical int) int {
+	for _, iv := range intervals {
+		n := iv.end - iv.start
+		if logical < n {
+			return iv.start + logical
+		}
+		logical -= n
+	}
+	return -1
+}
+
+func (vol *serviceVolumeIndex) underRootIDsByBasename(under string) []int {
+	base := strings.ToLower(filepath.Base(under))
+	if base == "" || base == "." || base == string(filepath.Separator) {
+		return nil
+	}
+	cleanUnder := filepath.Clean(under)
+	candidates := vol.exactNameIDs(base)
+	out := vol.filterUnderRootCandidates(candidates, base, cleanUnder)
+	if len(out) == 0 {
+		out = vol.filterUnderRootCandidates(vol.nameTermPosting(base), base, cleanUnder)
+	}
+	sort.Ints(out)
+	return uniqueSortedInts(out)
+}
+
+func (vol *serviceVolumeIndex) filterUnderRootCandidates(candidates []int, base, cleanUnder string) []int {
+	out := make([]int, 0, 1)
+	for _, id := range candidates {
+		if id < 0 || id >= vol.index.compactRecordCount() {
+			continue
+		}
+		rec := vol.index.compactRecord(id)
+		if rec.Deleted || rec.Mode&uint32(os.ModeDir) == 0 || vol.index.compactLowerNameAt(id) != base {
+			continue
+		}
+		path := vol.index.reconstructCompactPathCached(id, vol.pathCache)
+		if strings.EqualFold(filepath.Clean(path), cleanUnder) {
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
+func (vol *serviceVolumeIndex) underRootIDsByParentScans(candidates []int, parts []string) []int {
+	if len(candidates) == 0 {
+		return nil
+	}
+	recordCount := vol.index.compactRecordCount()
+	for _, part := range parts {
+		want := strings.ToLower(part)
+		parentFRNs := make(map[uint64]struct{}, len(candidates))
+		for _, id := range candidates {
+			if id < 0 || id >= recordCount {
+				continue
+			}
+			frn := vol.index.compactRecord(id).FRN
+			if frn != 0 {
+				parentFRNs[frn] = struct{}{}
+			}
+		}
+		if len(parentFRNs) == 0 {
+			return nil
+		}
+		next := make([]int, 0, 4)
+		for id := 0; id < recordCount; id++ {
+			rec := vol.index.compactRecord(id)
+			if rec.Deleted {
+				continue
+			}
+			if _, ok := parentFRNs[rec.ParentFRN]; !ok {
+				continue
+			}
+			if vol.index.compactLowerNameAt(id) == want {
+				next = append(next, id)
+			}
+		}
+		if len(next) == 0 {
 			return nil
 		}
 		candidates = next
@@ -4453,6 +4942,12 @@ func (vol *serviceVolumeIndex) underRootIDs(under string) []int {
 }
 
 func (vol *serviceVolumeIndex) isDescendantOrSelf(id, rootID int) bool {
+	if vol != nil && id >= 0 && rootID >= 0 && id < len(vol.subtreeStart) && rootID < len(vol.subtreeStart) {
+		pos, start, end := vol.subtreeStart[id], vol.subtreeStart[rootID], vol.subtreeEnd[rootID]
+		if start != ^uint32(0) && pos != ^uint32(0) {
+			return pos >= start && pos < end
+		}
+	}
 	seen := make(map[int]struct{}, 16)
 	cur := id
 	for depth := 0; depth < 1024; depth++ {
@@ -4475,11 +4970,138 @@ func (vol *serviceVolumeIndex) isDescendantOrSelf(id, rootID int) bool {
 	return false
 }
 
+func (vol *serviceVolumeIndex) underDescendants(rootID int) []int {
+	if vol == nil || vol.index == nil || rootID < 0 || rootID >= vol.index.compactRecordCount() {
+		return nil
+	}
+	if vol.underCache != nil {
+		if cached, ok := vol.underCache[rootID]; ok {
+			seq := vol.underSeq[rootID]
+			return vol.withRecentCandidates(cached, seq, func(rec CompactRecord) bool {
+				id, ok := vol.idForFRN(rec.FRN)
+				return ok && vol.isDescendantOrSelf(id, rootID)
+			})
+		}
+	}
+	recordCount := vol.index.compactRecordCount()
+	out := make([]int, 0, 256)
+	if rootID < len(vol.subtreeStart) && rootID < len(vol.subtreeEnd) && len(vol.subtreeOrder) > 0 {
+		start, end := vol.subtreeStart[rootID], vol.subtreeEnd[rootID]
+		if start != ^uint32(0) && start <= end && int(end) <= len(vol.subtreeOrder) {
+			out = make([]int, 0, int(end-start))
+			for _, id32 := range vol.subtreeOrder[start:end] {
+				id := int(id32)
+				if id < 0 || id >= recordCount {
+					continue
+				}
+				if !vol.index.compactRecord(id).Deleted {
+					out = append(out, id)
+				}
+			}
+		}
+	} else if len(vol.childOffsets) > 0 || vol.children != nil {
+		stack := []int{rootID}
+		seen := make(map[int]struct{}, 256)
+		for len(stack) > 0 {
+			last := len(stack) - 1
+			id := stack[last]
+			stack = stack[:last]
+			if _, ok := seen[id]; ok || id < 0 || id >= recordCount {
+				continue
+			}
+			seen[id] = struct{}{}
+			rec := vol.index.compactRecord(id)
+			if !rec.Deleted {
+				out = append(out, id)
+			}
+			for _, childID := range vol.childIDsForRecord(id) {
+				stack = append(stack, int(childID))
+			}
+		}
+	} else {
+		for id := 0; id < recordCount; id++ {
+			rec := vol.index.compactRecord(id)
+			if rec.Deleted {
+				continue
+			}
+			if vol.isDescendantOrSelf(id, rootID) {
+				out = append(out, id)
+			}
+		}
+	}
+	if len(out) == 0 {
+		return out
+	}
+	sort.Ints(out)
+	if len(out) <= serviceCachedPostingMaxIDs {
+		if vol.underCache == nil {
+			vol.underCache = make(map[int][]int)
+		}
+		if vol.underSeq == nil {
+			vol.underSeq = make(map[int]uint64)
+		}
+		vol.underCache[rootID] = out
+		vol.underSeq[rootID] = vol.recentSeq
+	}
+	return out
+}
+
+func (vol *serviceVolumeIndex) underDescendantsLimited(rootID, limit int) []int {
+	if vol == nil || vol.index == nil || rootID < 0 || rootID >= vol.index.compactRecordCount() {
+		return nil
+	}
+	if limit <= 0 {
+		return vol.underDescendants(rootID)
+	}
+	recordCount := vol.index.compactRecordCount()
+	if rootID < len(vol.subtreeStart) && rootID < len(vol.subtreeEnd) && len(vol.subtreeOrder) > 0 {
+		start, end := vol.subtreeStart[rootID], vol.subtreeEnd[rootID]
+		if start != ^uint32(0) && start <= end && int(end) <= len(vol.subtreeOrder) {
+			out := make([]int, 0, min(limit, int(end-start)))
+			for _, id32 := range vol.subtreeOrder[start:end] {
+				if len(out) >= limit {
+					break
+				}
+				id := int(id32)
+				if id < 0 || id >= recordCount {
+					continue
+				}
+				if !vol.index.compactRecord(id).Deleted {
+					out = append(out, id)
+				}
+			}
+			sort.Ints(out)
+			return out
+		}
+	}
+	out := make([]int, 0, min(limit, 256))
+	stack := []int{rootID}
+	seen := make(map[int]struct{}, 256)
+	for len(stack) > 0 && len(out) < limit {
+		last := len(stack) - 1
+		id := stack[last]
+		stack = stack[:last]
+		if _, ok := seen[id]; ok || id < 0 || id >= recordCount {
+			continue
+		}
+		seen[id] = struct{}{}
+		rec := vol.index.compactRecord(id)
+		if !rec.Deleted {
+			out = append(out, id)
+		}
+		for _, childID := range vol.childIDsForRecord(id) {
+			stack = append(stack, int(childID))
+		}
+	}
+	sort.Ints(out)
+	return out
+}
+
 func (vol *serviceVolumeIndex) underPrefilter(pq parsedQuery) map[int]struct{} {
 	if vol == nil || len(pq.Regexps) > 0 || pq.CaseSensitive || pq.HasModAfter || pq.Exists {
 		return nil
 	}
-	lists := make([][]int, 0, len(pq.Exts)+len(pq.Dirs)+len(pq.Terms))
+	lists := make([][]int, 0, len(pq.Exts)+len(pq.Dirs)+len(pq.Terms)+len(pq.Globs))
 	for _, ext := range pq.Exts {
 		list := vol.extPosting(ext)
 		if len(list) == 0 {
@@ -4487,16 +5109,57 @@ func (vol *serviceVolumeIndex) underPrefilter(pq parsedQuery) map[int]struct{} {
 		}
 		lists = append(lists, list)
 	}
+	globExts, globsOK := simpleGlobExts(pq.Globs)
+	if globsOK {
+		for _, ext := range globExts {
+			list := vol.extPosting(ext)
+			if len(list) == 0 {
+				return map[int]struct{}{}
+			}
+			lists = append(lists, list)
+		}
+	} else {
+		for _, ext := range complexGlobExts(pq.Globs) {
+			list := vol.extPosting(ext)
+			if len(list) == 0 {
+				return map[int]struct{}{}
+			}
+			lists = append(lists, list)
+		}
+		for _, globTerm := range globLiteralTerms(pq.Globs, pq.CaseSensitive) {
+			list := vol.nameTermPosting(globTerm)
+			if len(list) == 0 {
+				return map[int]struct{}{}
+			}
+			lists = append(lists, list)
+		}
+	}
 	for _, dir := range pq.Dirs {
-		list := vol.pathTermPosting(dir)
+		list := vol.pathComponentPosting(dir)
 		if len(list) == 0 {
 			return map[int]struct{}{}
 		}
 		lists = append(lists, list)
 	}
+	hasDottedTerm := false
 	for _, term := range pq.Terms {
-		list := vol.nameTermPosting(term)
-		if pq.MatchPath {
+		if strings.Contains(term, ".") {
+			hasDottedTerm = true
+			break
+		}
+	}
+	for _, term := range pq.Terms {
+		if pq.MatchPath && hasDottedTerm && !strings.Contains(term, ".") {
+			continue
+		}
+		list := []int(nil)
+		if strings.Contains(term, ".") {
+			list = vol.exactNameIDs(term)
+		}
+		if len(list) == 0 {
+			list = vol.nameTermPosting(term)
+		}
+		if pq.MatchPath && len(list) == 0 {
 			list = vol.pathTermPosting(term)
 		}
 		if len(list) == 0 {
@@ -4520,6 +5183,39 @@ func (vol *serviceVolumeIndex) underPrefilter(pq parsedQuery) map[int]struct{} {
 		out[id] = struct{}{}
 	}
 	return out
+}
+
+func sortCandidateIDs(ids []int, pq parsedQuery, idx *Index) {
+	sort.SliceStable(ids, func(i, j int) bool {
+		a, b := ids[i], ids[j]
+		ar, br := candidateRank(a, pq, idx), candidateRank(b, pq, idx)
+		if ar != br {
+			return ar < br
+		}
+		return a < b
+	})
+}
+
+func candidateRank(id int, pq parsedQuery, idx *Index) int {
+	if idx == nil || id < 0 || id >= idx.compactRecordCount() {
+		return 100
+	}
+	name := idx.compactLowerNameAt(id)
+	best := 50
+	for _, term := range pq.Terms {
+		if term == "" || !strings.Contains(term, ".") {
+			continue
+		}
+		switch {
+		case name == term:
+			return 0
+		case strings.HasPrefix(name, term):
+			best = min(best, 5)
+		case strings.Contains(name, term):
+			best = min(best, 10)
+		}
+	}
+	return best
 }
 
 func (vol *serviceVolumeIndex) pathDirFilterCandidates(pq parsedQuery) ([]int, bool) {
@@ -4602,7 +5298,7 @@ func (vol *serviceVolumeIndex) filterCandidates(pq parsedQuery) ([]int, bool) {
 		lists = append(lists, list)
 	}
 	for _, dir := range pq.Dirs {
-		list := vol.pathTermPosting(dir)
+		list := vol.pathComponentPosting(dir)
 		if len(list) == 0 {
 			return []int{}, true
 		}
@@ -4633,7 +5329,7 @@ func (vol *serviceVolumeIndex) filterCandidates(pq parsedQuery) ([]int, bool) {
 }
 
 func (vol *serviceVolumeIndex) regexLiteralCandidates(pq parsedQuery) ([]int, bool) {
-	if vol == nil || vol.index == nil || !pq.MatchPath || len(pq.Regexps) == 0 || len(pq.RegexTerms) == 0 || pq.CaseSensitive {
+	if vol == nil || vol.index == nil || !pq.MatchPath || len(pq.Regexps) == 0 || len(pq.RegexTerms) != 1 || pq.CaseSensitive {
 		return nil, false
 	}
 	lists := make([][]int, 0, len(pq.RegexTerms))
@@ -4653,6 +5349,72 @@ func (vol *serviceVolumeIndex) regexLiteralCandidates(pq parsedQuery) ([]int, bo
 		}
 	}
 	return candidates, true
+}
+
+func (vol *serviceVolumeIndex) pathRootLimitedCandidates(pq parsedQuery) ([]int, bool) {
+	if vol == nil || vol.index == nil || !pq.MatchPath || pq.CountOnly || len(pq.Terms) < 2 || len(pq.Dirs) > 0 || len(pq.Regexps) > 0 || pq.Under != "" || pq.CaseSensitive || pq.Limit <= 0 {
+		return nil, false
+	}
+	type rootTerm struct {
+		id   int
+		term string
+	}
+	roots := make([]rootTerm, 0, 4)
+	for _, term := range pq.Terms {
+		if strings.ContainsAny(term, `\/*?[]:`) {
+			continue
+		}
+		for _, id := range vol.pathComponentRootIDs(term) {
+			if id < 0 || id >= vol.index.compactRecordCount() {
+				continue
+			}
+			rec := vol.index.compactRecord(id)
+			if !rec.Deleted && rec.Mode&uint32(os.ModeDir) != 0 {
+				roots = append(roots, rootTerm{id: id, term: term})
+			}
+		}
+	}
+	if len(roots) == 0 {
+		return nil, false
+	}
+	out := make([]int, 0, pq.Limit)
+	seen := make(map[int]struct{}, pq.Limit)
+	for _, root := range roots {
+		for _, id := range vol.subtreeIDsInOrder(root.id) {
+			if len(out) >= pq.Limit {
+				sort.Ints(out)
+				return out, true
+			}
+			if _, ok := seen[id]; ok || id < 0 || id >= vol.index.compactRecordCount() {
+				continue
+			}
+			rec := vol.index.compactRecord(id)
+			if rec.Deleted || !compactRecordPrecheck(rec, pq, true) || !vol.recordPathContainsRemainingTerms(id, pq.Terms, root.term) {
+				continue
+			}
+			seen[id] = struct{}{}
+			out = append(out, id)
+		}
+	}
+	sort.Ints(out)
+	return out, true
+}
+
+func (vol *serviceVolumeIndex) subtreeIDsInOrder(rootID int) []int {
+	if vol == nil || vol.index == nil || rootID < 0 || rootID >= vol.index.compactRecordCount() {
+		return nil
+	}
+	if rootID < len(vol.subtreeStart) && rootID < len(vol.subtreeEnd) && len(vol.subtreeOrder) > 0 {
+		start, end := vol.subtreeStart[rootID], vol.subtreeEnd[rootID]
+		if start != ^uint32(0) && start <= end && int(end) <= len(vol.subtreeOrder) {
+			out := make([]int, 0, int(end-start))
+			for _, id32 := range vol.subtreeOrder[start:end] {
+				out = append(out, int(id32))
+			}
+			return out
+		}
+	}
+	return vol.underDescendants(rootID)
 }
 
 func (vol *serviceVolumeIndex) exactDirCandidates(pq parsedQuery) ([]int, bool) {
@@ -4790,8 +5552,23 @@ func (vol *serviceVolumeIndex) exactNameIDs(name string) []int {
 	if vol.exactNames != nil {
 		return append([]int(nil), vol.exactNames[name]...)
 	}
+	cacheKey := "\x00exact:" + name
+	vol.termMu.Lock()
+	if vol.termCache != nil {
+		if list, ok := vol.termCache[cacheKey]; ok {
+			seq := vol.termSeq[cacheKey]
+			vol.termMu.Unlock()
+			return vol.withRecentCandidates(list, seq, func(rec CompactRecord) bool {
+				id, ok := vol.idForFRN(rec.FRN)
+				return ok && vol.index.compactLowerNameAt(id) == name
+			})
+		}
+	}
+	vol.termMu.Unlock()
 	if vol.queryIndex == nil || len(vol.queryIndex.nameOrder) == 0 {
-		return nil
+		out := vol.scanExactNameIDs(name)
+		vol.cacheNamePosting(cacheKey, out)
+		return out
 	}
 	order := vol.queryIndex.nameOrder
 	start := sort.Search(len(order), func(i int) bool {
@@ -4819,6 +5596,44 @@ func (vol *serviceVolumeIndex) exactNameIDs(name string) []int {
 	}
 	sort.Ints(out)
 	out = uniqueSortedInts(out)
+	return out
+}
+
+func (vol *serviceVolumeIndex) scanExactNameIDs(name string) []int {
+	if ext := strings.TrimPrefix(filepath.Ext(name), "."); ext != "" && vol.queryIndex != nil {
+		if extIDs := vol.queryIndex.ext[strings.ToLower(ext)]; len(extIDs) > 0 {
+			out := make([]int, 0, 4)
+			for _, id32 := range extIDs {
+				id := int(id32)
+				if id < 0 || id >= vol.index.compactRecordCount() {
+					continue
+				}
+				rec := vol.index.compactRecord(id)
+				if !rec.Deleted && vol.index.compactLowerNameAt(id) == name {
+					out = append(out, id)
+				}
+			}
+			for id := range vol.recentIDs {
+				if id < 0 || id >= vol.index.compactRecordCount() {
+					continue
+				}
+				rec := vol.index.compactRecord(id)
+				if !rec.Deleted && vol.index.compactLowerNameAt(id) == name {
+					out = append(out, id)
+				}
+			}
+			sort.Ints(out)
+			return uniqueSortedInts(out)
+		}
+	}
+	out := make([]int, 0, 4)
+	recordCount := vol.index.compactRecordCount()
+	for id := 0; id < recordCount; id++ {
+		rec := vol.index.compactRecord(id)
+		if !rec.Deleted && vol.index.compactLowerNameAt(id) == name {
+			out = append(out, id)
+		}
+	}
 	return out
 }
 
@@ -5008,6 +5823,101 @@ func (vol *serviceVolumeIndex) pathTermPosting(term string) []int {
 	return out
 }
 
+func (vol *serviceVolumeIndex) pathComponentPosting(term string) []int {
+	if vol == nil || vol.index == nil || term == "" || strings.ContainsAny(term, `\/*?[]:`) {
+		return vol.pathTermPosting(term)
+	}
+	cacheKey := "\x00pathcomponent:" + term
+	vol.termMu.Lock()
+	if vol.pathTermCache != nil {
+		if list, ok := vol.pathTermCache[cacheKey]; ok {
+			seq := vol.pathTermSeq[cacheKey]
+			vol.termMu.Unlock()
+			return vol.withRecentCandidates(list, seq, func(rec CompactRecord) bool {
+				id, ok := vol.idForFRN(rec.FRN)
+				return ok && vol.index.compactPathContainsTerm(id, term)
+			})
+		}
+	}
+	vol.termMu.Unlock()
+
+	roots := vol.pathComponentRootIDs(term)
+	if len(roots) == 0 {
+		vol.cachePathPosting(cacheKey, nil)
+		return nil
+	}
+	seen := make(map[int]struct{}, 256)
+	out := make([]int, 0, 256)
+	for _, rootID := range roots {
+		for _, id := range vol.underDescendants(rootID) {
+			if _, ok := seen[id]; ok {
+				continue
+			}
+			seen[id] = struct{}{}
+			out = append(out, id)
+		}
+	}
+	sort.Ints(out)
+	vol.cachePathPosting(cacheKey, out)
+	return out
+}
+
+func (vol *serviceVolumeIndex) pathComponentRootIDs(term string) []int {
+	if vol == nil || vol.index == nil || term == "" {
+		return nil
+	}
+	term = strings.ToLower(term)
+	if vol.queryIndex == nil {
+		return vol.exactNameIDs(term)
+	}
+	candidates := make([]uint32, 0, 8)
+	for _, id := range vol.exactNameIDs(term) {
+		if id >= 0 && id < vol.index.compactRecordCount() {
+			rec := vol.index.compactRecord(id)
+			if !rec.Deleted && rec.Mode&uint32(os.ModeDir) != 0 {
+				candidates = append(candidates, uint32(id))
+			}
+		}
+	}
+	if len(candidates) == 0 && len(term) >= 3 && vol.queryIndex.pathGrams != nil {
+		grams := componentGrams(term)
+		lists := make([][]uint32, 0, len(grams))
+		for _, gram := range grams {
+			list := vol.queryIndex.pathGrams[gram]
+			if len(list) == 0 {
+				return nil
+			}
+			lists = append(lists, list)
+		}
+		sort.Slice(lists, func(i, j int) bool { return len(lists[i]) < len(lists[j]) })
+		if len(lists) > 0 {
+			candidates = append([]uint32(nil), lists[0]...)
+			for _, list := range lists[1:] {
+				candidates = intersectSortedUint32s(candidates, list)
+				if len(candidates) == 0 {
+					return nil
+				}
+			}
+		}
+	}
+	out := make([]int, 0, len(candidates))
+	for _, id32 := range candidates {
+		id := int(id32)
+		if id < 0 || id >= vol.index.compactRecordCount() {
+			continue
+		}
+		rec := vol.index.compactRecord(id)
+		if rec.Deleted || rec.Mode&uint32(os.ModeDir) == 0 {
+			continue
+		}
+		if strings.Contains(vol.index.compactLowerNameAt(id), term) {
+			out = append(out, id)
+		}
+	}
+	sort.Ints(out)
+	return uniqueSortedInts(out)
+}
+
 func (vol *serviceVolumeIndex) scanPathTermPosting(term string) []int {
 	recordCount := vol.index.compactRecordCount()
 	workers := min(runtime.GOMAXPROCS(0), max(1, recordCount/250_000))
@@ -5052,7 +5962,10 @@ func (vol *serviceVolumeIndex) scanPathTermPosting(term string) []int {
 }
 
 func (vol *serviceVolumeIndex) pathTermRootIDs(term string) []int {
-	roots := vol.exactNameIDs(term)
+	roots := vol.pathComponentRootIDs(term)
+	if len(roots) == 0 {
+		roots = vol.exactNameIDs(term)
+	}
 	for _, id := range vol.nameTermPosting(term) {
 		if id < 0 || id >= vol.index.compactRecordCount() {
 			continue
@@ -5067,6 +5980,19 @@ func (vol *serviceVolumeIndex) pathTermRootIDs(term string) []int {
 }
 
 func (vol *serviceVolumeIndex) extPosting(ext string) []int {
+	if vol.queryIndex != nil && vol.queryIndex.ext != nil {
+		if ids32, ok := vol.queryIndex.ext[strings.ToLower(ext)]; ok {
+			list := make([]int, 0, len(ids32))
+			for _, id := range ids32 {
+				list = append(list, int(id))
+			}
+			return vol.withRecentCandidates(list, 0, func(rec CompactRecord) bool {
+				actual := strings.TrimPrefix(filepath.Ext(rec.Name), ".")
+				return strings.EqualFold(actual, ext)
+			})
+		}
+		return nil
+	}
 	vol.termMu.Lock()
 	if vol.extCache == nil {
 		vol.extCache = make(map[string][]int)
@@ -5242,51 +6168,255 @@ func parseQuery(opts queryOptions) (parsedQuery, error) {
 		pq.HasModAfter = true
 	}
 	for _, raw := range strings.Fields(opts.Query) {
-		switch {
-		case strings.HasPrefix(raw, "ext:"):
-			ext := strings.TrimPrefix(raw, "ext:")
-			ext = strings.TrimPrefix(ext, ".")
-			if ext != "" {
-				pq.Exts = append(pq.Exts, normalizeCase(ext, pq.CaseSensitive))
-			}
-		case strings.HasPrefix(raw, "dir:"):
-			dir := strings.TrimPrefix(raw, "dir:")
-			if dir != "" {
-				pq.Dirs = append(pq.Dirs, normalizeCase(dir, pq.CaseSensitive))
-			}
-		case strings.HasPrefix(raw, "glob:"):
-			glob := strings.TrimPrefix(raw, "glob:")
-			if glob != "" {
-				pq.Globs = append(pq.Globs, normalizeCase(glob, pq.CaseSensitive))
-			}
-		case strings.HasPrefix(raw, "regex:"):
-			pat := strings.TrimPrefix(raw, "regex:")
-			if pat == "" {
-				continue
-			}
-			pq.RegexTerms = appendRegexLiteralTerms(pq.RegexTerms, pat, pq.CaseSensitive)
-			if !pq.CaseSensitive {
-				pat = "(?i)" + pat
-			}
-			re, err := regexp.Compile(pat)
-			if err != nil {
-				return pq, fmt.Errorf("invalid regex %q: %w", pat, err)
-			}
-			pq.Regexps = append(pq.Regexps, re)
-		case raw == "case:" || raw == "case:true":
-			pq.CaseSensitive = true
-		case raw == "case:false":
-			pq.CaseSensitive = false
-		case raw == "type:file" || raw == "type:dir":
-			pq.Type = strings.TrimPrefix(raw, "type:")
-		default:
-			pq.Terms = append(pq.Terms, normalizeCase(raw, pq.CaseSensitive))
+		if err := applyQueryToken(&pq, raw); err != nil {
+			return pq, err
 		}
 	}
-	if len(pq.Terms) == 0 && len(pq.Exts) == 0 && len(pq.Dirs) == 0 && len(pq.Globs) == 0 && len(pq.Regexps) == 0 && pq.Type == "" && pq.Under == "" && !pq.HasModAfter {
+	if pq.isEmpty() {
 		return pq, errors.New("query has no searchable terms or filters")
 	}
 	return pq, nil
+}
+
+// isEmpty reports whether a parsed query carries no searchable constraints.
+func (pq parsedQuery) isEmpty() bool {
+	return len(pq.Terms) == 0 && len(pq.Exts) == 0 && len(pq.Dirs) == 0 &&
+		len(pq.Globs) == 0 && len(pq.Regexps) == 0 && pq.Type == "" &&
+		pq.Under == "" && !pq.HasModAfter && len(pq.SizeFilters) == 0 &&
+		len(pq.DateFilters) == 0 && len(pq.OrGroups) == 0 && len(pq.NotGroups) == 0
+}
+
+// applyQueryToken parses a single whitespace-delimited token and folds it into
+// pq. It handles OR groups (a|b), negation (!term or -term), structured filters
+// (ext:, dir:, glob:, regex:, type:, case:, size:, dm:), and plain terms.
+// Unknown "name:" style prefixes are rejected so the tool never silently
+// degrades an unsupported filter into a literal substring match.
+func applyQueryToken(pq *parsedQuery, raw string) error {
+	if raw == "" {
+		return nil
+	}
+
+	// Negation: !term or -term excludes records matching the inner token.
+	if (strings.HasPrefix(raw, "!") || strings.HasPrefix(raw, "-")) && len(raw) > 1 {
+		inner := raw[1:]
+		sub := parsedQuery{MatchPath: pq.MatchPath, CaseSensitive: pq.CaseSensitive}
+		if err := applyQueryToken(&sub, inner); err != nil {
+			return err
+		}
+		if !sub.isEmpty() {
+			pq.NotGroups = append(pq.NotGroups, sub)
+		}
+		return nil
+	}
+
+	// OR group: a|b|c. Each alternative is parsed as its own subquery; a record
+	// matches the group if it matches any alternative. We only treat '|' as an
+	// operator when it joins token-like alternatives (not inside a regex, which
+	// uses the regex: prefix and is handled before this point).
+	if strings.Contains(raw, "|") && !strings.HasPrefix(raw, "regex:") {
+		parts := strings.Split(raw, "|")
+		group := make([]parsedQuery, 0, len(parts))
+		for _, part := range parts {
+			if part == "" {
+				continue
+			}
+			sub := parsedQuery{MatchPath: pq.MatchPath, CaseSensitive: pq.CaseSensitive}
+			if err := applyQueryToken(&sub, part); err != nil {
+				return err
+			}
+			if !sub.isEmpty() {
+				group = append(group, sub)
+			}
+		}
+		if len(group) == 1 {
+			// A degenerate "a|" collapses to a plain token.
+			mergeSubquery(pq, group[0])
+		} else if len(group) > 1 {
+			pq.OrGroups = append(pq.OrGroups, group)
+		}
+		return nil
+	}
+
+	switch {
+	case strings.HasPrefix(raw, "ext:"):
+		ext := strings.TrimPrefix(raw, "ext:")
+		ext = strings.TrimPrefix(ext, ".")
+		if ext != "" {
+			pq.Exts = append(pq.Exts, normalizeCase(ext, pq.CaseSensitive))
+		}
+	case strings.HasPrefix(raw, "dir:"):
+		dir := strings.TrimPrefix(raw, "dir:")
+		if dir != "" {
+			pq.Dirs = append(pq.Dirs, normalizeCase(dir, pq.CaseSensitive))
+		}
+	case strings.HasPrefix(raw, "glob:"):
+		glob := strings.TrimPrefix(raw, "glob:")
+		if glob != "" {
+			pq.Globs = append(pq.Globs, normalizeCase(glob, pq.CaseSensitive))
+		}
+	case strings.HasPrefix(raw, "regex:"):
+		pat := strings.TrimPrefix(raw, "regex:")
+		if pat == "" {
+			return nil
+		}
+		pq.RegexTerms = appendRegexLiteralTerms(pq.RegexTerms, pat, pq.CaseSensitive)
+		if !pq.CaseSensitive {
+			pat = "(?i)" + pat
+		}
+		re, err := regexp.Compile(pat)
+		if err != nil {
+			return fmt.Errorf("invalid regex %q: %w", pat, err)
+		}
+		pq.Regexps = append(pq.Regexps, re)
+	case strings.HasPrefix(raw, "size:"):
+		sf, err := parseSizeFilter(strings.TrimPrefix(raw, "size:"))
+		if err != nil {
+			return err
+		}
+		pq.SizeFilters = append(pq.SizeFilters, sf)
+	case strings.HasPrefix(raw, "dm:"):
+		df, err := parseDateFilter(strings.TrimPrefix(raw, "dm:"))
+		if err != nil {
+			return err
+		}
+		pq.DateFilters = append(pq.DateFilters, df)
+	case raw == "case:" || raw == "case:true":
+		pq.CaseSensitive = true
+	case raw == "case:false":
+		pq.CaseSensitive = false
+	case raw == "type:file" || raw == "type:dir":
+		pq.Type = strings.TrimPrefix(raw, "type:")
+	case isUnknownFilterToken(raw):
+		return fmt.Errorf("unsupported filter %q; supported: ext: dir: glob: regex: type: case: size: dm: (and !term, a|b)", raw)
+	default:
+		for _, term := range queryPlainTerms(raw, pq.CaseSensitive, pq.MatchPath) {
+			pq.Terms = append(pq.Terms, term)
+		}
+	}
+	return nil
+}
+
+// mergeSubquery folds the constraints of src into dst. Used when an OR group
+// collapses to a single alternative.
+func mergeSubquery(dst *parsedQuery, src parsedQuery) {
+	dst.Terms = append(dst.Terms, src.Terms...)
+	dst.Exts = append(dst.Exts, src.Exts...)
+	dst.Dirs = append(dst.Dirs, src.Dirs...)
+	dst.Globs = append(dst.Globs, src.Globs...)
+	dst.Regexps = append(dst.Regexps, src.Regexps...)
+	dst.RegexTerms = append(dst.RegexTerms, src.RegexTerms...)
+	dst.SizeFilters = append(dst.SizeFilters, src.SizeFilters...)
+	dst.DateFilters = append(dst.DateFilters, src.DateFilters...)
+	if src.Type != "" {
+		dst.Type = src.Type
+	}
+}
+
+// isUnknownFilterToken reports whether raw looks like an unsupported "name:"
+// filter prefix (a short alphabetic prefix followed by ':') rather than a plain
+// term that merely contains a colon (e.g. a Windows drive path "c:\foo").
+func isUnknownFilterToken(raw string) bool {
+	idx := strings.IndexByte(raw, ':')
+	if idx <= 0 {
+		return false
+	}
+	prefix := raw[:idx]
+	// Windows drive letters ("c", "d") are single-char; treat single-char
+	// prefixes as path-like, not filters.
+	if len(prefix) < 2 {
+		return false
+	}
+	// A filter prefix starts with a letter and is otherwise alphanumeric
+	// (e.g. "size2", "attrib"). Anything else (digits-first, punctuation) is a
+	// plain term that merely contains a colon.
+	for i, r := range prefix {
+		isLetter := (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z')
+		isDigit := r >= '0' && r <= '9'
+		if i == 0 && !isLetter {
+			return false
+		}
+		if !isLetter && !isDigit {
+			return false
+		}
+	}
+	return true
+}
+
+func queryPlainTerms(raw string, caseSensitive, matchPath bool) []string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	if !matchPath || !strings.ContainsAny(raw, `\/`) {
+		return []string{normalizeCase(raw, caseSensitive)}
+	}
+	parts := strings.FieldsFunc(raw, func(r rune) bool { return r == '\\' || r == '/' })
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" || part == "." {
+			continue
+		}
+		out = append(out, normalizeCase(part, caseSensitive))
+	}
+	if len(out) == 0 {
+		return []string{normalizeCase(raw, caseSensitive)}
+	}
+	return out
+}
+
+func globLiteralTerms(globs []string, caseSensitive bool) []string {
+	seen := make(map[string]struct{}, len(globs))
+	out := make([]string, 0, len(globs))
+	for _, glob := range globs {
+		for _, term := range splitGlobLiteralTerms(glob, caseSensitive) {
+			if _, ok := seen[term]; ok {
+				continue
+			}
+			seen[term] = struct{}{}
+			out = append(out, term)
+		}
+	}
+	return out
+}
+
+func complexGlobExts(globs []string) []string {
+	seen := make(map[string]struct{}, len(globs))
+	out := make([]string, 0, len(globs))
+	for _, glob := range globs {
+		ext := strings.TrimPrefix(filepath.Ext(glob), ".")
+		if ext == "" || strings.ContainsAny(ext, `\/*?[]:`) {
+			continue
+		}
+		ext = strings.ToLower(ext)
+		if _, ok := seen[ext]; ok {
+			continue
+		}
+		seen[ext] = struct{}{}
+		out = append(out, ext)
+	}
+	return out
+}
+
+func splitGlobLiteralTerms(glob string, caseSensitive bool) []string {
+	var b strings.Builder
+	out := make([]string, 0, 2)
+	flush := func() {
+		if b.Len() >= 3 {
+			out = append(out, normalizeCase(b.String(), caseSensitive))
+		}
+		b.Reset()
+	}
+	for _, r := range glob {
+		switch r {
+		case '*', '?', '[', ']', '\\', '/', ':':
+			flush()
+		default:
+			b.WriteRune(r)
+		}
+	}
+	flush()
+	return out
 }
 
 func appendRegexLiteralTerms(out []string, pattern string, caseSensitive bool) []string {
@@ -5382,6 +6512,33 @@ func entryMatches(entry Entry, pq parsedQuery, matchPath bool) bool {
 			return false
 		}
 	}
+	for _, sf := range pq.SizeFilters {
+		if !sf.matches(entry.Size) {
+			return false
+		}
+	}
+	for _, df := range pq.DateFilters {
+		if !df.matches(entry.ModUnix) {
+			return false
+		}
+	}
+	for _, group := range pq.OrGroups {
+		matched := false
+		for _, alt := range group {
+			if entryMatches(entry, alt, matchPath) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return false
+		}
+	}
+	for _, neg := range pq.NotGroups {
+		if entryMatches(entry, neg, matchPath) {
+			return false
+		}
+	}
 	return true
 }
 
@@ -5436,6 +6593,140 @@ func parseTimeValue(value string) (time.Time, error) {
 	return time.Time{}, fmt.Errorf("invalid time %q; use RFC3339 or YYYY-MM-DD", value)
 }
 
+// parseSizeFilter parses an Everything-style size constraint such as ">100mb",
+// ">=1gb", "<4k", or "1024". A bare number is treated as an exact match.
+func parseSizeFilter(spec string) (sizeFilter, error) {
+	spec = strings.TrimSpace(spec)
+	if spec == "" {
+		return sizeFilter{}, errors.New("empty size: filter")
+	}
+	op := "="
+	switch {
+	case strings.HasPrefix(spec, ">="):
+		op, spec = ">=", spec[2:]
+	case strings.HasPrefix(spec, "<="):
+		op, spec = "<=", spec[2:]
+	case strings.HasPrefix(spec, ">"):
+		op, spec = ">", spec[1:]
+	case strings.HasPrefix(spec, "<"):
+		op, spec = "<", spec[1:]
+	case strings.HasPrefix(spec, "="):
+		op, spec = "=", spec[1:]
+	}
+	bytes, err := parseByteSize(strings.TrimSpace(spec))
+	if err != nil {
+		return sizeFilter{}, fmt.Errorf("invalid size: filter %q: %w", spec, err)
+	}
+	return sizeFilter{op: op, bytes: bytes}, nil
+}
+
+// parseByteSize parses a number with an optional unit suffix (b, kb, mb, gb,
+// tb; the trailing 'b' is optional, e.g. "100mb" or "100m"). Units are 1024-based.
+func parseByteSize(s string) (int64, error) {
+	s = strings.ToLower(strings.TrimSpace(s))
+	if s == "" {
+		return 0, errors.New("empty size")
+	}
+	mult := int64(1)
+	switch {
+	case strings.HasSuffix(s, "tb"):
+		mult, s = 1<<40, s[:len(s)-2]
+	case strings.HasSuffix(s, "gb"):
+		mult, s = 1<<30, s[:len(s)-2]
+	case strings.HasSuffix(s, "mb"):
+		mult, s = 1<<20, s[:len(s)-2]
+	case strings.HasSuffix(s, "kb"):
+		mult, s = 1<<10, s[:len(s)-2]
+	case strings.HasSuffix(s, "t"):
+		mult, s = 1<<40, s[:len(s)-1]
+	case strings.HasSuffix(s, "g"):
+		mult, s = 1<<30, s[:len(s)-1]
+	case strings.HasSuffix(s, "m"):
+		mult, s = 1<<20, s[:len(s)-1]
+	case strings.HasSuffix(s, "k"):
+		mult, s = 1<<10, s[:len(s)-1]
+	case strings.HasSuffix(s, "b"):
+		mult, s = 1, s[:len(s)-1]
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64)
+	if err != nil || n < 0 {
+		return 0, fmt.Errorf("not a valid byte count")
+	}
+	return n * mult, nil
+}
+
+// parseDateFilter parses an Everything-style dm: constraint. Supported specs:
+// "today", "yesterday", "thisweek", "lastweek", a relative duration like "24h"
+// or "7d", or an absolute date (YYYY-MM-DD) / RFC3339 timestamp meaning
+// "modified on or after".
+func parseDateFilter(spec string) (dateFilter, error) {
+	spec = strings.ToLower(strings.TrimSpace(spec))
+	if spec == "" {
+		return dateFilter{}, errors.New("empty dm: filter")
+	}
+	now := time.Now()
+	startOfDay := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+	switch spec {
+	case "today":
+		return dateFilter{after: startOfDay, before: startOfDay.AddDate(0, 0, 1)}, nil
+	case "yesterday":
+		return dateFilter{after: startOfDay.AddDate(0, 0, -1), before: startOfDay}, nil
+	case "thisweek":
+		weekday := int(startOfDay.Weekday())
+		weekStart := startOfDay.AddDate(0, 0, -weekday)
+		return dateFilter{after: weekStart, before: weekStart.AddDate(0, 0, 7)}, nil
+	case "lastweek":
+		weekday := int(startOfDay.Weekday())
+		weekStart := startOfDay.AddDate(0, 0, -weekday-7)
+		return dateFilter{after: weekStart, before: weekStart.AddDate(0, 0, 7)}, nil
+	}
+	// Relative duration: support a "d" (days) suffix in addition to Go durations.
+	if strings.HasSuffix(spec, "d") {
+		if days, err := strconv.Atoi(strings.TrimSuffix(spec, "d")); err == nil {
+			return dateFilter{after: now.AddDate(0, 0, -days)}, nil
+		}
+	}
+	if d, err := time.ParseDuration(spec); err == nil {
+		return dateFilter{after: now.Add(-d)}, nil
+	}
+	if t, err := parseTimeValue(spec); err == nil {
+		return dateFilter{after: t}, nil
+	}
+	return dateFilter{}, fmt.Errorf("invalid dm: filter %q; use today|yesterday|thisweek|lastweek, a duration (24h, 7d), or a date", spec)
+}
+
+// matchesSize reports whether size satisfies the filter.
+func (sf sizeFilter) matches(size int64) bool {
+	switch sf.op {
+	case ">":
+		return size > sf.bytes
+	case ">=":
+		return size >= sf.bytes
+	case "<":
+		return size < sf.bytes
+	case "<=":
+		return size <= sf.bytes
+	default:
+		return size == sf.bytes
+	}
+}
+
+// matches reports whether the modification time (unix nanoseconds) satisfies the
+// filter. A zero before bound means "no upper bound".
+func (df dateFilter) matches(modUnixNanos int64) bool {
+	if modUnixNanos == 0 {
+		return false
+	}
+	t := time.Unix(0, modUnixNanos)
+	if !df.after.IsZero() && t.Before(df.after) {
+		return false
+	}
+	if !df.before.IsZero() && !t.Before(df.before) {
+		return false
+	}
+	return true
+}
+
 func firstNonEmpty(values ...string) string {
 	for _, value := range values {
 		if value != "" {
@@ -5476,21 +6767,20 @@ func (idx *Index) compactPathContainsTerm(i int, term string) bool {
 	if idx.Volume != "" && strings.Contains(strings.ToLower(idx.Volume), term) {
 		return true
 	}
-	seen := make(map[int]struct{}, 16)
+	// Walk the parent chain without a per-call cycle-detection map: this is on
+	// the broad-scan hot path (called per term per record across tens of millions
+	// of records), and the depth cap already bounds a malformed chain. A cycle
+	// simply exhausts the cap and returns false, the same result the map gave.
 	cur := i
 	for depth := 0; depth < 1024; depth++ {
 		if cur < 0 || cur >= idx.compactRecordCount() {
 			return false
 		}
-		if _, ok := seen[cur]; ok {
-			return false
-		}
-		seen[cur] = struct{}{}
 		rec := idx.compactRecord(cur)
 		if strings.Contains(idx.compactLowerNameAt(cur), term) {
 			return true
 		}
-		if rec.Parent < 0 {
+		if rec.Parent < 0 || int(rec.Parent) == cur {
 			return false
 		}
 		cur = int(rec.Parent)
@@ -5969,6 +7259,44 @@ func saveIndex(path string, idx *Index) error {
 		_ = dir.Close()
 	}
 	return nil
+}
+
+func (vol *serviceVolumeIndex) buildSubtreeRanges() {
+	if vol == nil || vol.index == nil || len(vol.childOffsets) == 0 {
+		return
+	}
+	recordCount := vol.index.compactRecordCount()
+	start := make([]uint32, recordCount)
+	end := make([]uint32, recordCount)
+	for i := range start {
+		start[i] = ^uint32(0)
+	}
+	order := make([]uint32, 0, recordCount)
+	seen := make([]bool, recordCount)
+	var walk func(int)
+	walk = func(id int) {
+		if id < 0 || id >= recordCount || seen[id] {
+			return
+		}
+		seen[id] = true
+		start[id] = uint32(len(order))
+		order = append(order, uint32(id))
+		for _, childID := range vol.childIDsForRecord(id) {
+			walk(int(childID))
+		}
+		end[id] = uint32(len(order))
+	}
+	for _, rootID := range vol.rootIDs {
+		walk(int(rootID))
+	}
+	for id := 0; id < recordCount; id++ {
+		if !seen[id] {
+			walk(id)
+		}
+	}
+	vol.subtreeOrder = order
+	vol.subtreeStart = start
+	vol.subtreeEnd = end
 }
 
 func loadIndex(path string) (*Index, error) {

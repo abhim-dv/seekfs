@@ -7,3 +7,13 @@ type:file ext:md
 type:dir docs
 regex:README\.(md|txt)$
 regex:^.*\.(go|rs|py|js)$
+src ext:go
+src ext:rs
+test ext:py
+test ext:js
+docs ext:md
+config ext:json
+src main.go
+src lib.rs
+test package.json
+docs README.md

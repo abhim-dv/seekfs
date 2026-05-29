@@ -1,0 +1,146 @@
+package main
+
+import "testing"
+
+func TestPlannedCandidatesMatchFullSearchForStructuralFilters(t *testing.T) {
+	idx := commonSearchFixture()
+	vol := newServiceVolumeIndex("fixture.gsi", idx)
+	cases := []queryOptions{
+		{Query: "src ext:go", MatchPath: true, Limit: 20},
+		{Query: "dir:src ext:go", MatchPath: true, Limit: 20},
+		{Query: "glob:*test*.go", MatchPath: true, Limit: 20},
+		{Query: `regex:Assets.*\.dat$`, MatchPath: true, Under: `C:\fixture\workspace`, Limit: 20},
+		{Query: "type:file glob:*.go", MatchPath: true, Under: `C:\fixture\workspace`, Limit: 20},
+	}
+	for _, opts := range cases {
+		t.Run(opts.Query, func(t *testing.T) {
+			pq, err := parseQuery(opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			pq.Limit = normalizedLimit(opts.Limit, false)
+			got, ok := vol.plannedCandidates(pq)
+			if !ok {
+				t.Fatal("plannedCandidates declined query")
+			}
+			full, err := searchCompactWithCache(idx, opts, false, make(map[int]string), nil)
+			if err != nil {
+				t.Fatalf("full search: %v", err)
+			}
+			fast, err := searchCompactWithCache(idx, opts, false, vol.pathCache, func(parsedQuery) ([]int, bool) {
+				return got, true
+			})
+			if err != nil {
+				t.Fatalf("planned search: %v", err)
+			}
+			if !sameStringSet(namesOf(fast), namesOf(full)) {
+				t.Fatalf("planned names = %v, full names = %v", namesOf(fast), namesOf(full))
+			}
+		})
+	}
+}
+
+func TestPlannedCountMatchesFullSearchCount(t *testing.T) {
+	idx := commonSearchFixture()
+	vol := newServiceVolumeIndex("fixture.gsi", idx)
+	cases := []queryOptions{
+		{Query: "type:file ext:go", MatchPath: true},
+		{Query: "dir:src ext:go", MatchPath: true},
+		{Query: "glob:*test*.go", MatchPath: true},
+		{Query: "ext:dat", MatchPath: true, Under: `C:\fixture\workspace\Assets`},
+		{Query: `regex:Assets.*\.(dat|txt)$`, MatchPath: true, Under: `C:\fixture\workspace`},
+	}
+	for _, opts := range cases {
+		t.Run(opts.Query, func(t *testing.T) {
+			pq, err := parseQuery(opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, ok := vol.plannedCount(pq)
+			if !ok {
+				t.Fatal("plannedCount declined query")
+			}
+			full, err := searchCompactWithCache(idx, opts, true, make(map[int]string), nil)
+			if err != nil {
+				t.Fatalf("full count search: %v", err)
+			}
+			if got != len(full) {
+				t.Fatalf("planned count = %d, full count = %d", got, len(full))
+			}
+		})
+	}
+}
+
+func TestCandidatePlanUsesCheapestUnderOrPostingSource(t *testing.T) {
+	idx := commonSearchFixture()
+	vol := newServiceVolumeIndex("fixture.gsi", idx)
+	pq, err := parseQuery(queryOptions{Query: "type:file ext:go", MatchPath: true, Under: `C:\fixture\workspace`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, ok := vol.buildCandidatePlan(pq)
+	if !ok {
+		t.Fatal("buildCandidatePlan declined query")
+	}
+	if len(plan.sources) == 0 || plan.sources[0].name != "ext:go" {
+		t.Fatalf("plan sources = %+v, want extension posting before subtree materialization", plan.sources)
+	}
+
+	pq, err = parseQuery(queryOptions{Query: "type:file", MatchPath: true, Under: `C:\fixture\workspace\src`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, ok = vol.buildCandidatePlan(pq)
+	if !ok {
+		t.Fatal("buildCandidatePlan declined under-only query")
+	}
+	if len(plan.sources) == 0 || plan.sources[0].name != "under" {
+		t.Fatalf("plan sources = %+v, want under source for unposted subtree query", plan.sources)
+	}
+}
+
+func TestCandidatePlanSkipsSingleCharacterPathTermWhenSelectiveTermExists(t *testing.T) {
+	idx := commonSearchFixture()
+	vol := newServiceVolumeIndex("fixture.gsi", idx)
+	pq, err := parseQuery(queryOptions{Query: "c main.go", MatchPath: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, ok := vol.buildCandidatePlan(pq)
+	if !ok {
+		t.Fatal("buildCandidatePlan declined query")
+	}
+	for _, source := range plan.sources {
+		if source.name == "term:c" {
+			t.Fatalf("plan sources = %+v, should not build broad single-character path term posting", plan.sources)
+		}
+	}
+	got := plan.execute()
+	if len(got) == 0 {
+		t.Fatal("plan returned no candidates from the selective term")
+	}
+}
+
+func TestCandidatePlanDeclinesCaseSensitivePostings(t *testing.T) {
+	idx := commonSearchFixture()
+	vol := newServiceVolumeIndex("fixture.gsi", idx)
+	pq, err := parseQuery(queryOptions{Query: "case: README", MatchPath: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := vol.plannedCandidates(pq); ok {
+		t.Fatal("plannedCandidates accepted case-sensitive query")
+	}
+}
+
+func TestRegexLiteralCandidatesDeclinesAlternationLiterals(t *testing.T) {
+	idx := commonSearchFixture()
+	vol := newServiceVolumeIndex("fixture.gsi", idx)
+	pq, err := parseQuery(queryOptions{Query: `regex:Assets.*\.(dat|txt)$`, MatchPath: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := vol.regexLiteralCandidates(pq); ok {
+		t.Fatal("regexLiteralCandidates accepted ambiguous alternation literals")
+	}
+}
