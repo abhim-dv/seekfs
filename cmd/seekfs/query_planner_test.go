@@ -99,6 +99,30 @@ func TestCandidatePlanUsesCheapestUnderOrPostingSource(t *testing.T) {
 	}
 }
 
+func TestCandidatePlanUsesNameTermBeforeUnderSubtree(t *testing.T) {
+	idx := commonSearchFixture()
+	vol := newServiceVolumeIndex("fixture.gsi", idx)
+	pq, err := parseQuery(queryOptions{Query: "main.go", Under: `C:\fixture\workspace`, Limit: 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, ok := vol.buildCandidatePlan(pq)
+	if !ok {
+		t.Fatal("buildCandidatePlan declined query")
+	}
+	if len(plan.sources) == 0 {
+		t.Fatal("buildCandidatePlan returned no sources")
+	}
+	for _, source := range plan.sources {
+		if source.name == "under" {
+			t.Fatalf("plan sources = %+v, should filter selective filename candidates by --under instead of materializing subtree", plan.sources)
+		}
+	}
+	if plan.sources[0].name != "term:main.go" {
+		t.Fatalf("first source = %q, want term:main.go", plan.sources[0].name)
+	}
+}
+
 func TestCandidatePlanSkipsSingleCharacterPathTermWhenSelectiveTermExists(t *testing.T) {
 	idx := commonSearchFixture()
 	vol := newServiceVolumeIndex("fixture.gsi", idx)

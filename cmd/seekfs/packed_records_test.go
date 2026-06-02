@@ -69,6 +69,34 @@ func TestPackedRecordsSetAndAppendUseNameBlob(t *testing.T) {
 	}
 }
 
+func TestPackedRecordsSetUnchangedNameDoesNotGrowNameBlob(t *testing.T) {
+	packed := newPackedRecords([]CompactRecord{{FRN: 1, ParentFRN: 1, Parent: -1, Name: "same.txt"}})
+	initialNameBlob := len(packed.NameBlob)
+	initialLowerBlob := len(packed.LowerBlob)
+
+	for i := 0; i < 100; i++ {
+		packed.Set(0, CompactRecord{
+			FRN:       1,
+			ParentFRN: 1,
+			Parent:    -1,
+			Name:      "same.txt",
+			Mode:      uint32(i),
+			Size:      int64(i),
+			ModUnix:   int64(i + 1),
+		})
+	}
+
+	if len(packed.NameBlob) != initialNameBlob {
+		t.Fatalf("NameBlob grew from %d to %d for unchanged names", initialNameBlob, len(packed.NameBlob))
+	}
+	if len(packed.LowerBlob) != initialLowerBlob {
+		t.Fatalf("LowerBlob grew from %d to %d for unchanged names", initialLowerBlob, len(packed.LowerBlob))
+	}
+	if got := packed.At(0); got.Mode != 99 || got.Size != 99 || got.ModUnix != 100 {
+		t.Fatalf("At(0) = %+v, want metadata updates preserved", got)
+	}
+}
+
 func TestNewPackedRecordsDeduplicatesNameBlob(t *testing.T) {
 	packed := newPackedRecords([]CompactRecord{
 		{FRN: 1, Name: "same.txt"},
@@ -171,5 +199,31 @@ func TestIndexPackCompactRecordsDropRecordsKeepsPackedAccess(t *testing.T) {
 	}
 	if got := idx.compactRecord(1); got.FRN != 2 || got.Name != "two.txt" || got.Size != 22 {
 		t.Fatalf("compactRecord(1) = %+v, want packed second record", got)
+	}
+}
+
+func TestIndexRepackCompactRecordsDeduplicatesUpdatedNames(t *testing.T) {
+	idx := &Index{
+		Compact: true,
+		Records: []CompactRecord{
+			{FRN: 1, ParentFRN: 1, Parent: -1, Name: "."},
+			{FRN: 2, ParentFRN: 1, Parent: 0, Name: "old.txt"},
+			{FRN: 3, ParentFRN: 1, Parent: 0, Name: "old.txt"},
+		},
+	}
+	idx.packCompactRecords(true)
+	idx.setCompactRecord(1, CompactRecord{FRN: 2, ParentFRN: 1, Parent: 0, Name: "new.txt"})
+	idx.setCompactRecord(2, CompactRecord{FRN: 3, ParentFRN: 1, Parent: 0, Name: "new.txt"})
+	if len(idx.PackedRecords.NameBlob) <= len(".old.txtnew.txt") {
+		t.Fatalf("test setup did not create stale name blob bytes: %q", string(idx.PackedRecords.NameBlob))
+	}
+
+	idx.repackCompactRecords()
+
+	if got, want := string(idx.PackedRecords.NameBlob), ".new.txt"; got != want {
+		t.Fatalf("NameBlob after repack = %q, want %q", got, want)
+	}
+	if got := idx.compactRecord(2).Name; got != "new.txt" {
+		t.Fatalf("record name after repack = %q, want new.txt", got)
 	}
 }

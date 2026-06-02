@@ -392,8 +392,54 @@ func run(args []string) error {
 		printSearchHelp()
 		return nil
 	default:
+		if looksLikeSearchWithoutSubcommand(args) {
+			return fmt.Errorf("missing command: use `seekfs search %s`", strings.Join(normalizeCommandlessSearchArgs(args), " "))
+		}
 		return usage()
 	}
+}
+
+func looksLikeSearchWithoutSubcommand(args []string) bool {
+	for _, arg := range args {
+		if arg == "--under" || strings.HasPrefix(arg, "--under=") || arg == "-path" || arg == "--json" || arg == "-n" {
+			return true
+		}
+	}
+	if len(args) > 1 && !strings.HasPrefix(args[0], "-") {
+		return true
+	}
+	return false
+}
+
+func normalizeCommandlessSearchArgs(args []string) []string {
+	valueFlags := map[string]bool{
+		"--under": true, "-db": true, "--db": true, "-n": true, "--n": true,
+		"-config": true, "--config": true, "-pipe": true, "--pipe": true,
+		"-root-bias": true, "--root-bias": true, "-recent": true, "--recent": true,
+		"-modified-after": true, "--modified-after": true,
+	}
+	boolFlags := map[string]bool{
+		"-path": true, "--path": true, "--json": true, "-json": true,
+		"-service": true, "--service": true, "-local": true, "--local": true,
+		"--exists": true, "-exists": true, "--cwd-bias": true, "-cwd-bias": true,
+		"-case": true, "--case": true,
+	}
+	flags := make([]string, 0, len(args))
+	query := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if valueFlags[arg] && i+1 < len(args) {
+			flags = append(flags, arg, args[i+1])
+			i++
+			continue
+		}
+		if boolFlags[arg] || strings.Contains(arg, "=") && strings.HasPrefix(arg, "-") {
+			flags = append(flags, arg)
+			continue
+		}
+		query = append(query, arg)
+	}
+	return append(flags, query...)
 }
 
 func usage() error {
@@ -2499,6 +2545,7 @@ func catchUpServiceVolume(vol *serviceVolumeIndex) error {
 			vol.staleReason = err.Error()
 			return err
 		}
+		vol.repackResidentRecordsIfBloated()
 		if err := removeWAL(vol.dbPath); err != nil {
 			serviceLog("wal cleanup error volume=%s db=%s err=%v", vol.volume, vol.dbPath, err)
 		}
@@ -2640,6 +2687,7 @@ func (s *goSearchService) persistVolumeIfDue(vol *serviceVolumeIndex, force bool
 		vol.staleReason = err.Error()
 		serviceLog("background persist error volume=%s db=%s err=%v", vol.volume, vol.dbPath, err)
 	} else {
+		vol.repackResidentRecordsIfBloated()
 		if err := removeWAL(vol.dbPath); err != nil {
 			serviceLog("wal cleanup error volume=%s db=%s err=%v", vol.volume, vol.dbPath, err)
 		}
@@ -2659,6 +2707,21 @@ func (vol *serviceVolumeIndex) afterPersist() {
 	vol.recentSeq++
 	vol.clearSearchCachesLocked()
 	debug.FreeOSMemory()
+}
+
+func (vol *serviceVolumeIndex) repackResidentRecordsIfBloated() {
+	if vol == nil || vol.index == nil || !vol.index.packedNameBlobLooksBloated() {
+		return
+	}
+	before := len(vol.index.PackedRecords.NameBlob)
+	start := time.Now()
+	vol.index.repackCompactRecords()
+	debug.FreeOSMemory()
+	after := 0
+	if vol.index.PackedRecords != nil {
+		after = len(vol.index.PackedRecords.NameBlob)
+	}
+	serviceLog("repacked resident name blob volume=%s before=%d after=%d elapsed=%s", vol.volume, before, after, time.Since(start).Round(time.Millisecond))
 }
 
 func queryUSNJournal(handle windows.Handle) (usnJournalDataV0, error) {
@@ -2971,7 +3034,23 @@ func (vol *serviceVolumeIndex) buildCompactChildren() {
 	}
 	vol.childOffsets = counts
 	vol.childIDs = childIDs
-	vol.buildSubtreeRanges()
+	if serviceSubtreeIntervalsEnabled() {
+		vol.buildSubtreeRanges()
+	} else {
+		vol.subtreeOrder = nil
+		vol.subtreeStart = nil
+		vol.subtreeEnd = nil
+	}
+}
+
+func serviceSubtreeIntervalsEnabled() bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv("SEEKFS_SUBTREE_INTERVALS")))
+	return v == "1" || v == "true" || v == "yes" || v == "on"
+}
+
+func servicePathGramsEnabled() bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv("SEEKFS_PATH_GRAMS")))
+	return v == "1" || v == "true" || v == "yes" || v == "on"
 }
 
 func (vol *serviceVolumeIndex) childIDsForRecord(id int) []uint32 {
@@ -3004,9 +3083,11 @@ func (vol *serviceVolumeIndex) childIDsForRecord(id int) []uint32 {
 func buildResidentQueryIndex(vol *serviceVolumeIndex) *residentQueryIndex {
 	recordCount := vol.index.compactRecordCount()
 	qi := &residentQueryIndex{
-		ext:       make(map[string][]uint32),
-		pathGrams: make(map[string][]uint32),
-		dirs:      make([]uint32, 0, recordCount/8),
+		ext:  make(map[string][]uint32),
+		dirs: make([]uint32, 0, recordCount/8),
+	}
+	if servicePathGramsEnabled() {
+		qi.pathGrams = make(map[string][]uint32)
 	}
 	qi.nameOrder = make([]uint32, 0, recordCount)
 	for id := 0; id < recordCount; id++ {
@@ -3018,7 +3099,7 @@ func buildResidentQueryIndex(vol *serviceVolumeIndex) *residentQueryIndex {
 		name := vol.index.compactLowerNameAt(id)
 		if rec.Mode&uint32(os.ModeDir) != 0 {
 			qi.dirs = append(qi.dirs, uint32(id))
-			if name != "" && name != "." {
+			if qi.pathGrams != nil && name != "" && name != "." {
 				for _, gram := range componentGrams(name) {
 					qi.pathGrams[gram] = append(qi.pathGrams[gram], uint32(id))
 				}
@@ -3031,7 +3112,9 @@ func buildResidentQueryIndex(vol *serviceVolumeIndex) *residentQueryIndex {
 		}
 	}
 	sortResidentPostings(qi.ext)
-	sortResidentPostings(qi.pathGrams)
+	if qi.pathGrams != nil {
+		sortResidentPostings(qi.pathGrams)
+	}
 	sortUint32s(qi.dirs)
 	if len(qi.nameOrder) > 0 {
 		sort.Slice(qi.nameOrder, func(i, j int) bool {
@@ -3219,6 +3302,35 @@ func (idx *Index) packCompactRecords(dropRecords bool) {
 	}
 }
 
+func (idx *Index) repackCompactRecords() {
+	if idx == nil || !idx.Compact || idx.PackedRecords == nil {
+		return
+	}
+	count := idx.PackedRecords.Len()
+	records := make([]CompactRecord, count)
+	for i := range records {
+		records[i] = idx.PackedRecords.At(i)
+	}
+	idx.PackedRecords = newPackedRecords(records)
+	idx.Records = nil
+	idx.CompactNameOrder = nil
+}
+
+func (idx *Index) packedNameBlobLooksBloated() bool {
+	if idx == nil || idx.PackedRecords == nil {
+		return false
+	}
+	recordCount := idx.PackedRecords.Len()
+	if recordCount == 0 {
+		return false
+	}
+	limit := recordCount * 64
+	if limit < 512*1024*1024 {
+		limit = 512 * 1024 * 1024
+	}
+	return len(idx.PackedRecords.NameBlob) > limit
+}
+
 func (p *PackedRecords) Len() int {
 	if p == nil {
 		return 0
@@ -3252,8 +3364,10 @@ func (p *PackedRecords) Set(i int, rec CompactRecord) {
 	p.FRNs[i] = rec.FRN
 	p.Parents[i] = rec.Parent
 	p.setParentFRN(i, rec.ParentFRN)
-	p.setName(i, rec.Name)
-	p.setLowerName(i, rec.Name)
+	if rec.Name != p.nameAt(i) {
+		p.setName(i, rec.Name)
+		p.setLowerName(i, rec.Name)
+	}
 	p.Modes[i] = rec.Mode
 	p.setSize(i, rec.Size)
 	p.setModUnix(i, rec.ModUnix)
@@ -3934,6 +4048,10 @@ func searchAll(indexes []*Index, opts queryOptions, countOnly bool) ([]Entry, er
 }
 
 func searchServiceVolumes(volumes []*serviceVolumeIndex, opts queryOptions, countOnly bool) ([]Entry, error) {
+	volumes, err := serviceVolumesForQuery(volumes, opts)
+	if err != nil {
+		return nil, err
+	}
 	if len(volumes) == 1 {
 		vol := volumes[0]
 		vol.searchMu.Lock()
@@ -3967,6 +4085,10 @@ func searchServiceVolumes(volumes []*serviceVolumeIndex, opts queryOptions, coun
 }
 
 func countServiceVolumes(volumes []*serviceVolumeIndex, opts queryOptions) (int, bool, error) {
+	volumes, err := serviceVolumesForQuery(volumes, opts)
+	if err != nil {
+		return 0, true, err
+	}
 	pq, err := parseQuery(opts)
 	if err != nil {
 		return 0, true, err
@@ -3990,6 +4112,38 @@ func countServiceVolumes(volumes []*serviceVolumeIndex, opts queryOptions) (int,
 		total += count
 	}
 	return total, true, nil
+}
+
+func serviceVolumesForQuery(volumes []*serviceVolumeIndex, opts queryOptions) ([]*serviceVolumeIndex, error) {
+	if len(volumes) == 0 {
+		return nil, errors.New("service has no search indexes loaded")
+	}
+	wantVolume := strings.ToUpper(filepath.VolumeName(filepath.Clean(opts.Under)))
+	ready := make([]*serviceVolumeIndex, 0, len(volumes))
+	stale := make([]string, 0, len(volumes))
+	for _, vol := range volumes {
+		if vol == nil || vol.index == nil {
+			continue
+		}
+		if wantVolume != "" && !strings.EqualFold(vol.index.Volume, wantVolume) {
+			continue
+		}
+		if vol.state != "" && vol.state != "ready" {
+			stale = append(stale, fmt.Sprintf("%s: %s", vol.index.Volume, vol.staleReason))
+			continue
+		}
+		ready = append(ready, vol)
+	}
+	if len(ready) > 0 {
+		return ready, nil
+	}
+	if len(stale) > 0 {
+		return nil, fmt.Errorf("matching search index is stale: %s", strings.Join(stale, "; "))
+	}
+	if wantVolume != "" {
+		return nil, fmt.Errorf("no loaded search index for volume %s", wantVolume)
+	}
+	return nil, errors.New("service has no ready search indexes loaded")
 }
 
 func (vol *serviceVolumeIndex) fastPostingCount(pq parsedQuery) (int, bool) {
@@ -4316,10 +4470,10 @@ func compactRecordPrecheck(rec CompactRecord, pq parsedQuery, matchPath bool) bo
 }
 
 func (vol *serviceVolumeIndex) nameTermCandidates(pq parsedQuery) ([]int, bool) {
-	if candidates, ok := vol.underCandidates(pq); ok {
+	if candidates, ok := vol.plannedCandidates(pq); ok {
 		return candidates, true
 	}
-	if candidates, ok := vol.plannedCandidates(pq); ok {
+	if candidates, ok := vol.underCandidates(pq); ok {
 		return candidates, true
 	}
 	if candidates, ok := vol.broadPathScanCandidates(pq); ok {
@@ -4785,6 +4939,9 @@ func (vol *serviceVolumeIndex) scanUnderRootsTermLimited(roots []int, term strin
 
 func (vol *serviceVolumeIndex) scanUnderTermLimited(rootID int, term string, limit int) ([]int, bool) {
 	if vol == nil || vol.index == nil || limit <= 0 || rootID < 0 || rootID >= vol.index.compactRecordCount() {
+		return nil, false
+	}
+	if rootID >= len(vol.subtreeStart) || rootID >= len(vol.subtreeEnd) || len(vol.subtreeOrder) == 0 {
 		return nil, false
 	}
 	start, end := vol.subtreeStart[rootID], vol.subtreeEnd[rootID]
