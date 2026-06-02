@@ -1,6 +1,9 @@
 package main
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestServiceVolumeIndexAfterPersistClearsRecentAndSearchCaches(t *testing.T) {
 	vol := syntheticServiceVolumeIndexForCacheTests()
@@ -99,6 +102,64 @@ func TestSimpleGlobExtsDeclinesComplexGlobs(t *testing.T) {
 	}
 	if got := complexGlobExts([]string{"*test*.go", "README.*"}); len(got) != 1 || got[0] != "go" {
 		t.Fatalf("complexGlobExts = %v, want [go]", got)
+	}
+}
+
+func TestServiceSubtreeIntervalsDisabledByDefault(t *testing.T) {
+	t.Setenv("SEEKFS_SUBTREE_INTERVALS", "")
+	if serviceSubtreeIntervalsEnabled() {
+		t.Fatal("subtree intervals should be disabled by default")
+	}
+	t.Setenv("SEEKFS_SUBTREE_INTERVALS", "1")
+	if !serviceSubtreeIntervalsEnabled() {
+		t.Fatal("subtree intervals should be enabled by explicit opt-in")
+	}
+}
+
+func TestServicePathGramsDisabledByDefault(t *testing.T) {
+	t.Setenv("SEEKFS_PATH_GRAMS", "")
+	if servicePathGramsEnabled() {
+		t.Fatal("path grams should be disabled by default")
+	}
+	t.Setenv("SEEKFS_PATH_GRAMS", "true")
+	if !servicePathGramsEnabled() {
+		t.Fatal("path grams should be enabled by explicit opt-in")
+	}
+}
+
+func TestServiceVolumesForQuerySkipsStaleNonMatchingUnderVolume(t *testing.T) {
+	c := &serviceVolumeIndex{index: &Index{Volume: "C:"}, state: "stale", staleReason: "old checkpoint"}
+	f := &serviceVolumeIndex{index: &Index{Volume: "F:"}, state: "ready"}
+	got, err := serviceVolumesForQuery([]*serviceVolumeIndex{c, f}, queryOptions{Under: `F:\git\seekfs`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0] != f {
+		t.Fatalf("volumes = %+v, want only ready F: volume", got)
+	}
+}
+
+func TestServiceVolumesForQueryErrorsForMatchingStaleVolume(t *testing.T) {
+	c := &serviceVolumeIndex{index: &Index{Volume: "C:"}, state: "stale", staleReason: "old checkpoint"}
+	if _, err := serviceVolumesForQuery([]*serviceVolumeIndex{c}, queryOptions{Under: `C:\Data`}); err == nil || !strings.Contains(err.Error(), "stale") {
+		t.Fatalf("error = %v, want stale index error", err)
+	}
+}
+
+func TestLooksLikeSearchWithoutSubcommand(t *testing.T) {
+	if !looksLikeSearchWithoutSubcommand([]string{"ScenePropertyPanel.cpp", "--under", `F:\git\DVCode`}) {
+		t.Fatal("expected omitted search command to be recognized")
+	}
+	if looksLikeSearchWithoutSubcommand([]string{"bogus"}) {
+		t.Fatal("single unknown command should not be treated as omitted search")
+	}
+}
+
+func TestNormalizeCommandlessSearchArgsMovesFlagsBeforeQuery(t *testing.T) {
+	got := normalizeCommandlessSearchArgs([]string{"ScenePropertyPanel.cpp", "--under", `F:\git\DVCode`, "-path"})
+	want := []string{"--under", `F:\git\DVCode`, "-path", "ScenePropertyPanel.cpp"}
+	if !sameStringSet(got, want) || strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("normalized args = %v, want %v", got, want)
 	}
 }
 

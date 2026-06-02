@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.8.1 - Resident Memory and Repo-Scoped Search Fixes
+
+### Fixed
+
+- Stopped resident `NameBlob` and lowercase-name blob growth during live USN
+  updates when a record's name has not changed.
+- Added resident repacking after catch-up and background persistence when packed
+  name blobs have grown beyond expected size.
+- Reduced default resident memory by making subtree interval arrays and path
+  component 3-gram postings opt-in (`SEEKFS_SUBTREE_INTERVALS=1` and
+  `SEEKFS_PATH_GRAMS=1`).
+- Reordered repo-scoped candidate planning so selective filename, extension,
+  and glob postings can drive `--under` queries before materializing a subtree.
+- Stale volumes that cannot match a query's `--under` root are skipped; stale
+  matching volumes now return a clear stale-index error.
+- Improved the error for omitted `search` subcommands, including flag ordering
+  in the suggested replacement command.
+
+### Validation
+
+- Reproduced and fixed dogfood timeouts: `--under F:\git\seekfs dogfood` dropped
+  from about 34 seconds to under 1 second, and a broad repo-scoped `retrieval`
+  query dropped from about 19 seconds to under 1 second on the maintainer's
+  machine.
+- `go test ./...`, `go vet ./...`, and the CLI integration test passed before
+  release packaging.
+
 ## 0.8.0 - Query Planning and Metadata Filters
 
 ### Added
