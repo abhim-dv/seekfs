@@ -42,8 +42,12 @@
 
 - `ext:` matches exact file extensions without the leading dot.
 - `glob:` currently matches the file name, not the full path.
+- Bare wildcard filename tokens such as `*_test.go` are treated as filename
+  globs too; use `glob:` when you want that behavior to be explicit.
 - `dir:` is a path substring filter.
 - `regex:` evaluates against the normalized full path.
+- Omitting the `search` subcommand is accepted for search-like invocations, for
+  example `seekfs --under F:\git\seekfs "main.go"`.
 - `--exists` calls `os.Stat` and is slower, but filters stale index entries.
 - `size:` units are 1024-based (`kb`, `mb`, `gb`, `tb`; the trailing `b` is
   optional). `size:` and `dm:` require an index built with file metadata; NTFS

@@ -58,6 +58,7 @@ Query through the service:
 .\seekfs.exe config set output_format json
 .\seekfs.exe config set default_limit 20
 .\seekfs.exe search "gh.exe"
+.\seekfs.exe --under F:\git\seekfs "main.go"
 .\seekfs.exe search --under F:\git\seekfs "main.go"
 .\seekfs.exe search -path "ext:go dir:cmd main"
 .\seekfs.exe count  -path "ext:go dir:cmd main"
@@ -104,6 +105,10 @@ contents or symbols. Use `rg` for text-content search, definitions, import
 references, and line matches. For repo-local file discovery, use `--under` to
 avoid unrelated machine-wide results. If `seekfs` is not on PATH in a fresh
 agent shell, call the binary directly, for example `F:\git\seekfs\seekfs.exe`.
+For agent convenience, omitting the `search` subcommand also works for search
+flags, for example `seekfs --under F:\git\seekfs "main.go"`.
+Bare wildcard filename queries such as `seekfs "*_test.go"` are also treated
+as filename globs without requiring an explicit `glob:` prefix.
 
 Inspect an index:
 

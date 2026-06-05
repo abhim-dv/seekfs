@@ -393,7 +393,7 @@ func run(args []string) error {
 		return nil
 	default:
 		if looksLikeSearchWithoutSubcommand(args) {
-			return fmt.Errorf("missing command: use `seekfs search %s`", strings.Join(normalizeCommandlessSearchArgs(args), " "))
+			return cmdSearch(normalizeCommandlessSearchArgs(args), false)
 		}
 		return usage()
 	}
@@ -401,11 +401,23 @@ func run(args []string) error {
 
 func looksLikeSearchWithoutSubcommand(args []string) bool {
 	for _, arg := range args {
-		if arg == "--under" || strings.HasPrefix(arg, "--under=") || arg == "-path" || arg == "--json" || arg == "-n" {
+		if arg == "--under" || strings.HasPrefix(arg, "--under=") ||
+			arg == "-db" || arg == "--db" || strings.HasPrefix(arg, "-db=") || strings.HasPrefix(arg, "--db=") ||
+			arg == "-path" || arg == "--path" || arg == "--json" || arg == "-json" ||
+			arg == "-n" || arg == "--n" || strings.HasPrefix(arg, "-n=") || strings.HasPrefix(arg, "--n=") ||
+			arg == "-service" || arg == "--service" || arg == "-local" || arg == "--local" ||
+			arg == "--exists" || arg == "-exists" || arg == "--cwd-bias" || arg == "-cwd-bias" ||
+			arg == "-root-bias" || arg == "--root-bias" || strings.HasPrefix(arg, "-root-bias=") || strings.HasPrefix(arg, "--root-bias=") ||
+			arg == "-recent" || arg == "--recent" || strings.HasPrefix(arg, "-recent=") || strings.HasPrefix(arg, "--recent=") ||
+			arg == "-modified-after" || arg == "--modified-after" || strings.HasPrefix(arg, "-modified-after=") || strings.HasPrefix(arg, "--modified-after=") ||
+			arg == "-case" || arg == "--case" {
 			return true
 		}
 	}
 	if len(args) > 1 && !strings.HasPrefix(args[0], "-") {
+		return true
+	}
+	if len(args) == 1 && looksLikeImplicitFilenameGlob(args[0]) {
 		return true
 	}
 	return false
@@ -482,6 +494,7 @@ Agent starting points:
   seekfs config set output_format json
   seekfs config set default_limit 20
   seekfs search "gh.exe"
+  seekfs --under F:\git\seekfs "main.go"
   seekfs search --under F:\git\seekfs "main.go"
   seekfs search -path "ext:go dir:cmd main"
   seekfs count -path "type:file ext:go"`)
@@ -520,6 +533,7 @@ Query filters:
 
 Examples:
   seekfs search "gh.exe"
+  seekfs --under F:\git\seekfs "main.go"
   seekfs search -path "ext:go dir:cmd main"
   seekfs search -path --under F:\git\seekfs "type:file glob:*.md"
   seekfs search -path --exists --recent 24h "ext:go"
@@ -556,6 +570,7 @@ Recommended commands:
   seekfs config set output_format json
   seekfs config set default_limit 20
   seekfs search "gh.exe"
+  seekfs --under F:\git\seekfs "main.go"
   seekfs search --under F:\git\seekfs "main.go"
   seekfs search -path "ext:go dir:cmd main"
   seekfs count -path "type:file ext:go"
@@ -2266,6 +2281,8 @@ func probeDoctor(pipeName string) doctorResponse {
 	if !resp.OK && resp.Message == "" {
 		if resp.PipeReachable && !resp.Running {
 			resp.Message = "seekfs pipe is reachable but the Windows service is not running"
+		} else if !resp.PipeReachable && resp.ServiceError != "" && strings.Contains(strings.ToLower(resp.ServiceError), "access is denied") {
+			resp.Message = "seekfs service pipe denied access; run seekfs launch/setup-service from an elevated shell to refresh the service ACL"
 		} else {
 			resp.Message = "seekfs service is not fully healthy"
 		}
@@ -2310,6 +2327,23 @@ func queryWindowsService() (svc.Status, error) {
 }
 
 func callService(pipeName string, req serviceRequest) (serviceResponse, error) {
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		resp, err := callServiceOnce(pipeName, req)
+		if err == nil {
+			return resp, nil
+		}
+		if !isTransientPipeError(err) || time.Now().After(deadline) {
+			if strings.Contains(strings.ToLower(err.Error()), "access is denied") {
+				return serviceResponse{}, fmt.Errorf("access denied opening seekfs service pipe %s; run seekfs launch/setup-service from an elevated shell to refresh the service ACL: %w", pipeName, err)
+			}
+			return serviceResponse{}, err
+		}
+		time.Sleep(75 * time.Millisecond)
+	}
+}
+
+func callServiceOnce(pipeName string, req serviceRequest) (serviceResponse, error) {
 	handle, err := openPipeClient(pipeName)
 	if err != nil {
 		return serviceResponse{}, err
@@ -2324,6 +2358,23 @@ func callService(pipeName string, req serviceRequest) (serviceResponse, error) {
 		return serviceResponse{}, err
 	}
 	return resp, nil
+}
+
+func isTransientPipeError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, windows.ERROR_PIPE_BUSY) ||
+		errors.Is(err, windows.ERROR_PIPE_NOT_CONNECTED) ||
+		errors.Is(err, windows.ERROR_BROKEN_PIPE) ||
+		errors.Is(err, windows.ERROR_NO_DATA) ||
+		errors.Is(err, windows.ERROR_FILE_NOT_FOUND) {
+		return true
+	}
+	text := strings.ToLower(err.Error())
+	return strings.Contains(text, "pipe is being closed") ||
+		strings.Contains(text, "broken pipe") ||
+		strings.Contains(text, "no process is on the other end")
 }
 
 func openPipeClient(pipeName string) (windows.Handle, error) {
@@ -2426,6 +2477,14 @@ func (s *goSearchService) loadConfiguredIndexes() error {
 		}
 		if err := catchUpServiceVolume(vol); err != nil {
 			serviceLog("startup catch-up skipped volume=%s db=%s err=%v", vol.volume, vol.dbPath, err)
+			if shouldRebuildStaleIndex(err) {
+				if rebuilt, rebuildErr := rebuildServiceVolumeIndex(vol); rebuildErr == nil {
+					serviceLog("startup stale rebuild complete volume=%s db=%s entries=%d", rebuilt.volume, rebuilt.dbPath, rebuilt.index.entryCount())
+					vol = rebuilt
+				} else {
+					serviceLog("startup stale rebuild failed volume=%s db=%s err=%v", vol.volume, vol.dbPath, rebuildErr)
+				}
+			}
 		}
 		vol.queryIndex = buildResidentQueryIndex(vol)
 		if vol.children == nil && vol.index != nil && vol.index.Compact && vol.index.Source == "usn" {
@@ -2598,6 +2657,14 @@ func (s *goSearchService) replayVolumeLoop(vol *serviceVolumeIndex) {
 		}
 		if err := s.replayVolumeOnce(vol, buffer); err != nil {
 			serviceLog("background replay error volume=%s db=%s err=%v", vol.volume, vol.dbPath, err)
+			if shouldRebuildStaleIndex(err) {
+				rebuildErr := s.rebuildVolumeInPlace(vol)
+				if rebuildErr == nil {
+					time.Sleep(500 * time.Millisecond)
+					continue
+				}
+				serviceLog("background stale rebuild failed volume=%s db=%s err=%v", vol.volume, vol.dbPath, rebuildErr)
+			}
 			s.indexMu.Lock()
 			vol.state = "stale"
 			vol.staleReason = err.Error()
@@ -2620,6 +2687,11 @@ func (s *goSearchService) replayVolumeOnce(vol *serviceVolumeIndex, buffer []byt
 	startUSN := vol.checkpoint
 	journalID := vol.journalID
 	s.indexMu.RUnlock()
+	if journal, err := queryUSNJournal(handle); err != nil {
+		return err
+	} else if err := validateUSNCheckpoint(vol, journal); err != nil {
+		return err
+	}
 
 	nextUSN, changes, err := readUSNChanges(handle, journalID, startUSN, buffer)
 	if err != nil {
@@ -2742,18 +2814,74 @@ func queryUSNJournal(handle windows.Handle) (usnJournalDataV0, error) {
 
 func validateUSNCheckpoint(vol *serviceVolumeIndex, journal usnJournalDataV0) error {
 	if vol.journalID != 0 && vol.journalID != journal.UsnJournalID {
-		return fmt.Errorf("journal id changed from %d to %d", vol.journalID, journal.UsnJournalID)
+		return staleIndexError{reason: fmt.Sprintf("journal id changed from %d to %d", vol.journalID, journal.UsnJournalID), rebuild: true}
 	}
 	firstValid := journal.FirstUsn
 	if journal.LowestValidUsn > firstValid {
 		firstValid = journal.LowestValidUsn
 	}
 	if vol.checkpoint < firstValid {
-		return fmt.Errorf("checkpoint %d is before first valid USN %d", vol.checkpoint, firstValid)
+		return staleIndexError{reason: fmt.Sprintf("checkpoint %d is before first valid USN %d", vol.checkpoint, firstValid), rebuild: true}
 	}
 	if vol.checkpoint > journal.NextUsn {
-		return fmt.Errorf("checkpoint %d is after journal next USN %d", vol.checkpoint, journal.NextUsn)
+		return staleIndexError{reason: fmt.Sprintf("checkpoint %d is after journal next USN %d", vol.checkpoint, journal.NextUsn), rebuild: true}
 	}
+	return nil
+}
+
+type staleIndexError struct {
+	reason  string
+	rebuild bool
+}
+
+func (e staleIndexError) Error() string {
+	return e.reason
+}
+
+func shouldRebuildStaleIndex(err error) bool {
+	var staleErr staleIndexError
+	if errors.As(err, &staleErr) {
+		return staleErr.rebuild
+	}
+	text := strings.ToLower(err.Error())
+	return strings.Contains(text, "journal id changed") ||
+		strings.Contains(text, "before first valid usn") ||
+		strings.Contains(text, "after journal next usn")
+}
+
+func rebuildServiceVolumeIndex(vol *serviceVolumeIndex) (*serviceVolumeIndex, error) {
+	if vol == nil || vol.volume == "" || vol.dbPath == "" {
+		return nil, errors.New("stale index rebuild requires a volume and db path")
+	}
+	idx, err := indexUSNVolume(vol.volume)
+	if err != nil {
+		return nil, err
+	}
+	buildOrders(idx)
+	if err := saveIndex(vol.dbPath, idx); err != nil {
+		return nil, err
+	}
+	rebuilt := newServiceVolumeIndex(vol.dbPath, idx)
+	rebuilt.state = "ready"
+	rebuilt.staleReason = ""
+	return rebuilt, nil
+}
+
+func (s *goSearchService) rebuildVolumeInPlace(vol *serviceVolumeIndex) error {
+	rebuilt, err := rebuildServiceVolumeIndex(vol)
+	if err != nil {
+		return err
+	}
+	s.indexMu.Lock()
+	replaceServiceVolumeContents(vol, rebuilt)
+	for i, existing := range s.volumes {
+		if existing == vol {
+			s.indexes[i] = vol.index
+			break
+		}
+	}
+	s.indexMu.Unlock()
+	serviceLog("rebuilt stale index volume=%s db=%s entries=%d", rebuilt.volume, rebuilt.dbPath, rebuilt.index.entryCount())
 	return nil
 }
 
@@ -3826,6 +3954,7 @@ func handleServiceConn(conn *os.File, s *goSearchService) {
 			_ = json.NewEncoder(conn).Encode(serviceResponse{OK: false, Message: err.Error()})
 			return
 		}
+		s.replaceLoadedVolume(req.DB, idx)
 		serviceLog("index-usn complete volume=%s entries=%d", req.Volume, idx.entryCount())
 		_ = json.NewEncoder(conn).Encode(serviceResponse{OK: true, Message: "indexed", Entries: idx.entryCount()})
 	case "status":
@@ -3833,6 +3962,65 @@ func handleServiceConn(conn *os.File, s *goSearchService) {
 	default:
 		_ = json.NewEncoder(conn).Encode(serviceResponse{OK: false, Message: "unknown command"})
 	}
+}
+
+func (s *goSearchService) replaceLoadedVolume(dbPath string, idx *Index) {
+	if s == nil || idx == nil || dbPath == "" {
+		return
+	}
+	vol := newServiceVolumeIndex(dbPath, idx)
+	s.indexMu.Lock()
+	defer s.indexMu.Unlock()
+	for i, existing := range s.volumes {
+		if existing != nil && (samePath(existing.dbPath, dbPath) || strings.EqualFold(existing.volume, idx.Volume)) {
+			replaceServiceVolumeContents(existing, vol)
+			if i < len(s.indexes) {
+				s.indexes[i] = existing.index
+			}
+			return
+		}
+	}
+	s.volumes = append(s.volumes, vol)
+	s.indexes = append(s.indexes, idx)
+}
+
+func replaceServiceVolumeContents(dst, src *serviceVolumeIndex) {
+	if dst == nil || src == nil {
+		return
+	}
+	dst.dbPath = src.dbPath
+	dst.index = src.index
+	dst.volume = src.volume
+	dst.journalID = src.journalID
+	dst.checkpoint = src.checkpoint
+	dst.state = src.state
+	dst.staleReason = src.staleReason
+	dst.frnToID = src.frnToID
+	dst.frnIDs = src.frnIDs
+	dst.children = src.children
+	dst.childOffsets = src.childOffsets
+	dst.childIDs = src.childIDs
+	dst.rootIDs = src.rootIDs
+	dst.subtreeOrder = src.subtreeOrder
+	dst.subtreeStart = src.subtreeStart
+	dst.subtreeEnd = src.subtreeEnd
+	dst.exactNames = src.exactNames
+	dst.pathCache = src.pathCache
+	dst.queryIndex = src.queryIndex
+	dst.termCache = src.termCache
+	dst.pathTermCache = src.pathTermCache
+	dst.extCache = src.extCache
+	dst.recentIDs = src.recentIDs
+	dst.recentSeq = src.recentSeq
+	dst.termSeq = src.termSeq
+	dst.pathTermSeq = src.pathTermSeq
+	dst.extSeq = src.extSeq
+	dst.underCache = src.underCache
+	dst.underSeq = src.underSeq
+	dst.underRootCache = src.underRootCache
+	dst.dirty = src.dirty
+	dst.lastPersist = src.lastPersist
+	dst.searchCount = src.searchCount
 }
 
 func searchService(pipeName string, opts queryOptions, countOnly bool, jsonOut bool) error {
@@ -5310,7 +5498,9 @@ func (vol *serviceVolumeIndex) underPrefilter(pq parsedQuery) map[int]struct{} {
 			continue
 		}
 		list := []int(nil)
-		if strings.Contains(term, ".") {
+		if ext, ok := dottedExtensionTerm(term); ok {
+			list = vol.extPosting(ext)
+		} else if strings.Contains(term, ".") {
 			list = vol.exactNameIDs(term)
 		}
 		if len(list) == 0 {
@@ -5598,7 +5788,7 @@ func (vol *serviceVolumeIndex) pathTermSubtreeCandidates(pq parsedQuery) ([]int,
 	}
 	lists := make([][]int, 0, len(pq.Terms))
 	for _, term := range pq.Terms {
-		list := vol.pathTermPosting(term)
+		list := vol.pathPlanTermPosting(term)
 		if len(list) == 0 {
 			return []int{}, true
 		}
@@ -5652,6 +5842,21 @@ func (vol *serviceVolumeIndex) exactNameCandidates(pq parsedQuery) ([]int, bool)
 		}
 	}
 	return out, len(out) > 0
+}
+
+func samePath(a, b string) bool {
+	if a == "" || b == "" {
+		return false
+	}
+	aa, errA := filepath.Abs(a)
+	bb, errB := filepath.Abs(b)
+	if errA == nil {
+		a = aa
+	}
+	if errB == nil {
+		b = bb
+	}
+	return strings.EqualFold(filepath.Clean(a), filepath.Clean(b))
 }
 
 func (vol *serviceVolumeIndex) namePrefixCandidates(pq parsedQuery) ([]int, bool) {
@@ -6329,10 +6534,40 @@ func parseQuery(opts queryOptions) (parsedQuery, error) {
 			return pq, err
 		}
 	}
+	promotePathExtensionTerms(&pq)
 	if pq.isEmpty() {
 		return pq, errors.New("query has no searchable terms or filters")
 	}
 	return pq, nil
+}
+
+func promotePathExtensionTerms(pq *parsedQuery) {
+	if pq == nil || !pq.MatchPath || len(pq.Terms) < 2 {
+		return
+	}
+	terms := pq.Terms[:0]
+	for _, term := range pq.Terms {
+		if ext, ok := dottedExtensionTerm(term); ok {
+			pq.Exts = append(pq.Exts, ext)
+			continue
+		}
+		terms = append(terms, term)
+	}
+	pq.Terms = terms
+}
+
+func dottedExtensionTerm(term string) (string, bool) {
+	if len(term) < 2 || len(term) > 9 || term[0] != '.' || strings.ContainsAny(term, `\/*?[]:`) {
+		return "", false
+	}
+	ext := term[1:]
+	for _, r := range ext {
+		if r >= 'a' && r <= 'z' || r >= '0' && r <= '9' {
+			continue
+		}
+		return "", false
+	}
+	return ext, true
 }
 
 // isEmpty reports whether a parsed query carries no searchable constraints.
@@ -6445,6 +6680,8 @@ func applyQueryToken(pq *parsedQuery, raw string) error {
 		pq.Type = strings.TrimPrefix(raw, "type:")
 	case isUnknownFilterToken(raw):
 		return fmt.Errorf("unsupported filter %q; supported: ext: dir: glob: regex: type: case: size: dm: (and !term, a|b)", raw)
+	case looksLikeImplicitFilenameGlob(raw):
+		pq.Globs = append(pq.Globs, normalizeCase(raw, pq.CaseSensitive))
 	default:
 		for _, term := range queryPlainTerms(raw, pq.CaseSensitive, pq.MatchPath) {
 			pq.Terms = append(pq.Terms, term)
@@ -6520,6 +6757,14 @@ func queryPlainTerms(raw string, caseSensitive, matchPath bool) []string {
 		return []string{normalizeCase(raw, caseSensitive)}
 	}
 	return out
+}
+
+func looksLikeImplicitFilenameGlob(raw string) bool {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || strings.ContainsAny(raw, `\/`) {
+		return false
+	}
+	return strings.ContainsAny(raw, "*?[")
 }
 
 func globLiteralTerms(globs []string, caseSensitive bool) []string {

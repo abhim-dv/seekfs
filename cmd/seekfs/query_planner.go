@@ -281,12 +281,12 @@ func (vol *serviceVolumeIndex) buildCandidatePlan(pq parsedQuery) (candidatePlan
 				if len(underRoots) == 0 {
 					return plan, false
 				}
-			} else if !addRequired("term:"+term, vol.pathTermPosting(term)) {
+			} else if !addRequired("term:"+term, vol.pathPlanTermPosting(term)) {
 				return plan, true
 			}
 		} else if !pq.MatchPath {
 			for _, term := range pq.Terms {
-				if !addRequired("term:"+term, vol.nameTermPosting(term)) {
+				if !addRequired("term:"+term, vol.namePlanTermPosting(term)) {
 					return plan, true
 				}
 			}
@@ -464,7 +464,7 @@ func (vol *serviceVolumeIndex) mostSelectivePathTerm(pq parsedQuery) (string, bo
 		if isVolumeQueryTerm(term) {
 			continue
 		}
-		size := len(vol.nameTermPosting(term))
+		size := len(vol.pathPlanTermPosting(term))
 		if bestSize < 0 || size < bestSize {
 			best, bestSize = term, size
 		}
@@ -476,6 +476,29 @@ func (vol *serviceVolumeIndex) mostSelectivePathTerm(pq parsedQuery) (string, bo
 		return "", false
 	}
 	return best, true
+}
+
+func (vol *serviceVolumeIndex) namePlanTermPosting(term string) []int {
+	if strings.Contains(term, ".") {
+		if exact := vol.exactNameIDs(term); len(exact) > 0 {
+			return exact
+		}
+	}
+	return vol.nameTermPosting(term)
+}
+
+func (vol *serviceVolumeIndex) pathPlanTermPosting(term string) []int {
+	if ext, ok := dottedExtensionTerm(term); ok {
+		if ids := vol.extPosting(ext); len(ids) > 0 {
+			return ids
+		}
+	}
+	if strings.Contains(term, ".") {
+		if exact := vol.exactNameIDs(term); len(exact) > 0 {
+			return exact
+		}
+	}
+	return vol.pathTermPosting(term)
 }
 
 func (plan candidatePlan) execute() []int {

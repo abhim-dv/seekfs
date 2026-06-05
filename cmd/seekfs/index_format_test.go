@@ -247,6 +247,11 @@ func TestValidateUSNCheckpoint(t *testing.T) {
 	vol.checkpoint = 29
 	if err := validateUSNCheckpoint(vol, journal); err == nil {
 		t.Fatal("checkpoint before lowest valid USN was accepted")
+	} else {
+		var staleErr staleIndexError
+		if !errors.As(err, &staleErr) || !staleErr.rebuild {
+			t.Fatalf("error = %T %v, want rebuildable staleIndexError", err, err)
+		}
 	}
 
 	vol.checkpoint = 101

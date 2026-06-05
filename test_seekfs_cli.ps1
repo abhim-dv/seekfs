@@ -41,6 +41,16 @@ try {
     throw "expected one glob:*.py result"
   }
 
+  $implicitGlob = & $Exe search -db $Db -n 10 "*.py"
+  if (($implicitGlob | Measure-Object).Count -ne 1) {
+    throw "expected one implicit *.py glob result"
+  }
+
+  $implicitGlobCompat = & $Exe -db $Db -n 10 "*.py"
+  if (($implicitGlobCompat | Measure-Object).Count -ne 1) {
+    throw "expected one commandless implicit *.py glob result"
+  }
+
   $typed = & $Exe search -db $Db -path -n 10 "type:dir subdir"
   if (($typed | Measure-Object).Count -lt 1) {
     throw "expected type:dir subdir result"
@@ -49,6 +59,11 @@ try {
   $under = & $Exe search -db $Db -path -n 10 --under (Join-Path $Root "subdir") needle
   if (($under | Measure-Object).Count -ne 1) {
     throw "expected one --under needle result"
+  }
+
+  $compat = & $Exe -db $Db --under (Join-Path $Root "subdir") needle
+  if (($compat | Measure-Object).Count -ne 1) {
+    throw "expected commandless search compatibility result"
   }
 
   $json = & $Exe search -db $Db -path --json -n 1 "ext:go" | ConvertFrom-Json

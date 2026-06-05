@@ -130,7 +130,7 @@ func TestServicePathGramsDisabledByDefault(t *testing.T) {
 func TestServiceVolumesForQuerySkipsStaleNonMatchingUnderVolume(t *testing.T) {
 	c := &serviceVolumeIndex{index: &Index{Volume: "C:"}, state: "stale", staleReason: "old checkpoint"}
 	f := &serviceVolumeIndex{index: &Index{Volume: "F:"}, state: "ready"}
-	got, err := serviceVolumesForQuery([]*serviceVolumeIndex{c, f}, queryOptions{Under: `F:\git\seekfs`})
+	got, err := serviceVolumesForQuery([]*serviceVolumeIndex{c, f}, queryOptions{Under: `F:\workspace\project`})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -147,7 +147,7 @@ func TestServiceVolumesForQueryErrorsForMatchingStaleVolume(t *testing.T) {
 }
 
 func TestLooksLikeSearchWithoutSubcommand(t *testing.T) {
-	if !looksLikeSearchWithoutSubcommand([]string{"ScenePropertyPanel.cpp", "--under", `F:\git\DVCode`}) {
+	if !looksLikeSearchWithoutSubcommand([]string{"ExamplePanel.cpp", "--under", `F:\workspace\app`}) {
 		t.Fatal("expected omitted search command to be recognized")
 	}
 	if looksLikeSearchWithoutSubcommand([]string{"bogus"}) {
@@ -156,8 +156,8 @@ func TestLooksLikeSearchWithoutSubcommand(t *testing.T) {
 }
 
 func TestNormalizeCommandlessSearchArgsMovesFlagsBeforeQuery(t *testing.T) {
-	got := normalizeCommandlessSearchArgs([]string{"ScenePropertyPanel.cpp", "--under", `F:\git\DVCode`, "-path"})
-	want := []string{"--under", `F:\git\DVCode`, "-path", "ScenePropertyPanel.cpp"}
+	got := normalizeCommandlessSearchArgs([]string{"ExamplePanel.cpp", "--under", `F:\workspace\app`, "-path"})
+	want := []string{"--under", `F:\workspace\app`, "-path", "ExamplePanel.cpp"}
 	if !sameStringSet(got, want) || strings.Join(got, "\x00") != strings.Join(want, "\x00") {
 		t.Fatalf("normalized args = %v, want %v", got, want)
 	}
