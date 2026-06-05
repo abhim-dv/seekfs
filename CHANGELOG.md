@@ -2,6 +2,15 @@
 
 ## 0.8.2 - Service Reliability and Path Query Recovery
 
+### Added
+
+- Rolled in release-candidate CLI compatibility support for commandless search
+  invocations, including `seekfs --under <workspace> "main.go"`.
+- Treated bare wildcard filename tokens such as `*_test.go` as filename globs
+  without requiring an explicit `glob:` prefix.
+- Added CLI compatibility and PowerShell integration coverage for commandless
+  scoped search and implicit wildcard queries.
+
 ### Fixed
 
 - Tightened resident planning for repo-scoped known-file searches so exact
@@ -15,6 +24,8 @@
   when the service pipe denies access.
 - Refreshed a loaded resident index after `service-index-usn`/`index-usn`
   rebuilds so users do not need to restart the service to see the fresh index.
+- Updated README, help, and search syntax docs for the rolled-up CLI
+  compatibility behavior.
 
 ### Validation
 
