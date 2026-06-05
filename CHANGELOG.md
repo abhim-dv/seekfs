@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.8.2 - Service Reliability and Path Query Recovery
+
+### Fixed
+
+- Tightened resident planning for repo-scoped known-file searches so exact
+  dotted filenames and extension postings drive `--under` queries before broad
+  path scans.
+- Treated dotted extension terms in path queries, for example `Downloads .docx`,
+  as extension filters while preserving the remaining path terms.
+- Added automatic service-side rebuild for unrecoverable USN checkpoints, such
+  as checkpoints before the first valid USN or after the journal's next USN.
+- Added pipe-call retries for transient named-pipe failures and clearer guidance
+  when the service pipe denies access.
+- Refreshed a loaded resident index after `service-index-usn`/`index-usn`
+  rebuilds so users do not need to restart the service to see the fresh index.
+
+### Validation
+
+- `go test ./...`
+- `go vet ./...`
+- `.\test_seekfs_cli.ps1`
+
 ## 0.8.1 - Resident Memory and Repo-Scoped Search Fixes
 
 ### Fixed
@@ -20,10 +42,8 @@
 
 ### Validation
 
-- Reproduced and fixed dogfood timeouts: `--under F:\git\seekfs dogfood` dropped
-  from about 34 seconds to under 1 second, and a broad repo-scoped `retrieval`
-  query dropped from about 19 seconds to under 1 second on the maintainer's
-  machine.
+- Reproduced and fixed repo-scoped timeout cases where broad `--under` searches
+  could take tens of seconds before selective candidate planning was applied.
 - `go test ./...`, `go vet ./...`, and the CLI integration test passed before
   release packaging.
 

@@ -98,6 +98,35 @@ func TestKnownFiltersAndPathsAreNotRejected(t *testing.T) {
 	}
 }
 
+func TestImplicitFilenameGlobQuery(t *testing.T) {
+	pq, err := parseQuery(queryOptions{Query: "*_test.go", MatchPath: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pq.Globs) != 1 || pq.Globs[0] != "*_test.go" {
+		t.Fatalf("expected implicit glob for *_test.go, got globs=%v", pq.Globs)
+	}
+	if len(pq.Terms) != 0 {
+		t.Fatalf("expected no plain terms for implicit glob, got %v", pq.Terms)
+	}
+}
+
+func TestImplicitFilenameGlobMatchesFixture(t *testing.T) {
+	idx := commonSearchFixture()
+	got := searchFixtureNames(t, idx, queryOptions{Query: "*_test.go", MatchPath: true, Limit: 20})
+	if len(got) != 1 || got[0] != "search_test.go" {
+		t.Fatalf("implicit *_test.go glob = %v, want [search_test.go]", got)
+	}
+}
+
+func TestImplicitFilenameGlobMatchesFixtureByName(t *testing.T) {
+	idx := commonSearchFixture()
+	got := searchFixtureNames(t, idx, queryOptions{Query: "*_test.go", Limit: 20})
+	if len(got) != 1 || got[0] != "search_test.go" {
+		t.Fatalf("implicit *_test.go filename glob = %v, want [search_test.go]", got)
+	}
+}
+
 func TestParseOrGroup(t *testing.T) {
 	pq, err := parseQuery(queryOptions{Query: "ext:png|jpg"})
 	if err != nil {

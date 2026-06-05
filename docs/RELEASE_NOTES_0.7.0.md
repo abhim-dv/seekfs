@@ -24,8 +24,8 @@ for coding agents using seekfs as a file-discovery tool.
 
 ## Benchmark Notes
 
-On the maintainer's full local C: + F: service index, the public benchmark suite
-ran with zero failures before release packaging:
+On a large local service index, the public benchmark suite ran with zero
+failures before release packaging:
 
 ```text
 name/query suite: median 49.353 ms, p90 58.162 ms, p95 74.388 ms, max 147.027 ms

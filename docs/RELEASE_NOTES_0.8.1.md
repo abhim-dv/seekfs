@@ -1,7 +1,7 @@
 # seekfs v0.8.1
 
 This patch release fixes resident-service memory growth and repo-scoped search
-latency regressions found while dogfooding v0.8.0.
+latency regressions found during v0.8.0 validation.
 
 ## Highlights
 
@@ -20,16 +20,16 @@ latency regressions found while dogfooding v0.8.0.
   is stale.
 - Improved CLI guidance when agents omit the `search` subcommand.
 
-## Dogfood Results
+## Validation Results
 
-On the maintainer's machine after these fixes:
+Representative repo-scoped searches after these fixes:
 
 ```text
-seekfs search --under F:\git\seekfs dogfood
+seekfs search --under F:\workspace\project agent-log
   before: about 34 seconds
   after:  under 1 second
 
-seekfs search --under F:\git\rnd-lejepa-encoder-v1 retrieval
+seekfs search --under F:\workspace\project retrieval
   before: about 19 seconds
   after:  under 1 second
 ```

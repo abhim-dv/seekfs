@@ -16,9 +16,9 @@ agent queries, and more robust path-aware candidate narrowing.
 
 ## Benchmark Notes
 
-On the maintainer's full local C: + F: service index, the public benchmark suite
-ran with zero failures and service-process memory stabilized during repeated
-query loops after initial cache warmup.
+On a large local service index, the public benchmark suite ran with zero
+failures and service-process memory stabilized during repeated query loops after
+initial cache warmup.
 
 Everything still uses less resident memory on the same machine. Matching that
 footprint remains future work and will require deeper compact record storage

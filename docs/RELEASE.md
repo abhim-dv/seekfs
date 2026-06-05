@@ -20,12 +20,12 @@ Indexes and benchmark output are not included.
 
 ## Current Release
 
-Current release: `v0.8.1`.
+Current release: `v0.8.2`.
 
 Release notes:
 
 ```text
-docs/RELEASE_NOTES_0.8.1.md
+docs/RELEASE_NOTES_0.8.2.md
 ```
 
 ## Signing

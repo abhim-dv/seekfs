@@ -30,9 +30,9 @@ filters, and metadata-aware NTFS indexes.
 
 ## Benchmark Notes
 
-On the maintainer's full local C: + F: service index, the v0.8 prototype was
-validated against public benchmarks and local dogfood checks before release
-packaging. Public benchmark query suites completed with zero failures.
+The v0.8 prototype was validated against public benchmarks and repo-scoped
+service checks before release packaging. Public benchmark query suites completed
+with zero failures.
 
 Representative warm service CLI timings on that machine:
 
