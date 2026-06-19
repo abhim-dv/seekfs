@@ -73,8 +73,50 @@ func TestCompactIndexV8RoundTripKeepsFRNMetadata(t *testing.T) {
 	if file.FRN != 11 || file.ParentFRN != 10 || file.Parent != 0 || file.Name != "main.go" || file.Size != 1234 || file.ModUnix != modified.Add(time.Second).UnixNano() || !file.Deleted {
 		t.Fatalf("file record metadata mismatch: %+v", file)
 	}
-	if got.reconstructCompactPath(1) != `C:\.\main.go` {
+	if got.reconstructCompactPath(1) != `C:\main.go` {
 		t.Fatalf("path = %q", got.reconstructCompactPath(1))
+	}
+}
+
+func TestCompactDiskRecordRefsUseWideEncodingPastNarrowLimit(t *testing.T) {
+	var buf bytes.Buffer
+	parent := uint32(compactNarrowParentSentinel)
+	nameOff := uint32(compactNarrowParentSentinel + 7)
+	if err := writeCompactRecordRefs(&buf, parent, nameOff, true); err != nil {
+		t.Fatal(err)
+	}
+	if buf.Len() != 8 {
+		t.Fatalf("wide ref bytes = %d, want 8", buf.Len())
+	}
+	gotParent, gotNameOff, err := readCompactRecordRefs(bytes.NewReader(buf.Bytes()), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotParent != parent || gotNameOff != nameOff {
+		t.Fatalf("refs = (%d, %d), want (%d, %d)", gotParent, gotNameOff, parent, nameOff)
+	}
+}
+
+func TestCompactDiskRecordRefsRejectNarrowOverflow(t *testing.T) {
+	var buf bytes.Buffer
+	if err := writeCompactRecordRefs(&buf, compactNarrowParentSentinel+1, 1, false); err == nil {
+		t.Fatal("expected narrow parent overflow error")
+	}
+	if err := writeCompactRecordRefs(&buf, 1, compactNarrowParentSentinel, false); err == nil {
+		t.Fatal("expected narrow name ref overflow error")
+	}
+}
+
+func TestCompactDiskRecordBytesSwitchesToWideAtNarrowLimit(t *testing.T) {
+	narrowMaxCount := int(compactNarrowMaxRecordRef) + 1
+	if got := compactDiskRecordBytesForCounts(narrowMaxCount, 1); got != compactDiskRecordBytes {
+		t.Fatalf("narrow record bytes = %d, want %d", got, compactDiskRecordBytes)
+	}
+	if got := compactDiskRecordBytesForCounts(narrowMaxCount+1, 1); got != compactWideDiskRecordBytes {
+		t.Fatalf("wide-by-record-count bytes = %d, want %d", got, compactWideDiskRecordBytes)
+	}
+	if got := compactDiskRecordBytesForCounts(1, narrowMaxCount+1); got != compactWideDiskRecordBytes {
+		t.Fatalf("wide-by-name-count bytes = %d, want %d", got, compactWideDiskRecordBytes)
 	}
 }
 
@@ -166,7 +208,7 @@ func TestServiceVolumeIndexRepairsOutOfOrderParents(t *testing.T) {
 	if child.Parent != 2 {
 		t.Fatalf("child parent = %d, want parent record 2: %+v", child.Parent, child)
 	}
-	if got := idx.reconstructCompactPath(1); got != `F:\.\parent\child.txt` {
+	if got := idx.reconstructCompactPath(1); got != `F:\parent\child.txt` {
 		t.Fatalf("path = %q", got)
 	}
 }

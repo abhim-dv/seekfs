@@ -11,7 +11,9 @@
   `F:\git\seekfs\seekfs.exe`.
 - Seekfs searches indexed file names and paths only. It does not search file
   contents, symbols, import references, or line matches; use `rg` for those.
-- For repo-local file discovery, constrain global results with `--under`:
+- For repo-local file discovery, constrain global results with `--under` and a
+  selective filename/path query; quote multi-term queries. Prefer putting flags
+  before the query for compatibility with older seekfs binaries:
   `seekfs search --under F:\git\seekfs "main.go"` or
   `seekfs search -path --under F:\git\seekfs "ext:go dir:cmd main"`.
 - Avoid `seekfs search -path <directory-only-query>` when the intent is to list

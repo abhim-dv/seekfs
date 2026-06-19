@@ -1,8 +1,14 @@
 package main
 
 import (
+	"encoding/json"
+	"fmt"
+	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestServiceVolumeIndexAfterPersistClearsRecentAndSearchCaches(t *testing.T) {
@@ -155,8 +161,8 @@ func TestLooksLikeSearchWithoutSubcommand(t *testing.T) {
 	}
 }
 
-func TestNormalizeCommandlessSearchArgsMovesFlagsBeforeQuery(t *testing.T) {
-	got := normalizeCommandlessSearchArgs([]string{"ExamplePanel.cpp", "--under", `F:\workspace\app`, "-path"})
+func TestNormalizeSearchArgsMovesFlagsBeforeQuery(t *testing.T) {
+	got := normalizeSearchArgs([]string{"ExamplePanel.cpp", "--under", `F:\workspace\app`, "-path"})
 	want := []string{"--under", `F:\workspace\app`, "-path", "ExamplePanel.cpp"}
 	if !sameStringSet(got, want) || strings.Join(got, "\x00") != strings.Join(want, "\x00") {
 		t.Fatalf("normalized args = %v, want %v", got, want)
@@ -266,6 +272,134 @@ func TestServiceVolumeIndexResidentMemoryInfoReflectsSkippedViews(t *testing.T) 
 	}
 	if info.ExtPostBytes == 0 {
 		t.Fatalf("expected extension posting memory field: %+v", info)
+	}
+}
+
+func TestServiceWildcardUnderQueryMatchesWithoutPathMode(t *testing.T) {
+	idx := commonSearchFixture()
+	vol := newServiceVolumeIndex("fixture.gsi", idx)
+
+	got, err := searchCompactWithCache(idx, queryOptions{
+		Query: "*_test.go",
+		Under: `C:\fixture\workspace\src`,
+		Limit: 20,
+	}, false, make(map[int]string), vol.nameTermCandidates)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Name != "search_test.go" {
+		t.Fatalf("matches = %+v, want [search_test.go]", got)
+	}
+}
+
+func TestUnderQueryFallsBackToPathFilterWhenRootRecordIsDeleted(t *testing.T) {
+	idx := commonSearchFixture()
+	root := idx.compactRecord(2) // C:\fixture\workspace
+	root.Deleted = true
+	idx.setCompactRecord(2, root)
+	vol := newServiceVolumeIndex("fixture.gsi", idx)
+
+	got, err := searchCompactWithCache(idx, queryOptions{
+		Query: "readme",
+		Under: `C:\fixture\workspace`,
+		Limit: 20,
+	}, false, make(map[int]string), vol.plannedCandidates)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if names := namesOf(got); !sameStringSet(names, []string{"README.md", "readme.md"}) {
+		t.Fatalf("matches = %v, want readme files under deleted root record", names)
+	}
+}
+
+func TestServiceSearchFallsBackToFilesystemForScopedIndexMiss(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "specific_fixture_tool.py"), []byte("pass"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	volume := filepath.VolumeName(root)
+	idx := &Index{
+		Source:  "usn",
+		Volume:  volume,
+		Compact: true,
+		Records: []CompactRecord{{FRN: 1, ParentFRN: 1, Parent: -1, Name: ".", Mode: uint32(os.ModeDir)}},
+	}
+	buildOrders(idx)
+	vol := newServiceVolumeIndex("fixture.gsi", idx)
+
+	got, err := searchServiceVolumes([]*serviceVolumeIndex{vol}, queryOptions{
+		Query: "specific_fixture_tool.py",
+		Under: root,
+		Limit: 20,
+	}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Name != "specific_fixture_tool.py" {
+		t.Fatalf("matches = %+v, want filesystem fallback result", got)
+	}
+}
+
+func TestFilesystemUnderFallbackIsBounded(t *testing.T) {
+	root := t.TempDir()
+	for i := 0; i < 12; i++ {
+		if err := os.WriteFile(filepath.Join(root, fmt.Sprintf("item-%02d.txt", i)), []byte("pass"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, ok := filesystemUnderFallbackSearchLimited(queryOptions{
+		Query: "item-11.txt",
+		Under: root,
+		Limit: 20,
+	}, false, 3, time.Minute)
+	if ok {
+		t.Fatalf("fallback returned %v after maxVisited cap; want no result", got)
+	}
+}
+
+func TestExchangeServiceJSONTimesOutHungQuery(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	go func() {
+		defer server.Close()
+		var req serviceRequest
+		_ = json.NewDecoder(server).Decode(&req)
+		time.Sleep(200 * time.Millisecond)
+	}()
+
+	start := time.Now()
+	_, err := exchangeServiceJSON(client, serviceRequest{Command: "search"}, 50*time.Millisecond)
+	if err == nil || !strings.Contains(err.Error(), "timed out") {
+		t.Fatalf("err = %v, want timeout", err)
+	}
+	if elapsed := time.Since(start); elapsed > 150*time.Millisecond {
+		t.Fatalf("timeout elapsed = %s, want under 150ms", elapsed)
+	}
+}
+
+func TestReplayWALWithLimitMarksOversizedWALRebuildable(t *testing.T) {
+	db := filepath.Join(t.TempDir(), "test.gsi")
+	if err := os.WriteFile(walPath(db), []byte("oversized wal"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	vol := &serviceVolumeIndex{dbPath: db, volume: "F:"}
+	err := vol.replayWALWithLimit(4)
+	if err == nil {
+		t.Fatal("expected oversized wal error")
+	}
+	if !shouldRebuildStaleIndex(err) {
+		t.Fatalf("err = %v, want rebuildable stale index error", err)
+	}
+}
+
+func TestServiceCallTimeoutLeavesIndexRequestsUnlimited(t *testing.T) {
+	if got := serviceCallTimeout(serviceRequest{Command: "search"}); got != serviceQueryTimeout {
+		t.Fatalf("search timeout = %s, want %s", got, serviceQueryTimeout)
+	}
+	if got := serviceCallTimeout(serviceRequest{Command: "index-usn"}); got != 0 {
+		t.Fatalf("index-usn timeout = %s, want 0", got)
 	}
 }
 

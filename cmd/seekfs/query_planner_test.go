@@ -153,19 +153,19 @@ func TestCandidatePlanUsesExactKnownFileUnderRepo(t *testing.T) {
 func TestPathDottedExtensionTermUsesExtensionPosting(t *testing.T) {
 	idx := commonSearchFixture()
 	idx.Records = append(idx.Records,
-		CompactRecord{FRN: 17, ParentFRN: 3, Parent: 2, Name: "Downloads", Mode: uint32(os.ModeDir)},
+		CompactRecord{FRN: 17, ParentFRN: 3, Parent: 2, Name: "Reports", Mode: uint32(os.ModeDir)},
 		CompactRecord{FRN: 18, ParentFRN: 17, Parent: 16, Name: "annual-report.docx"},
 		CompactRecord{FRN: 19, ParentFRN: 17, Parent: 16, Name: "notes.txt"},
 	)
 	buildOrders(idx)
 	vol := newServiceVolumeIndex("fixture.gsi", idx)
-	opts := queryOptions{Query: "Downloads .docx", MatchPath: true, Limit: 20}
+	opts := queryOptions{Query: "Reports .docx", MatchPath: true, Limit: 20}
 	pq, err := parseQuery(opts)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(pq.Exts) != 1 || pq.Exts[0] != "docx" || len(pq.Terms) != 1 || pq.Terms[0] != "downloads" {
-		t.Fatalf("parsed query terms=%v exts=%v, want downloads + docx extension", pq.Terms, pq.Exts)
+	if len(pq.Exts) != 1 || pq.Exts[0] != "docx" || len(pq.Terms) != 1 || pq.Terms[0] != "reports" {
+		t.Fatalf("parsed query terms=%v exts=%v, want reports + docx extension", pq.Terms, pq.Exts)
 	}
 	plan, ok := vol.buildCandidatePlan(pq)
 	if !ok {
@@ -202,6 +202,19 @@ func TestCandidatePlanSkipsSingleCharacterPathTermWhenSelectiveTermExists(t *tes
 	got := plan.execute()
 	if len(got) == 0 {
 		t.Fatal("plan returned no candidates from the selective term")
+	}
+}
+
+func TestPathPlanProbeTermsPreferSpecificFragments(t *testing.T) {
+	got := pathPlanProbeTerms([]string{"f:", "repo", "tools", "fixtures", "reports", "specific_fixture_tool.py"})
+	want := []string{"specific_fixture_tool.py", "fixtures", "reports", "tools", "repo"}
+	if !sameStringSet(got, want) {
+		t.Fatalf("probe terms = %v, want same terms as %v", got, want)
+	}
+	for i, term := range want {
+		if got[i] != term {
+			t.Fatalf("probe terms = %v, want ordered prefix %v", got, want)
+		}
 	}
 }
 
