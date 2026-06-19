@@ -35,6 +35,9 @@ const serviceCachedPostingMaxIDs = 50_000
 const serviceRecentRebuildThreshold = 100_000
 const serviceResidentNameOrderMaxRecords = 2_000_000
 const serviceResidentChildRangeMaxRecords = 2_000_000
+const serviceStartupWALRebuildBytes = 512 * 1024 * 1024
+const filesystemFallbackMaxVisited = 100_000
+const filesystemFallbackMaxDuration = 2 * time.Second
 
 var indexMagic = [8]byte{'G', 'O', 'S', 'R', 'C', 'H', '0', '8'}
 
@@ -47,19 +50,26 @@ var (
 const packedLowerSameAsName = ^uint32(0)
 
 const (
-	fsctlEnumUSNData       = 0x000900b3
-	fsctlQueryUSNJournal   = 0x000900f4
-	fsctlReadUSNJournal    = 0x000900bb
-	fileAttributeDir       = 0x10
-	usnReasonFileCreate    = 0x00000100
-	usnReasonFileDelete    = 0x00000200
-	usnReasonRenameOld     = 0x00001000
-	usnReasonRenameNew     = 0x00002000
-	serviceName            = "seekfs"
-	defaultServicePipe     = `\\.\pipe\seekfs-service`
-	defaultServiceSDDL     = `D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)`
-	persistDebounce        = 5 * time.Minute
-	compactDiskRecordBytes = 43
+	fsctlEnumUSNData            = 0x000900b3
+	fsctlQueryUSNJournal        = 0x000900f4
+	fsctlReadUSNJournal         = 0x000900bb
+	fileAttributeDir            = 0x10
+	usnReasonFileCreate         = 0x00000100
+	usnReasonFileDelete         = 0x00000200
+	usnReasonRenameOld          = 0x00001000
+	usnReasonRenameNew          = 0x00002000
+	serviceName                 = "seekfs"
+	defaultServicePipe          = `\\.\pipe\seekfs-service`
+	defaultServiceSDDL          = `D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)`
+	serviceQueryTimeout         = 10 * time.Second
+	persistDebounce             = 5 * time.Minute
+	compactDiskRecordBytes      = 43
+	compactWideDiskRecordBytes  = 45
+	compactDiskFlag             = 1
+	compactDiskWideRefsFlag     = 2
+	compactNarrowParentSentinel = 0xFFFFFF
+	compactNarrowMaxRecordRef   = compactNarrowParentSentinel - 1
+	compactWideParentSentinel   = ^uint32(0)
 )
 
 type Entry struct {
@@ -393,7 +403,7 @@ func run(args []string) error {
 		return nil
 	default:
 		if looksLikeSearchWithoutSubcommand(args) {
-			return cmdSearch(normalizeCommandlessSearchArgs(args), false)
+			return cmdSearch(normalizeSearchArgs(args), false)
 		}
 		return usage()
 	}
@@ -423,7 +433,7 @@ func looksLikeSearchWithoutSubcommand(args []string) bool {
 	return false
 }
 
-func normalizeCommandlessSearchArgs(args []string) []string {
+func normalizeSearchArgs(args []string) []string {
 	valueFlags := map[string]bool{
 		"--under": true, "-db": true, "--db": true, "-n": true, "--n": true,
 		"-config": true, "--config": true, "-pipe": true, "--pipe": true,
@@ -816,6 +826,13 @@ func indexUSNVolume(volume string) (*Index, error) {
 	// Fall back to FSCTL_ENUM_USN_DATA (names only) if the raw MFT read fails.
 	if entries, err := enumMFT(handle); err == nil && len(entries) > 0 {
 		serviceLog("enum-mft complete volume=%s entries=%d", vol, len(entries))
+		if nodes, usnErr := enumUSN(handle, journal.NextUsn); usnErr == nil {
+			if added := mergeUSNNodesIntoMFT(entries, nodes); added > 0 {
+				serviceLog("enum-usn merge complete volume=%s added=%d total=%d", vol, added, len(entries))
+			}
+		} else {
+			serviceLog("enum-usn merge skipped volume=%s err=%v", vol, usnErr)
+		}
 		buildRecordsFromMFT(idx, entries)
 		serviceLog("compact records complete volume=%s entries=%d source=mft", vol, len(idx.Records))
 		return idx, nil
@@ -855,6 +872,31 @@ func indexUSNVolume(volume string) (*Index, error) {
 	}
 	serviceLog("compact records complete volume=%s entries=%d source=usn", vol, len(idx.Records))
 	return idx, nil
+}
+
+func mergeUSNNodesIntoMFT(entries map[uint64]mftEntry, nodes map[uint64]usnNode) int {
+	if len(entries) == 0 || len(nodes) == 0 {
+		return 0
+	}
+	added := 0
+	for frn, node := range nodes {
+		if frn == 0 || node.name == "" {
+			continue
+		}
+		if _, ok := entries[frn]; ok {
+			continue
+		}
+		entries[frn] = mftEntry{
+			frn:       frn,
+			parentFRN: node.parentFRN,
+			name:      node.name,
+			attr:      node.attr,
+			isDir:     node.attr&fileAttributeDir != 0,
+			inUse:     true,
+		}
+		added++
+	}
+	return added
 }
 
 // buildRecordsFromMFT converts MFT entries into compact records with stable
@@ -950,11 +992,11 @@ func enumUSN(handle windows.Handle, highUSN int64) (map[uint64]usnNode, error) {
 			}
 			major := binary.LittleEndian.Uint16(record[4:6])
 			if major == 2 || major == 3 {
-				frn := binary.LittleEndian.Uint64(record[8:16])
-				parent := binary.LittleEndian.Uint64(record[16:24])
-				attr := binary.LittleEndian.Uint32(record[52:56])
-				nameLen := binary.LittleEndian.Uint16(record[56:58])
-				nameOff := binary.LittleEndian.Uint16(record[58:60])
+				frn, parent, attr, nameLen, nameOff, ok := parseUSNRecordFields(record, major)
+				if !ok {
+					pos += recordLen
+					continue
+				}
 				if uint32(nameOff)+uint32(nameLen) <= recordLen {
 					nameBytes := record[nameOff : uint32(nameOff)+uint32(nameLen)]
 					name := windows.UTF16ToString(bytesToUTF16(nameBytes))
@@ -1023,24 +1065,72 @@ func parseUSNRecords(buffer []byte) ([]usnChange, error) {
 		}
 		major := binary.LittleEndian.Uint16(record[4:6])
 		if major == 2 || major == 3 {
-			nameLen := binary.LittleEndian.Uint16(record[56:58])
-			nameOff := binary.LittleEndian.Uint16(record[58:60])
+			frn, parent, attr, nameLen, nameOff, ok := parseUSNRecordFields(record, major)
+			if !ok {
+				pos += recordLen
+				continue
+			}
 			if uint32(nameOff)+uint32(nameLen) > recordLen {
 				return nil, errors.New("invalid USN record name")
 			}
 			nameBytes := record[nameOff : uint32(nameOff)+uint32(nameLen)]
 			changes = append(changes, usnChange{
-				FRN:       binary.LittleEndian.Uint64(record[8:16]),
-				ParentFRN: binary.LittleEndian.Uint64(record[16:24]),
-				USN:       int64(binary.LittleEndian.Uint64(record[24:32])),
-				Reason:    binary.LittleEndian.Uint32(record[40:44]),
-				Attr:      binary.LittleEndian.Uint32(record[52:56]),
+				FRN:       frn,
+				ParentFRN: parent,
+				USN:       parseUSNRecordUSN(record, major),
+				Reason:    parseUSNRecordReason(record, major),
+				Attr:      attr,
 				Name:      windows.UTF16ToString(bytesToUTF16(nameBytes)),
 			})
 		}
 		pos += recordLen
 	}
 	return changes, nil
+}
+
+func parseUSNRecordFields(record []byte, major uint16) (frn, parent uint64, attr uint32, nameLen, nameOff uint16, ok bool) {
+	switch major {
+	case 2:
+		if len(record) < 60 {
+			return 0, 0, 0, 0, 0, false
+		}
+		return fileReferenceRecordNumber(binary.LittleEndian.Uint64(record[8:16])),
+			fileReferenceRecordNumber(binary.LittleEndian.Uint64(record[16:24])),
+			binary.LittleEndian.Uint32(record[52:56]),
+			binary.LittleEndian.Uint16(record[56:58]),
+			binary.LittleEndian.Uint16(record[58:60]),
+			true
+	case 3:
+		if len(record) < 76 {
+			return 0, 0, 0, 0, 0, false
+		}
+		return fileReferenceRecordNumber(binary.LittleEndian.Uint64(record[8:16])),
+			fileReferenceRecordNumber(binary.LittleEndian.Uint64(record[24:32])),
+			binary.LittleEndian.Uint32(record[68:72]),
+			binary.LittleEndian.Uint16(record[72:74]),
+			binary.LittleEndian.Uint16(record[74:76]),
+			true
+	default:
+		return 0, 0, 0, 0, 0, false
+	}
+}
+
+func parseUSNRecordUSN(record []byte, major uint16) int64 {
+	if major == 3 {
+		return int64(binary.LittleEndian.Uint64(record[40:48]))
+	}
+	return int64(binary.LittleEndian.Uint64(record[24:32]))
+}
+
+func parseUSNRecordReason(record []byte, major uint16) uint32 {
+	if major == 3 {
+		return binary.LittleEndian.Uint32(record[56:60])
+	}
+	return binary.LittleEndian.Uint32(record[40:44])
+}
+
+func fileReferenceRecordNumber(ref uint64) uint64 {
+	return ref & 0x0000FFFFFFFFFFFF
 }
 
 func bytesToUTF16(b []byte) []uint16 {
@@ -1205,7 +1295,7 @@ func cmdSearch(args []string, countOnly bool) error {
 	recent := fs.String("recent", "", "only return results modified within this duration, for example 24h")
 	modifiedAfter := fs.String("modified-after", "", "only return results modified after RFC3339 time or YYYY-MM-DD")
 	caseSensitive := fs.Bool("case", false, "case-sensitive query matching")
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(normalizeSearchArgs(args)); err != nil {
 		return err
 	}
 	cfg, err := loadConfig(*configPath)
@@ -2277,6 +2367,9 @@ func probeDoctor(pipeName string) doctorResponse {
 	if searchErr == nil && searchResp.OK {
 		resp.QueryOK = true
 	}
+	if resp.Running && resp.PipeReachable {
+		resp.ServiceError = ""
+	}
 	resp.OK = resp.Installed && resp.Running && resp.PipeReachable && resp.Entries > 0 && resp.QueryOK
 	if !resp.OK && resp.Message == "" {
 		if resp.PipeReachable && !resp.Running {
@@ -2350,14 +2443,7 @@ func callServiceOnce(pipeName string, req serviceRequest) (serviceResponse, erro
 	}
 	file := os.NewFile(uintptr(handle), pipeName)
 	defer file.Close()
-	if err := json.NewEncoder(file).Encode(req); err != nil {
-		return serviceResponse{}, err
-	}
-	var resp serviceResponse
-	if err := json.NewDecoder(file).Decode(&resp); err != nil {
-		return serviceResponse{}, err
-	}
-	return resp, nil
+	return exchangeServiceJSON(file, req, serviceCallTimeout(req))
 }
 
 func isTransientPipeError(err error) bool {
@@ -2375,6 +2461,50 @@ func isTransientPipeError(err error) bool {
 	return strings.Contains(text, "pipe is being closed") ||
 		strings.Contains(text, "broken pipe") ||
 		strings.Contains(text, "no process is on the other end")
+}
+
+func serviceCallTimeout(req serviceRequest) time.Duration {
+	switch req.Command {
+	case "search", "status", "info":
+		return serviceQueryTimeout
+	default:
+		return 0
+	}
+}
+
+func exchangeServiceJSON(conn io.ReadWriteCloser, req serviceRequest, timeout time.Duration) (serviceResponse, error) {
+	if timeout <= 0 {
+		return exchangeServiceJSONBlocking(conn, req)
+	}
+	type result struct {
+		resp serviceResponse
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		resp, err := exchangeServiceJSONBlocking(conn, req)
+		done <- result{resp: resp, err: err}
+	}()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case res := <-done:
+		return res.resp, res.err
+	case <-timer.C:
+		_ = conn.Close()
+		return serviceResponse{}, fmt.Errorf("seekfs service %q request timed out after %s", req.Command, timeout)
+	}
+}
+
+func exchangeServiceJSONBlocking(conn io.ReadWriteCloser, req serviceRequest) (serviceResponse, error) {
+	if err := json.NewEncoder(conn).Encode(req); err != nil {
+		return serviceResponse{}, err
+	}
+	var resp serviceResponse
+	if err := json.NewDecoder(conn).Decode(&resp); err != nil {
+		return serviceResponse{}, err
+	}
+	return resp, nil
 }
 
 func openPipeClient(pipeName string) (windows.Handle, error) {
@@ -2412,6 +2542,11 @@ func (s *goSearchService) Execute(args []string, r <-chan svc.ChangeRequest, cha
 	}()
 	changes <- svc.Status{State: svc.Running, Accepts: svc.AcceptStop | svc.AcceptShutdown}
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				serviceLog("startup index load panic: %v\n%s", r, string(debug.Stack()))
+			}
+		}()
 		if err := s.loadConfiguredIndexes(); err != nil {
 			serviceLog("startup index load error: %v", err)
 		}
@@ -2474,6 +2609,14 @@ func (s *goSearchService) loadConfiguredIndexes() error {
 			serviceLog("startup wal replay skipped volume=%s db=%s err=%v", vol.volume, vol.dbPath, err)
 			vol.state = "stale"
 			vol.staleReason = err.Error()
+			if shouldRebuildStaleIndex(err) {
+				if rebuilt, rebuildErr := rebuildServiceVolumeIndex(vol); rebuildErr == nil {
+					serviceLog("startup wal rebuild complete volume=%s db=%s entries=%d", rebuilt.volume, rebuilt.dbPath, rebuilt.index.entryCount())
+					vol = rebuilt
+				} else {
+					serviceLog("startup wal rebuild failed volume=%s db=%s err=%v", vol.volume, vol.dbPath, rebuildErr)
+				}
+			}
 		}
 		if err := catchUpServiceVolume(vol); err != nil {
 			serviceLog("startup catch-up skipped volume=%s db=%s err=%v", vol.volume, vol.dbPath, err)
@@ -2605,6 +2748,7 @@ func catchUpServiceVolume(vol *serviceVolumeIndex) error {
 			return err
 		}
 		vol.repackResidentRecordsIfBloated()
+		releaseServiceMemoryAfterSave()
 		if err := removeWAL(vol.dbPath); err != nil {
 			serviceLog("wal cleanup error volume=%s db=%s err=%v", vol.volume, vol.dbPath, err)
 		}
@@ -2754,6 +2898,7 @@ func (s *goSearchService) persistVolumeIfDue(vol *serviceVolumeIndex, force bool
 		s.indexMu.Unlock()
 		return
 	}
+	saved := false
 	if err := saveIndex(vol.dbPath, vol.index); err != nil {
 		vol.state = "stale"
 		vol.staleReason = err.Error()
@@ -2766,8 +2911,16 @@ func (s *goSearchService) persistVolumeIfDue(vol *serviceVolumeIndex, force bool
 		vol.dirty = false
 		vol.lastPersist = time.Now()
 		vol.afterPersist()
+		saved = true
 	}
 	s.indexMu.Unlock()
+	if saved {
+		releaseServiceMemoryAfterSave()
+	}
+}
+
+func releaseServiceMemoryAfterSave() {
+	debug.FreeOSMemory()
 }
 
 func (vol *serviceVolumeIndex) afterPersist() {
@@ -2861,6 +3014,10 @@ func rebuildServiceVolumeIndex(vol *serviceVolumeIndex) (*serviceVolumeIndex, er
 	if err := saveIndex(vol.dbPath, idx); err != nil {
 		return nil, err
 	}
+	releaseServiceMemoryAfterSave()
+	if err := removeWAL(vol.dbPath); err != nil {
+		serviceLog("wal cleanup error volume=%s db=%s err=%v", vol.volume, vol.dbPath, err)
+	}
 	rebuilt := newServiceVolumeIndex(vol.dbPath, idx)
 	rebuilt.state = "ready"
 	rebuilt.staleReason = ""
@@ -2868,11 +3025,26 @@ func rebuildServiceVolumeIndex(vol *serviceVolumeIndex) (*serviceVolumeIndex, er
 }
 
 func (s *goSearchService) rebuildVolumeInPlace(vol *serviceVolumeIndex) error {
-	rebuilt, err := rebuildServiceVolumeIndex(vol)
+	if vol == nil || vol.volume == "" || vol.dbPath == "" {
+		return errors.New("stale index rebuild requires a volume and db path")
+	}
+	idx, err := indexUSNVolume(vol.volume)
 	if err != nil {
 		return err
 	}
+	buildOrders(idx)
+
 	s.indexMu.Lock()
+	if err := saveIndex(vol.dbPath, idx); err != nil {
+		s.indexMu.Unlock()
+		return err
+	}
+	if err := removeWAL(vol.dbPath); err != nil {
+		serviceLog("wal cleanup error volume=%s db=%s err=%v", vol.volume, vol.dbPath, err)
+	}
+	rebuilt := newServiceVolumeIndex(vol.dbPath, idx)
+	rebuilt.state = "ready"
+	rebuilt.staleReason = ""
 	replaceServiceVolumeContents(vol, rebuilt)
 	for i, existing := range s.volumes {
 		if existing == vol {
@@ -2881,6 +3053,7 @@ func (s *goSearchService) rebuildVolumeInPlace(vol *serviceVolumeIndex) error {
 		}
 	}
 	s.indexMu.Unlock()
+	releaseServiceMemoryAfterSave()
 	serviceLog("rebuilt stale index volume=%s db=%s entries=%d", rebuilt.volume, rebuilt.dbPath, rebuilt.index.entryCount())
 	return nil
 }
@@ -2950,6 +3123,10 @@ func (vol *serviceVolumeIndex) applyUSNChanges(changes []usnChange) {
 }
 
 func (vol *serviceVolumeIndex) replayWAL() error {
+	return vol.replayWALWithLimit(serviceStartupWALRebuildBytes)
+}
+
+func (vol *serviceVolumeIndex) replayWALWithLimit(maxBytes int64) error {
 	if vol == nil || vol.dbPath == "" {
 		return nil
 	}
@@ -2961,6 +3138,14 @@ func (vol *serviceVolumeIndex) replayWAL() error {
 		return err
 	}
 	defer f.Close()
+	if maxBytes > 0 {
+		if info, err := f.Stat(); err == nil && info.Size() > maxBytes {
+			return staleIndexError{
+				reason:  fmt.Sprintf("wal %s is %d bytes; rebuilding instead of replaying", walPath(vol.dbPath), info.Size()),
+				rebuild: true,
+			}
+		}
+	}
 	dec := json.NewDecoder(bufio.NewReaderSize(f, 1024*1024))
 	applied := 0
 	for {
@@ -3949,12 +4134,19 @@ func handleServiceConn(conn *os.File, s *goSearchService) {
 		serviceLog("index-usn built volume=%s entries=%d", req.Volume, idx.entryCount())
 		buildOrders(idx)
 		serviceLog("index-usn orders volume=%s", req.Volume)
+		s.indexMu.Lock()
 		if err := saveIndex(req.DB, idx); err != nil {
+			s.indexMu.Unlock()
 			serviceLog("index-usn save error volume=%s err=%v", req.Volume, err)
 			_ = json.NewEncoder(conn).Encode(serviceResponse{OK: false, Message: err.Error()})
 			return
 		}
-		s.replaceLoadedVolume(req.DB, idx)
+		if err := removeWAL(req.DB); err != nil {
+			serviceLog("wal cleanup error volume=%s db=%s err=%v", req.Volume, req.DB, err)
+		}
+		s.replaceLoadedVolumeLocked(req.DB, idx)
+		s.indexMu.Unlock()
+		releaseServiceMemoryAfterSave()
 		serviceLog("index-usn complete volume=%s entries=%d", req.Volume, idx.entryCount())
 		_ = json.NewEncoder(conn).Encode(serviceResponse{OK: true, Message: "indexed", Entries: idx.entryCount()})
 	case "status":
@@ -3968,9 +4160,16 @@ func (s *goSearchService) replaceLoadedVolume(dbPath string, idx *Index) {
 	if s == nil || idx == nil || dbPath == "" {
 		return
 	}
-	vol := newServiceVolumeIndex(dbPath, idx)
 	s.indexMu.Lock()
 	defer s.indexMu.Unlock()
+	s.replaceLoadedVolumeLocked(dbPath, idx)
+}
+
+func (s *goSearchService) replaceLoadedVolumeLocked(dbPath string, idx *Index) {
+	if s == nil || idx == nil || dbPath == "" {
+		return
+	}
+	vol := newServiceVolumeIndex(dbPath, idx)
 	for i, existing := range s.volumes {
 		if existing != nil && (samePath(existing.dbPath, dbPath) || strings.EqualFold(existing.volume, idx.Volume)) {
 			replaceServiceVolumeContents(existing, vol)
@@ -4113,7 +4312,7 @@ func search(idx *Index, opts queryOptions, countOnly bool) ([]Entry, error) {
 			}
 		}
 	}
-	return results, nil
+	return filterImplicitUnderExisting(results, opts, countOnly), nil
 }
 
 func writeJSON(w io.Writer, v any) error {
@@ -4160,12 +4359,23 @@ func estimateIndexLayout(idx *Index, path string) *indexLayout {
 	layout.UniqueNames = len(unique)
 	layout.NameBlobBytes = nameBlobBytes
 	layout.NameTableBytes = int64(layout.UniqueNames * 6)
-	layout.RecordBytes = int64(layout.RecordCount * compactDiskRecordBytes)
+	layout.RecordBytes = int64(layout.RecordCount * compactDiskRecordBytesForCounts(layout.RecordCount, layout.UniqueNames))
 	if layout.FileBytes > 0 {
 		layout.OtherBytes = layout.FileBytes - layout.RecordBytes - layout.NameBlobBytes - layout.NameTableBytes
 		layout.BytesPerRecord = float64(layout.FileBytes) / float64(max(layout.RecordCount, 1))
 	}
 	return layout
+}
+
+func compactNeedsWideDiskRecords(recordCount, tokenCount int) bool {
+	return recordCount > int(compactNarrowMaxRecordRef)+1 || tokenCount > int(compactNarrowMaxRecordRef)+1
+}
+
+func compactDiskRecordBytesForCounts(recordCount, tokenCount int) int {
+	if compactNeedsWideDiskRecords(recordCount, tokenCount) {
+		return compactWideDiskRecordBytes
+	}
+	return compactDiskRecordBytes
 }
 
 func entriesToJSON(entries []Entry) []jsonResult {
@@ -4212,7 +4422,11 @@ func entryToJSON(entry Entry) jsonResult {
 
 func searchAll(indexes []*Index, opts queryOptions, countOnly bool) ([]Entry, error) {
 	if len(indexes) == 1 {
-		return search(indexes[0], opts, countOnly)
+		matches, err := search(indexes[0], opts, countOnly)
+		if err != nil {
+			return nil, err
+		}
+		return filterImplicitUnderExisting(matches, opts, countOnly), nil
 	}
 	limit := normalizedLimit(opts.Limit, countOnly)
 	results := make([]Entry, 0, min(limit, 1024))
@@ -4232,7 +4446,7 @@ func searchAll(indexes []*Index, opts queryOptions, countOnly bool) ([]Entry, er
 		}
 		results = append(results, matches...)
 	}
-	return results, nil
+	return filterImplicitUnderExisting(results, opts, countOnly), nil
 }
 
 func searchServiceVolumes(volumes []*serviceVolumeIndex, opts queryOptions, countOnly bool) ([]Entry, error) {
@@ -4243,9 +4457,15 @@ func searchServiceVolumes(volumes []*serviceVolumeIndex, opts queryOptions, coun
 	if len(volumes) == 1 {
 		vol := volumes[0]
 		vol.searchMu.Lock()
-		defer vol.searchMu.Unlock()
 		matches, err := searchCompactWithCache(vol.index, opts, countOnly, vol.pathCache, vol.nameTermCandidates)
 		vol.trimSearchCachesLocked()
+		vol.searchMu.Unlock()
+		matches = filterImplicitUnderExisting(matches, opts, countOnly)
+		if err == nil && len(matches) == 0 {
+			if fallback, ok := filesystemUnderFallbackSearch(opts, countOnly); ok {
+				return fallback, nil
+			}
+		}
 		return matches, err
 	}
 	limit := normalizedLimit(opts.Limit, countOnly)
@@ -4269,7 +4489,109 @@ func searchServiceVolumes(volumes []*serviceVolumeIndex, opts queryOptions, coun
 		}
 		results = append(results, matches...)
 	}
-	return results, nil
+	results = filterImplicitUnderExisting(results, opts, countOnly)
+	if len(results) == 0 {
+		if fallback, ok := filesystemUnderFallbackSearch(opts, countOnly); ok {
+			return fallback, nil
+		}
+	}
+	return filterImplicitUnderExisting(results, opts, countOnly), nil
+}
+
+func filterImplicitUnderExisting(matches []Entry, opts queryOptions, countOnly bool) []Entry {
+	if countOnly || opts.Exists || opts.Under == "" || len(matches) == 0 {
+		return matches
+	}
+	info, err := os.Stat(opts.Under)
+	if err != nil || !info.IsDir() {
+		return matches
+	}
+	out := matches[:0]
+	for _, entry := range matches {
+		if _, err := os.Stat(entry.Path); err == nil {
+			out = append(out, entry)
+		}
+	}
+	return out
+}
+
+func filesystemUnderFallbackSearch(opts queryOptions, countOnly bool) ([]Entry, bool) {
+	return filesystemUnderFallbackSearchLimited(opts, countOnly, filesystemFallbackMaxVisited, filesystemFallbackMaxDuration)
+}
+
+func filesystemUnderFallbackSearchLimited(opts queryOptions, countOnly bool, maxVisited int, maxDuration time.Duration) ([]Entry, bool) {
+	if countOnly || opts.Under == "" || isVolumeRoot(opts.Under) {
+		return nil, false
+	}
+	root := normalizeFilterPath(opts.Under)
+	info, err := os.Stat(root)
+	if err != nil || !info.IsDir() {
+		return nil, false
+	}
+	pq, err := parseQuery(opts)
+	if err != nil {
+		return nil, false
+	}
+	limit := normalizedLimit(opts.Limit, false)
+	pq.Limit = limit
+	matches := make([]Entry, 0, min(limit, 128))
+	deadline := time.Time{}
+	if maxDuration > 0 {
+		deadline = time.Now().Add(maxDuration)
+	}
+	visited := 0
+	_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return nil
+		}
+		visited++
+		if maxVisited > 0 && visited > maxVisited {
+			return filepath.SkipAll
+		}
+		if !deadline.IsZero() && time.Now().After(deadline) {
+			return filepath.SkipAll
+		}
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+		entry := Entry{
+			Path:      path,
+			Name:      d.Name(),
+			LowerPath: strings.ToLower(path),
+			LowerName: strings.ToLower(d.Name()),
+			Size:      info.Size(),
+			Mode:      uint32(info.Mode()),
+			ModUnix:   info.ModTime().UnixNano(),
+		}
+		if entryMatches(entry, pq, opts.MatchPath) {
+			matches = append(matches, entry)
+			if limit > 0 && len(matches) >= limit {
+				return filepath.SkipAll
+			}
+		}
+		return nil
+	})
+	if len(matches) == 0 {
+		return nil, false
+	}
+	sort.Slice(matches, func(i, j int) bool {
+		if matches[i].LowerName == matches[j].LowerName {
+			return matches[i].LowerPath < matches[j].LowerPath
+		}
+		return matches[i].LowerName < matches[j].LowerName
+	})
+	return matches, true
+}
+
+func isVolumeRoot(path string) bool {
+	clean := normalizeFilterPath(path)
+	vol := filepath.VolumeName(clean)
+	if vol == "" {
+		return false
+	}
+	rest := strings.TrimPrefix(clean, vol)
+	return rest == `\` || rest == `/` || rest == ""
 }
 
 func countServiceVolumes(volumes []*serviceVolumeIndex, opts queryOptions) (int, bool, error) {
@@ -5474,7 +5796,7 @@ func (vol *serviceVolumeIndex) underPrefilter(pq parsedQuery) map[int]struct{} {
 		for _, globTerm := range globLiteralTerms(pq.Globs, pq.CaseSensitive) {
 			list := vol.nameTermPosting(globTerm)
 			if len(list) == 0 {
-				return map[int]struct{}{}
+				continue
 			}
 			lists = append(lists, list)
 		}
@@ -7220,7 +7542,9 @@ func (idx *Index) reconstructCompactPathCached(i int, cache map[int]string) stri
 		}
 		seen[cur] = struct{}{}
 		rec := idx.compactRecord(cur)
-		parts = append(parts, rec.Name)
+		if rec.Name != "." {
+			parts = append(parts, rec.Name)
+		}
 		if rec.Parent < 0 {
 			break
 		}
@@ -7279,7 +7603,6 @@ func writeIndex(w io.Writer, idx *Index) error {
 		Checkpoint: idx.Checkpoint,
 	}
 	if idx.Compact {
-		header.Compact = 1
 		header.EntryCount = uint64(recordCount)
 		nameIDs := make(map[string]uint32, recordCount/2)
 		nameBlob := make([]byte, 0, recordCount*16)
@@ -7304,6 +7627,10 @@ func writeIndex(w io.Writer, idx *Index) error {
 		idx.NameBlob = nameBlob
 		header.NameBlobLen = uint64(len(nameBlob))
 		header.TokenCount = uint64(len(nameOffs))
+		header.Compact = compactDiskFlag
+		if compactNeedsWideDiskRecords(recordCount, len(nameOffs)) {
+			header.Compact |= compactDiskWideRefsFlag
+		}
 	}
 	if err := binary.Write(w, binary.LittleEndian, header); err != nil {
 		return err
@@ -7319,6 +7646,7 @@ func writeIndex(w io.Writer, idx *Index) error {
 		}
 	}
 	if idx.Compact {
+		wideRefs := header.Compact&compactDiskWideRefsFlag != 0
 		if _, err := w.Write(idx.NameBlob); err != nil {
 			return err
 		}
@@ -7333,12 +7661,15 @@ func writeIndex(w io.Writer, idx *Index) error {
 		for i := 0; i < recordCount; i++ {
 			rec := idx.compactRecord(i)
 			rec.NameOff = nameIDForRecord[i]
-			parent := uint32(0xFFFFFF)
-			if rec.Parent >= 0 {
-				parent = uint32(rec.Parent)
+			parent := uint32(compactNarrowParentSentinel)
+			if wideRefs {
+				parent = compactWideParentSentinel
 			}
-			if parent > 0xFFFFFF || rec.NameOff > 0xFFFFFF {
-				return errors.New("compact index too large for packed record format")
+			if rec.Parent >= 0 {
+				if !wideRefs && uint32(rec.Parent) >= compactNarrowParentSentinel {
+					return errors.New("compact index too large for packed record format")
+				}
+				parent = uint32(rec.Parent)
 			}
 			if err := binary.Write(w, binary.LittleEndian, rec.FRN); err != nil {
 				return err
@@ -7346,10 +7677,7 @@ func writeIndex(w io.Writer, idx *Index) error {
 			if err := binary.Write(w, binary.LittleEndian, rec.ParentFRN); err != nil {
 				return err
 			}
-			if err := writeUint24(w, parent); err != nil {
-				return err
-			}
-			if err := writeUint24(w, rec.NameOff); err != nil {
+			if err := writeCompactRecordRefs(w, parent, rec.NameOff, wideRefs); err != nil {
 				return err
 			}
 			if err := binary.Write(w, binary.LittleEndian, rec.Mode); err != nil {
@@ -7427,6 +7755,7 @@ func readIndex(r io.Reader) (*Index, error) {
 		}
 	}
 	if idx.Compact {
+		wideRefs := header.Compact&compactDiskWideRefsFlag != 0
 		if header.NameBlobLen > uint64(^uint(0)>>1) {
 			return nil, errors.New("name blob too large")
 		}
@@ -7456,18 +7785,16 @@ func readIndex(r io.Reader) (*Index, error) {
 			if err := binary.Read(r, binary.LittleEndian, &rec.ParentFRN); err != nil {
 				return nil, err
 			}
-			parent, err := readUint24(r)
+			parent, nameOff, err := readCompactRecordRefs(r, wideRefs)
 			if err != nil {
 				return nil, err
 			}
-			if parent == 0xFFFFFF {
+			if (!wideRefs && parent == compactNarrowParentSentinel) || (wideRefs && parent == compactWideParentSentinel) {
 				rec.Parent = -1
 			} else {
 				rec.Parent = int32(parent)
 			}
-			if rec.NameOff, err = readUint24(r); err != nil {
-				return nil, err
-			}
+			rec.NameOff = nameOff
 			if int(rec.NameOff) >= len(nameOffs) {
 				return nil, errors.New("invalid compact name id")
 			}
@@ -7598,6 +7925,44 @@ func readUint32Slice(r io.Reader, n int) ([]int, error) {
 	return values, nil
 }
 
+func writeCompactRecordRefs(w io.Writer, parent, nameOff uint32, wide bool) error {
+	if wide {
+		if err := binary.Write(w, binary.LittleEndian, parent); err != nil {
+			return err
+		}
+		return binary.Write(w, binary.LittleEndian, nameOff)
+	}
+	if parent > compactNarrowParentSentinel || nameOff >= compactNarrowParentSentinel {
+		return errors.New("compact index too large for packed record format")
+	}
+	if err := writeUint24(w, parent); err != nil {
+		return err
+	}
+	return writeUint24(w, nameOff)
+}
+
+func readCompactRecordRefs(r io.Reader, wide bool) (uint32, uint32, error) {
+	if wide {
+		var parent, nameOff uint32
+		if err := binary.Read(r, binary.LittleEndian, &parent); err != nil {
+			return 0, 0, err
+		}
+		if err := binary.Read(r, binary.LittleEndian, &nameOff); err != nil {
+			return 0, 0, err
+		}
+		return parent, nameOff, nil
+	}
+	parent, err := readUint24(r)
+	if err != nil {
+		return 0, 0, err
+	}
+	nameOff, err := readUint24(r)
+	if err != nil {
+		return 0, 0, err
+	}
+	return parent, nameOff, nil
+}
+
 func writeUint24(w io.Writer, value uint32) error {
 	var buf [3]byte
 	buf[0] = byte(value)
@@ -7624,14 +7989,15 @@ func blobString(blob []byte, off uint64, length uint32) (string, error) {
 }
 
 func saveIndex(path string, idx *Index) error {
-	tmp := path + ".tmp"
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	f, err := os.Create(tmp)
+	f, err := os.CreateTemp(dir, filepath.Base(path)+".*.tmp")
 	if err != nil {
 		return err
 	}
+	tmp := f.Name()
 	bw := bufio.NewWriterSize(f, 16*1024*1024)
 	err = writeIndex(bw, idx)
 	if flushErr := bw.Flush(); err == nil {
@@ -7651,12 +8017,15 @@ func saveIndex(path string, idx *Index) error {
 		_ = os.Remove(tmp)
 		return closeErr
 	}
-	_ = os.Remove(path)
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		_ = os.Remove(tmp)
+		return err
+	}
 	if err := os.Rename(tmp, path); err != nil {
 		_ = os.Remove(tmp)
 		return err
 	}
-	if dir, err := os.Open(filepath.Dir(path)); err == nil {
+	if dir, err := os.Open(dir); err == nil {
 		_ = dir.Sync()
 		_ = dir.Close()
 	}

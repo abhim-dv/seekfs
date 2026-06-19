@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.8.3 - Large Index and Scoped Search Hardening
+
+### Fixed
+
+- Extended compact on-disk record references past the 24-bit packed limit so
+  large resident indexes no longer persist stale `compact index too large for
+  packed record format` failures.
+- Added startup rebuild fallback for oversized WAL replay so stale resident
+  indexes recover by rebuilding instead of hanging on large incremental logs.
+- Added client-side timeouts for hung resident `search`/`status`/`info` calls so
+  blocked pipe requests fail fast instead of hanging indefinitely.
+- Released resident heap pages after large saves and rebuilds so service memory
+  returns closer to steady-state after persisting wide indexes.
+- Accepted search flags before or after the query, so
+  `seekfs search main.go --under F:\workspace` scopes the query as expected.
+- Bounded scoped filesystem fallback walks so no-hit `--under` searches on large
+  roots cannot block the resident service behind a long recursive scan.
+
+### Validation
+
+- `go test .\...`
+- `go vet .\...`
+
 ## 0.8.2 - Service Reliability and Path Query Recovery
 
 ### Added

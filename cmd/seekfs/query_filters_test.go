@@ -2,6 +2,7 @@ package main
 
 import (
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -95,6 +96,55 @@ func TestKnownFiltersAndPathsAreNotRejected(t *testing.T) {
 		if _, err := parseQuery(queryOptions{Query: q, MatchPath: true}); err != nil {
 			t.Errorf("parseQuery(%q) unexpectedly rejected: %v", q, err)
 		}
+	}
+}
+
+func TestReconstructCompactPathSkipsSyntheticDotRoot(t *testing.T) {
+	idx := &Index{
+		Compact: true,
+		Volume:  "F:",
+		Records: []CompactRecord{
+			{FRN: 5, ParentFRN: 5, Parent: -1, Name: ".", Mode: uint32(os.ModeDir)},
+			{FRN: 10, ParentFRN: 5, Parent: 0, Name: "git", Mode: uint32(os.ModeDir)},
+			{FRN: 11, ParentFRN: 10, Parent: 1, Name: "seekfs", Mode: uint32(os.ModeDir)},
+			{FRN: 12, ParentFRN: 11, Parent: 2, Name: "main.go"},
+		},
+	}
+	if got, want := idx.reconstructCompactPath(3), `F:\git\seekfs\main.go`; got != want {
+		t.Fatalf("path = %q, want %q", got, want)
+	}
+	if !pathUnder(idx.reconstructCompactPath(3), `F:\git\seekfs`) {
+		t.Fatal("reconstructed path should be under F:\\git\\seekfs")
+	}
+}
+
+func TestUnderSearchFiltersStaleFilesystemEntriesByDefault(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "stale-indexed-path.txt")
+	if err := os.WriteFile(path, []byte("stale"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	idx := &Index{}
+	if err := walkRoot(root, idx); err != nil {
+		t.Fatal(err)
+	}
+	buildOrders(idx)
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	got, err := search(idx, queryOptions{Query: "stale-indexed-path.txt", Under: root, Limit: 20}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("matches = %+v, want stale indexed path filtered", got)
+	}
+	countMatches, err := search(idx, queryOptions{Query: "stale-indexed-path.txt", Under: root, Limit: 20}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(countMatches) != 1 {
+		t.Fatalf("count matches = %+v, want indexed count behavior unchanged", countMatches)
 	}
 }
 

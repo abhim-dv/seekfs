@@ -10,10 +10,11 @@ import (
 )
 
 type candidatePlan struct {
-	vol     *serviceVolumeIndex
-	pq      parsedQuery
-	sources []candidatePlanSource
-	empty   bool
+	vol               *serviceVolumeIndex
+	pq                parsedQuery
+	sources           []candidatePlanSource
+	empty             bool
+	underPathFallback string
 }
 
 type candidatePlanSource struct {
@@ -208,10 +209,11 @@ func (vol *serviceVolumeIndex) buildCandidatePlan(pq parsedQuery) (candidatePlan
 		}
 		underRoots = vol.underRootIDs(under)
 		if len(underRoots) == 0 {
-			plan.empty = true
-			return plan, true
+			plan.underPathFallback = under
 		}
-		underEstimatedSize = vol.estimateUnderDescendantCount(underRoots)
+		if len(underRoots) > 0 {
+			underEstimatedSize = vol.estimateUnderDescendantCount(underRoots)
+		}
 	}
 
 	for _, ext := range pq.Exts {
@@ -293,8 +295,10 @@ func (vol *serviceVolumeIndex) buildCandidatePlan(pq parsedQuery) (candidatePlan
 		}
 		if !globsOK {
 			for _, term := range globLiteralTerms(pq.Globs, pq.CaseSensitive) {
-				if !addRequired("glob-literal:"+term, vol.nameTermPosting(term)) {
-					return plan, true
+				if list := vol.nameTermPosting(term); len(list) > 0 {
+					if !addRequired("glob-literal:"+term, list) {
+						return plan, true
+					}
 				}
 			}
 		}
@@ -460,13 +464,13 @@ func hasNonVolumeTerm(terms []string) bool {
 func (vol *serviceVolumeIndex) mostSelectivePathTerm(pq parsedQuery) (string, bool) {
 	best := ""
 	bestSize := -1
-	for _, term := range pq.Terms {
-		if isVolumeQueryTerm(term) {
-			continue
-		}
+	for _, term := range pathPlanProbeTerms(pq.Terms) {
 		size := len(vol.pathPlanTermPosting(term))
 		if bestSize < 0 || size < bestSize {
 			best, bestSize = term, size
+		}
+		if bestSize <= serviceCachedPostingMaxIDs {
+			break
 		}
 	}
 	if bestSize < 0 {
@@ -476,6 +480,28 @@ func (vol *serviceVolumeIndex) mostSelectivePathTerm(pq parsedQuery) (string, bo
 		return "", false
 	}
 	return best, true
+}
+
+func pathPlanProbeTerms(terms []string) []string {
+	out := make([]string, 0, len(terms))
+	for _, term := range terms {
+		if term == "" || isVolumeQueryTerm(term) {
+			continue
+		}
+		out = append(out, term)
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		a, b := out[i], out[j]
+		aDot, bDot := strings.Contains(a, "."), strings.Contains(b, ".")
+		if aDot != bDot {
+			return aDot
+		}
+		if len(a) != len(b) {
+			return len(a) > len(b)
+		}
+		return a < b
+	})
+	return out
 }
 
 func (vol *serviceVolumeIndex) namePlanTermPosting(term string) []int {
@@ -522,6 +548,29 @@ func (plan candidatePlan) execute() []int {
 		out = append(out, mapKeys(plan.vol.recentIDs)...)
 		sort.Ints(out)
 		out = uniqueSortedInts(out)
+	}
+	if plan.underPathFallback != "" {
+		out = plan.filterUnderPath(out)
+	}
+	return out
+}
+
+func (plan candidatePlan) filterUnderPath(ids []int) []int {
+	if plan.vol == nil || plan.vol.index == nil || plan.underPathFallback == "" || len(ids) == 0 {
+		return ids
+	}
+	if plan.vol.pathCache == nil {
+		plan.vol.pathCache = make(map[int]string)
+	}
+	out := make([]int, 0, len(ids))
+	for _, id := range ids {
+		if id < 0 || id >= plan.vol.index.compactRecordCount() {
+			continue
+		}
+		path := plan.vol.index.reconstructCompactPathCached(id, plan.vol.pathCache)
+		if pathUnder(path, plan.underPathFallback) {
+			out = append(out, id)
+		}
 	}
 	return out
 }
