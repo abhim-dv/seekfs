@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -145,10 +146,64 @@ func TestServiceVolumesForQuerySkipsStaleNonMatchingUnderVolume(t *testing.T) {
 	}
 }
 
-func TestServiceVolumesForQueryErrorsForMatchingStaleVolume(t *testing.T) {
+func TestServiceVolumesForQueryUsesLoadedStaleVolume(t *testing.T) {
 	c := &serviceVolumeIndex{index: &Index{Volume: "C:"}, state: "stale", staleReason: "old checkpoint"}
-	if _, err := serviceVolumesForQuery([]*serviceVolumeIndex{c}, queryOptions{Under: `C:\Data`}); err == nil || !strings.Contains(err.Error(), "stale") {
-		t.Fatalf("error = %v, want stale index error", err)
+	got, err := serviceVolumesForQuery([]*serviceVolumeIndex{c}, queryOptions{Under: `C:\Data`})
+	if err != nil {
+		t.Fatalf("error = %v, want loaded stale volume to remain searchable", err)
+	}
+	if len(got) != 1 || got[0] != c {
+		t.Fatalf("volumes = %+v, want stale C: volume", got)
+	}
+}
+
+func TestServiceVolumesForQueryRoutesPathVolumeTerm(t *testing.T) {
+	c := &serviceVolumeIndex{index: &Index{Volume: "C:"}, state: "ready"}
+	f := &serviceVolumeIndex{index: &Index{Volume: "F:"}, state: "ready"}
+	cases := []string{
+		"path:F: .nrrd",
+		"path:F: .raw",
+		"path:F: .pdf",
+		"F: ext:pdf",
+	}
+	for _, query := range cases {
+		t.Run(query, func(t *testing.T) {
+			got, err := serviceVolumesForQuery([]*serviceVolumeIndex{c, f}, queryOptions{Query: query, MatchPath: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(got) != 1 || got[0] != f {
+				t.Fatalf("volumes = %+v, want only F: volume", got)
+			}
+		})
+	}
+}
+
+func TestServiceVolumesForQueryKeepsAllVolumesWithoutUniqueVolumeTerm(t *testing.T) {
+	c := &serviceVolumeIndex{index: &Index{Volume: "C:"}, state: "ready"}
+	f := &serviceVolumeIndex{index: &Index{Volume: "F:"}, state: "ready"}
+	got, err := serviceVolumesForQuery([]*serviceVolumeIndex{c, f}, queryOptions{Query: "path:C:|F: .pdf", MatchPath: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("volumes = %+v, want both volumes for ambiguous volume query", got)
+	}
+}
+
+func TestLockVolumeSearchCancelsWhileWaiting(t *testing.T) {
+	vol := &serviceVolumeIndex{}
+	vol.searchMu.Lock()
+	defer vol.searchMu.Unlock()
+	start := time.Now()
+	locked := lockVolumeSearch(vol, queryOptions{
+		Cancel: func() bool { return true },
+	})
+	if locked {
+		t.Fatal("lockVolumeSearch acquired lock for canceled query")
+	}
+	if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
+		t.Fatalf("lockVolumeSearch took %s for canceled query, want quick return", elapsed)
 	}
 }
 
@@ -272,6 +327,40 @@ func TestServiceVolumeIndexResidentMemoryInfoReflectsSkippedViews(t *testing.T) 
 	}
 	if info.ExtPostBytes == 0 {
 		t.Fatalf("expected extension posting memory field: %+v", info)
+	}
+	if info.FRNIndexBytes == 0 || info.KnownBytes == 0 {
+		t.Fatalf("expected FRN and known memory fields: %+v", info)
+	}
+}
+
+func TestServiceVolumeIndexPersistFailureBackoffRetainsQueryableState(t *testing.T) {
+	vol := syntheticServiceVolumeIndexForCacheTests()
+	vol.state = "ready"
+	vol.staleReason = ""
+	now := time.Unix(100, 0)
+
+	vol.notePersistFailureLocked(errors.New("not enough space on the disk"), now)
+
+	if vol.state != "ready" || vol.staleReason != "" {
+		t.Fatalf("persist failure changed query state: state=%q stale=%q", vol.state, vol.staleReason)
+	}
+	if vol.persistFailures != 1 {
+		t.Fatalf("persistFailures = %d, want 1", vol.persistFailures)
+	}
+	if got, want := vol.persistRetryAfter.Sub(now), time.Minute; got != want {
+		t.Fatalf("retry delay = %s, want %s", got, want)
+	}
+	if vol.lastPersistErr == "" {
+		t.Fatal("lastPersistErr was not recorded")
+	}
+}
+
+func TestPersistFailureBackoffCaps(t *testing.T) {
+	if got := persistFailureBackoff(1); got != time.Minute {
+		t.Fatalf("first backoff = %s, want 1m", got)
+	}
+	if got := persistFailureBackoff(9); got != 32*time.Minute {
+		t.Fatalf("capped backoff = %s, want 32m", got)
 	}
 }
 
@@ -400,6 +489,24 @@ func TestServiceCallTimeoutLeavesIndexRequestsUnlimited(t *testing.T) {
 	}
 	if got := serviceCallTimeout(serviceRequest{Command: "index-usn"}); got != 0 {
 		t.Fatalf("index-usn timeout = %s, want 0", got)
+	}
+}
+
+func TestServiceRequestRoundTripPreservesControlFields(t *testing.T) {
+	opts := queryOptions{
+		Query:        "ext:nrrd",
+		MatchPath:    true,
+		Limit:        200,
+		DeadlineUnix: 123456789,
+		RequestSeq:   42,
+	}
+	req := serviceRequestFromOptions(opts, false)
+	if req.DeadlineUnix != opts.DeadlineUnix || req.RequestSeq != opts.RequestSeq {
+		t.Fatalf("request deadline/seq = (%d, %d), want (%d, %d)", req.DeadlineUnix, req.RequestSeq, opts.DeadlineUnix, opts.RequestSeq)
+	}
+	got := requestToOptionsFromService(req)
+	if got.DeadlineUnix != opts.DeadlineUnix || got.RequestSeq != opts.RequestSeq || got.Query != opts.Query || !got.MatchPath || got.Limit != opts.Limit {
+		t.Fatalf("round trip options = %+v, want query/deadline/seq preserved", got)
 	}
 }
 

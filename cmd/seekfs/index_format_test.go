@@ -613,8 +613,11 @@ func TestParseQuerySplitsPathLikeTermsForPathSearch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(pq.Terms) != 1 || pq.Terms[0] != `cmd\seekfs\main.go` {
-		t.Fatalf("filename-mode terms = %v, want unsplit path-like term", pq.Terms)
+	if !pq.MatchPath {
+		t.Fatal("path-like query did not infer path mode")
+	}
+	if !sameStringSet(pq.Terms, want) {
+		t.Fatalf("inferred path-mode terms = %v, want %v", pq.Terms, want)
 	}
 }
 
