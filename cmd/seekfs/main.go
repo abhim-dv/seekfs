@@ -133,17 +133,18 @@ type indexLayout struct {
 }
 
 type doctorResponse struct {
-	OK            bool     `json:"ok"`
-	ServiceName   string   `json:"service_name"`
-	Installed     bool     `json:"installed"`
-	Running       bool     `json:"running"`
-	ServiceError  string   `json:"service_error,omitempty"`
-	PipeReachable bool     `json:"pipe_reachable"`
-	Entries       int      `json:"entries,omitempty"`
-	Loading       bool     `json:"loading,omitempty"`
-	QueryOK       bool     `json:"query_ok"`
-	Message       string   `json:"message,omitempty"`
-	DBs           []dbInfo `json:"dbs,omitempty"`
+	OK            bool               `json:"ok"`
+	ServiceName   string             `json:"service_name"`
+	Installed     bool               `json:"installed"`
+	Running       bool               `json:"running"`
+	ServiceError  string             `json:"service_error,omitempty"`
+	PipeReachable bool               `json:"pipe_reachable"`
+	Entries       int                `json:"entries,omitempty"`
+	Loading       bool               `json:"loading,omitempty"`
+	QueryOK       bool               `json:"query_ok"`
+	Message       string             `json:"message,omitempty"`
+	DBs           []dbInfo           `json:"dbs,omitempty"`
+	Runtime       *runtimeMemoryInfo `json:"runtime,omitempty"`
 }
 
 type benchSummary struct {
@@ -192,16 +193,19 @@ type appConfig struct {
 }
 
 type queryOptions struct {
-	Query         string `json:"query"`
-	MatchPath     bool   `json:"match_path"`
-	Limit         int    `json:"limit"`
-	Under         string `json:"under,omitempty"`
-	Exists        bool   `json:"exists,omitempty"`
-	CWDBias       string `json:"cwd_bias,omitempty"`
-	RootBias      string `json:"root_bias,omitempty"`
-	Recent        string `json:"recent,omitempty"`
-	ModifiedAfter string `json:"modified_after,omitempty"`
-	CaseSensitive bool   `json:"case_sensitive,omitempty"`
+	Query         string      `json:"query"`
+	MatchPath     bool        `json:"match_path"`
+	Limit         int         `json:"limit"`
+	Under         string      `json:"under,omitempty"`
+	Exists        bool        `json:"exists,omitempty"`
+	CWDBias       string      `json:"cwd_bias,omitempty"`
+	RootBias      string      `json:"root_bias,omitempty"`
+	Recent        string      `json:"recent,omitempty"`
+	ModifiedAfter string      `json:"modified_after,omitempty"`
+	CaseSensitive bool        `json:"case_sensitive,omitempty"`
+	DeadlineUnix  int64       `json:"deadline_unix,omitempty"`
+	RequestSeq    int64       `json:"request_seq,omitempty"`
+	Cancel        func() bool `json:"-"`
 }
 
 type parsedQuery struct {
@@ -227,6 +231,8 @@ type parsedQuery struct {
 	RootBias      string
 	Limit         int
 	CountOnly     bool
+	DeadlineUnix  int64
+	Cancel        func() bool
 }
 
 // sizeFilter expresses a size:<op><bytes> constraint, e.g. size:>100mb.
@@ -1640,102 +1646,128 @@ type serviceRequest struct {
 	Recent        string `json:"recent,omitempty"`
 	ModifiedAfter string `json:"modified_after,omitempty"`
 	CaseSensitive bool   `json:"case_sensitive,omitempty"`
+	DeadlineUnix  int64  `json:"deadline_unix,omitempty"`
+	RequestSeq    int64  `json:"request_seq,omitempty"`
 }
 
 type serviceResponse struct {
-	OK      bool     `json:"ok"`
-	Message string   `json:"message,omitempty"`
-	PID     int      `json:"pid,omitempty"`
-	Entries int      `json:"entries,omitempty"`
-	Loading bool     `json:"loading,omitempty"`
-	Count   int      `json:"count,omitempty"`
-	Results []string `json:"results,omitempty"`
-	DBs     []dbInfo `json:"dbs,omitempty"`
+	OK      bool               `json:"ok"`
+	Message string             `json:"message,omitempty"`
+	PID     int                `json:"pid,omitempty"`
+	Entries int                `json:"entries,omitempty"`
+	Loading bool               `json:"loading,omitempty"`
+	Count   int                `json:"count,omitempty"`
+	Results []string           `json:"results,omitempty"`
+	Rows    []jsonResult       `json:"rows,omitempty"`
+	DBs     []dbInfo           `json:"dbs,omitempty"`
+	Runtime *runtimeMemoryInfo `json:"runtime,omitempty"`
 }
 
 type dbInfo struct {
-	Path         string              `json:"path"`
-	Entries      int                 `json:"entries"`
-	Source       string              `json:"source"`
-	BuiltAt      string              `json:"built_at"`
-	Volume       string              `json:"volume,omitempty"`
-	JournalID    uint64              `json:"journal_id,omitempty"`
-	Checkpoint   int64               `json:"checkpoint_usn,omitempty"`
-	State        string              `json:"state,omitempty"`
-	StaleReason  string              `json:"stale_reason,omitempty"`
-	FRNRecords   int                 `json:"frn_records,omitempty"`
-	Recent       int                 `json:"recent,omitempty"`
-	PathCache    int                 `json:"path_cache,omitempty"`
-	TermCache    int                 `json:"term_cache,omitempty"`
-	PathTerms    int                 `json:"path_term_cache,omitempty"`
-	ExtCache     int                 `json:"ext_cache,omitempty"`
-	RecentSeq    uint64              `json:"recent_seq,omitempty"`
-	Dirty        bool                `json:"dirty,omitempty"`
-	LastPersist  string              `json:"last_persist,omitempty"`
-	QueryExtKeys int                 `json:"query_ext_keys,omitempty"`
-	QueryDirs    int                 `json:"query_dirs,omitempty"`
-	Memory       *residentMemoryInfo `json:"memory,omitempty"`
+	Path              string              `json:"path"`
+	Entries           int                 `json:"entries"`
+	Source            string              `json:"source"`
+	BuiltAt           string              `json:"built_at"`
+	Volume            string              `json:"volume,omitempty"`
+	JournalID         uint64              `json:"journal_id,omitempty"`
+	Checkpoint        int64               `json:"checkpoint_usn,omitempty"`
+	State             string              `json:"state,omitempty"`
+	StaleReason       string              `json:"stale_reason,omitempty"`
+	FRNRecords        int                 `json:"frn_records,omitempty"`
+	Recent            int                 `json:"recent,omitempty"`
+	PathCache         int                 `json:"path_cache,omitempty"`
+	TermCache         int                 `json:"term_cache,omitempty"`
+	PathTerms         int                 `json:"path_term_cache,omitempty"`
+	ExtCache          int                 `json:"ext_cache,omitempty"`
+	RecentSeq         uint64              `json:"recent_seq,omitempty"`
+	Dirty             bool                `json:"dirty,omitempty"`
+	LastPersist       string              `json:"last_persist,omitempty"`
+	PersistFailures   int                 `json:"persist_failures,omitempty"`
+	PersistRetryAfter string              `json:"persist_retry_after,omitempty"`
+	LastPersistError  string              `json:"last_persist_error,omitempty"`
+	QueryExtKeys      int                 `json:"query_ext_keys,omitempty"`
+	QueryDirs         int                 `json:"query_dirs,omitempty"`
+	Memory            *residentMemoryInfo `json:"memory,omitempty"`
 }
 
 type residentMemoryInfo struct {
-	Records        int   `json:"records"`
-	NameBlobBytes  int   `json:"name_blob_bytes,omitempty"`
-	LowerBlobBytes int   `json:"lower_blob_bytes,omitempty"`
-	RecordBytes    int64 `json:"record_bytes,omitempty"`
-	NameOrderBytes int   `json:"name_order_bytes,omitempty"`
-	ExtPostBytes   int   `json:"ext_posting_bytes,omitempty"`
-	TypePostBytes  int   `json:"type_posting_bytes,omitempty"`
-	ChildBytes     int   `json:"child_bytes,omitempty"`
+	Records           int   `json:"records"`
+	NameBlobBytes     int   `json:"name_blob_bytes,omitempty"`
+	LowerBlobBytes    int   `json:"lower_blob_bytes,omitempty"`
+	RecordBytes       int64 `json:"record_bytes,omitempty"`
+	NameOrderBytes    int   `json:"name_order_bytes,omitempty"`
+	ExtPostBytes      int   `json:"ext_posting_bytes,omitempty"`
+	TypePostBytes     int   `json:"type_posting_bytes,omitempty"`
+	ChildBytes        int   `json:"child_bytes,omitempty"`
+	FRNIndexBytes     int   `json:"frn_index_bytes,omitempty"`
+	FRNOverlayEntries int   `json:"frn_overlay_entries,omitempty"`
+	KnownBytes        int64 `json:"known_bytes,omitempty"`
+}
+
+type runtimeMemoryInfo struct {
+	HeapAllocBytes    uint64  `json:"heap_alloc_bytes"`
+	HeapInuseBytes    uint64  `json:"heap_inuse_bytes"`
+	HeapIdleBytes     uint64  `json:"heap_idle_bytes"`
+	HeapReleasedBytes uint64  `json:"heap_released_bytes"`
+	HeapSysBytes      uint64  `json:"heap_sys_bytes"`
+	StackInuseBytes   uint64  `json:"stack_inuse_bytes"`
+	SysBytes          uint64  `json:"sys_bytes"`
+	NumGC             uint32  `json:"num_gc"`
+	GCCPUFraction     float64 `json:"gc_cpu_fraction,omitempty"`
 }
 
 type goSearchService struct {
-	pipeName string
-	sddl     string
-	stop     chan struct{}
-	dbs      []string
-	indexes  []*Index
-	volumes  []*serviceVolumeIndex
-	loading  bool
-	loadErr  string
-	indexMu  sync.RWMutex
+	pipeName   string
+	sddl       string
+	stop       chan struct{}
+	dbs        []string
+	indexes    []*Index
+	volumes    []*serviceVolumeIndex
+	loading    bool
+	loadErr    string
+	indexMu    sync.RWMutex
+	requestSeq atomic.Int64
 }
 
 type serviceVolumeIndex struct {
-	dbPath         string
-	index          *Index
-	volume         string
-	journalID      uint64
-	checkpoint     int64
-	state          string
-	staleReason    string
-	frnToID        map[uint64]int
-	frnIDs         []frnIndexEntry
-	children       map[uint64]map[int]struct{}
-	childOffsets   []uint32
-	childIDs       []uint32
-	rootIDs        []uint32
-	subtreeOrder   []uint32
-	subtreeStart   []uint32
-	subtreeEnd     []uint32
-	exactNames     map[string][]int
-	pathCache      map[int]string
-	queryIndex     *residentQueryIndex
-	searchMu       sync.Mutex
-	termMu         sync.Mutex
-	termCache      map[string][]int
-	pathTermCache  map[string][]int
-	extCache       map[string][]int
-	recentIDs      map[int]struct{}
-	recentSeq      uint64
-	termSeq        map[string]uint64
-	pathTermSeq    map[string]uint64
-	extSeq         map[string]uint64
-	underCache     map[int][]int
-	underSeq       map[int]uint64
-	underRootCache map[string][]int
-	dirty          bool
-	lastPersist    time.Time
-	searchCount    uint64
+	dbPath            string
+	index             *Index
+	volume            string
+	journalID         uint64
+	checkpoint        int64
+	state             string
+	staleReason       string
+	frnToID           map[uint64]int
+	frnIDs            []frnIndexEntry
+	children          map[uint64]map[int]struct{}
+	childOffsets      []uint32
+	childIDs          []uint32
+	rootIDs           []uint32
+	subtreeOrder      []uint32
+	subtreeStart      []uint32
+	subtreeEnd        []uint32
+	exactNames        map[string][]int
+	pathCache         map[int]string
+	queryIndex        *residentQueryIndex
+	searchMu          sync.Mutex
+	termMu            sync.Mutex
+	termCache         map[string][]int
+	pathTermCache     map[string][]int
+	extCache          map[string][]int
+	recentIDs         map[int]struct{}
+	recentSeq         uint64
+	termSeq           map[string]uint64
+	pathTermSeq       map[string]uint64
+	extSeq            map[string]uint64
+	underCache        map[int][]int
+	underSeq          map[int]uint64
+	underRootCache    map[string][]int
+	dirty             bool
+	lastPersist       time.Time
+	persistFailures   int
+	persistRetryAfter time.Time
+	lastPersistErr    string
+	searchCount       uint64
 }
 
 type residentQueryIndex struct {
@@ -2356,11 +2388,13 @@ func probeDoctor(pipeName string) doctorResponse {
 		resp.Entries = info.Entries
 		resp.Loading = info.Loading
 		resp.DBs = info.DBs
+		resp.Runtime = info.Runtime
 	}
 	if err == nil && info.Loading {
 		resp.PipeReachable = true
 		resp.Loading = true
 		resp.DBs = info.DBs
+		resp.Runtime = info.Runtime
 		resp.Message = "seekfs service is loading indexes"
 	}
 	searchResp, searchErr := callService(pipeName, serviceRequestFromOptions(queryOptions{Query: "ext:go", MatchPath: true, Limit: 1}, false))
@@ -2370,10 +2404,10 @@ func probeDoctor(pipeName string) doctorResponse {
 	if resp.Running && resp.PipeReachable {
 		resp.ServiceError = ""
 	}
-	resp.OK = resp.Installed && resp.Running && resp.PipeReachable && resp.Entries > 0 && resp.QueryOK
+	resp.OK = resp.PipeReachable && resp.Entries > 0 && resp.QueryOK
 	if !resp.OK && resp.Message == "" {
-		if resp.PipeReachable && !resp.Running {
-			resp.Message = "seekfs pipe is reachable but the Windows service is not running"
+		if resp.PipeReachable && !resp.QueryOK {
+			resp.Message = "seekfs service pipe is reachable but search is not healthy"
 		} else if !resp.PipeReachable && resp.ServiceError != "" && strings.Contains(strings.ToLower(resp.ServiceError), "access is denied") {
 			resp.Message = "seekfs service pipe denied access; run seekfs launch/setup-service from an elevated shell to refresh the service ACL"
 		} else {
@@ -2886,23 +2920,25 @@ func (s *goSearchService) persistVolumeIfDue(vol *serviceVolumeIndex, force bool
 	if vol.dbPath == "" {
 		return
 	}
+	now := time.Now()
 	s.indexMu.RLock()
 	dirty := vol.dirty
-	due := force || time.Since(vol.lastPersist) >= persistDebounce
+	retryAfter := vol.persistRetryAfter
+	due := force || (now.Sub(vol.lastPersist) >= persistDebounce && (retryAfter.IsZero() || !now.Before(retryAfter)))
 	s.indexMu.RUnlock()
 	if !dirty || !due {
 		return
 	}
 	s.indexMu.Lock()
-	if !vol.dirty || (!force && time.Since(vol.lastPersist) < persistDebounce) {
+	now = time.Now()
+	if !vol.dirty || (!force && (now.Sub(vol.lastPersist) < persistDebounce || (!vol.persistRetryAfter.IsZero() && now.Before(vol.persistRetryAfter)))) {
 		s.indexMu.Unlock()
 		return
 	}
 	saved := false
 	if err := saveIndex(vol.dbPath, vol.index); err != nil {
-		vol.state = "stale"
-		vol.staleReason = err.Error()
-		serviceLog("background persist error volume=%s db=%s err=%v", vol.volume, vol.dbPath, err)
+		vol.notePersistFailureLocked(err, now)
+		serviceLog("background persist error volume=%s db=%s failures=%d retry_after=%s err=%v", vol.volume, vol.dbPath, vol.persistFailures, vol.persistRetryAfter.Format(time.RFC3339Nano), err)
 	} else {
 		vol.repackResidentRecordsIfBloated()
 		if err := removeWAL(vol.dbPath); err != nil {
@@ -2910,6 +2946,9 @@ func (s *goSearchService) persistVolumeIfDue(vol *serviceVolumeIndex, force bool
 		}
 		vol.dirty = false
 		vol.lastPersist = time.Now()
+		vol.persistFailures = 0
+		vol.persistRetryAfter = time.Time{}
+		vol.lastPersistErr = ""
 		vol.afterPersist()
 		saved = true
 	}
@@ -2917,6 +2956,25 @@ func (s *goSearchService) persistVolumeIfDue(vol *serviceVolumeIndex, force bool
 	if saved {
 		releaseServiceMemoryAfterSave()
 	}
+}
+
+func (vol *serviceVolumeIndex) notePersistFailureLocked(err error, now time.Time) {
+	if vol == nil || err == nil {
+		return
+	}
+	vol.persistFailures++
+	vol.persistRetryAfter = now.Add(persistFailureBackoff(vol.persistFailures))
+	vol.lastPersistErr = err.Error()
+}
+
+func persistFailureBackoff(failures int) time.Duration {
+	if failures <= 0 {
+		return time.Minute
+	}
+	if failures > 6 {
+		failures = 6
+	}
+	return time.Duration(1<<(failures-1)) * time.Minute
 }
 
 func releaseServiceMemoryAfterSave() {
@@ -3402,13 +3460,17 @@ func buildResidentQueryIndex(vol *serviceVolumeIndex) *residentQueryIndex {
 	if servicePathGramsEnabled() {
 		qi.pathGrams = make(map[string][]uint32)
 	}
-	qi.nameOrder = make([]uint32, 0, recordCount)
+	if recordCount <= serviceResidentNameOrderMaxRecords {
+		qi.nameOrder = make([]uint32, 0, recordCount)
+	}
 	for id := 0; id < recordCount; id++ {
 		rec := vol.index.compactRecord(id)
 		if rec.Deleted {
 			continue
 		}
-		qi.nameOrder = append(qi.nameOrder, uint32(id))
+		if qi.nameOrder != nil {
+			qi.nameOrder = append(qi.nameOrder, uint32(id))
+		}
 		name := vol.index.compactLowerNameAt(id)
 		if rec.Mode&uint32(os.ModeDir) != 0 {
 			qi.dirs = append(qi.dirs, uint32(id))
@@ -3507,7 +3569,33 @@ func (vol *serviceVolumeIndex) residentMemoryInfo() *residentMemoryInfo {
 		}
 	}
 	info.ChildBytes = (len(vol.childOffsets) + len(vol.childIDs) + len(vol.rootIDs) + len(vol.subtreeOrder) + len(vol.subtreeStart) + len(vol.subtreeEnd)) * 4
+	info.FRNIndexBytes = len(vol.frnIDs) * int(unsafe.Sizeof(frnIndexEntry{}))
+	info.FRNOverlayEntries = len(vol.frnToID)
+	info.KnownBytes = int64(info.NameBlobBytes) +
+		int64(info.LowerBlobBytes) +
+		info.RecordBytes +
+		int64(info.NameOrderBytes) +
+		int64(info.ExtPostBytes) +
+		int64(info.TypePostBytes) +
+		int64(info.ChildBytes) +
+		int64(info.FRNIndexBytes)
 	return info
+}
+
+func runtimeMemorySnapshot() *runtimeMemoryInfo {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	return &runtimeMemoryInfo{
+		HeapAllocBytes:    m.HeapAlloc,
+		HeapInuseBytes:    m.HeapInuse,
+		HeapIdleBytes:     m.HeapIdle,
+		HeapReleasedBytes: m.HeapReleased,
+		HeapSysBytes:      m.HeapSys,
+		StackInuseBytes:   m.StackInuse,
+		SysBytes:          m.Sys,
+		NumGC:             m.NumGC,
+		GCCPUFraction:     m.GCCPUFraction,
+	}
 }
 
 func sortResidentPostings(postings map[string][]uint32) {
@@ -4049,26 +4137,31 @@ func handleServiceConn(conn *os.File, s *goSearchService) {
 			idx := vol.index
 			total += idx.entryCount()
 			info := dbInfo{
-				Path:        vol.dbPath,
-				Entries:     idx.entryCount(),
-				Source:      idx.Source,
-				BuiltAt:     idx.BuiltAt.Format(time.RFC3339Nano),
-				Volume:      vol.volume,
-				JournalID:   vol.journalID,
-				Checkpoint:  vol.checkpoint,
-				State:       vol.state,
-				StaleReason: vol.staleReason,
-				FRNRecords:  vol.frnRecordCount(),
-				Recent:      len(vol.recentIDs),
-				PathCache:   len(vol.pathCache),
-				TermCache:   len(vol.termCache),
-				PathTerms:   len(vol.pathTermCache),
-				ExtCache:    len(vol.extCache),
-				RecentSeq:   vol.recentSeq,
-				Dirty:       vol.dirty,
+				Path:             vol.dbPath,
+				Entries:          idx.entryCount(),
+				Source:           idx.Source,
+				BuiltAt:          idx.BuiltAt.Format(time.RFC3339Nano),
+				Volume:           vol.volume,
+				JournalID:        vol.journalID,
+				Checkpoint:       vol.checkpoint,
+				State:            vol.state,
+				StaleReason:      vol.staleReason,
+				FRNRecords:       vol.frnRecordCount(),
+				Recent:           len(vol.recentIDs),
+				PathCache:        len(vol.pathCache),
+				TermCache:        len(vol.termCache),
+				PathTerms:        len(vol.pathTermCache),
+				ExtCache:         len(vol.extCache),
+				RecentSeq:        vol.recentSeq,
+				Dirty:            vol.dirty,
+				PersistFailures:  vol.persistFailures,
+				LastPersistError: vol.lastPersistErr,
 			}
 			if !vol.lastPersist.IsZero() {
 				info.LastPersist = vol.lastPersist.Format(time.RFC3339Nano)
+			}
+			if !vol.persistRetryAfter.IsZero() {
+				info.PersistRetryAfter = vol.persistRetryAfter.Format(time.RFC3339Nano)
 			}
 			if vol.queryIndex != nil {
 				info.QueryExtKeys = len(vol.queryIndex.ext)
@@ -4083,7 +4176,7 @@ func handleServiceConn(conn *os.File, s *goSearchService) {
 		} else if loadErr != "" {
 			message = loadErr
 		}
-		_ = json.NewEncoder(conn).Encode(serviceResponse{OK: loadErr == "", Message: message, PID: os.Getpid(), Entries: total, Loading: loading, DBs: infos})
+		_ = json.NewEncoder(conn).Encode(serviceResponse{OK: loadErr == "", Message: message, PID: os.Getpid(), Entries: total, Loading: loading, DBs: infos, Runtime: runtimeMemorySnapshot()})
 	case "search":
 		s.indexMu.RLock()
 		if len(s.indexes) == 0 {
@@ -4092,6 +4185,17 @@ func handleServiceConn(conn *os.File, s *goSearchService) {
 			return
 		}
 		opts := requestToOptionsFromService(req)
+		if req.RequestSeq > 0 {
+			for {
+				current := s.requestSeq.Load()
+				if req.RequestSeq <= current || s.requestSeq.CompareAndSwap(current, req.RequestSeq) {
+					break
+				}
+			}
+			opts.Cancel = func() bool {
+				return req.RequestSeq < s.requestSeq.Load()
+			}
+		}
 		var matches []Entry
 		var err error
 		if len(s.volumes) == len(s.indexes) {
@@ -4121,6 +4225,7 @@ func handleServiceConn(conn *os.File, s *goSearchService) {
 			for i, entry := range matches {
 				resp.Results[i] = entry.Path
 			}
+			resp.Rows = entriesToJSON(matches)
 		}
 		_ = json.NewEncoder(conn).Encode(resp)
 	case "index-usn":
@@ -4238,7 +4343,11 @@ func searchService(pipeName string, opts queryOptions, countOnly bool, jsonOut b
 			Limit: opts.Limit,
 		}
 		if !countOnly {
-			jsonResp.Results = pathsToJSON(resp.Results)
+			if len(resp.Rows) > 0 {
+				jsonResp.Results = resp.Rows
+			} else {
+				jsonResp.Results = pathsToJSON(resp.Results)
+			}
 		}
 		return writeJSON(os.Stdout, jsonResp)
 	}
@@ -4257,7 +4366,7 @@ func serviceRequestFromOptions(opts queryOptions, countOnly bool) serviceRequest
 	return serviceRequest{
 		Command:       "search",
 		Query:         opts.Query,
-		MatchPath:     opts.MatchPath,
+		MatchPath:     opts.MatchPath || queryLooksPathScoped(opts.Query),
 		Limit:         opts.Limit,
 		CountOnly:     countOnly,
 		Under:         opts.Under,
@@ -4267,6 +4376,8 @@ func serviceRequestFromOptions(opts queryOptions, countOnly bool) serviceRequest
 		Recent:        opts.Recent,
 		ModifiedAfter: opts.ModifiedAfter,
 		CaseSensitive: opts.CaseSensitive,
+		DeadlineUnix:  opts.DeadlineUnix,
+		RequestSeq:    opts.RequestSeq,
 	}
 }
 
@@ -4282,6 +4393,8 @@ func requestToOptionsFromService(req serviceRequest) queryOptions {
 		Recent:        req.Recent,
 		ModifiedAfter: req.ModifiedAfter,
 		CaseSensitive: req.CaseSensitive,
+		DeadlineUnix:  req.DeadlineUnix,
+		RequestSeq:    req.RequestSeq,
 	}
 }
 
@@ -4294,7 +4407,7 @@ func search(idx *Index, opts queryOptions, countOnly bool) ([]Entry, error) {
 		return nil, err
 	}
 	order := idx.NameOrder
-	if opts.MatchPath {
+	if pq.MatchPath {
 		order = idx.PathOrder
 	}
 	limit := normalizedLimit(opts.Limit, countOnly)
@@ -4302,10 +4415,13 @@ func search(idx *Index, opts queryOptions, countOnly bool) ([]Entry, error) {
 		order = biasOrderEntries(idx, order, firstNonEmpty(pq.CWDBias, pq.RootBias))
 	}
 	results := make([]Entry, 0, min(limit, 1024))
-	for _, entryIndex := range order {
+	for pos, entryIndex := range order {
+		if pos&1023 == 0 && queryCanceled(pq) {
+			return nil, errQueryCanceled
+		}
 		entry := idx.Entries[entryIndex]
 		entry.IndexSource = idx.Source
-		if entryMatches(entry, pq, opts.MatchPath) {
+		if entryMatches(entry, pq, pq.MatchPath) {
 			results = append(results, entry)
 			if !countOnly && len(results) >= limit {
 				break
@@ -4400,6 +4516,7 @@ func pathsToJSON(paths []string) []jsonResult {
 }
 
 func entryToJSON(entry Entry) jsonResult {
+	haveSize := entry.Size != 0
 	result := jsonResult{
 		Path:        filepath.Clean(entry.Path),
 		Name:        entry.Name,
@@ -4410,7 +4527,15 @@ func entryToJSON(entry Entry) jsonResult {
 	if result.Name == "" {
 		result.Name = filepath.Base(result.Path)
 	}
-	if entry.Size != 0 {
+	if info, err := os.Stat(result.Path); err == nil {
+		entry.Size = info.Size()
+		entry.ModUnix = info.ModTime().UnixNano()
+		haveSize = true
+		if info.IsDir() {
+			result.IsDir = true
+		}
+	}
+	if haveSize {
 		size := entry.Size
 		result.Size = &size
 	}
@@ -4456,7 +4581,9 @@ func searchServiceVolumes(volumes []*serviceVolumeIndex, opts queryOptions, coun
 	}
 	if len(volumes) == 1 {
 		vol := volumes[0]
-		vol.searchMu.Lock()
+		if !lockVolumeSearch(vol, opts) {
+			return nil, errQueryCanceled
+		}
 		matches, err := searchCompactWithCache(vol.index, opts, countOnly, vol.pathCache, vol.nameTermCandidates)
 		vol.trimSearchCachesLocked()
 		vol.searchMu.Unlock()
@@ -4480,7 +4607,9 @@ func searchServiceVolumes(volumes []*serviceVolumeIndex, opts queryOptions, coun
 		}
 		childOpts := opts
 		childOpts.Limit = perIndexLimit
-		vol.searchMu.Lock()
+		if !lockVolumeSearch(vol, childOpts) {
+			return nil, errQueryCanceled
+		}
 		matches, err := searchCompactWithCache(vol.index, childOpts, countOnly, vol.pathCache, vol.nameTermCandidates)
 		vol.trimSearchCachesLocked()
 		vol.searchMu.Unlock()
@@ -4496,6 +4625,30 @@ func searchServiceVolumes(volumes []*serviceVolumeIndex, opts queryOptions, coun
 		}
 	}
 	return filterImplicitUnderExisting(results, opts, countOnly), nil
+}
+
+func lockVolumeSearch(vol *serviceVolumeIndex, opts queryOptions) bool {
+	if vol == nil {
+		return false
+	}
+	if opts.Cancel == nil && opts.DeadlineUnix == 0 {
+		vol.searchMu.Lock()
+		return true
+	}
+	pq := parsedQuery{DeadlineUnix: opts.DeadlineUnix, Cancel: opts.Cancel}
+	for {
+		if queryCanceled(pq) {
+			return false
+		}
+		if vol.searchMu.TryLock() {
+			if queryCanceled(pq) {
+				vol.searchMu.Unlock()
+				return false
+			}
+			return true
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
 }
 
 func filterImplicitUnderExisting(matches []Entry, opts queryOptions, countOnly bool) []Entry {
@@ -4564,7 +4717,7 @@ func filesystemUnderFallbackSearchLimited(opts queryOptions, countOnly bool, max
 			Mode:      uint32(info.Mode()),
 			ModUnix:   info.ModTime().UnixNano(),
 		}
-		if entryMatches(entry, pq, opts.MatchPath) {
+		if entryMatches(entry, pq, pq.MatchPath) {
 			matches = append(matches, entry)
 			if limit > 0 && len(matches) >= limit {
 				return filepath.SkipAll
@@ -4628,7 +4781,7 @@ func serviceVolumesForQuery(volumes []*serviceVolumeIndex, opts queryOptions) ([
 	if len(volumes) == 0 {
 		return nil, errors.New("service has no search indexes loaded")
 	}
-	wantVolume := strings.ToUpper(filepath.VolumeName(filepath.Clean(opts.Under)))
+	wantVolume := queryVolumeConstraint(opts)
 	ready := make([]*serviceVolumeIndex, 0, len(volumes))
 	stale := make([]string, 0, len(volumes))
 	for _, vol := range volumes {
@@ -4640,7 +4793,6 @@ func serviceVolumesForQuery(volumes []*serviceVolumeIndex, opts queryOptions) ([
 		}
 		if vol.state != "" && vol.state != "ready" {
 			stale = append(stale, fmt.Sprintf("%s: %s", vol.index.Volume, vol.staleReason))
-			continue
 		}
 		ready = append(ready, vol)
 	}
@@ -4654,6 +4806,31 @@ func serviceVolumesForQuery(volumes []*serviceVolumeIndex, opts queryOptions) ([
 		return nil, fmt.Errorf("no loaded search index for volume %s", wantVolume)
 	}
 	return nil, errors.New("service has no ready search indexes loaded")
+}
+
+func queryVolumeConstraint(opts queryOptions) string {
+	if underVolume := strings.ToUpper(filepath.VolumeName(filepath.Clean(opts.Under))); underVolume != "" {
+		return underVolume
+	}
+	pq, err := parseQuery(opts)
+	if err != nil || !pq.MatchPath {
+		return ""
+	}
+	volume := ""
+	for _, term := range pq.Terms {
+		if !isVolumeQueryTerm(term) {
+			continue
+		}
+		normalized := strings.ToUpper(term)
+		if volume == "" {
+			volume = normalized
+			continue
+		}
+		if !strings.EqualFold(volume, normalized) {
+			return ""
+		}
+	}
+	return volume
 }
 
 func (vol *serviceVolumeIndex) fastPostingCount(pq parsedQuery) (int, bool) {
@@ -4869,15 +5046,18 @@ func searchCompactWithCache(idx *Index, opts queryOptions, countOnly bool, pathC
 		pathCache = make(map[int]string)
 	}
 	for pos := 0; pos < compactOrderLen(order, idx.compactRecordCount()); pos++ {
+		if pos&1023 == 0 && queryCanceled(pq) {
+			return nil, errQueryCanceled
+		}
 		recIndex := compactOrderAt(order, pos)
 		rec := idx.compactRecord(recIndex)
 		if rec.Deleted {
 			continue
 		}
-		if !compactRecordPrecheck(rec, pq, opts.MatchPath) {
+		if !compactRecordPrecheck(rec, pq, pq.MatchPath) {
 			continue
 		}
-		if !usedCandidates && opts.MatchPath && len(pq.Terms) > 0 && !idx.compactPathContainsAll(recIndex, pq.Terms) {
+		if !usedCandidates && pq.MatchPath && len(pq.Terms) > 0 && !idx.compactPathContainsAll(recIndex, pq.Terms) {
 			continue
 		}
 		path := idx.reconstructCompactPathCached(recIndex, pathCache)
@@ -4891,7 +5071,7 @@ func searchCompactWithCache(idx *Index, opts queryOptions, countOnly bool, pathC
 			ModUnix:     rec.ModUnix,
 			IndexSource: idx.Source,
 		}
-		if entryMatches(entry, pq, opts.MatchPath) {
+		if entryMatches(entry, pq, pq.MatchPath) {
 			results = append(results, Entry{
 				Path:        entry.Path,
 				Name:        entry.Name,
@@ -4908,6 +5088,15 @@ func searchCompactWithCache(idx *Index, opts queryOptions, countOnly bool, pathC
 		}
 	}
 	return results, nil
+}
+
+var errQueryCanceled = errors.New("query superseded")
+
+func queryCanceled(pq parsedQuery) bool {
+	if pq.Cancel != nil && pq.Cancel() {
+		return true
+	}
+	return pq.DeadlineUnix > 0 && time.Now().UnixNano() > pq.DeadlineUnix
 }
 
 // checkQueryCapabilities rejects queries whose filters need data the index does
@@ -4980,6 +5169,9 @@ func compactRecordPrecheck(rec CompactRecord, pq parsedQuery, matchPath bool) bo
 }
 
 func (vol *serviceVolumeIndex) nameTermCandidates(pq parsedQuery) ([]int, bool) {
+	if candidates, ok := vol.limitedSingleTermCandidates(pq); ok {
+		return candidates, true
+	}
 	if candidates, ok := vol.plannedCandidates(pq); ok {
 		return candidates, true
 	}
@@ -5042,6 +5234,101 @@ func (vol *serviceVolumeIndex) nameTermCandidates(pq parsedQuery) ([]int, bool) 
 		}
 	}
 	return candidates, true
+}
+
+func (vol *serviceVolumeIndex) limitedSingleTermCandidates(pq parsedQuery) ([]int, bool) {
+	if vol == nil || vol.index == nil || pq.CountOnly || pq.Limit <= 0 || pq.CaseSensitive ||
+		pq.Under != "" || pq.Type != "" || len(pq.Exts) > 0 || len(pq.Globs) > 0 ||
+		len(pq.Regexps) > 0 || len(pq.SizeFilters) > 0 || len(pq.DateFilters) > 0 ||
+		len(pq.OrGroups) > 0 || len(pq.NotGroups) > 0 || pq.HasModAfter || pq.Exists ||
+		pq.CWDBias != "" || pq.RootBias != "" {
+		return nil, false
+	}
+	if !pq.MatchPath && len(pq.Terms) == 1 && len(pq.Dirs) == 0 {
+		return vol.scanNameTermLimited(pq, pq.Terms[0], pq.Limit), true
+	}
+	if len(pq.Terms) == 0 && len(pq.Dirs) == 1 {
+		return vol.scanPathTermLimited(pq, pq.Dirs[0], pq.Limit), true
+	}
+	if pq.MatchPath && len(pq.Terms) == 1 && len(pq.Dirs) == 0 {
+		return vol.scanPathTermLimited(pq, pq.Terms[0], pq.Limit), true
+	}
+	return nil, false
+}
+
+func (vol *serviceVolumeIndex) scanNameTermLimited(pq parsedQuery, term string, limit int) []int {
+	if term == "" || limit <= 0 {
+		return nil
+	}
+	return vol.scanOrderedLimited(pq, limit, func(i int) bool {
+		return strings.Contains(vol.index.compactLowerNameAt(i), term)
+	})
+}
+
+func (vol *serviceVolumeIndex) scanPathTermLimited(pq parsedQuery, term string, limit int) []int {
+	if term == "" || limit <= 0 {
+		return nil
+	}
+	return vol.scanOrderedLimited(pq, limit, func(i int) bool {
+		return vol.index.compactPathContainsTerm(i, term)
+	})
+}
+
+func (vol *serviceVolumeIndex) scanOrderedLimited(pq parsedQuery, limit int, match func(int) bool) []int {
+	recordCount := vol.index.compactRecordCount()
+	order := vol.index.CompactNameOrder
+	prefixEnd := min(recordCount, 4_096)
+	out := vol.scanOrderedLimitedRange(pq, order, 0, prefixEnd, limit, match)
+	if len(out) >= limit || prefixEnd >= recordCount {
+		return out
+	}
+	workers := min(runtime.GOMAXPROCS(0), max(1, recordCount/25_000))
+	if workers <= 1 || recordCount < 50_000 {
+		tail := vol.scanOrderedLimitedRange(pq, order, prefixEnd, recordCount, limit-len(out), match)
+		return append(out, tail...)
+	}
+	parts := make([][]int, workers)
+	var wg sync.WaitGroup
+	for worker := 0; worker < workers; worker++ {
+		start := prefixEnd + worker*(recordCount-prefixEnd)/workers
+		end := prefixEnd + (worker+1)*(recordCount-prefixEnd)/workers
+		wg.Add(1)
+		go func(worker, start, end int) {
+			defer wg.Done()
+			parts[worker] = vol.scanOrderedLimitedRange(pq, order, start, end, limit-len(out), match)
+		}(worker, start, end)
+	}
+	wg.Wait()
+	for _, part := range parts {
+		for _, id := range part {
+			out = append(out, id)
+			if len(out) >= limit {
+				return out
+			}
+		}
+	}
+	return out
+}
+
+func (vol *serviceVolumeIndex) scanOrderedLimitedRange(pq parsedQuery, order []int, start, end, limit int, match func(int) bool) []int {
+	out := make([]int, 0, limit)
+	for pos := start; pos < end; pos++ {
+		if pos&4095 == 0 && queryCanceled(pq) {
+			return out
+		}
+		i := compactOrderAt(order, pos)
+		rec := vol.index.compactRecord(i)
+		if rec.Deleted {
+			continue
+		}
+		if match(i) {
+			out = append(out, i)
+			if len(out) >= limit {
+				return out
+			}
+		}
+	}
+	return out
 }
 
 func (vol *serviceVolumeIndex) cachedMultiNameTermCandidates(terms []string) ([]int, bool) {
@@ -5855,36 +6142,33 @@ func (vol *serviceVolumeIndex) underPrefilter(pq parsedQuery) map[int]struct{} {
 }
 
 func sortCandidateIDs(ids []int, pq parsedQuery, idx *Index) {
+	if idx == nil {
+		sort.Ints(ids)
+		return
+	}
+	recordCount := idx.compactRecordCount()
+	ranks := make([]int, recordCount)
+	for i := range ranks {
+		ranks[i] = i
+	}
+	order := idx.CompactNameOrder
+	for pos := 0; pos < compactOrderLen(order, recordCount); pos++ {
+		id := compactOrderAt(order, pos)
+		if id >= 0 && id < recordCount {
+			ranks[id] = pos
+		}
+	}
 	sort.SliceStable(ids, func(i, j int) bool {
 		a, b := ids[i], ids[j]
-		ar, br := candidateRank(a, pq, idx), candidateRank(b, pq, idx)
-		if ar != br {
-			return ar < br
+		ar, br := recordCount+a, recordCount+b
+		if a >= 0 && a < recordCount {
+			ar = ranks[a]
 		}
-		return a < b
+		if b >= 0 && b < recordCount {
+			br = ranks[b]
+		}
+		return ar < br
 	})
-}
-
-func candidateRank(id int, pq parsedQuery, idx *Index) int {
-	if idx == nil || id < 0 || id >= idx.compactRecordCount() {
-		return 100
-	}
-	name := idx.compactLowerNameAt(id)
-	best := 50
-	for _, term := range pq.Terms {
-		if term == "" || !strings.Contains(term, ".") {
-			continue
-		}
-		switch {
-		case name == term:
-			return 0
-		case strings.HasPrefix(name, term):
-			best = min(best, 5)
-		case strings.Contains(name, term):
-			best = min(best, 10)
-		}
-	}
-	return best
 }
 
 func (vol *serviceVolumeIndex) pathDirFilterCandidates(pq parsedQuery) ([]int, bool) {
@@ -6828,12 +7112,14 @@ func (idx *Index) compactPathContainsAll(i int, terms []string) bool {
 func parseQuery(opts queryOptions) (parsedQuery, error) {
 	pq := parsedQuery{
 		Raw:           opts.Query,
-		MatchPath:     opts.MatchPath,
+		MatchPath:     opts.MatchPath || queryLooksPathScoped(opts.Query),
 		CaseSensitive: opts.CaseSensitive,
 		Under:         normalizeFilterPath(opts.Under),
 		Exists:        opts.Exists,
 		CWDBias:       normalizeFilterPath(opts.CWDBias),
 		RootBias:      normalizeFilterPath(opts.RootBias),
+		DeadlineUnix:  opts.DeadlineUnix,
+		Cancel:        opts.Cancel,
 	}
 	if opts.ModifiedAfter != "" {
 		t, err := parseTimeValue(opts.ModifiedAfter)
@@ -6878,8 +7164,20 @@ func promotePathExtensionTerms(pq *parsedQuery) {
 	pq.Terms = terms
 }
 
+func queryLooksPathScoped(query string) bool {
+	for _, field := range strings.Fields(query) {
+		if strings.ContainsAny(field, `\/`) {
+			return true
+		}
+	}
+	return false
+}
+
 func dottedExtensionTerm(term string) (string, bool) {
-	if len(term) < 2 || len(term) > 9 || term[0] != '.' || strings.ContainsAny(term, `\/*?[]:`) {
+	// Bare dotted tokens are only an extension shorthand for common short
+	// extensions. Longer dotted strings, such as ".opencode", are ordinary
+	// substrings unless the user explicitly writes ext:opencode.
+	if len(term) < 2 || len(term) > 6 || term[0] != '.' || strings.ContainsAny(term, `\/*?[]:`) {
 		return "", false
 	}
 	ext := term[1:]
@@ -6939,6 +7237,9 @@ func applyQueryToken(pq *parsedQuery, raw string) error {
 				return err
 			}
 			if !sub.isEmpty() {
+				if sub.MatchPath {
+					pq.MatchPath = true
+				}
 				group = append(group, sub)
 			}
 		}
@@ -6962,6 +7263,14 @@ func applyQueryToken(pq *parsedQuery, raw string) error {
 		dir := strings.TrimPrefix(raw, "dir:")
 		if dir != "" {
 			pq.Dirs = append(pq.Dirs, normalizeCase(dir, pq.CaseSensitive))
+		}
+	case strings.HasPrefix(raw, "path:"):
+		term := strings.TrimPrefix(raw, "path:")
+		pq.MatchPath = true
+		if term != "" {
+			for _, part := range queryPlainTerms(term, pq.CaseSensitive, true) {
+				pq.Terms = append(pq.Terms, part)
+			}
 		}
 	case strings.HasPrefix(raw, "glob:"):
 		glob := strings.TrimPrefix(raw, "glob:")
@@ -7001,7 +7310,7 @@ func applyQueryToken(pq *parsedQuery, raw string) error {
 	case raw == "type:file" || raw == "type:dir":
 		pq.Type = strings.TrimPrefix(raw, "type:")
 	case isUnknownFilterToken(raw):
-		return fmt.Errorf("unsupported filter %q; supported: ext: dir: glob: regex: type: case: size: dm: (and !term, a|b)", raw)
+		return fmt.Errorf("unsupported filter %q; supported: path: ext: dir: glob: regex: type: case: size: dm: (and !term, a|b)", raw)
 	case looksLikeImplicitFilenameGlob(raw):
 		pq.Globs = append(pq.Globs, normalizeCase(raw, pq.CaseSensitive))
 	default:
@@ -7025,6 +7334,9 @@ func mergeSubquery(dst *parsedQuery, src parsedQuery) {
 	dst.DateFilters = append(dst.DateFilters, src.DateFilters...)
 	if src.Type != "" {
 		dst.Type = src.Type
+	}
+	if src.MatchPath {
+		dst.MatchPath = true
 	}
 }
 
@@ -7249,7 +7561,7 @@ func entryMatches(entry Entry, pq parsedQuery, matchPath bool) bool {
 	for _, group := range pq.OrGroups {
 		matched := false
 		for _, alt := range group {
-			if entryMatches(entry, alt, matchPath) {
+			if entryMatches(entry, alt, matchPath || alt.MatchPath) {
 				matched = true
 				break
 			}
@@ -7259,7 +7571,7 @@ func entryMatches(entry Entry, pq parsedQuery, matchPath bool) bool {
 		}
 	}
 	for _, neg := range pq.NotGroups {
-		if entryMatches(entry, neg, matchPath) {
+		if entryMatches(entry, neg, matchPath || neg.MatchPath) {
 			return false
 		}
 	}

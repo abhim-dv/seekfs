@@ -1,11 +1,27 @@
 package main
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
+
+func TestParseQueryInfersPathModeForPathSeparators(t *testing.T) {
+	pq, err := parseQuery(queryOptions{Query: `reaper_base_new_workspaces_since_20260619\clean_surface_dead_time_outlier_metrics_since_20260619.json`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !pq.MatchPath {
+		t.Fatal("query with path separator did not enable path matching")
+	}
+	wantTerms := []string{"reaper_base_new_workspaces_since_20260619", "clean_surface_dead_time_outlier_metrics_since_20260619.json"}
+	if !sameStringSet(pq.Terms, wantTerms) {
+		t.Fatalf("terms = %v, want %v", pq.Terms, wantTerms)
+	}
+}
 
 func TestParseSizeFilter(t *testing.T) {
 	cases := []struct {
@@ -96,6 +112,295 @@ func TestKnownFiltersAndPathsAreNotRejected(t *testing.T) {
 		if _, err := parseQuery(queryOptions{Query: q, MatchPath: true}); err != nil {
 			t.Errorf("parseQuery(%q) unexpectedly rejected: %v", q, err)
 		}
+	}
+}
+
+func TestPathFilterEnablesPathMatching(t *testing.T) {
+	pq, err := parseQuery(queryOptions{Query: "path:Downloads"})
+	if err != nil {
+		t.Fatalf("parseQuery: %v", err)
+	}
+	if !pq.MatchPath {
+		t.Fatal("path: filter did not enable path matching")
+	}
+	if len(pq.Terms) != 1 || pq.Terms[0] != "downloads" {
+		t.Fatalf("terms = %v, want [downloads]", pq.Terms)
+	}
+}
+
+func TestPathExtensionSyntaxMatrixMatchesAcrossSearchPaths(t *testing.T) {
+	idx := pathSyntaxFixture()
+	vol := newServiceVolumeIndex("fixture.gsi", idx)
+	cases := []struct {
+		name      string
+		opts      queryOptions
+		wantNames []string
+	}{
+		{
+			name:      "path filter and explicit extension",
+			opts:      queryOptions{Query: "path:Downloads ext:raw", Limit: 20},
+			wantNames: []string{"camera.raw", "draft.raw"},
+		},
+		{
+			name:      "path filter and dotted extension",
+			opts:      queryOptions{Query: "path:Downloads .raw", Limit: 20},
+			wantNames: []string{"camera.raw", "draft.raw"},
+		},
+		{
+			name:      "absolute path filter and dotted extension",
+			opts:      queryOptions{Query: `path:C:\fixture\Downloads .raw`, Limit: 20},
+			wantNames: []string{"camera.raw", "draft.raw"},
+		},
+		{
+			name:      "bare path-like term and dotted extension",
+			opts:      queryOptions{Query: `C:\fixture\Downloads .raw`, MatchPath: true, Limit: 20},
+			wantNames: []string{"camera.raw", "draft.raw"},
+		},
+		{
+			name:      "dir filter and dotted ext filter",
+			opts:      queryOptions{Query: "dir:Downloads ext:.raw", Limit: 20},
+			wantNames: []string{"camera.raw", "draft.raw"},
+		},
+		{
+			name:      "path filter and glob",
+			opts:      queryOptions{Query: "path:Downloads glob:*.raw", Limit: 20},
+			wantNames: []string{"camera.raw", "draft.raw"},
+		},
+		{
+			name:      "path filter and regex",
+			opts:      queryOptions{Query: `path:Downloads regex:Downloads.*\.raw$`, Limit: 20},
+			wantNames: []string{"camera.raw", "draft.raw"},
+		},
+		{
+			name:      "path filter extension type and not",
+			opts:      queryOptions{Query: "path:Downloads ext:raw type:file !draft", Limit: 20},
+			wantNames: []string{"camera.raw"},
+		},
+		{
+			name:      "path filter and extension or",
+			opts:      queryOptions{Query: "path:Downloads ext:raw|nrrd", Limit: 20},
+			wantNames: []string{"camera.raw", "draft.raw", "scan.nrrd"},
+		},
+		{
+			name:      "path filter inside or alternatives",
+			opts:      queryOptions{Query: "path:Downloads|path:Assets ext:raw", Limit: 20},
+			wantNames: []string{"asset.raw", "camera.raw", "draft.raw"},
+		},
+		{
+			name:      "path filter inside not",
+			opts:      queryOptions{Query: "ext:raw !path:Assets", Limit: 20},
+			wantNames: []string{"camera.raw", "draft.raw", "lab.raw"},
+		},
+		{
+			name:      "middle dotted substring is not extension",
+			opts:      queryOptions{Query: ".opencode", Limit: 20},
+			wantNames: []string{"ai.opencode.desktop"},
+		},
+		{
+			name:      "drive scoped middle dotted substring",
+			opts:      queryOptions{Query: "path:C: .opencode", Limit: 20},
+			wantNames: []string{"ai.opencode.desktop"},
+		},
+		{
+			name:      "explicit extension remains exact",
+			opts:      queryOptions{Query: "ext:opencode", Limit: 20},
+			wantNames: nil,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			full, err := searchCompactWithCache(idx, tc.opts, false, make(map[int]string), nil)
+			if err != nil {
+				t.Fatalf("full search: %v", err)
+			}
+			if got := namesOf(full); !sameStringSet(got, tc.wantNames) {
+				t.Fatalf("full names = %v, want %v", got, tc.wantNames)
+			}
+			fast, err := searchCompactWithCache(idx, tc.opts, false, vol.pathCache, vol.nameTermCandidates)
+			if err != nil {
+				t.Fatalf("candidate search: %v", err)
+			}
+			if got := namesOf(fast); !sameStringSet(got, tc.wantNames) {
+				t.Fatalf("candidate names = %v, want %v", got, tc.wantNames)
+			}
+		})
+	}
+}
+
+func TestStrictSpaceSplitDoesNotInferFusedPathExtensions(t *testing.T) {
+	idx := pathSyntaxFixture()
+	vol := newServiceVolumeIndex("fixture.gsi", idx)
+	cases := []queryOptions{
+		{Query: "path:C:.nrrd", Limit: 20},
+		{Query: "path:C:.NRRD", Limit: 20},
+		{Query: "path:Downloads.raw", Limit: 20},
+	}
+	for _, opts := range cases {
+		t.Run(opts.Query, func(t *testing.T) {
+			full, err := searchCompactWithCache(idx, opts, false, make(map[int]string), nil)
+			if err != nil {
+				t.Fatalf("full search: %v", err)
+			}
+			fast, err := searchCompactWithCache(idx, opts, false, vol.pathCache, vol.nameTermCandidates)
+			if err != nil {
+				t.Fatalf("candidate search: %v", err)
+			}
+			if len(full) != 0 || len(fast) != 0 {
+				t.Fatalf("strict fused query matched full=%v fast=%v, want no inferred extension matches", namesOf(full), namesOf(fast))
+			}
+		})
+	}
+}
+
+func TestStrictSpaceSplitTokenPermutationsMatchAcrossSearchPaths(t *testing.T) {
+	idx := pathSyntaxFixture()
+	vol := newServiceVolumeIndex("fixture.gsi", idx)
+	cases := []struct {
+		name      string
+		tokens    []string
+		wantNames []string
+	}{
+		{
+			name:      "path ext type",
+			tokens:    []string{"path:Downloads", "ext:raw", "type:file"},
+			wantNames: []string{"camera.raw", "draft.raw"},
+		},
+		{
+			name:      "path dotted type",
+			tokens:    []string{"path:Downloads", ".raw", "type:file"},
+			wantNames: []string{"camera.raw", "draft.raw"},
+		},
+		{
+			name:      "path ext not",
+			tokens:    []string{"path:Downloads", "ext:raw", "!draft"},
+			wantNames: []string{"camera.raw"},
+		},
+		{
+			name:      "path ext or",
+			tokens:    []string{"path:Downloads", "ext:raw|nrrd"},
+			wantNames: []string{"camera.raw", "draft.raw", "scan.nrrd"},
+		},
+	}
+	for _, tc := range cases {
+		for _, tokens := range permutations(tc.tokens) {
+			query := strings.Join(tokens, " ")
+			t.Run(tc.name+"/"+query, func(t *testing.T) {
+				full, err := searchCompactWithCache(idx, queryOptions{Query: query, Limit: 20}, false, make(map[int]string), nil)
+				if err != nil {
+					t.Fatalf("full search: %v", err)
+				}
+				fast, err := searchCompactWithCache(idx, queryOptions{Query: query, Limit: 20}, false, vol.pathCache, vol.nameTermCandidates)
+				if err != nil {
+					t.Fatalf("candidate search: %v", err)
+				}
+				if got := namesOf(full); !sameStringSet(got, tc.wantNames) {
+					t.Fatalf("full names = %v, want %v", got, tc.wantNames)
+				}
+				if got := namesOf(fast); !sameStringSet(got, tc.wantNames) {
+					t.Fatalf("candidate names = %v, want %v", got, tc.wantNames)
+				}
+			})
+		}
+	}
+}
+
+func TestPathFilterParsingPropagatesThroughNestedSyntax(t *testing.T) {
+	cases := []struct {
+		query     string
+		wantPath  bool
+		wantTerms []string
+		wantExts  []string
+	}{
+		{
+			query:     "path:Downloads .raw",
+			wantPath:  true,
+			wantTerms: []string{"downloads"},
+			wantExts:  []string{"raw"},
+		},
+		{
+			query:     `path:C:\fixture\Downloads ext:.raw`,
+			wantPath:  true,
+			wantTerms: []string{"c:", "fixture", "downloads"},
+			wantExts:  []string{"raw"},
+		},
+		{
+			query:     "path:C:.nrrd",
+			wantPath:  true,
+			wantTerms: []string{"c:.nrrd"},
+			wantExts:  nil,
+		},
+		{
+			query:     "path:.nrrd",
+			wantPath:  true,
+			wantTerms: []string{".nrrd"},
+			wantExts:  nil,
+		},
+		{
+			query:    "path:Downloads|path:Assets ext:raw",
+			wantPath: true,
+			wantExts: []string{"raw"},
+		},
+		{
+			query:    "ext:raw !path:Assets",
+			wantPath: false,
+			wantExts: []string{"raw"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.query, func(t *testing.T) {
+			pq, err := parseQuery(queryOptions{Query: tc.query})
+			if err != nil {
+				t.Fatalf("parseQuery: %v", err)
+			}
+			if pq.MatchPath != tc.wantPath {
+				t.Fatalf("MatchPath = %v, want %v", pq.MatchPath, tc.wantPath)
+			}
+			if !sameStringSet(pq.Terms, tc.wantTerms) {
+				t.Fatalf("terms = %v, want %v", pq.Terms, tc.wantTerms)
+			}
+			if !sameStringSet(pq.Exts, tc.wantExts) {
+				t.Fatalf("exts = %v, want %v", pq.Exts, tc.wantExts)
+			}
+		})
+	}
+}
+
+func permutations(values []string) [][]string {
+	out := make([][]string, 0)
+	var walk func(int)
+	items := append([]string(nil), values...)
+	walk = func(pos int) {
+		if pos == len(items) {
+			out = append(out, append([]string(nil), items...))
+			return
+		}
+		for i := pos; i < len(items); i++ {
+			items[pos], items[i] = items[i], items[pos]
+			walk(pos + 1)
+			items[pos], items[i] = items[i], items[pos]
+		}
+	}
+	walk(0)
+	return out
+}
+
+func TestSearchCompactHonorsQueryDeadlineAndCancel(t *testing.T) {
+	idx := syntheticCompactIndex(5000)
+	if _, err := searchCompactWithCache(idx, queryOptions{
+		Query:        "file",
+		MatchPath:    true,
+		Limit:        20,
+		DeadlineUnix: time.Now().Add(-time.Millisecond).UnixNano(),
+	}, false, make(map[int]string), nil); !errors.Is(err, errQueryCanceled) {
+		t.Fatalf("deadline error = %v, want %v", err, errQueryCanceled)
+	}
+	if _, err := searchCompactWithCache(idx, queryOptions{
+		Query:     "file",
+		MatchPath: true,
+		Limit:     20,
+		Cancel:    func() bool { return true },
+	}, false, make(map[int]string), nil); !errors.Is(err, errQueryCanceled) {
+		t.Fatalf("cancel error = %v, want %v", err, errQueryCanceled)
 	}
 }
 
@@ -319,4 +624,36 @@ func searchFixtureNames(t *testing.T, idx *Index, opts queryOptions) []string {
 		t.Fatalf("search %q: %v", opts.Query, err)
 	}
 	return namesOf(entries)
+}
+
+func pathSyntaxFixture() *Index {
+	idx := &Index{
+		Source:  "usn",
+		Volume:  "C:",
+		Compact: true,
+	}
+	add := func(frn, parentFRN uint64, parent int32, name string, mode uint32) {
+		idx.Records = append(idx.Records, CompactRecord{
+			FRN:       frn,
+			ParentFRN: parentFRN,
+			Parent:    parent,
+			Name:      name,
+			Mode:      mode,
+			Size:      1024,
+			ModUnix:   time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC).UnixNano(),
+		})
+	}
+	add(1, 1, -1, ".", uint32(os.ModeDir))
+	add(2, 1, 0, "fixture", uint32(os.ModeDir))
+	add(3, 2, 1, "Downloads", uint32(os.ModeDir))
+	add(4, 3, 2, "camera.raw", 0)
+	add(5, 3, 2, "scan.nrrd", 0)
+	add(6, 3, 2, "draft.raw", 0)
+	add(7, 2, 1, "Assets", uint32(os.ModeDir))
+	add(8, 7, 6, "asset.raw", 0)
+	add(9, 2, 1, "Lab", uint32(os.ModeDir))
+	add(10, 9, 8, "lab.raw", 0)
+	add(11, 2, 1, "ai.opencode.desktop", uint32(os.ModeDir))
+	buildOrders(idx)
+	return idx
 }

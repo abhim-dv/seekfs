@@ -252,6 +252,10 @@ func (vol *serviceVolumeIndex) buildCandidatePlan(pq parsedQuery) (candidatePlan
 			return plan, true
 		}
 	}
+	// When ext/glob/dir/type already gives us an indexed candidate source, keep
+	// path terms as verification filters. Building a cold path-term posting for
+	// a folder like "Downloads" can require walking a massive subtree before we
+	// ever intersect with a selective extension source.
 
 	// OR groups: a record must match at least one alternative, so the candidate
 	// source is the union of each alternative's posting. We only build a posting
@@ -514,11 +518,6 @@ func (vol *serviceVolumeIndex) namePlanTermPosting(term string) []int {
 }
 
 func (vol *serviceVolumeIndex) pathPlanTermPosting(term string) []int {
-	if ext, ok := dottedExtensionTerm(term); ok {
-		if ids := vol.extPosting(ext); len(ids) > 0 {
-			return ids
-		}
-	}
 	if strings.Contains(term, ".") {
 		if exact := vol.exactNameIDs(term); len(exact) > 0 {
 			return exact

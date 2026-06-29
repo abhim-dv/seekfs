@@ -1,5 +1,49 @@
 # Changelog
 
+## 0.8.4 - Backend Query Semantics and Service Parity
+
+### Added
+
+- Added deterministic query matrices for strict whitespace tokenization,
+  path-filter permutations, implicit path separators, dotted substring terms,
+  and drive-scoped broad extension-like searches.
+- Added synthetic benchmarks covering broad path substring searches such as
+  `path:F: .nrrd`, `path:F: .raw`, `path:F: .pdf`, and dotted non-extension
+  substrings such as `.opencode`.
+- Added service response rows that preserve indexed result metadata, including
+  size and modified time when available.
+- Added service request deadline and request sequence fields so clients can
+  supersede stale searches without blocking behind older work.
+
+### Changed
+
+- Bare queries containing path separators now infer path matching, bringing
+  path-like search strings closer to explicit `path:` behavior.
+- Drive-scoped path queries route to the constrained resident volume before
+  broad search planning, reducing multi-volume work for searches such as
+  `path:F: .pdf`.
+- Resident `doctor` now treats a reachable, query-capable standalone service
+  pipe as healthy even when it is not the installed Windows SCM service.
+
+### Fixed
+
+- Preserved literal dotted substring semantics for terms such as `.opencode`
+  instead of converting every dotted token into an extension filter.
+- Kept strict space-split parsing for path and extension-like terms, so
+  `path:Downloads .nrrd` is parsed differently from fused forms such as
+  `path:Downloads.nrrd`.
+- Hydrated live result metadata from filesystem stat data when indexed rows are
+  missing size or modification time, while preserving real zero-byte files.
+- Made resident search lock acquisition and scans honor cancellation/deadline
+  checks more promptly.
+
+### Validation
+
+- `go test -count=1 ./...`
+- `go test -tags dev -count=1 ./...`
+- `go test -tags production -count=1 ./...`
+- `go vet ./...`
+
 ## 0.8.3 - Large Index and Scoped Search Hardening
 
 ### Fixed
