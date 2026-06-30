@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"testing"
 	"time"
@@ -648,9 +649,46 @@ func TestSortCandidateIDsPrefersExactFilename(t *testing.T) {
 		t.Fatal(err)
 	}
 	ids := []int{1, 2}
-	sortCandidateIDs(ids, pq, idx)
+	sortCandidateIDs(ids, pq, idx, nil)
 	if ids[0] != 2 {
 		t.Fatalf("sorted candidates = %v, want exact Widget.cpp first", ids)
+	}
+}
+
+func TestSortCandidateIDsCachedRanksMatchesFallback(t *testing.T) {
+	idx := &Index{
+		Source:  "usn",
+		Volume:  "C:",
+		Compact: true,
+		Records: []CompactRecord{
+			{FRN: 1, ParentFRN: 1, Parent: -1, Name: ".", Mode: uint32(os.ModeDir)},
+			{FRN: 2, ParentFRN: 1, Parent: 0, Name: "zeta.txt"},
+			{FRN: 3, ParentFRN: 1, Parent: 0, Name: "alpha.txt"},
+			{FRN: 4, ParentFRN: 1, Parent: 0, Name: "middle.txt"},
+		},
+	}
+	buildOrders(idx)
+	ranks := make([]uint32, idx.compactRecordCount())
+	for i := range ranks {
+		ranks[i] = uint32(i)
+	}
+	for pos := 0; pos < compactOrderLen(idx.CompactNameOrder, idx.compactRecordCount()); pos++ {
+		id := compactOrderAt(idx.CompactNameOrder, pos)
+		if id >= 0 && id < len(ranks) {
+			ranks[id] = uint32(pos)
+		}
+	}
+	pq, err := parseQuery(queryOptions{Query: "txt"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fallback := []int{1, 2, -1, 3, 99}
+	cached := append([]int(nil), fallback...)
+	sortCandidateIDs(fallback, pq, idx, nil)
+	sortCandidateIDs(cached, pq, idx, ranks)
+	if !reflect.DeepEqual(cached, fallback) {
+		t.Fatalf("cached sort = %v, fallback = %v", cached, fallback)
 	}
 }
 

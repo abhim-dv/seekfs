@@ -199,7 +199,7 @@ func TestPathExtensionSyntaxMatrixMatchesAcrossSearchPaths(t *testing.T) {
 		{
 			name:      "drive scoped middle dotted substring",
 			opts:      queryOptions{Query: "path:C: .opencode", Limit: 20},
-			wantNames: []string{"ai.opencode.desktop"},
+			wantNames: []string{"ai.opencode.desktop", "settings.json"},
 		},
 		{
 			name:      "explicit extension remains exact",
@@ -654,6 +654,7 @@ func pathSyntaxFixture() *Index {
 	add(9, 2, 1, "Lab", uint32(os.ModeDir))
 	add(10, 9, 8, "lab.raw", 0)
 	add(11, 2, 1, "ai.opencode.desktop", uint32(os.ModeDir))
+	add(12, 11, 10, "settings.json", 0)
 	buildOrders(idx)
 	return idx
 }

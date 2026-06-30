@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>seekfs</title>
+    <link rel="icon" href="/assets/seekfs-radar.svg" type="image/svg+xml" />
+    <link rel="alternate icon" href="/assets/seekfs.ico" />
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="searchbar">
+        <input id="query" class="search-input" type="search" autocomplete="off" spellcheck="false" autofocus placeholder="Search" />
+      </section>
+
+      <section class="results-wrap">
+        <table class="results">
+          <thead>
+            <tr>
+              <th class="name-col">Name</th>
+              <th>Path</th>
+              <th class="size-col">Size</th>
+              <th class="date-col">Date Modified</th>
+            </tr>
+          </thead>
+          <tbody id="results"></tbody>
+        </table>
+        <div id="empty" class="empty">Type to search</div>
+      </section>
+
+      <section class="footer">
+        <span id="summary">Ready</span>
+        <span id="selected"></span>
+      </section>
+    </main>
+
+    <nav id="menu" class="context-menu">
+      <button data-action="open">Open</button>
+      <button data-action="reveal">Open Path</button>
+      <button data-action="copy">Copy Full Path</button>
+      <button data-action="copy-name">Copy Name</button>
+      <hr />
+      <button data-action="rename">Rename</button>
+      <button data-action="properties">Properties</button>
+      <button data-action="delete" class="danger">Move to Recycle Bin</button>
+    </nav>
+
+    <script src="/main.js"></script>
+  </body>
+</html>
