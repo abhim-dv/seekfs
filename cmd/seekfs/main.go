@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"container/heap"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -33,11 +34,28 @@ const servicePathCacheLimit = 25_000
 const serviceTermCacheLimit = 64
 const serviceCachedPostingMaxIDs = 50_000
 const serviceRecentRebuildThreshold = 100_000
+const serviceStartupDefaultWorkers = 2
 const serviceResidentNameOrderMaxRecords = 2_000_000
+const serviceBackgroundNameOrderMaxRecords = 30_000_000
+const serviceExtTopPostingLimit = 512
 const serviceResidentChildRangeMaxRecords = 2_000_000
 const serviceStartupWALRebuildBytes = 512 * 1024 * 1024
+const serviceNameTrigramCandidateMaxIDs = 25_000
+const servicePathNameTrigramCandidateMaxIDs = 250_000
+const serviceComponentTrigramCandidateMaxIDs = 10_000
+const serviceComponentTrigramExpansionMaxIDs = 25_000
+const serviceTrigramParallelVerifyMinIDs = 4_096
+const serviceRankParallelMinIDs = 500_000
+const serviceNameTrigramDefaultMaxRecords = 20_000_000
 const filesystemFallbackMaxVisited = 100_000
 const filesystemFallbackMaxDuration = 2 * time.Second
+
+const (
+	nameTrigramStateDisabled int32 = iota
+	nameTrigramStatePending
+	nameTrigramStateBuilding
+	nameTrigramStateReady
+)
 
 var indexMagic = [8]byte{'G', 'O', 'S', 'R', 'C', 'H', '0', '8'}
 
@@ -70,6 +88,7 @@ const (
 	compactNarrowParentSentinel = 0xFFFFFF
 	compactNarrowMaxRecordRef   = compactNarrowParentSentinel - 1
 	compactWideParentSentinel   = ^uint32(0)
+	packedSize64Sentinel        = ^uint32(0)
 )
 
 type Entry struct {
@@ -154,6 +173,10 @@ type benchSummary struct {
 	Failures   int                 `json:"failures"`
 	Queries    int                 `json:"queries"`
 	Stats      map[string]float64  `json:"stats_ms"`
+	Backend    map[string]float64  `json:"backend_stats_ms,omitempty"`
+	Sources    map[string]int      `json:"sources,omitempty"`
+	Declines   map[string]int      `json:"declines,omitempty"`
+	Candidates map[string]float64  `json:"candidate_stats,omitempty"`
 	PerQuery   []benchQuerySummary `json:"per_query,omitempty"`
 }
 
@@ -162,6 +185,10 @@ type benchQuerySummary struct {
 	Iterations int                `json:"iterations"`
 	Failures   int                `json:"failures"`
 	Stats      map[string]float64 `json:"stats_ms"`
+	Backend    map[string]float64 `json:"backend_stats_ms,omitempty"`
+	Sources    map[string]int     `json:"sources,omitempty"`
+	Declines   map[string]int     `json:"declines,omitempty"`
+	Candidates map[string]float64 `json:"candidate_stats,omitempty"`
 }
 
 type Index struct {
@@ -193,19 +220,20 @@ type appConfig struct {
 }
 
 type queryOptions struct {
-	Query         string      `json:"query"`
-	MatchPath     bool        `json:"match_path"`
-	Limit         int         `json:"limit"`
-	Under         string      `json:"under,omitempty"`
-	Exists        bool        `json:"exists,omitempty"`
-	CWDBias       string      `json:"cwd_bias,omitempty"`
-	RootBias      string      `json:"root_bias,omitempty"`
-	Recent        string      `json:"recent,omitempty"`
-	ModifiedAfter string      `json:"modified_after,omitempty"`
-	CaseSensitive bool        `json:"case_sensitive,omitempty"`
-	DeadlineUnix  int64       `json:"deadline_unix,omitempty"`
-	RequestSeq    int64       `json:"request_seq,omitempty"`
-	Cancel        func() bool `json:"-"`
+	Query         string       `json:"query"`
+	MatchPath     bool         `json:"match_path"`
+	Limit         int          `json:"limit"`
+	Under         string       `json:"under,omitempty"`
+	Exists        bool         `json:"exists,omitempty"`
+	CWDBias       string       `json:"cwd_bias,omitempty"`
+	RootBias      string       `json:"root_bias,omitempty"`
+	Recent        string       `json:"recent,omitempty"`
+	ModifiedAfter string       `json:"modified_after,omitempty"`
+	CaseSensitive bool         `json:"case_sensitive,omitempty"`
+	DeadlineUnix  int64        `json:"deadline_unix,omitempty"`
+	RequestSeq    int64        `json:"request_seq,omitempty"`
+	Cancel        func() bool  `json:"-"`
+	Trace         *searchTrace `json:"-"`
 }
 
 type parsedQuery struct {
@@ -233,6 +261,35 @@ type parsedQuery struct {
 	CountOnly     bool
 	DeadlineUnix  int64
 	Cancel        func() bool
+	Trace         *searchTrace
+}
+
+type searchTrace struct {
+	Source     string
+	Decline    string
+	Candidates int
+}
+
+func (t *searchTrace) setSource(source string, candidates int) {
+	if t == nil || t.Source != "" {
+		return
+	}
+	t.Source = source
+	t.Candidates = candidates
+}
+
+func (t *searchTrace) setDecline(reason string) {
+	if t == nil || t.Decline != "" {
+		return
+	}
+	t.Decline = reason
+}
+
+func (t *searchTrace) replaceDecline(reason string) {
+	if t == nil {
+		return
+	}
+	t.Decline = reason
 }
 
 // sizeFilter expresses a size:<op><bytes> constraint, e.g. size:>100mb.
@@ -268,10 +325,14 @@ type PackedRecords struct {
 	NameOffs        []uint32
 	NameLens        []uint16
 	LowerOffs       []uint32
-	Modes           []uint32
-	Sizes           []int64
+	DirBits         []uint64
+	ModeExtraIDs    []uint32
+	ModeExtraValues []uint32
+	Size32          []uint32
+	Size64IDs       []uint32
+	Size64Values    []int64
 	ModUnix         []int64
-	Deleted         []bool
+	DeletedBits     []uint64
 	NameBlob        []byte
 	LowerBlob       []byte
 }
@@ -385,10 +446,12 @@ func run(args []string) error {
 		return cmdDoctor(args[1:])
 	case "service-index-usn":
 		return cmdServiceIndexUSN(args[1:])
-	case "loaded":
+	case "loaded", "service-info":
 		return cmdServiceInfo(args[1:])
 	case "bench":
 		return cmdBenchAgent(args[1:])
+	case "ui":
+		return cmdUI(args[1:])
 	case "info":
 		return cmdInfo(args[1:])
 	case "search":
@@ -491,6 +554,7 @@ func printUsage(w io.Writer) {
   seekfs config path|show|get|set
   seekfs service-index-usn -volume C: -db seekfs.gsi [-pipe \\.\pipe\seekfs-service]
   seekfs bench [-db index.gsi...] [-service] [--json] [-iterations 100]
+  seekfs ui [-pipe \\.\pipe\seekfs-service] [-n 200]
   seekfs info [-db seekfs.gsi] [--json]
   seekfs syntax
   seekfs agent
@@ -1472,9 +1536,12 @@ func cmdBenchAgent(args []string) error {
 	configPath := fs.String("config", "", "optional seekfs.toml config path")
 	fs.Var(&dbs, "db", "index database path; repeatable")
 	useService := fs.Bool("service", false, "query the installed seekfs service")
+	useResident := fs.Bool("resident", false, "query resident service-volume indexes in-process")
+	residentWait := fs.Duration("resident-wait", 2*time.Minute, "max time to wait for resident background indexes")
 	pipeName := fs.String("pipe", defaultServicePipe, "service named pipe")
 	jsonOut := fs.Bool("json", false, "write machine-readable JSON")
 	iterations := fs.Int("iterations", 100, "number of benchmark iterations")
+	warmup := fs.Int("warmup", 0, "untimed warmup iterations")
 	limit := fs.Int("n", 20, "maximum results per query")
 	queryFile := fs.String("query-file", "", "file containing benchmark queries, one per line")
 	matchPath := fs.Bool("path", false, "match full path and file name")
@@ -1508,30 +1575,80 @@ func cmdBenchAgent(args []string) error {
 	if *iterations <= 0 {
 		return errors.New("iterations must be positive")
 	}
+	if *warmup < 0 {
+		return errors.New("warmup must be non-negative")
+	}
 	var indexes []*Index
+	var residentVolumes []*serviceVolumeIndex
 	if !*useService {
 		if len(dbs) == 0 {
 			dbs = append(dbs, defaultDB())
 		}
-		indexes, err = loadIndexes(dbs)
-		if err != nil {
-			return err
+		if *useResident {
+			indexes, residentVolumes, _, err = loadConfiguredVolumes(dbs)
+			if err != nil {
+				return err
+			}
+			_ = indexes
+			svc := &goSearchService{}
+			svc.startBackgroundNameOrderBuilds(residentVolumes)
+			svc.startBackgroundNameTrigramBuilds(residentVolumes)
+			waitResidentBackgroundIndexes(residentVolumes, *residentWait)
+		} else {
+			indexes, err = loadIndexes(dbs)
+			if err != nil {
+				return err
+			}
 		}
 	}
 	timings := make([]float64, 0, *iterations)
+	backendTimings := make([]float64, 0, *iterations)
 	queryTimings := make(map[string][]float64, len(queries))
+	queryBackendTimings := make(map[string][]float64, len(queries))
+	sourceCounts := make(map[string]int)
+	querySourceCounts := make(map[string]map[string]int, len(queries))
+	declineCounts := make(map[string]int)
+	queryDeclineCounts := make(map[string]map[string]int, len(queries))
+	candidateCounts := make([]float64, 0, *iterations)
+	queryCandidateCounts := make(map[string][]float64, len(queries))
 	queryFailures := make(map[string]int, len(queries))
 	failures := 0
+	for i := 0; i < *warmup; i++ {
+		query := queries[i%len(queries)]
+		opts := queryOptions{Query: query, MatchPath: *matchPath, Limit: *limit}
+		if err := runBenchQuery(*useService, *useResident, *pipeName, indexes, residentVolumes, opts, nil); err != nil {
+			return fmt.Errorf("warmup query %q failed: %w", query, err)
+		}
+	}
 	for i := 0; i < *iterations; i++ {
 		query := queries[i%len(queries)]
 		opts := queryOptions{Query: query, MatchPath: *matchPath, Limit: *limit}
 		start := time.Now()
 		if *useService {
-			err = benchServiceQuery(*pipeName, opts)
+			var resp serviceResponse
+			resp, err = benchServiceQuery(*pipeName, opts)
+			if err == nil {
+				backendTimings = append(backendTimings, resp.SearchMS)
+				queryBackendTimings[query] = append(queryBackendTimings[query], resp.SearchMS)
+				recordBenchSource(sourceCounts, querySourceCounts, query, resp.Source)
+				recordBenchOptional(declineCounts, queryDeclineCounts, query, resp.Decline)
+				candidateCounts = append(candidateCounts, float64(resp.Candidates))
+				queryCandidateCounts[query] = append(queryCandidateCounts[query], float64(resp.Candidates))
+			}
+		} else if *useResident {
+			trace := &searchTrace{}
+			opts.Trace = trace
+			_, err = searchServiceVolumes(residentVolumes, opts, false)
+			if err == nil {
+				recordBenchSource(sourceCounts, querySourceCounts, query, trace.Source)
+				recordBenchOptional(declineCounts, queryDeclineCounts, query, trace.Decline)
+				candidateCounts = append(candidateCounts, float64(trace.Candidates))
+				queryCandidateCounts[query] = append(queryCandidateCounts[query], float64(trace.Candidates))
+			}
 		} else {
 			_, err = searchAll(indexes, opts, false)
 		}
-		elapsed := float64(time.Since(start).Microseconds()) / 1000
+		elapsed := float64(time.Since(start).Nanoseconds()) / 1_000_000
 		timings = append(timings, elapsed)
 		queryTimings[query] = append(queryTimings[query], elapsed)
 		if err != nil {
@@ -1551,16 +1668,48 @@ func cmdBenchAgent(args []string) error {
 			Iterations: len(queryTimings[query]),
 			Failures:   queryFailures[query],
 			Stats:      latencyStats(queryTimings[query]),
+			Backend:    latencyStats(queryBackendTimings[query]),
+			Sources:    querySourceCounts[query],
+			Declines:   queryDeclineCounts[query],
+			Candidates: latencyStats(queryCandidateCounts[query]),
 		})
+		if len(queryBackendTimings[query]) == 0 {
+			perQuery[len(perQuery)-1].Backend = nil
+		}
+		if len(querySourceCounts[query]) == 0 {
+			perQuery[len(perQuery)-1].Sources = nil
+		}
+		if len(queryDeclineCounts[query]) == 0 {
+			perQuery[len(perQuery)-1].Declines = nil
+		}
+		if len(queryCandidateCounts[query]) == 0 {
+			perQuery[len(perQuery)-1].Candidates = nil
+		}
 	}
 	summary := benchSummary{
 		OK:         failures == 0,
-		Mode:       map[bool]string{true: "service", false: "local"}[*useService],
+		Mode:       benchModeName(*useService, *useResident),
 		Iterations: *iterations,
 		Failures:   failures,
 		Queries:    len(queries),
 		Stats:      latencyStats(timings),
+		Backend:    latencyStats(backendTimings),
+		Sources:    sourceCounts,
+		Declines:   declineCounts,
+		Candidates: latencyStats(candidateCounts),
 		PerQuery:   perQuery,
+	}
+	if len(backendTimings) == 0 {
+		summary.Backend = nil
+	}
+	if len(sourceCounts) == 0 {
+		summary.Sources = nil
+	}
+	if len(declineCounts) == 0 {
+		summary.Declines = nil
+	}
+	if len(candidateCounts) == 0 {
+		summary.Candidates = nil
 	}
 	if *jsonOut {
 		return writeJSON(os.Stdout, summary)
@@ -1570,7 +1719,11 @@ func cmdBenchAgent(args []string) error {
 		fmt.Printf("%s_ms: %.3f\n", key, summary.Stats[key])
 	}
 	for _, item := range summary.PerQuery {
-		fmt.Printf("query=%q iterations=%d failures=%d median_ms=%.3f p90_ms=%.3f max_ms=%.3f\n", item.Query, item.Iterations, item.Failures, item.Stats["median"], item.Stats["p90"], item.Stats["max"])
+		if item.Backend != nil {
+			fmt.Printf("query=%q iterations=%d failures=%d median_ms=%.3f backend_median_ms=%.3f p90_ms=%.3f max_ms=%.3f candidates_median=%.0f sources=%v\n", item.Query, item.Iterations, item.Failures, item.Stats["median"], item.Backend["median"], item.Stats["p90"], item.Stats["max"], item.Candidates["median"], item.Sources)
+		} else {
+			fmt.Printf("query=%q iterations=%d failures=%d median_ms=%.3f p90_ms=%.3f max_ms=%.3f candidates_median=%.0f sources=%v\n", item.Query, item.Iterations, item.Failures, item.Stats["median"], item.Stats["p90"], item.Stats["max"], item.Candidates["median"], item.Sources)
+		}
 	}
 	return nil
 }
@@ -1591,15 +1744,87 @@ func readBenchQueries(path string) ([]string, error) {
 	return out, nil
 }
 
-func benchServiceQuery(pipeName string, opts queryOptions) error {
-	resp, err := callService(pipeName, serviceRequestFromOptions(opts, false))
-	if err != nil {
+func benchModeName(useService, useResident bool) string {
+	if useService {
+		return "service"
+	}
+	if useResident {
+		return "resident-local"
+	}
+	return "local"
+}
+
+func recordBenchSource(global map[string]int, perQuery map[string]map[string]int, query string, source string) {
+	if source == "" {
+		source = "unknown"
+	}
+	global[source]++
+	if perQuery[query] == nil {
+		perQuery[query] = make(map[string]int)
+	}
+	perQuery[query][source]++
+}
+
+func recordBenchOptional(global map[string]int, perQuery map[string]map[string]int, query string, value string) {
+	if value == "" {
+		return
+	}
+	global[value]++
+	if perQuery[query] == nil {
+		perQuery[query] = make(map[string]int)
+	}
+	perQuery[query][value]++
+}
+
+func runBenchQuery(useService bool, useResident bool, pipeName string, indexes []*Index, volumes []*serviceVolumeIndex, opts queryOptions, trace *searchTrace) error {
+	if useService {
+		_, err := benchServiceQuery(pipeName, opts)
 		return err
 	}
-	if !resp.OK {
-		return errors.New(resp.Message)
+	if useResident {
+		opts.Trace = trace
+		_, err := searchServiceVolumes(volumes, opts, false)
+		return err
 	}
-	return nil
+	_, err := searchAll(indexes, opts, false)
+	return err
+}
+
+func waitResidentBackgroundIndexes(volumes []*serviceVolumeIndex, maxWait time.Duration) {
+	if maxWait <= 0 || len(volumes) == 0 {
+		return
+	}
+	deadline := time.Now().Add(maxWait)
+	for time.Now().Before(deadline) {
+		allDone := true
+		for _, vol := range volumes {
+			if vol == nil {
+				continue
+			}
+			nameOrderState := vol.nameOrderStateString()
+			nameTrigramState := vol.nameTrigramStateString()
+			if nameOrderState == "pending" || nameOrderState == "building" ||
+				nameTrigramState == "pending" || nameTrigramState == "building" {
+				allDone = false
+				break
+			}
+		}
+		if allDone {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+func benchServiceQuery(pipeName string, opts queryOptions) (serviceResponse, error) {
+	resp, err := callService(pipeName, serviceRequestFromOptions(opts, false))
+	if err != nil {
+		return serviceResponse{}, err
+	}
+	if !resp.OK {
+		return resp, errors.New(resp.Message)
+	}
+	return resp, nil
 }
 
 func latencyStats(values []float64) map[string]float64 {
@@ -1651,16 +1876,20 @@ type serviceRequest struct {
 }
 
 type serviceResponse struct {
-	OK      bool               `json:"ok"`
-	Message string             `json:"message,omitempty"`
-	PID     int                `json:"pid,omitempty"`
-	Entries int                `json:"entries,omitempty"`
-	Loading bool               `json:"loading,omitempty"`
-	Count   int                `json:"count,omitempty"`
-	Results []string           `json:"results,omitempty"`
-	Rows    []jsonResult       `json:"rows,omitempty"`
-	DBs     []dbInfo           `json:"dbs,omitempty"`
-	Runtime *runtimeMemoryInfo `json:"runtime,omitempty"`
+	OK         bool               `json:"ok"`
+	Message    string             `json:"message,omitempty"`
+	PID        int                `json:"pid,omitempty"`
+	Entries    int                `json:"entries,omitempty"`
+	Loading    bool               `json:"loading,omitempty"`
+	Count      int                `json:"count,omitempty"`
+	SearchMS   float64            `json:"search_ms,omitempty"`
+	Source     string             `json:"source,omitempty"`
+	Decline    string             `json:"decline,omitempty"`
+	Candidates int                `json:"candidates,omitempty"`
+	Results    []string           `json:"results,omitempty"`
+	Rows       []jsonResult       `json:"rows,omitempty"`
+	DBs        []dbInfo           `json:"dbs,omitempty"`
+	Runtime    *runtimeMemoryInfo `json:"runtime,omitempty"`
 }
 
 type dbInfo struct {
@@ -1687,6 +1916,10 @@ type dbInfo struct {
 	LastPersistError  string              `json:"last_persist_error,omitempty"`
 	QueryExtKeys      int                 `json:"query_ext_keys,omitempty"`
 	QueryDirs         int                 `json:"query_dirs,omitempty"`
+	NameOrderState    string              `json:"name_order_state,omitempty"`
+	NameOrderMillis   int64               `json:"name_order_build_ms,omitempty"`
+	NameTrigramState  string              `json:"name_trigram_state,omitempty"`
+	NameTrigramMillis int64               `json:"name_trigram_build_ms,omitempty"`
 	Memory            *residentMemoryInfo `json:"memory,omitempty"`
 }
 
@@ -1697,6 +1930,8 @@ type residentMemoryInfo struct {
 	RecordBytes       int64 `json:"record_bytes,omitempty"`
 	NameOrderBytes    int   `json:"name_order_bytes,omitempty"`
 	ExtPostBytes      int   `json:"ext_posting_bytes,omitempty"`
+	NameTrigramBytes  int   `json:"name_trigram_bytes,omitempty"`
+	NameTrigramKeys   int   `json:"name_trigram_keys,omitempty"`
 	TypePostBytes     int   `json:"type_posting_bytes,omitempty"`
 	ChildBytes        int   `json:"child_bytes,omitempty"`
 	FRNIndexBytes     int   `json:"frn_index_bytes,omitempty"`
@@ -1738,7 +1973,8 @@ type serviceVolumeIndex struct {
 	state             string
 	staleReason       string
 	frnToID           map[uint64]int
-	frnIDs            []frnIndexEntry
+	frns              []uint64
+	frnRecordIDs      []uint32
 	children          map[uint64]map[int]struct{}
 	childOffsets      []uint32
 	childIDs          []uint32
@@ -1749,12 +1985,18 @@ type serviceVolumeIndex struct {
 	exactNames        map[string][]int
 	pathCache         map[int]string
 	queryIndex        *residentQueryIndex
+	nameOrderState    atomic.Int32
+	nameOrderMillis   atomic.Int64
+	nameTrigrams      atomic.Pointer[compressedTrigramIndex]
+	nameTrigramState  atomic.Int32
+	nameTrigramMillis atomic.Int64
 	searchMu          sync.Mutex
 	termMu            sync.Mutex
 	termCache         map[string][]int
 	pathTermCache     map[string][]int
 	extCache          map[string][]int
 	recentIDs         map[int]struct{}
+	nameTrigramRecent map[int]struct{}
 	recentSeq         uint64
 	termSeq           map[string]uint64
 	pathTermSeq       map[string]uint64
@@ -1772,14 +2014,11 @@ type serviceVolumeIndex struct {
 
 type residentQueryIndex struct {
 	ext       map[string][]uint32
+	extTop    map[string][]uint32
 	pathGrams map[string][]uint32
 	nameOrder []uint32
+	nameRank  []uint32
 	dirs      []uint32
-}
-
-type frnIndexEntry struct {
-	frn uint64
-	id  int32
 }
 
 func serviceLog(format string, args ...any) {
@@ -2542,11 +2781,18 @@ func exchangeServiceJSONBlocking(conn io.ReadWriteCloser, req serviceRequest) (s
 }
 
 func openPipeClient(pipeName string) (windows.Handle, error) {
+	return openPipeClientWithTimeout(pipeName, 5*time.Second)
+}
+
+func openPipeClientWithTimeout(pipeName string, timeout time.Duration) (windows.Handle, error) {
 	ptr, err := windows.UTF16PtrFromString(pipeName)
 	if err != nil {
 		return 0, err
 	}
-	deadline := time.Now().Add(5 * time.Second)
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	deadline := time.Now().Add(timeout)
 	for {
 		handle, err := windows.CreateFile(
 			ptr,
@@ -2563,7 +2809,14 @@ func openPipeClient(pipeName string) (windows.Handle, error) {
 		if err != windows.ERROR_PIPE_BUSY || time.Now().After(deadline) {
 			return 0, err
 		}
-		time.Sleep(50 * time.Millisecond)
+		sleep := 50 * time.Millisecond
+		if remaining := time.Until(deadline); remaining < sleep {
+			sleep = remaining
+		}
+		if sleep <= 0 {
+			return 0, err
+		}
+		time.Sleep(sleep)
 	}
 }
 
@@ -2623,51 +2876,12 @@ func (s *goSearchService) loadConfiguredIndexes() error {
 		return nil
 	}
 	start := time.Now()
-	indexes, err := loadIndexes(s.dbs)
+	indexes, volumes, total, err := loadConfiguredVolumes(s.dbs)
 	if err != nil {
 		s.indexMu.Lock()
 		s.loadErr = err.Error()
 		s.indexMu.Unlock()
 		return err
-	}
-	volumes := make([]*serviceVolumeIndex, 0, len(indexes))
-	total := 0
-	for i, idx := range indexes {
-		total += idx.entryCount()
-		dbPath := ""
-		if i < len(s.dbs) {
-			dbPath = s.dbs[i]
-		}
-		vol := newServiceVolumeIndex(dbPath, idx)
-		if err := vol.replayWAL(); err != nil {
-			serviceLog("startup wal replay skipped volume=%s db=%s err=%v", vol.volume, vol.dbPath, err)
-			vol.state = "stale"
-			vol.staleReason = err.Error()
-			if shouldRebuildStaleIndex(err) {
-				if rebuilt, rebuildErr := rebuildServiceVolumeIndex(vol); rebuildErr == nil {
-					serviceLog("startup wal rebuild complete volume=%s db=%s entries=%d", rebuilt.volume, rebuilt.dbPath, rebuilt.index.entryCount())
-					vol = rebuilt
-				} else {
-					serviceLog("startup wal rebuild failed volume=%s db=%s err=%v", vol.volume, vol.dbPath, rebuildErr)
-				}
-			}
-		}
-		if err := catchUpServiceVolume(vol); err != nil {
-			serviceLog("startup catch-up skipped volume=%s db=%s err=%v", vol.volume, vol.dbPath, err)
-			if shouldRebuildStaleIndex(err) {
-				if rebuilt, rebuildErr := rebuildServiceVolumeIndex(vol); rebuildErr == nil {
-					serviceLog("startup stale rebuild complete volume=%s db=%s entries=%d", rebuilt.volume, rebuilt.dbPath, rebuilt.index.entryCount())
-					vol = rebuilt
-				} else {
-					serviceLog("startup stale rebuild failed volume=%s db=%s err=%v", vol.volume, vol.dbPath, rebuildErr)
-				}
-			}
-		}
-		vol.queryIndex = buildResidentQueryIndex(vol)
-		if vol.children == nil && vol.index != nil && vol.index.Compact && vol.index.Source == "usn" {
-			vol.buildCompactChildren()
-		}
-		volumes = append(volumes, vol)
 	}
 	s.indexMu.Lock()
 	s.indexes = indexes
@@ -2675,6 +2889,8 @@ func (s *goSearchService) loadConfiguredIndexes() error {
 	s.loadErr = ""
 	s.indexMu.Unlock()
 	debug.FreeOSMemory()
+	s.startBackgroundNameOrderBuilds(volumes)
+	s.startBackgroundNameTrigramBuilds(volumes)
 	for _, vol := range volumes {
 		if vol.state == "ready" && vol.index.Compact && vol.index.Source == "usn" {
 			go s.replayVolumeLoop(vol)
@@ -2683,6 +2899,99 @@ func (s *goSearchService) loadConfiguredIndexes() error {
 	}
 	serviceLog("loaded %d dbs entries=%d elapsed=%s", len(indexes), total, time.Since(start).Round(time.Millisecond))
 	return nil
+}
+
+type startupVolumeResult struct {
+	idx *Index
+	vol *serviceVolumeIndex
+	err error
+}
+
+func loadConfiguredVolumes(dbs []string) ([]*Index, []*serviceVolumeIndex, int, error) {
+	results := make([]startupVolumeResult, len(dbs))
+	workers := serviceStartupWorkerCount(len(dbs))
+	sem := make(chan struct{}, workers)
+	var wg sync.WaitGroup
+	for i, dbPath := range dbs {
+		i, dbPath := i, dbPath
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			idx, vol, err := loadConfiguredVolume(dbPath)
+			results[i] = startupVolumeResult{idx: idx, vol: vol, err: err}
+		}()
+	}
+	wg.Wait()
+	indexes := make([]*Index, 0, len(results))
+	volumes := make([]*serviceVolumeIndex, 0, len(results))
+	total := 0
+	for _, result := range results {
+		if result.err != nil {
+			return nil, nil, 0, result.err
+		}
+		indexes = append(indexes, result.idx)
+		volumes = append(volumes, result.vol)
+		total += result.idx.entryCount()
+	}
+	return indexes, volumes, total, nil
+}
+
+func serviceStartupWorkerCount(dbCount int) int {
+	if dbCount <= 1 {
+		return 1
+	}
+	raw := strings.TrimSpace(os.Getenv("SEEKFS_STARTUP_WORKERS"))
+	if raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err == nil && n > 0 {
+			return min(n, dbCount)
+		}
+	}
+	return min(serviceStartupDefaultWorkers, dbCount)
+}
+
+func loadConfiguredVolume(dbPath string) (*Index, *serviceVolumeIndex, error) {
+	idx, err := loadIndex(dbPath)
+	if err != nil {
+		return nil, nil, err
+	}
+	idx.DBPath = dbPath
+	vol := newServiceVolumeIndex(dbPath, idx)
+	if err := vol.replayWAL(); err != nil {
+		serviceLog("startup wal replay skipped volume=%s db=%s err=%v", vol.volume, vol.dbPath, err)
+		vol.state = "stale"
+		vol.staleReason = err.Error()
+		if shouldRebuildStaleIndex(err) {
+			if rebuilt, rebuildErr := rebuildServiceVolumeIndex(vol); rebuildErr == nil {
+				serviceLog("startup wal rebuild complete volume=%s db=%s entries=%d", rebuilt.volume, rebuilt.dbPath, rebuilt.index.entryCount())
+				vol = rebuilt
+				idx = rebuilt.index
+			} else {
+				serviceLog("startup wal rebuild failed volume=%s db=%s err=%v", vol.volume, vol.dbPath, rebuildErr)
+			}
+		}
+	}
+	if err := catchUpServiceVolume(vol); err != nil {
+		serviceLog("startup catch-up skipped volume=%s db=%s err=%v", vol.volume, vol.dbPath, err)
+		if shouldRebuildStaleIndex(err) {
+			if rebuilt, rebuildErr := rebuildServiceVolumeIndex(vol); rebuildErr == nil {
+				serviceLog("startup stale rebuild complete volume=%s db=%s entries=%d", rebuilt.volume, rebuilt.dbPath, rebuilt.index.entryCount())
+				vol = rebuilt
+				idx = rebuilt.index
+			} else {
+				serviceLog("startup stale rebuild failed volume=%s db=%s err=%v", vol.volume, vol.dbPath, rebuildErr)
+			}
+		}
+	}
+	vol.queryIndex = buildResidentQueryIndex(vol)
+	vol.resetNameOrderBuild()
+	vol.resetNameTrigrams()
+	if vol.needsCompactChildrenBuild() {
+		vol.buildCompactChildren()
+	}
+	return idx, vol, nil
 }
 
 func newServiceVolumeIndex(dbPath string, idx *Index) *serviceVolumeIndex {
@@ -2706,7 +3015,8 @@ func newServiceVolumeIndex(dbPath string, idx *Index) *serviceVolumeIndex {
 			idx.packCompactRecords(true)
 		}
 		recordCount = idx.compactRecordCount()
-		vol.frnIDs = make([]frnIndexEntry, 0, recordCount)
+		vol.frns = make([]uint64, 0, recordCount)
+		vol.frnRecordIDs = make([]uint32, 0, recordCount)
 		if !largeResident {
 			vol.children = make(map[uint64]map[int]struct{}, recordCount)
 			vol.exactNames = make(map[string][]int, recordCount/2)
@@ -2714,7 +3024,8 @@ func newServiceVolumeIndex(dbPath string, idx *Index) *serviceVolumeIndex {
 		for i := 0; i < recordCount; i++ {
 			rec := idx.compactRecord(i)
 			if rec.FRN != 0 {
-				vol.frnIDs = append(vol.frnIDs, frnIndexEntry{frn: rec.FRN, id: int32(i)})
+				vol.frns = append(vol.frns, rec.FRN)
+				vol.frnRecordIDs = append(vol.frnRecordIDs, uint32(i))
 			}
 			if vol.children != nil && rec.ParentFRN != 0 && rec.ParentFRN != rec.FRN {
 				vol.addChild(rec.ParentFRN, i)
@@ -2723,13 +3034,41 @@ func newServiceVolumeIndex(dbPath string, idx *Index) *serviceVolumeIndex {
 				vol.exactNames[name] = append(vol.exactNames[name], i)
 			}
 		}
-		sort.Slice(vol.frnIDs, func(i, j int) bool { return vol.frnIDs[i].frn < vol.frnIDs[j].frn })
+		sortFRNIndexEntries(vol.frns, vol.frnRecordIDs)
 		vol.queryIndex = buildResidentQueryIndex(vol)
-		if largeResident {
-			vol.buildCompactChildren()
-		}
+		vol.resetNameOrderBuild()
+		vol.resetNameTrigrams()
+		vol.buildCompactChildren()
 	}
 	return vol
+}
+
+func sortFRNIndexEntries(frns []uint64, ids []uint32) {
+	if len(frns) <= 1 || len(frns) != len(ids) || sort.SliceIsSorted(frns, func(i, j int) bool {
+		return frns[i] < frns[j]
+	}) {
+		return
+	}
+	sort.Sort(frnIndexPairs{frns: frns, ids: ids})
+}
+
+type frnIndexPairs struct {
+	frns []uint64
+	ids  []uint32
+}
+
+func (p frnIndexPairs) Len() int { return len(p.frns) }
+
+func (p frnIndexPairs) Less(i, j int) bool {
+	if p.frns[i] == p.frns[j] {
+		return p.ids[i] < p.ids[j]
+	}
+	return p.frns[i] < p.frns[j]
+}
+
+func (p frnIndexPairs) Swap(i, j int) {
+	p.frns[i], p.frns[j] = p.frns[j], p.frns[i]
+	p.ids[i], p.ids[j] = p.ids[j], p.ids[i]
 }
 
 func catchUpServiceVolume(vol *serviceVolumeIndex) error {
@@ -2801,9 +3140,9 @@ func (vol *serviceVolumeIndex) idForFRN(frn uint64) (int, bool) {
 			return id, true
 		}
 	}
-	i := sort.Search(len(vol.frnIDs), func(i int) bool { return vol.frnIDs[i].frn >= frn })
-	if i < len(vol.frnIDs) && vol.frnIDs[i].frn == frn {
-		return int(vol.frnIDs[i].id), true
+	i := sort.Search(len(vol.frns), func(i int) bool { return vol.frns[i] >= frn })
+	if i < len(vol.frns) && i < len(vol.frnRecordIDs) && vol.frns[i] == frn {
+		return int(vol.frnRecordIDs[i]), true
 	}
 	return 0, false
 }
@@ -2822,7 +3161,7 @@ func (vol *serviceVolumeIndex) addFRNID(frn uint64, id int) {
 }
 
 func (vol *serviceVolumeIndex) frnRecordCount() int {
-	return len(vol.frnIDs) + len(vol.frnToID)
+	return len(vol.frns) + len(vol.frnToID)
 }
 
 func (s *goSearchService) replayVolumeLoop(vol *serviceVolumeIndex) {
@@ -2955,6 +3294,8 @@ func (s *goSearchService) persistVolumeIfDue(vol *serviceVolumeIndex, force bool
 	s.indexMu.Unlock()
 	if saved {
 		releaseServiceMemoryAfterSave()
+		s.startBackgroundNameOrderBuilds([]*serviceVolumeIndex{vol})
+		s.startBackgroundNameTrigramBuilds([]*serviceVolumeIndex{vol})
 	}
 }
 
@@ -2983,7 +3324,9 @@ func releaseServiceMemoryAfterSave() {
 
 func (vol *serviceVolumeIndex) afterPersist() {
 	vol.queryIndex = buildResidentQueryIndex(vol)
-	if vol.children == nil && vol.index != nil && vol.index.Compact && vol.index.Source == "usn" {
+	vol.resetNameOrderBuild()
+	vol.resetNameTrigrams()
+	if vol.needsCompactChildrenBuild() {
 		vol.buildCompactChildren()
 	}
 	vol.recentIDs = nil
@@ -3112,6 +3455,7 @@ func (s *goSearchService) rebuildVolumeInPlace(vol *serviceVolumeIndex) error {
 	}
 	s.indexMu.Unlock()
 	releaseServiceMemoryAfterSave()
+	s.startBackgroundNameTrigramBuilds([]*serviceVolumeIndex{vol})
 	serviceLog("rebuilt stale index volume=%s db=%s entries=%d", rebuilt.volume, rebuilt.dbPath, rebuilt.index.entryCount())
 	return nil
 }
@@ -3126,6 +3470,7 @@ func (vol *serviceVolumeIndex) applyUSNChanges(changes []usnChange) {
 		}
 		if change.Reason&usnReasonFileDelete != 0 {
 			if id, ok := vol.idForFRN(change.FRN); ok {
+				vol.markNameTrigramRecent(id)
 				vol.removeExactName(id)
 				vol.markDeleted(id)
 			}
@@ -3143,6 +3488,7 @@ func (vol *serviceVolumeIndex) applyUSNChanges(changes []usnChange) {
 			vol.recentIDs = make(map[int]struct{})
 		}
 		vol.recentIDs[id] = struct{}{}
+		vol.markNameTrigramRecent(id)
 		vol.recentSeq++
 		rec := vol.index.compactRecord(id)
 		if rec.ParentFRN != 0 && rec.ParentFRN != change.ParentFRN {
@@ -3174,6 +3520,8 @@ func (vol *serviceVolumeIndex) applyUSNChanges(changes []usnChange) {
 	vol.pathCache = make(map[int]string)
 	if len(vol.recentIDs) > serviceRecentRebuildThreshold {
 		vol.queryIndex = buildResidentQueryIndex(vol)
+		vol.resetNameOrderBuild()
+		vol.resetNameTrigrams()
 		vol.recentIDs = nil
 		vol.recentSeq++
 		vol.clearSearchCachesLocked()
@@ -3414,14 +3762,367 @@ func (vol *serviceVolumeIndex) buildCompactChildren() {
 	}
 }
 
+func (vol *serviceVolumeIndex) needsCompactChildrenBuild() bool {
+	return vol != nil &&
+		vol.index != nil &&
+		vol.index.Compact &&
+		vol.index.Source == "usn" &&
+		len(vol.childOffsets) == 0 &&
+		len(vol.childIDs) == 0
+}
+
 func serviceSubtreeIntervalsEnabled() bool {
 	v := strings.ToLower(strings.TrimSpace(os.Getenv("SEEKFS_SUBTREE_INTERVALS")))
-	return v == "1" || v == "true" || v == "yes" || v == "on"
+	return v != "0" && v != "false" && v != "no" && v != "off"
 }
 
 func servicePathGramsEnabled() bool {
 	v := strings.ToLower(strings.TrimSpace(os.Getenv("SEEKFS_PATH_GRAMS")))
-	return v == "1" || v == "true" || v == "yes" || v == "on"
+	return v != "0" && v != "false" && v != "no" && v != "off"
+}
+
+func serviceNameOrderEnabled() bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv("SEEKFS_NAME_ORDER")))
+	return v != "0" && v != "false" && v != "no" && v != "off"
+}
+
+func serviceNameOrderEnabledForIndex(idx *Index) bool {
+	if idx == nil || !idx.Compact || !serviceNameOrderEnabled() {
+		return false
+	}
+	v := strings.ToLower(strings.TrimSpace(os.Getenv("SEEKFS_NAME_ORDER")))
+	if v == "1" || v == "true" || v == "yes" || v == "on" {
+		return true
+	}
+	return idx.compactRecordCount() <= serviceBackgroundNameOrderMaxRecords
+}
+
+func serviceNameTrigramsEnabled() bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv("SEEKFS_NAME_TRIGRAMS")))
+	return v != "0" && v != "false" && v != "no" && v != "off"
+}
+
+func serviceNameTrigramsEnabledForIndex(idx *Index) bool {
+	if idx == nil || !idx.Compact || !serviceNameTrigramsEnabled() {
+		return false
+	}
+	v := strings.ToLower(strings.TrimSpace(os.Getenv("SEEKFS_NAME_TRIGRAMS")))
+	if v == "1" || v == "true" || v == "yes" || v == "on" {
+		return true
+	}
+	return idx.compactRecordCount() <= serviceNameTrigramMaxRecords()
+}
+
+func serviceNameTrigramMaxRecords() int {
+	raw := strings.TrimSpace(os.Getenv("SEEKFS_NAME_TRIGRAM_MAX_RECORDS"))
+	if raw == "" {
+		return serviceNameTrigramDefaultMaxRecords
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n <= 0 {
+		return serviceNameTrigramDefaultMaxRecords
+	}
+	return n
+}
+
+func (s *goSearchService) startBackgroundNameTrigramBuilds(volumes []*serviceVolumeIndex) {
+	if !serviceNameTrigramsEnabled() || len(volumes) == 0 {
+		return
+	}
+	go func() {
+		for _, vol := range volumes {
+			if vol == nil || !serviceNameTrigramsEnabledForIndex(vol.index) {
+				continue
+			}
+			s.rebuildNameTrigramsInBackground(vol)
+		}
+		debug.FreeOSMemory()
+	}()
+}
+
+func (s *goSearchService) startBackgroundNameOrderBuilds(volumes []*serviceVolumeIndex) {
+	if !serviceNameOrderEnabled() || len(volumes) == 0 {
+		return
+	}
+	go func() {
+		for _, vol := range volumes {
+			if vol == nil || !serviceNameOrderEnabledForIndex(vol.index) {
+				continue
+			}
+			s.rebuildNameOrderInBackground(vol)
+		}
+		debug.FreeOSMemory()
+	}()
+}
+
+func (s *goSearchService) rebuildNameOrderInBackground(vol *serviceVolumeIndex) {
+	if vol == nil || !vol.nameOrderState.CompareAndSwap(nameTrigramStatePending, nameTrigramStateBuilding) {
+		return
+	}
+	s.indexMu.RLock()
+	defer s.indexMu.RUnlock()
+	vol.rebuildNameOrderLocked()
+}
+
+func (s *goSearchService) rebuildNameTrigramsInBackground(vol *serviceVolumeIndex) {
+	if vol == nil || !vol.nameTrigramState.CompareAndSwap(nameTrigramStatePending, nameTrigramStateBuilding) {
+		return
+	}
+	s.indexMu.RLock()
+	defer s.indexMu.RUnlock()
+	vol.rebuildNameTrigramsLocked()
+}
+
+func (vol *serviceVolumeIndex) resetNameOrderBuild() {
+	if vol == nil {
+		return
+	}
+	vol.nameOrderMillis.Store(0)
+	if vol.queryIndex != nil && len(vol.queryIndex.nameOrder) > 0 {
+		vol.nameOrderState.Store(nameTrigramStateReady)
+		return
+	}
+	if serviceNameOrderEnabledForIndex(vol.index) {
+		vol.nameOrderState.Store(nameTrigramStatePending)
+	} else {
+		vol.nameOrderState.Store(nameTrigramStateDisabled)
+	}
+}
+
+func (vol *serviceVolumeIndex) rebuildNameOrderLocked() {
+	if vol == nil || vol.index == nil || !serviceNameOrderEnabledForIndex(vol.index) {
+		vol.resetNameOrderBuild()
+		return
+	}
+	start := time.Now()
+	order, ranks := buildCompactNameOrderRank(vol.index)
+	vol.searchMu.Lock()
+	if vol.queryIndex == nil {
+		vol.queryIndex = &residentQueryIndex{}
+	}
+	vol.queryIndex.nameOrder = order
+	vol.queryIndex.nameRank = ranks
+	vol.queryIndex.extTop = buildExtTopPostings(vol.queryIndex.ext, ranks, serviceExtTopPostingLimit)
+	vol.nameOrderMillis.Store(time.Since(start).Milliseconds())
+	vol.nameOrderState.Store(nameTrigramStateReady)
+	vol.searchMu.Unlock()
+	serviceLog("built resident name order volume=%s records=%d bytes=%d elapsed=%s",
+		vol.volume, vol.index.compactRecordCount(), (len(order)+len(ranks))*4, time.Since(start).Round(time.Millisecond))
+}
+
+func buildCompactNameOrderRank(idx *Index) ([]uint32, []uint32) {
+	recordCount := 0
+	if idx != nil {
+		recordCount = idx.compactRecordCount()
+	}
+	if recordCount == 0 {
+		return nil, nil
+	}
+	order := make([]uint32, 0, recordCount)
+	for id := 0; id < recordCount; id++ {
+		rec := idx.compactRecord(id)
+		if !rec.Deleted {
+			order = append(order, uint32(id))
+		}
+	}
+	sort.Slice(order, func(i, j int) bool {
+		a, b := int(order[i]), int(order[j])
+		an, bn := idx.compactLowerNameAt(a), idx.compactLowerNameAt(b)
+		if an == bn {
+			return a < b
+		}
+		return an < bn
+	})
+	ranks := make([]uint32, recordCount)
+	for i := range ranks {
+		ranks[i] = uint32(i)
+	}
+	for pos, id32 := range order {
+		id := int(id32)
+		if id >= 0 && id < recordCount {
+			ranks[id] = uint32(pos)
+		}
+	}
+	return order, ranks
+}
+
+func buildExtTopPostings(ext map[string][]uint32, ranks []uint32, limit int) map[string][]uint32 {
+	if len(ext) == 0 || len(ranks) == 0 || limit <= 0 {
+		return nil
+	}
+	out := make(map[string][]uint32, len(ext))
+	for key, ids := range ext {
+		if len(ids) == 0 {
+			continue
+		}
+		if len(ids) <= limit {
+			top := append([]uint32(nil), ids...)
+			sortExtTopByRank(top, ranks)
+			out[key] = top
+			continue
+		}
+		h := make(extRankMaxHeap, 0, limit)
+		for _, id := range ids {
+			item := extRankItem{id: id, rank: extRankOf(id, ranks)}
+			if len(h) < limit {
+				heap.Push(&h, item)
+				continue
+			}
+			if extRankLess(item, h[0]) {
+				h[0] = item
+				heap.Fix(&h, 0)
+			}
+		}
+		top := make([]uint32, len(h))
+		for i := range h {
+			top[i] = h[i].id
+		}
+		sortExtTopByRank(top, ranks)
+		out[key] = top
+	}
+	return out
+}
+
+func sortExtTopByRank(ids []uint32, ranks []uint32) {
+	sort.Slice(ids, func(i, j int) bool {
+		a, b := ids[i], ids[j]
+		ra, rb := extRankOf(a, ranks), extRankOf(b, ranks)
+		if ra == rb {
+			return a < b
+		}
+		return ra < rb
+	})
+}
+
+func extRankOf(id uint32, ranks []uint32) uint32 {
+	if int(id) >= len(ranks) {
+		return id
+	}
+	return ranks[id]
+}
+
+func extRankLess(a, b extRankItem) bool {
+	if a.rank == b.rank {
+		return a.id < b.id
+	}
+	return a.rank < b.rank
+}
+
+type extRankItem struct {
+	id   uint32
+	rank uint32
+}
+
+type extRankMaxHeap []extRankItem
+
+func (h extRankMaxHeap) Len() int { return len(h) }
+
+func (h extRankMaxHeap) Less(i, j int) bool {
+	if h[i].rank == h[j].rank {
+		return h[i].id > h[j].id
+	}
+	return h[i].rank > h[j].rank
+}
+
+func (h extRankMaxHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
+
+func (h *extRankMaxHeap) Push(x any) {
+	*h = append(*h, x.(extRankItem))
+}
+
+func (h *extRankMaxHeap) Pop() any {
+	old := *h
+	n := len(old)
+	x := old[n-1]
+	*h = old[:n-1]
+	return x
+}
+
+func (vol *serviceVolumeIndex) nameOrderStateString() string {
+	if vol == nil {
+		return ""
+	}
+	switch vol.nameOrderState.Load() {
+	case nameTrigramStatePending:
+		return "pending"
+	case nameTrigramStateBuilding:
+		return "building"
+	case nameTrigramStateReady:
+		return "ready"
+	default:
+		if serviceNameOrderEnabled() {
+			return "disabled"
+		}
+		return ""
+	}
+}
+
+func (vol *serviceVolumeIndex) nameTrigramIndex() *compressedTrigramIndex {
+	if vol == nil {
+		return nil
+	}
+	return vol.nameTrigrams.Load()
+}
+
+func (vol *serviceVolumeIndex) markNameTrigramRecent(id int) {
+	if vol == nil || id < 0 || !serviceNameTrigramsEnabledForIndex(vol.index) {
+		return
+	}
+	if vol.nameTrigramRecent == nil {
+		vol.nameTrigramRecent = make(map[int]struct{})
+	}
+	vol.nameTrigramRecent[id] = struct{}{}
+}
+
+func (vol *serviceVolumeIndex) resetNameTrigrams() {
+	if vol == nil {
+		return
+	}
+	vol.nameTrigrams.Store(nil)
+	vol.nameTrigramMillis.Store(0)
+	vol.nameTrigramRecent = nil
+	if serviceNameTrigramsEnabledForIndex(vol.index) {
+		vol.nameTrigramState.Store(nameTrigramStatePending)
+	} else {
+		vol.nameTrigramState.Store(nameTrigramStateDisabled)
+	}
+}
+
+func (vol *serviceVolumeIndex) rebuildNameTrigramsLocked() {
+	if vol == nil || vol.index == nil || !serviceNameTrigramsEnabledForIndex(vol.index) {
+		vol.resetNameTrigrams()
+		return
+	}
+	start := time.Now()
+	ti := buildNameTrigramIndex(vol.index)
+	ti.dropCommonPostings(trigramStoredPostingMaxCount)
+	vol.searchMu.Lock()
+	vol.nameTrigrams.Store(ti)
+	vol.nameTrigramRecent = nil
+	vol.nameTrigramMillis.Store(time.Since(start).Milliseconds())
+	vol.nameTrigramState.Store(nameTrigramStateReady)
+	vol.searchMu.Unlock()
+	serviceLog("built name trigram index volume=%s records=%d keys=%d bytes=%d elapsed=%s",
+		vol.volume, vol.index.compactRecordCount(), ti.keyCount(), ti.postingBytes, time.Since(start).Round(time.Millisecond))
+}
+
+func (vol *serviceVolumeIndex) nameTrigramStateString() string {
+	if vol == nil {
+		return ""
+	}
+	switch vol.nameTrigramState.Load() {
+	case nameTrigramStatePending:
+		return "pending"
+	case nameTrigramStateBuilding:
+		return "building"
+	case nameTrigramStateReady:
+		return "ready"
+	default:
+		if serviceNameTrigramsEnabled() {
+			return "disabled"
+		}
+		return ""
+	}
 }
 
 func (vol *serviceVolumeIndex) childIDsForRecord(id int) []uint32 {
@@ -3460,16 +4161,10 @@ func buildResidentQueryIndex(vol *serviceVolumeIndex) *residentQueryIndex {
 	if servicePathGramsEnabled() {
 		qi.pathGrams = make(map[string][]uint32)
 	}
-	if recordCount <= serviceResidentNameOrderMaxRecords {
-		qi.nameOrder = make([]uint32, 0, recordCount)
-	}
 	for id := 0; id < recordCount; id++ {
 		rec := vol.index.compactRecord(id)
 		if rec.Deleted {
 			continue
-		}
-		if qi.nameOrder != nil {
-			qi.nameOrder = append(qi.nameOrder, uint32(id))
 		}
 		name := vol.index.compactLowerNameAt(id)
 		if rec.Mode&uint32(os.ModeDir) != 0 {
@@ -3491,15 +4186,9 @@ func buildResidentQueryIndex(vol *serviceVolumeIndex) *residentQueryIndex {
 		sortResidentPostings(qi.pathGrams)
 	}
 	sortUint32s(qi.dirs)
-	if len(qi.nameOrder) > 0 {
-		sort.Slice(qi.nameOrder, func(i, j int) bool {
-			a, b := int(qi.nameOrder[i]), int(qi.nameOrder[j])
-			an, bn := vol.index.compactLowerNameAt(a), vol.index.compactLowerNameAt(b)
-			if an == bn {
-				return a < b
-			}
-			return an < bn
-		})
+	if serviceNameOrderEnabled() && recordCount <= serviceResidentNameOrderMaxRecords {
+		qi.nameOrder, qi.nameRank = buildCompactNameOrderRank(vol.index)
+		qi.extTop = buildExtTopPostings(qi.ext, qi.nameRank, serviceExtTopPostingLimit)
 	}
 	return qi
 }
@@ -3533,9 +4222,6 @@ func (vol *serviceVolumeIndex) trimSearchCachesLocked() {
 		vol.underRootCache = nil
 	}
 	vol.searchCount++
-	if vol.searchCount%16 == 0 {
-		debug.FreeOSMemory()
-	}
 }
 
 func (vol *serviceVolumeIndex) residentMemoryInfo() *residentMemoryInfo {
@@ -3553,29 +4239,41 @@ func (vol *serviceVolumeIndex) residentMemoryInfo() *residentMemoryInfo {
 			int64(len(p.NameOffs))*4 +
 			int64(len(p.NameLens))*2 +
 			int64(len(p.LowerOffs))*4 +
-			int64(len(p.Modes))*4 +
-			int64(len(p.Sizes))*8 +
+			int64(len(p.DirBits))*8 +
+			int64(len(p.ModeExtraIDs))*4 +
+			int64(len(p.ModeExtraValues))*4 +
+			int64(len(p.Size32))*4 +
+			int64(len(p.Size64IDs))*4 +
+			int64(len(p.Size64Values))*8 +
 			int64(len(p.ModUnix))*8 +
-			int64(len(p.Deleted))
+			int64(len(p.DeletedBits))*8
 	}
 	if vol.queryIndex != nil {
-		info.NameOrderBytes = len(vol.queryIndex.nameOrder) * 4
+		info.NameOrderBytes = (len(vol.queryIndex.nameOrder) + len(vol.queryIndex.nameRank)) * 4
 		info.TypePostBytes = len(vol.queryIndex.dirs) * 4
 		for _, list := range vol.queryIndex.ext {
+			info.ExtPostBytes += len(list) * 4
+		}
+		for _, list := range vol.queryIndex.extTop {
 			info.ExtPostBytes += len(list) * 4
 		}
 		for _, list := range vol.queryIndex.pathGrams {
 			info.ExtPostBytes += len(list) * 4
 		}
 	}
+	if trigrams := vol.nameTrigramIndex(); trigrams != nil {
+		info.NameTrigramBytes = trigrams.postingBytes
+		info.NameTrigramKeys = trigrams.keyCount()
+	}
 	info.ChildBytes = (len(vol.childOffsets) + len(vol.childIDs) + len(vol.rootIDs) + len(vol.subtreeOrder) + len(vol.subtreeStart) + len(vol.subtreeEnd)) * 4
-	info.FRNIndexBytes = len(vol.frnIDs) * int(unsafe.Sizeof(frnIndexEntry{}))
+	info.FRNIndexBytes = len(vol.frns)*8 + len(vol.frnRecordIDs)*4
 	info.FRNOverlayEntries = len(vol.frnToID)
 	info.KnownBytes = int64(info.NameBlobBytes) +
 		int64(info.LowerBlobBytes) +
 		info.RecordBytes +
 		int64(info.NameOrderBytes) +
 		int64(info.ExtPostBytes) +
+		int64(info.NameTrigramBytes) +
 		int64(info.TypePostBytes) +
 		int64(info.ChildBytes) +
 		int64(info.FRNIndexBytes)
@@ -3648,18 +4346,18 @@ func newPackedRecords(records []CompactRecord) *PackedRecords {
 		}
 	}
 	p := &PackedRecords{
-		FRNs:      make([]uint64, len(records)),
-		Parents:   make([]int32, len(records)),
-		NameOffs:  make([]uint32, len(records)),
-		NameLens:  make([]uint16, len(records)),
-		LowerOffs: make([]uint32, len(records)),
-		Modes:     make([]uint32, len(records)),
-		Deleted:   make([]bool, len(records)),
-		NameBlob:  make([]byte, 0, len(records)*16),
-		LowerBlob: make([]byte, 0, len(records)*16),
+		FRNs:        make([]uint64, len(records)),
+		Parents:     make([]int32, len(records)),
+		NameOffs:    make([]uint32, len(records)),
+		NameLens:    make([]uint16, len(records)),
+		LowerOffs:   make([]uint32, len(records)),
+		DirBits:     make([]uint64, (len(records)+63)/64),
+		DeletedBits: make([]uint64, (len(records)+63)/64),
+		NameBlob:    make([]byte, 0, len(records)*16),
+		LowerBlob:   make([]byte, 0, len(records)*16),
 	}
 	if hasSize {
-		p.Sizes = make([]int64, len(records))
+		p.Size32 = make([]uint32, len(records))
 	}
 	if hasModUnix {
 		p.ModUnix = make([]int64, len(records))
@@ -3677,14 +4375,14 @@ func newPackedRecords(records []CompactRecord) *PackedRecords {
 		p.Parents[i] = rec.Parent
 		p.setNameDedup(i, rec.Name, nameRefs)
 		p.setLowerNameDedup(i, rec.Name, lowerRefs)
-		p.Modes[i] = rec.Mode
-		if p.Sizes != nil {
-			p.Sizes[i] = rec.Size
+		p.setMode(i, rec.Mode)
+		if p.Size32 != nil {
+			p.setSize(i, rec.Size)
 		}
 		if p.ModUnix != nil {
 			p.ModUnix[i] = rec.ModUnix
 		}
-		p.Deleted[i] = rec.Deleted
+		p.setDeleted(i, rec.Deleted)
 	}
 	for i, rec := range records {
 		p.setParentFRN(i, rec.ParentFRN)
@@ -3751,10 +4449,10 @@ func (p *PackedRecords) At(i int) CompactRecord {
 		Name:      name,
 		NameOff:   p.NameOffs[i],
 		NameLen:   p.NameLens[i],
-		Mode:      p.Modes[i],
+		Mode:      p.modeAt(i),
 		Size:      p.sizeAt(i),
 		ModUnix:   p.modUnixAt(i),
-		Deleted:   p.Deleted[i],
+		Deleted:   p.deletedAt(i),
 	}
 }
 
@@ -3769,10 +4467,10 @@ func (p *PackedRecords) Set(i int, rec CompactRecord) {
 		p.setName(i, rec.Name)
 		p.setLowerName(i, rec.Name)
 	}
-	p.Modes[i] = rec.Mode
+	p.setMode(i, rec.Mode)
 	p.setSize(i, rec.Size)
 	p.setModUnix(i, rec.ModUnix)
-	p.Deleted[i] = rec.Deleted
+	p.setDeleted(i, rec.Deleted)
 }
 
 func (p *PackedRecords) Append(rec CompactRecord) {
@@ -3784,12 +4482,15 @@ func (p *PackedRecords) Append(rec CompactRecord) {
 	p.NameOffs = append(p.NameOffs, 0)
 	p.NameLens = append(p.NameLens, 0)
 	p.LowerOffs = append(p.LowerOffs, 0)
-	p.Modes = append(p.Modes, rec.Mode)
-	if p.Sizes != nil {
-		p.Sizes = append(p.Sizes, rec.Size)
+	if need := (len(p.FRNs) + 63) / 64; len(p.DirBits) < need {
+		p.DirBits = append(p.DirBits, 0)
+	}
+	if p.Size32 != nil {
+		p.Size32 = append(p.Size32, 0)
+		p.setSize(len(p.FRNs)-1, rec.Size)
 	} else if rec.Size != 0 {
-		p.Sizes = make([]int64, len(p.FRNs))
-		p.Sizes[len(p.Sizes)-1] = rec.Size
+		p.Size32 = make([]uint32, len(p.FRNs))
+		p.setSize(len(p.FRNs)-1, rec.Size)
 	}
 	if p.ModUnix != nil {
 		p.ModUnix = append(p.ModUnix, rec.ModUnix)
@@ -3797,10 +4498,14 @@ func (p *PackedRecords) Append(rec CompactRecord) {
 		p.ModUnix = make([]int64, len(p.FRNs))
 		p.ModUnix[len(p.ModUnix)-1] = rec.ModUnix
 	}
-	p.Deleted = append(p.Deleted, rec.Deleted)
+	if need := (len(p.FRNs) + 63) / 64; len(p.DeletedBits) < need {
+		p.DeletedBits = append(p.DeletedBits, 0)
+	}
 	p.setName(len(p.FRNs)-1, rec.Name)
 	p.setLowerName(len(p.FRNs)-1, rec.Name)
 	p.setParentFRN(len(p.FRNs)-1, rec.ParentFRN)
+	p.setDeleted(len(p.FRNs)-1, rec.Deleted)
+	p.setMode(len(p.FRNs)-1, rec.Mode)
 }
 
 func (p *PackedRecords) parentFRNAt(i int) uint64 {
@@ -3841,10 +4546,18 @@ func (p *PackedRecords) setParentFRN(i int, parentFRN uint64) {
 }
 
 func (p *PackedRecords) sizeAt(i int) int64 {
-	if p == nil || i < 0 || i >= len(p.Sizes) {
+	if p == nil || i < 0 || i >= len(p.Size32) {
 		return 0
 	}
-	return p.Sizes[i]
+	value := p.Size32[i]
+	if value != packedSize64Sentinel {
+		return int64(value)
+	}
+	j := sort.Search(len(p.Size64IDs), func(j int) bool { return p.Size64IDs[j] >= uint32(i) })
+	if j < len(p.Size64IDs) && p.Size64IDs[j] == uint32(i) && j < len(p.Size64Values) {
+		return p.Size64Values[j]
+	}
+	return 0
 }
 
 func (p *PackedRecords) modUnixAt(i int) int64 {
@@ -3854,17 +4567,135 @@ func (p *PackedRecords) modUnixAt(i int) int64 {
 	return p.ModUnix[i]
 }
 
+func (p *PackedRecords) deletedAt(i int) bool {
+	if p == nil || i < 0 {
+		return false
+	}
+	word := i >> 6
+	if word >= len(p.DeletedBits) {
+		return false
+	}
+	return p.DeletedBits[word]&(uint64(1)<<uint(i&63)) != 0
+}
+
+func (p *PackedRecords) setDeleted(i int, value bool) {
+	if p == nil || i < 0 || i >= len(p.FRNs) {
+		return
+	}
+	word := i >> 6
+	if word >= len(p.DeletedBits) {
+		next := make([]uint64, word+1)
+		copy(next, p.DeletedBits)
+		p.DeletedBits = next
+	}
+	mask := uint64(1) << uint(i&63)
+	if value {
+		p.DeletedBits[word] |= mask
+		return
+	}
+	p.DeletedBits[word] &^= mask
+}
+
+func (p *PackedRecords) modeAt(i int) uint32 {
+	if p == nil || i < 0 {
+		return 0
+	}
+	id := uint32(i)
+	j := sort.Search(len(p.ModeExtraIDs), func(j int) bool { return p.ModeExtraIDs[j] >= id })
+	if j < len(p.ModeExtraIDs) && p.ModeExtraIDs[j] == id && j < len(p.ModeExtraValues) {
+		return p.ModeExtraValues[j]
+	}
+	word := i >> 6
+	if word >= len(p.DirBits) {
+		return 0
+	}
+	if p.DirBits[word]&(uint64(1)<<uint(i&63)) != 0 {
+		return uint32(os.ModeDir)
+	}
+	return 0
+}
+
+func (p *PackedRecords) setMode(i int, mode uint32) {
+	if p == nil || i < 0 || i >= len(p.FRNs) {
+		return
+	}
+	word := i >> 6
+	if word >= len(p.DirBits) {
+		next := make([]uint64, word+1)
+		copy(next, p.DirBits)
+		p.DirBits = next
+	}
+	mask := uint64(1) << uint(i&63)
+	if mode&uint32(os.ModeDir) != 0 {
+		p.DirBits[word] |= mask
+	} else {
+		p.DirBits[word] &^= mask
+	}
+	if mode == 0 || mode == uint32(os.ModeDir) {
+		p.removeModeExtra(i)
+		return
+	}
+	p.upsertModeExtra(i, mode)
+}
+
+func (p *PackedRecords) upsertModeExtra(i int, value uint32) {
+	id := uint32(i)
+	j := sort.Search(len(p.ModeExtraIDs), func(j int) bool { return p.ModeExtraIDs[j] >= id })
+	if j < len(p.ModeExtraIDs) && p.ModeExtraIDs[j] == id {
+		p.ModeExtraValues[j] = value
+		return
+	}
+	p.ModeExtraIDs = append(p.ModeExtraIDs, 0)
+	copy(p.ModeExtraIDs[j+1:], p.ModeExtraIDs[j:])
+	p.ModeExtraIDs[j] = id
+	p.ModeExtraValues = append(p.ModeExtraValues, 0)
+	copy(p.ModeExtraValues[j+1:], p.ModeExtraValues[j:])
+	p.ModeExtraValues[j] = value
+}
+
+func (p *PackedRecords) removeModeExtra(i int) {
+	id := uint32(i)
+	j := sort.Search(len(p.ModeExtraIDs), func(j int) bool { return p.ModeExtraIDs[j] >= id })
+	if j >= len(p.ModeExtraIDs) || p.ModeExtraIDs[j] != id {
+		return
+	}
+	copy(p.ModeExtraIDs[j:], p.ModeExtraIDs[j+1:])
+	p.ModeExtraIDs = p.ModeExtraIDs[:len(p.ModeExtraIDs)-1]
+	copy(p.ModeExtraValues[j:], p.ModeExtraValues[j+1:])
+	p.ModeExtraValues = p.ModeExtraValues[:len(p.ModeExtraValues)-1]
+}
+
 func (p *PackedRecords) setSize(i int, value int64) {
 	if p == nil || i < 0 || i >= len(p.FRNs) {
 		return
 	}
-	if p.Sizes == nil {
+	if p.Size32 == nil {
 		if value == 0 {
 			return
 		}
-		p.Sizes = make([]int64, len(p.FRNs))
+		p.Size32 = make([]uint32, len(p.FRNs))
 	}
-	p.Sizes[i] = value
+	if value >= 0 && value < int64(packedSize64Sentinel) {
+		p.Size32[i] = uint32(value)
+		return
+	}
+	p.Size32[i] = packedSize64Sentinel
+	p.upsertSize64(i, value)
+}
+
+func (p *PackedRecords) upsertSize64(i int, value int64) {
+	id := uint32(i)
+	j := sort.Search(len(p.Size64IDs), func(j int) bool { return p.Size64IDs[j] >= id })
+	if j < len(p.Size64IDs) && p.Size64IDs[j] == id {
+		p.Size64Values[j] = value
+		return
+	}
+	p.Size64IDs = append(p.Size64IDs, 0)
+	copy(p.Size64IDs[j+1:], p.Size64IDs[j:])
+	p.Size64IDs[j] = id
+	p.Size64Values = append(p.Size64Values, 0)
+	copy(p.Size64Values[j+1:], p.Size64Values[j:])
+	p.Size64Values[j] = value
 }
 
 func (p *PackedRecords) setModUnix(i int, value int64) {
@@ -4068,7 +4899,7 @@ func (s *goSearchService) createPipeInstance() (*os.File, error) {
 	handle, err := windows.CreateNamedPipe(
 		ptr,
 		windows.PIPE_ACCESS_DUPLEX,
-		windows.PIPE_TYPE_BYTE|windows.PIPE_READMODE_BYTE|windows.PIPE_NOWAIT,
+		windows.PIPE_TYPE_BYTE|windows.PIPE_READMODE_BYTE|windows.PIPE_WAIT,
 		windows.PIPE_UNLIMITED_INSTANCES,
 		64*1024,
 		64*1024,
@@ -4078,22 +4909,21 @@ func (s *goSearchService) createPipeInstance() (*os.File, error) {
 	if err != nil {
 		return nil, err
 	}
-	for {
-		err = windows.ConnectNamedPipe(handle, nil)
-		if err == nil || err == windows.ERROR_PIPE_CONNECTED {
-			return os.NewFile(uintptr(handle), s.pipeName), nil
-		}
-		if err != windows.ERROR_PIPE_LISTENING {
-			windows.CloseHandle(handle)
-			return nil, err
-		}
+	done := make(chan struct{})
+	go func() {
 		select {
 		case <-s.stop:
-			windows.CloseHandle(handle)
-			return nil, windows.ERROR_OPERATION_ABORTED
-		case <-time.After(50 * time.Millisecond):
+			_ = windows.CloseHandle(handle)
+		case <-done:
 		}
+	}()
+	err = windows.ConnectNamedPipe(handle, nil)
+	close(done)
+	if err == nil || err == windows.ERROR_PIPE_CONNECTED {
+		return os.NewFile(uintptr(handle), s.pipeName), nil
 	}
+	windows.CloseHandle(handle)
+	return nil, err
 }
 
 func securityAttributesFromSDDL(sddl string) (*windows.SecurityAttributes, error) {
@@ -4167,8 +4997,15 @@ func handleServiceConn(conn *os.File, s *goSearchService) {
 				info.QueryExtKeys = len(vol.queryIndex.ext)
 				info.QueryDirs = len(vol.queryIndex.dirs)
 			}
+			info.NameOrderState = vol.nameOrderStateString()
+			info.NameOrderMillis = vol.nameOrderMillis.Load()
+			info.NameTrigramState = vol.nameTrigramStateString()
+			info.NameTrigramMillis = vol.nameTrigramMillis.Load()
 			info.Memory = vol.residentMemoryInfo()
 			infos = append(infos, info)
+		}
+		if !loading && serviceResidentBackgroundLoading(volumes) {
+			loading = true
 		}
 		message := ""
 		if loading {
@@ -4185,6 +5022,8 @@ func handleServiceConn(conn *os.File, s *goSearchService) {
 			return
 		}
 		opts := requestToOptionsFromService(req)
+		trace := &searchTrace{}
+		opts.Trace = trace
 		if req.RequestSeq > 0 {
 			for {
 				current := s.requestSeq.Load()
@@ -4198,14 +5037,17 @@ func handleServiceConn(conn *os.File, s *goSearchService) {
 		}
 		var matches []Entry
 		var err error
+		searchStart := time.Now()
 		if len(s.volumes) == len(s.indexes) {
 			if req.CountOnly {
 				if count, ok, countErr := countServiceVolumes(s.volumes, opts); ok {
 					s.indexMu.RUnlock()
+					searchMS := float64(time.Since(searchStart).Nanoseconds()) / 1_000_000
 					if countErr != nil {
 						_ = json.NewEncoder(conn).Encode(serviceResponse{OK: false, Message: countErr.Error()})
 					} else {
-						_ = json.NewEncoder(conn).Encode(serviceResponse{OK: true, Count: count})
+						trace.setSource("count-fast-posting", count)
+						_ = json.NewEncoder(conn).Encode(serviceResponse{OK: true, Count: count, SearchMS: searchMS, Source: trace.Source, Decline: trace.Decline, Candidates: trace.Candidates})
 					}
 					return
 				}
@@ -4214,12 +5056,13 @@ func handleServiceConn(conn *os.File, s *goSearchService) {
 		} else {
 			matches, err = searchAll(s.indexes, opts, req.CountOnly)
 		}
+		searchMS := float64(time.Since(searchStart).Nanoseconds()) / 1_000_000
 		s.indexMu.RUnlock()
 		if err != nil {
 			_ = json.NewEncoder(conn).Encode(serviceResponse{OK: false, Message: err.Error()})
 			return
 		}
-		resp := serviceResponse{OK: true, Count: len(matches)}
+		resp := serviceResponse{OK: true, Count: len(matches), SearchMS: searchMS, Source: trace.Source, Decline: trace.Decline, Candidates: trace.Candidates}
 		if !req.CountOnly {
 			resp.Results = make([]string, len(matches))
 			for i, entry := range matches {
@@ -4249,9 +5092,11 @@ func handleServiceConn(conn *os.File, s *goSearchService) {
 		if err := removeWAL(req.DB); err != nil {
 			serviceLog("wal cleanup error volume=%s db=%s err=%v", req.Volume, req.DB, err)
 		}
-		s.replaceLoadedVolumeLocked(req.DB, idx)
+		vol := s.replaceLoadedVolumeLocked(req.DB, idx)
 		s.indexMu.Unlock()
 		releaseServiceMemoryAfterSave()
+		s.startBackgroundNameOrderBuilds([]*serviceVolumeIndex{vol})
+		s.startBackgroundNameTrigramBuilds([]*serviceVolumeIndex{vol})
 		serviceLog("index-usn complete volume=%s entries=%d", req.Volume, idx.entryCount())
 		_ = json.NewEncoder(conn).Encode(serviceResponse{OK: true, Message: "indexed", Entries: idx.entryCount()})
 	case "status":
@@ -4261,18 +5106,37 @@ func handleServiceConn(conn *os.File, s *goSearchService) {
 	}
 }
 
+func serviceResidentBackgroundLoading(volumes []*serviceVolumeIndex) bool {
+	for _, vol := range volumes {
+		if vol == nil {
+			continue
+		}
+		nameOrderState := vol.nameOrderStateString()
+		if nameOrderState == "pending" || nameOrderState == "building" {
+			return true
+		}
+		nameTrigramState := vol.nameTrigramStateString()
+		if nameTrigramState == "pending" || nameTrigramState == "building" {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *goSearchService) replaceLoadedVolume(dbPath string, idx *Index) {
 	if s == nil || idx == nil || dbPath == "" {
 		return
 	}
 	s.indexMu.Lock()
-	defer s.indexMu.Unlock()
-	s.replaceLoadedVolumeLocked(dbPath, idx)
+	vol := s.replaceLoadedVolumeLocked(dbPath, idx)
+	s.indexMu.Unlock()
+	s.startBackgroundNameOrderBuilds([]*serviceVolumeIndex{vol})
+	s.startBackgroundNameTrigramBuilds([]*serviceVolumeIndex{vol})
 }
 
-func (s *goSearchService) replaceLoadedVolumeLocked(dbPath string, idx *Index) {
+func (s *goSearchService) replaceLoadedVolumeLocked(dbPath string, idx *Index) *serviceVolumeIndex {
 	if s == nil || idx == nil || dbPath == "" {
-		return
+		return nil
 	}
 	vol := newServiceVolumeIndex(dbPath, idx)
 	for i, existing := range s.volumes {
@@ -4281,11 +5145,12 @@ func (s *goSearchService) replaceLoadedVolumeLocked(dbPath string, idx *Index) {
 			if i < len(s.indexes) {
 				s.indexes[i] = existing.index
 			}
-			return
+			return existing
 		}
 	}
 	s.volumes = append(s.volumes, vol)
 	s.indexes = append(s.indexes, idx)
+	return vol
 }
 
 func replaceServiceVolumeContents(dst, src *serviceVolumeIndex) {
@@ -4300,7 +5165,8 @@ func replaceServiceVolumeContents(dst, src *serviceVolumeIndex) {
 	dst.state = src.state
 	dst.staleReason = src.staleReason
 	dst.frnToID = src.frnToID
-	dst.frnIDs = src.frnIDs
+	dst.frns = src.frns
+	dst.frnRecordIDs = src.frnRecordIDs
 	dst.children = src.children
 	dst.childOffsets = src.childOffsets
 	dst.childIDs = src.childIDs
@@ -4311,10 +5177,14 @@ func replaceServiceVolumeContents(dst, src *serviceVolumeIndex) {
 	dst.exactNames = src.exactNames
 	dst.pathCache = src.pathCache
 	dst.queryIndex = src.queryIndex
+	dst.nameTrigrams.Store(src.nameTrigramIndex())
+	dst.nameTrigramState.Store(src.nameTrigramState.Load())
+	dst.nameTrigramMillis.Store(src.nameTrigramMillis.Load())
 	dst.termCache = src.termCache
 	dst.pathTermCache = src.pathTermCache
 	dst.extCache = src.extCache
 	dst.recentIDs = src.recentIDs
+	dst.nameTrigramRecent = src.nameTrigramRecent
 	dst.recentSeq = src.recentSeq
 	dst.termSeq = src.termSeq
 	dst.pathTermSeq = src.pathTermSeq
@@ -4516,7 +5386,6 @@ func pathsToJSON(paths []string) []jsonResult {
 }
 
 func entryToJSON(entry Entry) jsonResult {
-	haveSize := entry.Size != 0
 	result := jsonResult{
 		Path:        filepath.Clean(entry.Path),
 		Name:        entry.Name,
@@ -4527,18 +5396,8 @@ func entryToJSON(entry Entry) jsonResult {
 	if result.Name == "" {
 		result.Name = filepath.Base(result.Path)
 	}
-	if info, err := os.Stat(result.Path); err == nil {
-		entry.Size = info.Size()
-		entry.ModUnix = info.ModTime().UnixNano()
-		haveSize = true
-		if info.IsDir() {
-			result.IsDir = true
-		}
-	}
-	if haveSize {
-		size := entry.Size
-		result.Size = &size
-	}
+	size := entry.Size
+	result.Size = &size
 	if entry.ModUnix != 0 {
 		result.Modified = time.Unix(0, entry.ModUnix).Format(time.RFC3339Nano)
 	}
@@ -4590,6 +5449,7 @@ func searchServiceVolumes(volumes []*serviceVolumeIndex, opts queryOptions, coun
 		matches = filterImplicitUnderExisting(matches, opts, countOnly)
 		if err == nil && len(matches) == 0 {
 			if fallback, ok := filesystemUnderFallbackSearch(opts, countOnly); ok {
+				opts.Trace.setSource("filesystem-under-fallback", len(fallback))
 				return fallback, nil
 			}
 		}
@@ -4621,6 +5481,7 @@ func searchServiceVolumes(volumes []*serviceVolumeIndex, opts queryOptions, coun
 	results = filterImplicitUnderExisting(results, opts, countOnly)
 	if len(results) == 0 {
 		if fallback, ok := filesystemUnderFallbackSearch(opts, countOnly); ok {
+			opts.Trace.setSource("filesystem-under-fallback", len(fallback))
 			return fallback, nil
 		}
 	}
@@ -4958,7 +5819,7 @@ func (idx *Index) compactRecordCount() int {
 // against those indexes rather than silently match nothing.
 func (idx *Index) compactHasSize() bool {
 	if idx.PackedRecords != nil {
-		return idx.PackedRecords.Sizes != nil
+		return idx.PackedRecords.Size32 != nil
 	}
 	for i := range idx.Records {
 		if idx.Records[i].Size != 0 {
@@ -5027,6 +5888,7 @@ func searchCompactWithCache(idx *Index, opts queryOptions, countOnly bool, pathC
 	if err := checkQueryCapabilities(pq, idx); err != nil {
 		return nil, err
 	}
+	dropSatisfiedVolumeTerms(&pq, idx.Volume)
 	limit := normalizedLimit(opts.Limit, countOnly)
 	pq.Limit = limit
 	pq.CountOnly = countOnly
@@ -5038,12 +5900,19 @@ func searchCompactWithCache(idx *Index, opts queryOptions, countOnly bool, pathC
 			usedCandidates = true
 		}
 	}
+	if !usedCandidates {
+		pq.Trace.setSource("compact-name-order-scan", compactOrderLen(order, idx.compactRecordCount()))
+	}
 	if pq.RootBias != "" || pq.CWDBias != "" {
 		order = idx.biasOrderCompact(order, firstNonEmpty(pq.CWDBias, pq.RootBias))
 	}
 	results := make([]Entry, 0, min(limit, 1024))
 	if pathCache == nil {
 		pathCache = make(map[int]string)
+	}
+	skipEntryMatches := compactCandidateCanSkipEntryMatches(pq, usedCandidates)
+	if usedCandidates && !countOnly && len(order) >= serviceTrigramParallelVerifyMinIDs {
+		return verifyCompactCandidateOrderParallel(idx, pq, order, pathCache, limit, skipEntryMatches)
 	}
 	for pos := 0; pos < compactOrderLen(order, idx.compactRecordCount()); pos++ {
 		if pos&1023 == 0 && queryCanceled(pq) {
@@ -5058,6 +5927,13 @@ func searchCompactWithCache(idx *Index, opts queryOptions, countOnly bool, pathC
 			continue
 		}
 		if !usedCandidates && pq.MatchPath && len(pq.Terms) > 0 && !idx.compactPathContainsAll(recIndex, pq.Terms) {
+			continue
+		}
+		if skipEntryMatches {
+			results = append(results, compactEntryFromRecord(idx, recIndex, rec, pathCache, false))
+			if !countOnly && len(results) >= limit {
+				break
+			}
 			continue
 		}
 		path := idx.reconstructCompactPathCached(recIndex, pathCache)
@@ -5088,6 +5964,151 @@ func searchCompactWithCache(idx *Index, opts queryOptions, countOnly bool, pathC
 		}
 	}
 	return results, nil
+}
+
+func compactCandidateCanSkipEntryMatches(pq parsedQuery, usedCandidates bool) bool {
+	if !usedCandidates {
+		return false
+	}
+	if pq.Under != "" ||
+		pq.Exists ||
+		len(pq.Dirs) > 0 ||
+		len(pq.Regexps) > 0 ||
+		len(pq.SizeFilters) > 0 ||
+		len(pq.DateFilters) > 0 ||
+		len(pq.OrGroups) > 0 ||
+		len(pq.NotGroups) > 0 {
+		return false
+	}
+	if len(pq.Terms) == 0 {
+		return true
+	}
+	return pq.MatchPath &&
+		countNonVolumeTerms(pq.Terms) == 1 &&
+		len(pq.Exts) == 0 &&
+		len(pq.Globs) == 0 &&
+		pq.Type == "" &&
+		!pq.HasModAfter &&
+		pq.CWDBias == "" &&
+		pq.RootBias == ""
+}
+
+func compactEntryFromRecord(idx *Index, recIndex int, rec CompactRecord, pathCache map[int]string, withLower bool) Entry {
+	path := idx.reconstructCompactPathCached(recIndex, pathCache)
+	entry := Entry{
+		Path:        path,
+		Name:        rec.Name,
+		Mode:        rec.Mode,
+		Size:        rec.Size,
+		ModUnix:     rec.ModUnix,
+		IndexSource: idx.Source,
+	}
+	if withLower {
+		entry.LowerPath = strings.ToLower(path)
+		entry.LowerName = idx.compactLowerNameAt(recIndex)
+	}
+	return entry
+}
+
+func verifyCompactCandidateOrderParallel(idx *Index, pq parsedQuery, order []int, pathCache map[int]string, limit int, skipEntryMatches bool) ([]Entry, error) {
+	if len(order) == 0 || limit <= 0 {
+		return nil, nil
+	}
+	workers := min(runtime.GOMAXPROCS(0), max(1, len(order)/serviceTrigramParallelVerifyMinIDs))
+	if workers <= 1 {
+		return verifyCompactCandidateOrderRange(idx, pq, order, pathCache, limit, skipEntryMatches)
+	}
+	parts := make([][]Entry, workers)
+	var canceled atomic.Bool
+	var wg sync.WaitGroup
+	for worker := 0; worker < workers; worker++ {
+		start := worker * len(order) / workers
+		end := (worker + 1) * len(order) / workers
+		wg.Add(1)
+		go func(worker, start, end int) {
+			defer wg.Done()
+			localCache := make(map[int]string)
+			local := make([]Entry, 0, min(limit, end-start))
+			for pos := start; pos < end; pos++ {
+				if pos&1023 == 0 && queryCanceled(pq) {
+					canceled.Store(true)
+					return
+				}
+				if entry, ok := compactCandidateEntryIfMatch(idx, pq, order[pos], localCache, true, skipEntryMatches); ok {
+					local = append(local, entry)
+					if len(local) >= limit {
+						break
+					}
+				}
+			}
+			parts[worker] = local
+		}(worker, start, end)
+	}
+	wg.Wait()
+	if canceled.Load() {
+		return nil, errQueryCanceled
+	}
+	out := make([]Entry, 0, min(limit, 1024))
+	for _, part := range parts {
+		for _, entry := range part {
+			out = append(out, entry)
+			if len(out) >= limit {
+				return out, nil
+			}
+		}
+	}
+	return out, nil
+}
+
+func verifyCompactCandidateOrderRange(idx *Index, pq parsedQuery, order []int, pathCache map[int]string, limit int, skipEntryMatches bool) ([]Entry, error) {
+	out := make([]Entry, 0, min(limit, 1024))
+	for pos, recIndex := range order {
+		if pos&1023 == 0 && queryCanceled(pq) {
+			return nil, errQueryCanceled
+		}
+		if entry, ok := compactCandidateEntryIfMatch(idx, pq, recIndex, pathCache, true, skipEntryMatches); ok {
+			out = append(out, entry)
+			if len(out) >= limit {
+				return out, nil
+			}
+		}
+	}
+	return out, nil
+}
+
+func compactCandidateEntryIfMatch(idx *Index, pq parsedQuery, recIndex int, pathCache map[int]string, usedCandidates bool, skipEntryMatches bool) (Entry, bool) {
+	rec := idx.compactRecord(recIndex)
+	if rec.Deleted {
+		return Entry{}, false
+	}
+	if !compactRecordPrecheck(rec, pq, pq.MatchPath) {
+		return Entry{}, false
+	}
+	if !usedCandidates && pq.MatchPath && len(pq.Terms) > 0 && !idx.compactPathContainsAll(recIndex, pq.Terms) {
+		return Entry{}, false
+	}
+	if skipEntryMatches {
+		return compactEntryFromRecord(idx, recIndex, rec, pathCache, false), true
+	}
+	entry := compactEntryFromRecord(idx, recIndex, rec, pathCache, true)
+	if !entryMatches(entry, pq, pq.MatchPath) {
+		return Entry{}, false
+	}
+	return entry, true
+}
+
+func dropSatisfiedVolumeTerms(pq *parsedQuery, volume string) {
+	if pq == nil || !pq.MatchPath || volume == "" || len(pq.Terms) == 0 {
+		return
+	}
+	out := pq.Terms[:0]
+	for _, term := range pq.Terms {
+		if isVolumeQueryTerm(term) && strings.EqualFold(term, volume) {
+			continue
+		}
+		out = append(out, term)
+	}
+	pq.Terms = out
 }
 
 var errQueryCanceled = errors.New("query superseded")
@@ -5169,43 +6190,116 @@ func compactRecordPrecheck(rec CompactRecord, pq parsedQuery, matchPath bool) bo
 }
 
 func (vol *serviceVolumeIndex) nameTermCandidates(pq parsedQuery) ([]int, bool) {
+	if pq.MatchPath {
+		if candidates, ok := vol.extensionShapedPathTopCandidates(pq); ok {
+			pq.Trace.setSource("path-extension-top", len(candidates))
+			return candidates, true
+		}
+		if candidates, ok := vol.componentRootTopCandidates(pq); ok {
+			pq.Trace.setSource("path-component-root-top", len(candidates))
+			return candidates, true
+		}
+		if candidates, ok := vol.nameTrigramCandidates(pq); ok {
+			if compactCandidateCanSkipEntryMatches(pq, true) && pq.Limit > 0 {
+				candidates = topCandidateIDsByRank(candidates, pq.Limit, vol.index, vol.nameOrderRanks())
+			} else {
+				sortCandidateIDs(candidates, pq, vol.index, vol.nameOrderRanks())
+			}
+			pq.Trace.setSource("path-component-trigram", len(candidates))
+			return candidates, true
+		}
+		if candidates, ok := vol.nameTrigramPathNameTopCandidates(pq); ok {
+			pq.Trace.setSource("path-name-trigram-top", len(candidates))
+			return candidates, true
+		}
+		if candidates, ok := vol.limitedPathTermCandidates(pq); ok {
+			pq.Trace.setSource("path-term-limited", len(candidates))
+			return candidates, true
+		}
+		if candidates, ok := vol.limitedDottedPathScanCandidates(pq); ok {
+			pq.Trace.setSource("path-dotted-limited-scan", len(candidates))
+			return candidates, true
+		}
+	} else {
+		if candidates, ok := vol.nameTrigramCandidates(pq); ok {
+			sortCandidateIDs(candidates, pq, vol.index, vol.nameOrderRanks())
+			pq.Trace.setSource("name-trigram", len(candidates))
+			return candidates, true
+		}
+	}
 	if candidates, ok := vol.limitedSingleTermCandidates(pq); ok {
+		pq.Trace.setSource("limited-single-term", len(candidates))
 		return candidates, true
+	}
+	if !pq.MatchPath {
+		if candidates, ok := vol.plannedCandidates(pq); ok {
+			pq.Trace.setSource("planned", len(candidates))
+			return candidates, true
+		}
+	}
+	if pq.MatchPath {
+		if candidates, ok := vol.nameTrigramCandidates(pq); ok {
+			if compactCandidateCanSkipEntryMatches(pq, true) && pq.Limit > 0 {
+				candidates = topCandidateIDsByRank(candidates, pq.Limit, vol.index, vol.nameOrderRanks())
+			} else {
+				sortCandidateIDs(candidates, pq, vol.index, vol.nameOrderRanks())
+			}
+			pq.Trace.setSource("path-component-trigram", len(candidates))
+			return candidates, true
+		}
 	}
 	if candidates, ok := vol.plannedCandidates(pq); ok {
+		pq.Trace.setSource("planned", len(candidates))
 		return candidates, true
 	}
+	if pq.MatchPath {
+		if candidates, ok := vol.componentTrigramCandidates(pq); ok {
+			pq.Trace.setSource("component-trigram", len(candidates))
+			return candidates, true
+		}
+	}
 	if candidates, ok := vol.underCandidates(pq); ok {
+		pq.Trace.setSource("under", len(candidates))
 		return candidates, true
 	}
 	if candidates, ok := vol.broadPathScanCandidates(pq); ok {
+		pq.Trace.setSource("broad-path-scan", len(candidates))
 		return candidates, true
 	}
 	if candidates, ok := vol.plannerCandidates(pq); ok {
+		pq.Trace.setSource("legacy-planner", len(candidates))
 		return candidates, true
 	}
 	if candidates, ok := vol.pathDirFilterCandidates(pq); ok {
+		pq.Trace.setSource("path-dir-filter", len(candidates))
 		return candidates, true
 	}
 	if candidates, ok := vol.filterCandidates(pq); ok {
+		pq.Trace.setSource("filter", len(candidates))
 		return candidates, true
 	}
 	if candidates, ok := vol.pathRootLimitedCandidates(pq); ok {
+		pq.Trace.setSource("path-root-limited", len(candidates))
 		return candidates, true
 	}
 	if candidates, ok := vol.pathTermSubtreeCandidates(pq); ok {
+		pq.Trace.setSource("path-term-subtree", len(candidates))
 		return candidates, true
 	}
 	if candidates, ok := vol.regexLiteralCandidates(pq); ok {
+		pq.Trace.setSource("regex-literal", len(candidates))
 		return candidates, true
 	}
 	if candidates, ok := vol.exactDirCandidates(pq); ok {
+		pq.Trace.setSource("exact-dir", len(candidates))
 		return candidates, true
 	}
 	if candidates, ok := vol.exactNameCandidates(pq); ok {
+		pq.Trace.setSource("exact-name", len(candidates))
 		return candidates, true
 	}
 	if candidates, ok := vol.namePrefixCandidates(pq); ok {
+		pq.Trace.setSource("name-prefix", len(candidates))
 		return candidates, true
 	}
 	if vol == nil || vol.index == nil || len(pq.Terms) == 0 || len(pq.Dirs) > 0 || len(pq.Regexps) > 0 || pq.Under != "" {
@@ -5213,9 +6307,12 @@ func (vol *serviceVolumeIndex) nameTermCandidates(pq parsedQuery) ([]int, bool) 
 	}
 	if len(pq.Terms) > 1 && !pq.CaseSensitive && !pq.MatchPath {
 		if candidates, ok := vol.cachedMultiNameTermCandidates(pq.Terms); ok {
+			pq.Trace.setSource("cached-multi-name-term", len(candidates))
 			return candidates, true
 		}
-		return vol.multiNameTermCandidates(pq.Terms), true
+		candidates := vol.multiNameTermCandidates(pq.Terms)
+		pq.Trace.setSource("multi-name-term", len(candidates))
+		return candidates, true
 	}
 	lists := make([][]int, 0, len(pq.Terms))
 	for _, term := range pq.Terms {
@@ -5233,7 +6330,526 @@ func (vol *serviceVolumeIndex) nameTermCandidates(pq parsedQuery) ([]int, bool) 
 			break
 		}
 	}
+	pq.Trace.setSource("name-term-posting", len(candidates))
 	return candidates, true
+}
+
+func (vol *serviceVolumeIndex) componentRootTopCandidates(pq parsedQuery) ([]int, bool) {
+	if vol == nil || vol.index == nil || !pq.MatchPath || pq.CountOnly || pq.Limit <= 0 ||
+		pq.CaseSensitive || pq.Under != "" || pq.Type != "" || len(pq.Exts) > 0 ||
+		len(pq.Globs) > 0 || len(pq.Dirs) > 0 || len(pq.Regexps) > 0 ||
+		len(pq.SizeFilters) > 0 || len(pq.DateFilters) > 0 ||
+		len(pq.OrGroups) > 0 || len(pq.NotGroups) > 0 || pq.HasModAfter || pq.Exists ||
+		pq.CWDBias != "" || pq.RootBias != "" || countNonVolumeTerms(pq.Terms) != 1 {
+		return nil, false
+	}
+	term := ""
+	for _, candidate := range pq.Terms {
+		if isVolumeQueryTerm(candidate) {
+			continue
+		}
+		term = candidate
+		break
+	}
+	if term == "" || strings.ContainsAny(term, `\/*?[]:._-`) ||
+		len(vol.subtreeStart) == 0 || len(vol.subtreeEnd) == 0 || len(vol.subtreeOrder) == 0 {
+		return nil, false
+	}
+	roots := vol.pathComponentRootIDs(term)
+	if len(roots) == 0 {
+		return nil, false
+	}
+	largeRoots := roots[:0]
+	for _, rootID := range roots {
+		if vol.estimatedDescendantOrSelfCount(rootID) >= 100_000 {
+			largeRoots = append(largeRoots, rootID)
+		}
+	}
+	roots = largeRoots
+	if len(roots) == 0 {
+		return nil, false
+	}
+	recordCount := vol.index.compactRecordCount()
+	out := make([]int, 0, pq.Limit)
+	seen := make(map[int]struct{}, pq.Limit)
+	add := func(id int) bool {
+		if id < 0 || id >= recordCount {
+			return false
+		}
+		if _, ok := seen[id]; ok {
+			return false
+		}
+		rec := vol.index.compactRecord(id)
+		if rec.Deleted {
+			return false
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+		return len(out) >= pq.Limit
+	}
+	for _, rootID := range roots {
+		if add(rootID) {
+			return out, true
+		}
+		if rootID < 0 || rootID >= len(vol.subtreeStart) || rootID >= len(vol.subtreeEnd) {
+			continue
+		}
+		start, end := vol.subtreeStart[rootID], vol.subtreeEnd[rootID]
+		if start == ^uint32(0) || start >= end || int(end) > len(vol.subtreeOrder) {
+			continue
+		}
+		for pos := start; pos < end; pos++ {
+			if add(int(vol.subtreeOrder[pos])) {
+				return out, true
+			}
+		}
+	}
+	return out, len(out) > 0
+}
+
+func (vol *serviceVolumeIndex) nameTrigramCandidates(pq parsedQuery) ([]int, bool) {
+	if pq.MatchPath {
+		return vol.componentTrigramCandidates(pq)
+	}
+	return vol.filenameTrigramCandidates(pq)
+}
+
+func (vol *serviceVolumeIndex) filenameTrigramCandidates(pq parsedQuery) ([]int, bool) {
+	trigrams := vol.nameTrigramIndex()
+	if vol == nil || vol.index == nil || trigrams == nil || pq.CaseSensitive ||
+		pq.MatchPath || len(pq.Terms) == 0 || pq.Under != "" || pq.Type != "" ||
+		len(pq.Exts) > 0 || len(pq.Globs) > 0 || len(pq.Dirs) > 0 || len(pq.Regexps) > 0 ||
+		len(pq.OrGroups) > 0 || len(pq.NotGroups) > 0 || pq.HasModAfter || pq.Exists ||
+		pq.CWDBias != "" || pq.RootBias != "" {
+		return nil, false
+	}
+	bestTerm := ""
+	bestCount := serviceNameTrigramCandidateMaxIDs + 1
+	missingTerm := ""
+	for _, term := range pq.Terms {
+		if len(term) < 3 {
+			continue
+		}
+		count, ok := trigrams.postingCount(term)
+		if !ok {
+			continue
+		}
+		if count == 0 {
+			missingTerm = term
+			continue
+		}
+		if count <= serviceNameTrigramCandidateMaxIDs && count < bestCount {
+			bestTerm = term
+			bestCount = count
+		}
+	}
+	if bestTerm == "" {
+		if missingTerm != "" {
+			return vol.nameTrigramRecentMatches(missingTerm), true
+		}
+		return nil, false
+	}
+	candidates, ok := vol.nameTrigramNameTermPosting(bestTerm)
+	if !ok {
+		return nil, false
+	}
+	if len(candidates) > serviceNameTrigramCandidateMaxIDs {
+		return nil, false
+	}
+	return candidates, true
+}
+
+func (vol *serviceVolumeIndex) componentTrigramCandidates(pq parsedQuery) ([]int, bool) {
+	trigrams := vol.nameTrigramIndex()
+	if vol == nil || vol.index == nil {
+		pq.Trace.setDecline("component-trigram:no-volume")
+		return nil, false
+	}
+	if trigrams == nil {
+		pq.Trace.setDecline("component-trigram:not-ready")
+		return nil, false
+	}
+	if pq.CaseSensitive || !pq.MatchPath || len(pq.Terms) == 0 || pq.Under != "" || pq.Type != "" ||
+		len(pq.Exts) > 0 || len(pq.Globs) > 0 || len(pq.Dirs) > 0 || len(pq.Regexps) > 0 ||
+		len(pq.OrGroups) > 0 || len(pq.NotGroups) > 0 || pq.HasModAfter || pq.Exists ||
+		pq.CWDBias != "" || pq.RootBias != "" {
+		pq.Trace.setDecline("component-trigram:unsupported-query")
+		return nil, false
+	}
+	bestTerm := ""
+	bestCount := serviceComponentTrigramCandidateMaxIDs + 1
+	missingTerm := ""
+	for _, term := range pq.Terms {
+		if isVolumeQueryTerm(term) {
+			continue
+		}
+		if len(term) < 3 {
+			continue
+		}
+		count, ok := trigrams.postingCount(term)
+		if !ok {
+			pq.Trace.setDecline("component-trigram:no-posting-count")
+			continue
+		}
+		if count == 0 {
+			missingTerm = term
+			continue
+		}
+		if count > serviceComponentTrigramCandidateMaxIDs {
+			if len(term) < 6 {
+				continue
+			}
+			count = serviceComponentTrigramCandidateMaxIDs
+		}
+		if count < bestCount {
+			bestTerm = term
+			bestCount = count
+		}
+	}
+	if bestTerm == "" {
+		if missingTerm != "" {
+			candidates, ok := vol.nameTrigramPathTermPosting(missingTerm)
+			if !ok {
+				pq.Trace.setDecline("component-trigram:missing-term-posting-declined")
+				return nil, false
+			}
+			if len(candidates) > serviceComponentTrigramExpansionMaxIDs {
+				pq.Trace.setDecline("component-trigram:missing-term-expanded-too-large")
+				return nil, false
+			}
+			return candidates, true
+		}
+		pq.Trace.setDecline("component-trigram:no-selective-term")
+		return nil, false
+	}
+	candidates, ok := vol.nameTrigramPathTermPosting(bestTerm)
+	if !ok {
+		pq.Trace.setDecline("component-trigram:path-posting-declined")
+		return nil, false
+	}
+	if len(candidates) > serviceComponentTrigramExpansionMaxIDs {
+		pq.Trace.setDecline("component-trigram:expanded-too-large")
+		return nil, false
+	}
+	return candidates, true
+}
+
+func (vol *serviceVolumeIndex) nameTrigramPathNameTopCandidates(pq parsedQuery) ([]int, bool) {
+	if vol == nil || vol.index == nil || pq.CaseSensitive ||
+		!pq.MatchPath || pq.CountOnly || pq.Limit <= 0 || len(pq.Terms) == 0 ||
+		pq.Under != "" || pq.Type != "" || len(pq.Exts) > 0 || len(pq.Globs) > 0 ||
+		len(pq.Dirs) > 0 || len(pq.Regexps) > 0 || len(pq.OrGroups) > 0 ||
+		len(pq.NotGroups) > 0 || pq.HasModAfter || pq.Exists ||
+		pq.CWDBias != "" || pq.RootBias != "" || countNonVolumeTerms(pq.Terms) != 1 {
+		pq.Trace.replaceDecline("path-name-trigram-top:unsupported-query")
+		return nil, false
+	}
+	term := ""
+	for _, candidate := range pq.Terms {
+		if isVolumeQueryTerm(candidate) {
+			continue
+		}
+		term = candidate
+		break
+	}
+	if len(term) < 6 || strings.ContainsAny(term, `\/*?[]:`) {
+		pq.Trace.replaceDecline("path-name-trigram-top:bad-term")
+		return nil, false
+	}
+	nameMatches, ok := vol.nameTrigramNameTermPostingLimited(term, servicePathNameTrigramCandidateMaxIDs)
+	if !ok || len(nameMatches) == 0 {
+		pq.Trace.replaceDecline("path-name-trigram-top:name-posting-declined")
+		return nil, false
+	}
+	direct := make([]int, 0, len(nameMatches))
+	seen := make(map[int]struct{}, len(nameMatches)+pq.Limit)
+	for _, id := range nameMatches {
+		if id < 0 || id >= vol.index.compactRecordCount() {
+			continue
+		}
+		rec := vol.index.compactRecord(id)
+		if rec.Deleted {
+			continue
+		}
+		if _, exists := seen[id]; !exists {
+			seen[id] = struct{}{}
+			direct = append(direct, id)
+		}
+		if rec.Mode&uint32(os.ModeDir) != 0 && vol.estimatedDescendantOrSelfCount(id) > serviceComponentTrigramExpansionMaxIDs {
+			direct = vol.appendTopSubtreeCandidatesByRank(direct, seen, id, pq.Limit*4)
+		}
+	}
+	if len(direct) < pq.Limit {
+		pq.Trace.replaceDecline("path-name-trigram-top:too-few-direct")
+		return nil, false
+	}
+	return topCandidateIDsByRank(direct, pq.Limit, vol.index, vol.nameOrderRanks()), true
+}
+
+func (vol *serviceVolumeIndex) appendTopSubtreeCandidatesByRank(out []int, seen map[int]struct{}, rootID int, limit int) []int {
+	if vol == nil || vol.index == nil || limit <= 0 || rootID < 0 ||
+		rootID >= len(vol.subtreeStart) || rootID >= len(vol.subtreeEnd) ||
+		len(vol.subtreeOrder) == 0 {
+		return out
+	}
+	start, end := vol.subtreeStart[rootID], vol.subtreeEnd[rootID]
+	if start == ^uint32(0) || start >= end {
+		return out
+	}
+	recordCount := vol.index.compactRecordCount()
+	orderLen := recordCount
+	useResidentOrder := vol.queryIndex != nil && len(vol.queryIndex.nameOrder) > 0
+	if useResidentOrder {
+		orderLen = len(vol.queryIndex.nameOrder)
+	} else {
+		orderLen = compactOrderLen(vol.index.CompactNameOrder, recordCount)
+	}
+	for pos := 0; pos < orderLen && len(out) < limit; pos++ {
+		id := pos
+		if useResidentOrder {
+			id = int(vol.queryIndex.nameOrder[pos])
+		} else {
+			id = compactOrderAt(vol.index.CompactNameOrder, pos)
+		}
+		if id < 0 || id >= recordCount || id >= len(vol.subtreeStart) {
+			continue
+		}
+		treePos := vol.subtreeStart[id]
+		if treePos < start || treePos >= end {
+			continue
+		}
+		if _, exists := seen[id]; exists {
+			continue
+		}
+		rec := vol.index.compactRecord(id)
+		if rec.Deleted {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	return out
+}
+
+func (vol *serviceVolumeIndex) nameTrigramNameTermPosting(term string) ([]int, bool) {
+	return vol.nameTrigramNameTermPostingLimited(term, serviceNameTrigramCandidateMaxIDs)
+}
+
+func (vol *serviceVolumeIndex) nameTrigramNameTermPostingLimited(term string, maxIDs int) ([]int, bool) {
+	trigrams := vol.nameTrigramIndex()
+	if vol == nil || trigrams == nil {
+		return nil, false
+	}
+	cacheKey := "\x00trigramname:" + term
+	vol.termMu.Lock()
+	if vol.termCache != nil {
+		if list, ok := vol.termCache[cacheKey]; ok {
+			seq := vol.termSeq[cacheKey]
+			vol.termMu.Unlock()
+			return vol.withRecentCandidates(list, seq, func(rec CompactRecord) bool {
+				id, ok := vol.idForFRN(rec.FRN)
+				return ok && vol.nameTrigramCandidateMatches(id, term)
+			}), true
+		}
+	}
+	vol.termMu.Unlock()
+	ids, ok, missing := trigrams.selectiveCandidateIDs(term, maxIDs)
+	if len(term) >= 6 {
+		ids, ok, missing = trigrams.selectiveIntersectCandidateIDs(term, maxIDs)
+	}
+	if !ok {
+		return nil, false
+	}
+	if missing {
+		return vol.nameTrigramRecentMatches(term), true
+	}
+	out := vol.verifyNameTrigramCandidateIDs(ids, term)
+	out = uniqueSortedInts(out)
+	vol.cacheNamePosting(cacheKey, out)
+	return vol.withNameTrigramRecentCandidates(out, term), true
+}
+
+func (vol *serviceVolumeIndex) nameTrigramRecentMatches(term string) []int {
+	if vol == nil || len(vol.nameTrigramRecent) == 0 {
+		return nil
+	}
+	out := make([]int, 0, min(len(vol.nameTrigramRecent), 64))
+	for id := range vol.nameTrigramRecent {
+		if vol.nameTrigramCandidateMatches(id, term) {
+			out = append(out, id)
+		}
+	}
+	sort.Ints(out)
+	return out
+}
+
+func (vol *serviceVolumeIndex) withNameTrigramRecentCandidates(base []int, term string) []int {
+	if vol == nil || len(vol.nameTrigramRecent) == 0 {
+		return base
+	}
+	out := append([]int(nil), base...)
+	seen := make(map[int]struct{}, len(out))
+	for _, id := range out {
+		seen[id] = struct{}{}
+	}
+	for id := range vol.nameTrigramRecent {
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		if vol.nameTrigramCandidateMatches(id, term) {
+			out = append(out, id)
+		}
+	}
+	sort.Ints(out)
+	return out
+}
+
+func (vol *serviceVolumeIndex) verifyNameTrigramCandidateIDs(ids []int, term string) []int {
+	if len(ids) == 0 || vol == nil || vol.index == nil {
+		return nil
+	}
+	if len(ids) < serviceTrigramParallelVerifyMinIDs {
+		out := make([]int, 0, len(ids))
+		for _, id := range ids {
+			if vol.nameTrigramCandidateMatches(id, term) {
+				out = append(out, id)
+			}
+		}
+		return out
+	}
+	workers := min(runtime.GOMAXPROCS(0), max(1, len(ids)/serviceTrigramParallelVerifyMinIDs))
+	if workers <= 1 {
+		out := make([]int, 0, len(ids))
+		for _, id := range ids {
+			if vol.nameTrigramCandidateMatches(id, term) {
+				out = append(out, id)
+			}
+		}
+		return out
+	}
+	parts := make([][]int, workers)
+	var wg sync.WaitGroup
+	for worker := 0; worker < workers; worker++ {
+		start := worker * len(ids) / workers
+		end := (worker + 1) * len(ids) / workers
+		wg.Add(1)
+		go func(worker, start, end int) {
+			defer wg.Done()
+			local := make([]int, 0, end-start)
+			for _, id := range ids[start:end] {
+				if vol.nameTrigramCandidateMatches(id, term) {
+					local = append(local, id)
+				}
+			}
+			parts[worker] = local
+		}(worker, start, end)
+	}
+	wg.Wait()
+	total := 0
+	for _, part := range parts {
+		total += len(part)
+	}
+	out := make([]int, 0, total)
+	for _, part := range parts {
+		out = append(out, part...)
+	}
+	return out
+}
+
+func (vol *serviceVolumeIndex) nameTrigramCandidateMatches(id int, term string) bool {
+	if id < 0 || id >= vol.index.compactRecordCount() {
+		return false
+	}
+	rec := vol.index.compactRecord(id)
+	if rec.Deleted {
+		return false
+	}
+	return strings.Contains(vol.index.compactLowerNameAt(id), term)
+}
+
+func (vol *serviceVolumeIndex) nameTrigramPathTermPosting(term string) ([]int, bool) {
+	cacheKey := "\x00trigrampath:" + term
+	vol.termMu.Lock()
+	if vol.pathTermCache != nil {
+		if list, ok := vol.pathTermCache[cacheKey]; ok {
+			seq := vol.pathTermSeq[cacheKey]
+			vol.termMu.Unlock()
+			return vol.withRecentCandidates(list, seq, func(rec CompactRecord) bool {
+				id, ok := vol.idForFRN(rec.FRN)
+				return ok && vol.index.compactPathContainsTerm(id, term)
+			}), true
+		}
+	}
+	vol.termMu.Unlock()
+	ids, ok := vol.nameTrigramNameTermPostingLimited(term, servicePathNameTrigramCandidateMaxIDs)
+	if !ok {
+		return nil, false
+	}
+	seen := make(map[int]struct{}, len(ids))
+	out := make([]int, 0, len(ids))
+	estimated := 0
+	for _, id := range ids {
+		if id < 0 || id >= vol.index.compactRecordCount() {
+			continue
+		}
+		rec := vol.index.compactRecord(id)
+		if rec.Deleted {
+			continue
+		}
+		if rec.Mode&uint32(os.ModeDir) == 0 {
+			estimated++
+		} else {
+			estimated += vol.estimatedDescendantOrSelfCount(id)
+		}
+		if estimated > serviceComponentTrigramExpansionMaxIDs {
+			return nil, false
+		}
+	}
+	for _, id := range ids {
+		if id < 0 || id >= vol.index.compactRecordCount() {
+			continue
+		}
+		if _, exists := seen[id]; !exists {
+			seen[id] = struct{}{}
+			out = append(out, id)
+		}
+		rec := vol.index.compactRecord(id)
+		if rec.Deleted || rec.Mode&uint32(os.ModeDir) == 0 {
+			continue
+		}
+		for _, childID := range vol.underDescendants(id) {
+			child := int(childID)
+			if _, exists := seen[child]; exists {
+				continue
+			}
+			seen[child] = struct{}{}
+			out = append(out, child)
+			if len(out) > serviceComponentTrigramExpansionMaxIDs {
+				return nil, false
+			}
+		}
+	}
+	sort.Ints(out)
+	vol.cachePathPosting(cacheKey, out)
+	return out, true
+}
+
+func (vol *serviceVolumeIndex) estimatedDescendantOrSelfCount(rootID int) int {
+	if vol == nil || vol.index == nil || rootID < 0 || rootID >= vol.index.compactRecordCount() {
+		return 0
+	}
+	if rootID < len(vol.subtreeStart) && rootID < len(vol.subtreeEnd) && len(vol.subtreeOrder) > 0 {
+		start, end := vol.subtreeStart[rootID], vol.subtreeEnd[rootID]
+		if start != ^uint32(0) && start <= end && int(end) <= len(vol.subtreeOrder) {
+			return int(end - start)
+		}
+	}
+	if vol.underCache != nil {
+		if cached, ok := vol.underCache[rootID]; ok {
+			return len(cached)
+		}
+	}
+	return len(vol.underDescendantsLimited(rootID, serviceComponentTrigramExpansionMaxIDs+1))
 }
 
 func (vol *serviceVolumeIndex) limitedSingleTermCandidates(pq parsedQuery) ([]int, bool) {
@@ -5274,28 +6890,50 @@ func (vol *serviceVolumeIndex) scanPathTermLimited(pq parsedQuery, term string, 
 	})
 }
 
+func (vol *serviceVolumeIndex) scanPathTermPrefixLimited(pq parsedQuery, term string, limit int, maxScan int) []int {
+	if term == "" || limit <= 0 || maxScan <= 0 {
+		return nil
+	}
+	orderLen := vol.index.compactRecordCount()
+	if vol.queryIndex != nil && len(vol.queryIndex.nameOrder) > 0 {
+		orderLen = len(vol.queryIndex.nameOrder)
+	} else {
+		orderLen = compactOrderLen(vol.index.CompactNameOrder, vol.index.compactRecordCount())
+	}
+	end := min(orderLen, maxScan)
+	return vol.scanOrderedLimitedRange(pq, 0, end, limit, func(i int) bool {
+		return vol.index.compactPathContainsTerm(i, term)
+	})
+}
+
 func (vol *serviceVolumeIndex) scanOrderedLimited(pq parsedQuery, limit int, match func(int) bool) []int {
 	recordCount := vol.index.compactRecordCount()
-	order := vol.index.CompactNameOrder
-	prefixEnd := min(recordCount, 4_096)
-	out := vol.scanOrderedLimitedRange(pq, order, 0, prefixEnd, limit, match)
-	if len(out) >= limit || prefixEnd >= recordCount {
+	orderLen := recordCount
+	useResidentOrder := vol.queryIndex != nil && len(vol.queryIndex.nameOrder) > 0
+	if useResidentOrder {
+		orderLen = len(vol.queryIndex.nameOrder)
+	} else {
+		orderLen = compactOrderLen(vol.index.CompactNameOrder, recordCount)
+	}
+	prefixEnd := min(orderLen, 4_096)
+	out := vol.scanOrderedLimitedRange(pq, 0, prefixEnd, limit, match)
+	if len(out) >= limit || prefixEnd >= orderLen {
 		return out
 	}
-	workers := min(runtime.GOMAXPROCS(0), max(1, recordCount/25_000))
-	if workers <= 1 || recordCount < 50_000 {
-		tail := vol.scanOrderedLimitedRange(pq, order, prefixEnd, recordCount, limit-len(out), match)
+	workers := min(runtime.GOMAXPROCS(0), max(1, orderLen/25_000))
+	if workers <= 1 || orderLen < 50_000 {
+		tail := vol.scanOrderedLimitedRange(pq, prefixEnd, orderLen, limit-len(out), match)
 		return append(out, tail...)
 	}
 	parts := make([][]int, workers)
 	var wg sync.WaitGroup
 	for worker := 0; worker < workers; worker++ {
-		start := prefixEnd + worker*(recordCount-prefixEnd)/workers
-		end := prefixEnd + (worker+1)*(recordCount-prefixEnd)/workers
+		start := prefixEnd + worker*(orderLen-prefixEnd)/workers
+		end := prefixEnd + (worker+1)*(orderLen-prefixEnd)/workers
 		wg.Add(1)
 		go func(worker, start, end int) {
 			defer wg.Done()
-			parts[worker] = vol.scanOrderedLimitedRange(pq, order, start, end, limit-len(out), match)
+			parts[worker] = vol.scanOrderedLimitedRange(pq, start, end, limit-len(out), match)
 		}(worker, start, end)
 	}
 	wg.Wait()
@@ -5310,13 +6948,23 @@ func (vol *serviceVolumeIndex) scanOrderedLimited(pq parsedQuery, limit int, mat
 	return out
 }
 
-func (vol *serviceVolumeIndex) scanOrderedLimitedRange(pq parsedQuery, order []int, start, end, limit int, match func(int) bool) []int {
+func (vol *serviceVolumeIndex) scanOrderedLimitedRange(pq parsedQuery, start, end, limit int, match func(int) bool) []int {
 	out := make([]int, 0, limit)
+	recordCount := vol.index.compactRecordCount()
+	useResidentOrder := vol.queryIndex != nil && len(vol.queryIndex.nameOrder) > 0
 	for pos := start; pos < end; pos++ {
 		if pos&4095 == 0 && queryCanceled(pq) {
 			return out
 		}
-		i := compactOrderAt(order, pos)
+		i := pos
+		if useResidentOrder {
+			i = int(vol.queryIndex.nameOrder[pos])
+		} else {
+			i = compactOrderAt(vol.index.CompactNameOrder, pos)
+		}
+		if i < 0 || i >= recordCount {
+			continue
+		}
 		rec := vol.index.compactRecord(i)
 		if rec.Deleted {
 			continue
@@ -5582,7 +7230,7 @@ func (vol *serviceVolumeIndex) underCandidates(pq parsedQuery) ([]int, bool) {
 			}
 		}
 	}
-	sortCandidateIDs(out, pq, vol.index)
+	sortCandidateIDs(out, pq, vol.index, vol.nameOrderRanks())
 	return out, true
 }
 
@@ -6141,34 +7789,185 @@ func (vol *serviceVolumeIndex) underPrefilter(pq parsedQuery) map[int]struct{} {
 	return out
 }
 
-func sortCandidateIDs(ids []int, pq parsedQuery, idx *Index) {
+func sortCandidateIDs(ids []int, pq parsedQuery, idx *Index, cachedRanks []uint32) {
 	if idx == nil {
 		sort.Ints(ids)
 		return
 	}
-	recordCount := idx.compactRecordCount()
-	ranks := make([]int, recordCount)
-	for i := range ranks {
-		ranks[i] = i
-	}
-	order := idx.CompactNameOrder
-	for pos := 0; pos < compactOrderLen(order, recordCount); pos++ {
-		id := compactOrderAt(order, pos)
-		if id >= 0 && id < recordCount {
-			ranks[id] = pos
-		}
-	}
+	rankOf := candidateRanker(idx, cachedRanks)
 	sort.SliceStable(ids, func(i, j int) bool {
-		a, b := ids[i], ids[j]
-		ar, br := recordCount+a, recordCount+b
-		if a >= 0 && a < recordCount {
-			ar = ranks[a]
-		}
-		if b >= 0 && b < recordCount {
-			br = ranks[b]
-		}
-		return ar < br
+		return rankOf(ids[i]) < rankOf(ids[j])
 	})
+}
+
+func topCandidateIDsByRank(ids []int, limit int, idx *Index, cachedRanks []uint32) []int {
+	if limit <= 0 || len(ids) <= limit {
+		sortCandidateIDs(ids, parsedQuery{}, idx, cachedRanks)
+		return ids
+	}
+	if idx == nil {
+		sort.Ints(ids)
+		return ids[:limit]
+	}
+	rankOf := candidateRanker(idx, cachedRanks)
+	if len(ids) >= serviceRankParallelMinIDs && limit <= 256 && runtime.GOMAXPROCS(0) > 1 {
+		return topCandidateIDsByRankParallel(ids, limit, rankOf)
+	}
+	h := make(candidateRankMaxHeap, 0, limit)
+	for _, id := range ids {
+		item := candidateRankItem{id: id, rank: rankOf(id)}
+		if len(h) < limit {
+			heap.Push(&h, item)
+			continue
+		}
+		if item.rank < h[0].rank {
+			h[0] = item
+			heap.Fix(&h, 0)
+		}
+	}
+	out := make([]int, len(h))
+	for i := range h {
+		out[i] = h[i].id
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return rankOf(out[i]) < rankOf(out[j])
+	})
+	return out
+}
+
+func topCandidateIDsByRankParallel(ids []int, limit int, rankOf func(int) int) []int {
+	workers := min(runtime.GOMAXPROCS(0), max(2, len(ids)/serviceRankParallelMinIDs))
+	if workers <= 1 {
+		return topCandidateIDsByRankSerial(ids, limit, rankOf)
+	}
+	chunk := (len(ids) + workers - 1) / workers
+	partials := make([][]candidateRankItem, workers)
+	var wg sync.WaitGroup
+	for worker := 0; worker < workers; worker++ {
+		start := worker * chunk
+		end := min(len(ids), start+chunk)
+		if start >= end {
+			partials = partials[:worker]
+			break
+		}
+		wg.Add(1)
+		go func(worker, start, end int) {
+			defer wg.Done()
+			partials[worker] = topCandidateRankItems(ids[start:end], limit, rankOf)
+		}(worker, start, end)
+	}
+	wg.Wait()
+	h := make(candidateRankMaxHeap, 0, limit)
+	for _, partial := range partials {
+		for _, item := range partial {
+			if len(h) < limit {
+				heap.Push(&h, item)
+				continue
+			}
+			if item.rank < h[0].rank {
+				h[0] = item
+				heap.Fix(&h, 0)
+			}
+		}
+	}
+	out := make([]int, len(h))
+	for i := range h {
+		out[i] = h[i].id
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return rankOf(out[i]) < rankOf(out[j])
+	})
+	return out
+}
+
+func topCandidateIDsByRankSerial(ids []int, limit int, rankOf func(int) int) []int {
+	items := topCandidateRankItems(ids, limit, rankOf)
+	out := make([]int, len(items))
+	for i := range items {
+		out[i] = items[i].id
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return rankOf(out[i]) < rankOf(out[j])
+	})
+	return out
+}
+
+func topCandidateRankItems(ids []int, limit int, rankOf func(int) int) []candidateRankItem {
+	h := make(candidateRankMaxHeap, 0, limit)
+	for _, id := range ids {
+		item := candidateRankItem{id: id, rank: rankOf(id)}
+		if len(h) < limit {
+			heap.Push(&h, item)
+			continue
+		}
+		if item.rank < h[0].rank {
+			h[0] = item
+			heap.Fix(&h, 0)
+		}
+	}
+	out := make([]candidateRankItem, len(h))
+	copy(out, h)
+	return out
+}
+
+type candidateRankItem struct {
+	id   int
+	rank int
+}
+
+type candidateRankMaxHeap []candidateRankItem
+
+func (h candidateRankMaxHeap) Len() int { return len(h) }
+
+func (h candidateRankMaxHeap) Less(i, j int) bool { return h[i].rank > h[j].rank }
+
+func (h candidateRankMaxHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
+
+func (h *candidateRankMaxHeap) Push(x any) {
+	*h = append(*h, x.(candidateRankItem))
+}
+
+func (h *candidateRankMaxHeap) Pop() any {
+	old := *h
+	n := len(old)
+	x := old[n-1]
+	*h = old[:n-1]
+	return x
+}
+
+func candidateRanker(idx *Index, cachedRanks []uint32) func(int) int {
+	recordCount := idx.compactRecordCount()
+	var ranks []int
+	if len(cachedRanks) < recordCount {
+		ranks = make([]int, recordCount)
+		for i := range ranks {
+			ranks[i] = i
+		}
+		order := idx.CompactNameOrder
+		for pos := 0; pos < compactOrderLen(order, recordCount); pos++ {
+			id := compactOrderAt(order, pos)
+			if id >= 0 && id < recordCount {
+				ranks[id] = pos
+			}
+		}
+	}
+	return func(id int) int {
+		rank := recordCount + id
+		if id < 0 || id >= recordCount {
+			return rank
+		}
+		if len(cachedRanks) >= recordCount {
+			return int(cachedRanks[id])
+		}
+		return ranks[id]
+	}
+}
+
+func (vol *serviceVolumeIndex) nameOrderRanks() []uint32 {
+	if vol == nil || vol.queryIndex == nil || len(vol.queryIndex.nameRank) == 0 {
+		return nil
+	}
+	return vol.queryIndex.nameRank
 }
 
 func (vol *serviceVolumeIndex) pathDirFilterCandidates(pq parsedQuery) ([]int, bool) {
@@ -6990,6 +8789,76 @@ func (vol *serviceVolumeIndex) extPosting(ext string) []int {
 	return list
 }
 
+func (vol *serviceVolumeIndex) extTopPosting(ext string, limit int) ([]int, bool) {
+	if vol == nil || vol.queryIndex == nil || vol.queryIndex.extTop == nil || limit <= 0 {
+		return nil, false
+	}
+	ids32, ok := vol.queryIndex.extTop[strings.ToLower(ext)]
+	if !ok || len(ids32) < limit {
+		return nil, false
+	}
+	list := make([]int, 0, len(ids32)+len(vol.recentIDs))
+	seen := make(map[int]struct{}, len(ids32)+len(vol.recentIDs))
+	for _, id32 := range ids32 {
+		id := int(id32)
+		list = append(list, id)
+		seen[id] = struct{}{}
+	}
+	for id := range vol.recentIDs {
+		if _, exists := seen[id]; exists || id < 0 || id >= vol.index.compactRecordCount() {
+			continue
+		}
+		rec := vol.index.compactRecord(id)
+		actual := strings.TrimPrefix(filepath.Ext(rec.Name), ".")
+		if strings.EqualFold(actual, ext) {
+			list = append(list, id)
+		}
+	}
+	return topCandidateIDsByRank(list, limit, vol.index, vol.nameOrderRanks()), true
+}
+
+func (vol *serviceVolumeIndex) extTopPathTermCandidates(ext string, terms []string, limit int) ([]int, bool) {
+	if vol == nil || vol.queryIndex == nil || vol.queryIndex.extTop == nil || limit <= 0 || len(terms) == 0 {
+		return nil, false
+	}
+	ids32, ok := vol.queryIndex.extTop[strings.ToLower(ext)]
+	if !ok {
+		return nil, false
+	}
+	out := make([]int, 0, limit)
+	seen := make(map[int]struct{}, min(len(ids32)+len(vol.recentIDs), serviceExtTopPostingLimit))
+	for _, id32 := range ids32 {
+		id := int(id32)
+		seen[id] = struct{}{}
+		if id < 0 || id >= vol.index.compactRecordCount() {
+			continue
+		}
+		rec := vol.index.compactRecord(id)
+		if rec.Deleted || !vol.index.compactPathContainsAll(id, terms) {
+			continue
+		}
+		out = append(out, id)
+		if len(out) >= limit {
+			return out, true
+		}
+	}
+	for id := range vol.recentIDs {
+		if _, exists := seen[id]; exists || id < 0 || id >= vol.index.compactRecordCount() {
+			continue
+		}
+		rec := vol.index.compactRecord(id)
+		actual := strings.TrimPrefix(filepath.Ext(rec.Name), ".")
+		if rec.Deleted || !strings.EqualFold(actual, ext) || !vol.index.compactPathContainsAll(id, terms) {
+			continue
+		}
+		out = append(out, id)
+	}
+	if len(out) < limit {
+		return nil, false
+	}
+	return topCandidateIDsByRank(out, limit, vol.index, vol.nameOrderRanks()), true
+}
+
 func (vol *serviceVolumeIndex) withRecentCandidates(base []int, seq uint64, keep func(CompactRecord) bool) []int {
 	if len(vol.recentIDs) == 0 || seq == vol.recentSeq {
 		return base
@@ -7120,6 +8989,7 @@ func parseQuery(opts queryOptions) (parsedQuery, error) {
 		RootBias:      normalizeFilterPath(opts.RootBias),
 		DeadlineUnix:  opts.DeadlineUnix,
 		Cancel:        opts.Cancel,
+		Trace:         opts.Trace,
 	}
 	if opts.ModifiedAfter != "" {
 		t, err := parseTimeValue(opts.ModifiedAfter)

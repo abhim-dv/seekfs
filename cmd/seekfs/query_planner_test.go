@@ -46,6 +46,27 @@ func TestPlannedCandidatesMatchFullSearchForStructuralFilters(t *testing.T) {
 	}
 }
 
+func TestExactTopCandidatesFilterPathTerms(t *testing.T) {
+	idx := commonSearchFixture()
+	vol := newServiceVolumeIndex("fixture.gsi", idx)
+	opts := queryOptions{Query: "src ext:go", MatchPath: true, Limit: 2}
+	pq := mustParseQuery(t, opts)
+	pq.Limit = normalizedLimit(opts.Limit, false)
+
+	candidates, ok := vol.exactTopPlannedCandidates(pq)
+	if !ok {
+		t.Fatal("exactTopPlannedCandidates declined ext + path term query")
+	}
+	fast := entriesForIDs(idx, candidates)
+	full, err := searchCompactWithCache(idx, opts, false, make(map[int]string), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := pathsOf(fast), pathsOf(full); !sameOrderedStrings(got, want) {
+		t.Fatalf("exact top ext+path candidates = %v, full = %v", got, want)
+	}
+}
+
 func TestPlannedCountMatchesFullSearchCount(t *testing.T) {
 	idx := commonSearchFixture()
 	vol := newServiceVolumeIndex("fixture.gsi", idx)
@@ -236,6 +257,299 @@ func TestPathOnlyDottedExtensionUsesPathPostingCandidate(t *testing.T) {
 	}
 	if names := namesOf(extMatches); !sameStringSet(names, []string{"data.nrrd", "scan.nrrd"}) {
 		t.Fatalf("ext:.nrrd names = %v, want extension matches only", names)
+	}
+}
+
+func TestExtensionShapedPathTermCandidatesUseExtensionAndPathOnlyMatches(t *testing.T) {
+	idx := commonSearchFixture()
+	idx.Records = append(idx.Records,
+		CompactRecord{FRN: 17, ParentFRN: 3, Parent: 2, Name: "Downloads", Mode: uint32(os.ModeDir)},
+		CompactRecord{FRN: 18, ParentFRN: 17, Parent: 16, Name: "scan.nrrd"},
+		CompactRecord{FRN: 19, ParentFRN: 17, Parent: 16, Name: "backup.nrrd.bak"},
+		CompactRecord{FRN: 20, ParentFRN: 3, Parent: 2, Name: "data.nrrd", Mode: uint32(os.ModeDir)},
+		CompactRecord{FRN: 21, ParentFRN: 20, Parent: 19, Name: "metadata.json"},
+	)
+	buildOrders(idx)
+	vol := newServiceVolumeIndex("fixture.gsi", idx)
+	(&goSearchService{}).rebuildNameTrigramsInBackground(vol)
+	pq := mustParseQuery(t, queryOptions{Query: "path:.nrrd", Limit: 20})
+	pq.Limit = normalizedLimit(20, false)
+
+	candidates, ok := vol.extensionShapedPathTermCandidates(pq)
+	if !ok {
+		t.Fatal("extensionShapedPathTermCandidates declined path:.nrrd")
+	}
+	names := namesOf(entriesForIDs(idx, candidates))
+	if !sameStringSet(names, []string{"scan.nrrd", "backup.nrrd.bak", "data.nrrd", "metadata.json"}) {
+		t.Fatalf("extension-shaped path candidates = %v, want extension, path-only, and descendant matches", names)
+	}
+	got, err := searchCompactWithCache(idx, queryOptions{Query: "path:.nrrd", Limit: 20}, false, vol.pathCache, vol.nameTermCandidates)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotNames := namesOf(got); !sameStringSet(gotNames, names) {
+		t.Fatalf("search names = %v, candidate names = %v", gotNames, names)
+	}
+}
+
+func TestSinglePathTermCandidateCanSkipEntryMatches(t *testing.T) {
+	pq := mustParseQuery(t, queryOptions{Query: "path:.nrrd", Limit: 20})
+	pq.Limit = normalizedLimit(20, false)
+	if !compactCandidateCanSkipEntryMatches(pq, true) {
+		t.Fatal("single path-term candidate query should skip redundant entryMatches")
+	}
+	if compactCandidateCanSkipEntryMatches(pq, false) {
+		t.Fatal("non-candidate query skipped entryMatches")
+	}
+	withFilter := mustParseQuery(t, queryOptions{Query: "path:.nrrd ext:json", Limit: 20})
+	withFilter.Limit = normalizedLimit(20, false)
+	if compactCandidateCanSkipEntryMatches(withFilter, true) {
+		t.Fatal("candidate query with extra extension filter skipped entryMatches")
+	}
+	multiTerm := mustParseQuery(t, queryOptions{Query: "path:Downloads .nrrd", Limit: 20})
+	multiTerm.Limit = normalizedLimit(20, false)
+	if compactCandidateCanSkipEntryMatches(multiTerm, true) {
+		t.Fatal("multi-term path query skipped entryMatches")
+	}
+}
+
+func TestLimitedDottedPathScanCandidatesMatchFullSearch(t *testing.T) {
+	idx := dottedPathBenchmarkIndex(25000)
+	vol := newServiceVolumeIndex("fixture.gsi", idx)
+	opts := queryOptions{Query: "path:.nrrd", Limit: 20}
+	pq := mustParseQuery(t, opts)
+	pq.Limit = normalizedLimit(opts.Limit, false)
+	candidates, ok := vol.limitedDottedPathScanCandidates(pq)
+	if !ok {
+		t.Fatal("limitedDottedPathScanCandidates declined path:.nrrd")
+	}
+	fast := entriesForIDs(idx, candidates)
+	full, err := searchCompactWithCache(idx, opts, false, make(map[int]string), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := pathsOf(fast), pathsOf(full); !sameOrderedStrings(got, want) {
+		t.Fatalf("limited dotted paths = %v, full paths = %v", got, want)
+	}
+	filtered := mustParseQuery(t, queryOptions{Query: "path:.nrrd ext:json", Limit: 20})
+	filtered.Limit = normalizedLimit(20, false)
+	if _, ok := vol.limitedDottedPathScanCandidates(filtered); ok {
+		t.Fatal("limited dotted path scan accepted filtered query")
+	}
+	late := mustParseQuery(t, queryOptions{Query: "path:.pdf", Limit: 20})
+	late.Limit = normalizedLimit(20, false)
+	lateCandidates, ok := vol.limitedDottedPathScanCandidates(late)
+	if !ok {
+		t.Fatal("limited dotted path scan declined late dotted term")
+	}
+	lateFast := entriesForIDs(idx, lateCandidates)
+	lateFull, err := searchCompactWithCache(idx, queryOptions{Query: "path:.pdf", Limit: 20}, false, make(map[int]string), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := pathsOf(lateFast), pathsOf(lateFull); !sameOrderedStrings(got, want) {
+		t.Fatalf("late limited dotted paths = %v, full paths = %v", got, want)
+	}
+}
+
+func TestSearchTraceReportsCandidateSource(t *testing.T) {
+	idx := dottedPathBenchmarkIndex(1200)
+	vol := newServiceVolumeIndex("fixture.gsi", idx)
+	cases := []struct {
+		name       string
+		opts       queryOptions
+		wantSource string
+	}{
+		{
+			name:       "dotted path term",
+			opts:       queryOptions{Query: "path:.nrrd", Limit: 20},
+			wantSource: "path-term-limited",
+		},
+		{
+			name:       "extension planner",
+			opts:       queryOptions{Query: "ext:.pdf", MatchPath: true, Limit: 20},
+			wantSource: "planned:ext:pdf",
+		},
+		{
+			name:       "limited missing term",
+			opts:       queryOptions{Query: "zzzzzz-no-hit", Limit: 20},
+			wantSource: "limited-single-term",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			trace := &searchTrace{}
+			opts := tc.opts
+			opts.Trace = trace
+			if _, err := searchCompactWithCache(idx, opts, false, vol.pathCache, vol.nameTermCandidates); err != nil {
+				t.Fatal(err)
+			}
+			if trace.Source != tc.wantSource {
+				t.Fatalf("trace source = %q, want %q", trace.Source, tc.wantSource)
+			}
+			if trace.Candidates < 0 {
+				t.Fatalf("trace candidates = %d, want non-negative", trace.Candidates)
+			}
+		})
+	}
+}
+
+func TestExtensionShapedPathTopCandidatesAvoidDottedScan(t *testing.T) {
+	t.Setenv("SEEKFS_NAME_TRIGRAMS", "1")
+	idx := dottedPathBenchmarkIndex(25000)
+	vol := newServiceVolumeIndex("fixture.gsi", idx)
+	(&goSearchService{}).rebuildNameTrigramsInBackground(vol)
+	opts := queryOptions{Query: "path:.pdf", Limit: 20}
+	trace := &searchTrace{}
+	fastOpts := opts
+	fastOpts.Trace = trace
+
+	fast, err := searchCompactWithCache(idx, fastOpts, false, vol.pathCache, vol.nameTermCandidates)
+	if err != nil {
+		t.Fatal(err)
+	}
+	full, err := searchCompactWithCache(idx, opts, false, make(map[int]string), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := pathsOf(fast), pathsOf(full); !sameOrderedStrings(got, want) {
+		t.Fatalf("extension-shaped top paths = %v, full paths = %v", got, want)
+	}
+	if trace.Source != "path-extension-top" {
+		t.Fatalf("trace source = %q, want path-extension-top", trace.Source)
+	}
+	if trace.Candidates != 20 {
+		t.Fatalf("trace candidates = %d, want 20", trace.Candidates)
+	}
+}
+
+func TestFusedDottedPathNoHitUsesIntersectedTrigramCandidates(t *testing.T) {
+	t.Setenv("SEEKFS_NAME_TRIGRAMS", "1")
+	idx := dottedPathBenchmarkIndex(25000)
+	vol := newServiceVolumeIndex("fixture.gsi", idx)
+	(&goSearchService{}).rebuildNameTrigramsInBackground(vol)
+	opts := queryOptions{Query: "path:Downloads.nrrd", Limit: 20}
+	trace := &searchTrace{}
+	fastOpts := opts
+	fastOpts.Trace = trace
+
+	fast, err := searchCompactWithCache(idx, fastOpts, false, vol.pathCache, vol.nameTermCandidates)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(fast) != 0 {
+		t.Fatalf("fused no-hit matches = %v, want none", pathsOf(fast))
+	}
+	if trace.Source != "path-component-trigram" {
+		t.Fatalf("trace source = %q, want path-component-trigram", trace.Source)
+	}
+	if trace.Candidates != 0 {
+		t.Fatalf("trace candidates = %d, want 0", trace.Candidates)
+	}
+}
+
+func TestLongComponentTermUsesIntersectedTrigramDespiteCommonGrams(t *testing.T) {
+	t.Setenv("SEEKFS_NAME_TRIGRAMS", "1")
+	idx := pathSyntaxFixture()
+	vol := newServiceVolumeIndex("fixture.gsi", idx)
+	(&goSearchService{}).rebuildNameTrigramsInBackground(vol)
+	opts := queryOptions{Query: "path:opencode", Limit: 20}
+	trace := &searchTrace{}
+	fastOpts := opts
+	fastOpts.Trace = trace
+
+	fast, err := searchCompactWithCache(idx, fastOpts, false, vol.pathCache, vol.nameTermCandidates)
+	if err != nil {
+		t.Fatal(err)
+	}
+	full, err := searchCompactWithCache(idx, opts, false, make(map[int]string), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := pathsOf(fast), pathsOf(full); !sameOrderedStrings(got, want) {
+		t.Fatalf("opencode trigram paths = %v, full paths = %v", got, want)
+	}
+	if trace.Source != "path-component-trigram" {
+		t.Fatalf("trace source = %q, want path-component-trigram", trace.Source)
+	}
+}
+
+func TestLimitedPathTermUsesTrigramNameMatches(t *testing.T) {
+	t.Setenv("SEEKFS_NAME_TRIGRAMS", "1")
+	idx := pathSyntaxFixture()
+	vol := newServiceVolumeIndex("fixture.gsi", idx)
+	(&goSearchService{}).rebuildNameTrigramsInBackground(vol)
+	opts := queryOptions{Query: "path:opencode", Limit: 20}
+	pq := mustParseQuery(t, opts)
+	pq.Limit = normalizedLimit(opts.Limit, false)
+
+	candidates, ok := vol.pathPlanTermPostingLimited("opencode", pq)
+	if !ok {
+		t.Fatal("pathPlanTermPostingLimited declined opencode")
+	}
+	fast := entriesForIDs(idx, candidates)
+	full, err := searchCompactWithCache(idx, opts, false, make(map[int]string), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := pathsOf(fast), pathsOf(full); !sameOrderedStrings(got, want) {
+		t.Fatalf("limited opencode paths = %v, full paths = %v", got, want)
+	}
+}
+
+func TestPathNameTrigramTopCandidatesForManyDirectMatches(t *testing.T) {
+	t.Setenv("SEEKFS_NAME_TRIGRAMS", "1")
+	idx := manyDirectNameMatchIndex("opencode", 80)
+	vol := newServiceVolumeIndex("fixture.gsi", idx)
+	(&goSearchService{}).rebuildNameTrigramsInBackground(vol)
+	opts := queryOptions{Query: "path:opencode", Limit: 20}
+	pq := mustParseQuery(t, opts)
+	pq.Limit = normalizedLimit(opts.Limit, false)
+
+	candidates, ok := vol.nameTrigramPathNameTopCandidates(pq)
+	if !ok {
+		t.Fatal("nameTrigramPathNameTopCandidates declined direct opencode matches")
+	}
+	if len(candidates) != 20 {
+		t.Fatalf("candidate count = %d, want 20", len(candidates))
+	}
+	fast := entriesForIDs(idx, candidates)
+	full, err := searchCompactWithCache(idx, opts, false, make(map[int]string), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := pathsOf(fast), pathsOf(full); !sameOrderedStrings(got, want) {
+		t.Fatalf("top trigram paths = %v, full paths = %v", got, want)
+	}
+}
+
+func TestPathNameTrigramTopCandidatesBoundLargeDirectory(t *testing.T) {
+	t.Setenv("SEEKFS_NAME_TRIGRAMS", "1")
+	idx := broadComponentExpansionIndex(serviceComponentTrigramExpansionMaxIDs + 500)
+	dir := idx.compactRecord(1)
+	dir.Name = "opencode"
+	idx.setCompactRecord(1, dir)
+	buildOrders(idx)
+	vol := newServiceVolumeIndex("fixture.gsi", idx)
+	(&goSearchService{}).rebuildNameTrigramsInBackground(vol)
+	opts := queryOptions{Query: "path:opencode", Limit: 20}
+	pq := mustParseQuery(t, opts)
+	pq.Limit = normalizedLimit(opts.Limit, false)
+
+	candidates, ok := vol.nameTrigramPathNameTopCandidates(pq)
+	if !ok {
+		t.Fatal("nameTrigramPathNameTopCandidates declined large matching directory")
+	}
+	if len(candidates) != 20 {
+		t.Fatalf("candidate count = %d, want 20", len(candidates))
+	}
+	fast := entriesForIDs(idx, candidates)
+	full, err := searchCompactWithCache(idx, opts, false, make(map[int]string), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := pathsOf(fast), pathsOf(full); !sameOrderedStrings(got, want) {
+		t.Fatalf("large directory top paths = %v, full paths = %v", got, want)
 	}
 }
 
@@ -560,6 +874,273 @@ func TestGeneratedBroadPathQueryParityAcrossResidentVariants(t *testing.T) {
 	}
 }
 
+func TestNameTrigramPathCandidatesIncludeDirectoryDescendants(t *testing.T) {
+	t.Setenv("SEEKFS_NAME_TRIGRAMS", "1")
+	idx := pathSyntaxFixture()
+	vol := newServiceVolumeIndex("fixture.gsi", idx)
+	(&goSearchService{}).rebuildNameTrigramsInBackground(vol)
+	opts := queryOptions{Query: "path:C: .opencode", Limit: 20}
+	trigram, ok := vol.nameTrigramCandidates(mustParseQuery(t, opts))
+	if !ok {
+		t.Fatal("nameTrigramCandidates declined path dotted substring query")
+	}
+	gotNames := namesOf(entriesForIDs(idx, trigram))
+	if !sameStringSet(gotNames, []string{"ai.opencode.desktop", "settings.json"}) {
+		t.Fatalf("trigram candidate names = %v, want directory and descendant", gotNames)
+	}
+	fast, err := searchCompactWithCache(idx, opts, false, vol.pathCache, vol.nameTermCandidates)
+	if err != nil {
+		t.Fatal(err)
+	}
+	full, err := searchCompactWithCache(idx, opts, false, make(map[int]string), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := namesOf(fast), namesOf(full); !sameStringSet(got, want) {
+		t.Fatalf("fast names = %v, full names = %v", got, want)
+	}
+}
+
+func TestLimitedPathComponentPostingMatchesFullSearch(t *testing.T) {
+	idx := dottedPathBenchmarkIndex(25000)
+	vol := newServiceVolumeIndex("fixture.gsi", idx)
+	opts := queryOptions{Query: "path:C: .opencode", Limit: 20}
+	pq := mustParseQuery(t, opts)
+	dropSatisfiedVolumeTerms(&pq, idx.Volume)
+	pq.Limit = normalizedLimit(opts.Limit, false)
+
+	limited, ok := vol.pathPlanTermPostingLimited(".opencode", pq)
+	if !ok {
+		t.Fatal("pathPlanTermPostingLimited declined selective component query")
+	}
+	if len(limited) == 0 || len(limited) > opts.Limit {
+		t.Fatalf("limited candidates = %d, want 1..%d", len(limited), opts.Limit)
+	}
+	plan, ok := vol.buildCandidatePlan(pq)
+	if !ok || len(plan.sources) != 1 || !strings.HasPrefix(plan.sources[0].name, "term-limited:") {
+		t.Fatalf("plan = %+v, ok=%v, want term-limited source", plan, ok)
+	}
+	full, err := searchCompactWithCache(idx, opts, false, make(map[int]string), nil)
+	if err != nil {
+		t.Fatalf("full search: %v", err)
+	}
+	fast, err := searchServiceVolumes([]*serviceVolumeIndex{vol}, opts, false)
+	if err != nil {
+		t.Fatalf("service search: %v", err)
+	}
+	if got, want := pathsOf(fast), pathsOf(full); !sameOrderedStrings(got, want) {
+		t.Fatalf("limited paths = %v, full paths = %v", got, want)
+	}
+}
+
+func TestComponentTrigramDeclinesBroadDirectoryExpansion(t *testing.T) {
+	t.Setenv("SEEKFS_NAME_TRIGRAMS", "1")
+	idx := broadComponentExpansionIndex(serviceComponentTrigramExpansionMaxIDs + 500)
+	vol := newServiceVolumeIndex("fixture.gsi", idx)
+	opts := queryOptions{Query: "path:C: workspace", Limit: 20}
+	pq := mustParseQuery(t, opts)
+	if candidates, ok := vol.componentTrigramCandidates(pq); ok {
+		t.Fatalf("componentTrigramCandidates returned %d broad workspace candidates, want fallback", len(candidates))
+	}
+	fast, err := searchCompactWithCache(idx, opts, false, vol.pathCache, vol.nameTermCandidates)
+	if err != nil {
+		t.Fatal(err)
+	}
+	full, err := searchCompactWithCache(idx, opts, false, make(map[int]string), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := pathsOf(fast), pathsOf(full); !sameOrderedStrings(got, want) {
+		t.Fatalf("fast paths = %v, full paths = %v", got, want)
+	}
+}
+
+func TestLargePlainComponentRootUsesBoundedTopSource(t *testing.T) {
+	idx := broadComponentExpansionIndex(100_100)
+	vol := newServiceVolumeIndex("fixture.gsi", idx)
+	opts := queryOptions{Query: "path:C: workspace", Limit: 20}
+	pq := mustParseQuery(t, opts)
+	dropSatisfiedVolumeTerms(&pq, idx.Volume)
+	pq.Limit = opts.Limit
+
+	candidates, ok := vol.componentRootTopCandidates(pq)
+	if !ok {
+		t.Fatal("componentRootTopCandidates declined large plain component root")
+	}
+	if len(candidates) != opts.Limit {
+		t.Fatalf("candidate count = %d, want %d", len(candidates), opts.Limit)
+	}
+	if names := namesOf(entriesForIDs(idx, candidates)); !containsString(names, "workspace") {
+		t.Fatalf("candidate names = %v, want workspace root included", names)
+	}
+}
+
+func TestNameTrigramRecentOverlayFindsCreateWithMissingBaseGram(t *testing.T) {
+	t.Setenv("SEEKFS_NAME_TRIGRAMS", "1")
+	idx := pathSyntaxFixture()
+	vol := newServiceVolumeIndex("fixture.gsi", idx)
+	(&goSearchService{}).rebuildNameTrigramsInBackground(vol)
+
+	id := idx.appendCompactRecord(CompactRecord{FRN: 30, ParentFRN: 2, Parent: 1, Name: "zzquark-note.txt", Size: 1, ModUnix: time.Now().UnixNano()})
+	vol.addFRNID(30, id)
+	vol.addExactName(id)
+	vol.markNameTrigramRecent(id)
+
+	opts := queryOptions{Query: "path:C: zzquark", Limit: 20}
+	fast, err := searchCompactWithCache(idx, opts, false, vol.pathCache, vol.nameTermCandidates)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if names := namesOf(fast); !sameStringSet(names, []string{"zzquark-note.txt"}) {
+		t.Fatalf("recent create names = %v, want zzquark-note.txt", names)
+	}
+}
+
+func TestNameTrigramPathPostingCachesAndKeepsRecentOverlay(t *testing.T) {
+	t.Setenv("SEEKFS_NAME_TRIGRAMS", "1")
+	idx := pathSyntaxFixture()
+	vol := newServiceVolumeIndex("fixture.gsi", idx)
+	(&goSearchService{}).rebuildNameTrigramsInBackground(vol)
+
+	first, ok := vol.nameTrigramPathTermPosting(".opencode")
+	if !ok || len(first) == 0 {
+		t.Fatalf("first trigram path posting = %v, %v; want candidates", first, ok)
+	}
+	cacheKey := "\x00trigrampath:.opencode"
+	if vol.pathTermCache == nil || len(vol.pathTermCache[cacheKey]) == 0 {
+		t.Fatal("trigram path posting was not cached")
+	}
+
+	dirID := 10 // ai.opencode.desktop in pathSyntaxFixture.
+	id := idx.appendCompactRecord(CompactRecord{FRN: 40, ParentFRN: 10, Parent: int32(dirID), Name: "new-child.txt", Size: 1, ModUnix: time.Now().UnixNano()})
+	vol.addFRNID(40, id)
+	vol.addChild(10, id)
+	vol.markNameTrigramRecent(id)
+	if vol.recentIDs == nil {
+		vol.recentIDs = make(map[int]struct{})
+	}
+	vol.recentIDs[id] = struct{}{}
+	vol.recentSeq++
+
+	second, ok := vol.nameTrigramPathTermPosting(".opencode")
+	if !ok {
+		t.Fatal("cached trigram path posting declined after recent update")
+	}
+	found := false
+	for _, gotID := range second {
+		if gotID == id {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("cached trigram path posting = %v, want recent descendant id %d", second, id)
+	}
+}
+
+func TestFilenameTrigramCandidatesMatchFullSearch(t *testing.T) {
+	t.Setenv("SEEKFS_NAME_TRIGRAMS", "1")
+	idx := pathSyntaxFixture()
+	vol := newServiceVolumeIndex("fixture.gsi", idx)
+	(&goSearchService{}).rebuildNameTrigramsInBackground(vol)
+	opts := queryOptions{Query: ".opencode", Limit: 20}
+	candidates, ok := vol.filenameTrigramCandidates(mustParseQuery(t, opts))
+	if !ok {
+		t.Fatal("filenameTrigramCandidates declined selective filename query")
+	}
+	if names := namesOf(entriesForIDs(idx, candidates)); !sameStringSet(names, []string{"ai.opencode.desktop"}) {
+		t.Fatalf("filename trigram candidates = %v, want ai.opencode.desktop", names)
+	}
+	fast, err := searchCompactWithCache(idx, opts, false, vol.pathCache, vol.nameTermCandidates)
+	if err != nil {
+		t.Fatal(err)
+	}
+	full, err := searchCompactWithCache(idx, opts, false, make(map[int]string), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := namesOf(fast), namesOf(full); !sameStringSet(got, want) {
+		t.Fatalf("fast names = %v, full names = %v", got, want)
+	}
+}
+
+func TestFilenameTrigramRecentOverlayFindsMissingBaseGram(t *testing.T) {
+	t.Setenv("SEEKFS_NAME_TRIGRAMS", "1")
+	idx := pathSyntaxFixture()
+	vol := newServiceVolumeIndex("fixture.gsi", idx)
+	(&goSearchService{}).rebuildNameTrigramsInBackground(vol)
+	id := idx.appendCompactRecord(CompactRecord{FRN: 30, ParentFRN: 2, Parent: 1, Name: "zzquark-note.txt"})
+	vol.addFRNID(30, id)
+	vol.addExactName(id)
+	vol.markNameTrigramRecent(id)
+
+	opts := queryOptions{Query: "zzquark", Limit: 20}
+	fast, err := searchCompactWithCache(idx, opts, false, vol.pathCache, vol.nameTermCandidates)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if names := namesOf(fast); !sameStringSet(names, []string{"zzquark-note.txt"}) {
+		t.Fatalf("recent filename names = %v, want zzquark-note.txt", names)
+	}
+}
+
+func TestFilenameTrigramDeclinesCommonTerm(t *testing.T) {
+	t.Setenv("SEEKFS_NAME_TRIGRAMS", "1")
+	idx := dottedPathBenchmarkIndex(100_000)
+	vol := newServiceVolumeIndex("fixture.gsi", idx)
+	(&goSearchService{}).rebuildNameTrigramsInBackground(vol)
+	if candidates, ok := vol.filenameTrigramCandidates(mustParseQuery(t, queryOptions{Query: "plain", Limit: 20})); ok {
+		t.Fatalf("filenameTrigramCandidates returned %d common candidates, want fallback", len(candidates))
+	}
+}
+
+func TestNameTrigramRecentOverlayFindsRenamedDirectoryDescendants(t *testing.T) {
+	t.Setenv("SEEKFS_NAME_TRIGRAMS", "1")
+	idx := pathSyntaxFixture()
+	vol := newServiceVolumeIndex("fixture.gsi", idx)
+	(&goSearchService{}).rebuildNameTrigramsInBackground(vol)
+
+	dirID := 10 // ai.opencode.desktop in pathSyntaxFixture.
+	rec := idx.compactRecord(dirID)
+	vol.removeExactName(dirID)
+	rec.Name = "zzquark-folder"
+	idx.setCompactRecord(dirID, rec)
+	vol.addExactName(dirID)
+	vol.markNameTrigramRecent(dirID)
+
+	opts := queryOptions{Query: "path:C: zzquark", Limit: 20}
+	fast, err := searchCompactWithCache(idx, opts, false, vol.pathCache, vol.nameTermCandidates)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if names := namesOf(fast); !sameStringSet(names, []string{"settings.json", "zzquark-folder"}) {
+		t.Fatalf("recent renamed directory names = %v, want directory and descendant", names)
+	}
+}
+
+func TestNameTrigramRecentOverlayExcludesDeletedBaseMatch(t *testing.T) {
+	t.Setenv("SEEKFS_NAME_TRIGRAMS", "1")
+	idx := pathSyntaxFixture()
+	id := idx.appendCompactRecord(CompactRecord{FRN: 30, ParentFRN: 2, Parent: 1, Name: "zzstable.txt", Size: 1, ModUnix: time.Now().UnixNano()})
+	buildOrders(idx)
+	vol := newServiceVolumeIndex("fixture.gsi", idx)
+	(&goSearchService{}).rebuildNameTrigramsInBackground(vol)
+
+	rec := idx.compactRecord(id)
+	rec.Deleted = true
+	idx.setCompactRecord(id, rec)
+	vol.markNameTrigramRecent(id)
+
+	opts := queryOptions{Query: "path:C: zzstable", Limit: 20}
+	fast, err := searchCompactWithCache(idx, opts, false, vol.pathCache, vol.nameTermCandidates)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if names := namesOf(fast); len(names) != 0 {
+		t.Fatalf("deleted base match names = %v, want none", names)
+	}
+}
+
 func TestLiveDottedExtensionQueryMatchesExtensionFilter(t *testing.T) {
 	idx := commonSearchFixture()
 	vol := newServiceVolumeIndex("fixture.gsi", idx)
@@ -635,6 +1216,34 @@ func TestPlannerUsesSelectiveExtensionBeforePathVerification(t *testing.T) {
 	}
 	if names := namesOf(got); !sameStringSet(names, []string{"camera-001.raw", "camera-002.raw"}) {
 		t.Fatalf("names = %v, want Downloads raw files only", names)
+	}
+}
+
+func TestDropSatisfiedVolumeTermsOnlyForMatchingVolume(t *testing.T) {
+	pq := mustParseQuery(t, queryOptions{Query: "path:F: .pdf", Limit: 20})
+	dropSatisfiedVolumeTerms(&pq, "F:")
+	if len(pq.Terms) != 0 {
+		t.Fatalf("terms after matching F: drop = %v, want no terms", pq.Terms)
+	}
+	if len(pq.Exts) != 1 || pq.Exts[0] != "pdf" {
+		t.Fatalf("exts after matching F: drop = %v, want [pdf]", pq.Exts)
+	}
+	if !compactCandidateCanSkipEntryMatches(pq, true) {
+		t.Fatal("matching volume ext-only path query should skip full entryMatches after candidate selection")
+	}
+
+	pq = mustParseQuery(t, queryOptions{Query: "path:F: .pdf", Limit: 20})
+	dropSatisfiedVolumeTerms(&pq, "C:")
+	if len(pq.Terms) != 1 || pq.Terms[0] != "f:" {
+		t.Fatalf("terms after mismatched C: drop = %v, want [f:]", pq.Terms)
+	}
+	if compactCandidateCanSkipEntryMatches(pq, true) {
+		t.Fatal("mismatched volume term must still require full entryMatches")
+	}
+
+	pq = mustParseQuery(t, queryOptions{Query: "Downloads ext:raw", MatchPath: true, Limit: 20})
+	if compactCandidateCanSkipEntryMatches(pq, true) {
+		t.Fatal("path term query must not skip full entryMatches")
 	}
 }
 
@@ -968,6 +1577,66 @@ func orderedLimitedBenchmarkIndex(n int) *Index {
 	return idx
 }
 
+func broadComponentExpansionIndex(children int) *Index {
+	idx := &Index{
+		Source:  "usn",
+		Volume:  "C:",
+		Compact: true,
+		Records: make([]CompactRecord, 0, children+2),
+	}
+	add := func(frn, parentFRN uint64, parent int32, name string, mode uint32) int32 {
+		idx.Records = append(idx.Records, CompactRecord{
+			FRN:       frn,
+			ParentFRN: parentFRN,
+			Parent:    parent,
+			Name:      name,
+			Mode:      mode,
+			Size:      1024,
+			ModUnix:   time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC).UnixNano(),
+		})
+		return int32(len(idx.Records) - 1)
+	}
+	root := add(1, 1, -1, ".", uint32(os.ModeDir))
+	workspace := add(2, 1, root, "workspace", uint32(os.ModeDir))
+	nextFRN := uint64(10)
+	for i := 0; i < children; i++ {
+		add(nextFRN, 2, workspace, fmt.Sprintf("file-%06d.txt", i), 0)
+		nextFRN++
+	}
+	buildOrders(idx)
+	return idx
+}
+
+func manyDirectNameMatchIndex(term string, matches int) *Index {
+	idx := &Index{
+		Source:  "usn",
+		Volume:  "C:",
+		Compact: true,
+		Records: make([]CompactRecord, 0, matches+2),
+	}
+	add := func(frn, parentFRN uint64, parent int32, name string, mode uint32) int32 {
+		idx.Records = append(idx.Records, CompactRecord{
+			FRN:       frn,
+			ParentFRN: parentFRN,
+			Parent:    parent,
+			Name:      name,
+			Mode:      mode,
+			Size:      1024,
+			ModUnix:   time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC).UnixNano(),
+		})
+		return int32(len(idx.Records) - 1)
+	}
+	root := add(1, 1, -1, ".", uint32(os.ModeDir))
+	workspace := add(2, 1, root, "workspace", uint32(os.ModeDir))
+	nextFRN := uint64(10)
+	for i := 0; i < matches; i++ {
+		add(nextFRN, 2, workspace, fmt.Sprintf("%s-%06d.txt", term, i), 0)
+		nextFRN++
+	}
+	buildOrders(idx)
+	return idx
+}
+
 func broadSubstringOrderingFixture() *Index {
 	idx := &Index{
 		Source:  "usn",
@@ -1020,6 +1689,23 @@ func pathsOf(entries []Entry) []string {
 		paths = append(paths, entry.Path)
 	}
 	return paths
+}
+
+func entriesForIDs(idx *Index, ids []int) []Entry {
+	entries := make([]Entry, 0, len(ids))
+	cache := make(map[int]string)
+	for _, id := range ids {
+		if id < 0 || id >= idx.compactRecordCount() {
+			continue
+		}
+		rec := idx.compactRecord(id)
+		entries = append(entries, Entry{
+			Path: idx.reconstructCompactPathCached(id, cache),
+			Name: rec.Name,
+			Mode: rec.Mode,
+		})
+	}
+	return entries
 }
 
 func sameOrderedStrings(a, b []string) bool {

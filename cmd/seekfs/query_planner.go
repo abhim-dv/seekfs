@@ -1,6 +1,7 @@
 package main
 
 import (
+	"container/heap"
 	"os"
 	"path/filepath"
 	"sort"
@@ -23,13 +24,54 @@ type candidatePlanSource struct {
 }
 
 func (vol *serviceVolumeIndex) plannedCandidates(pq parsedQuery) ([]int, bool) {
+	if compactCandidateCanSkipEntryMatches(pq, true) && pq.Limit > 0 {
+		if out, ok := vol.exactTopPlannedCandidates(pq); ok {
+			pq.Trace.setSource("planned:ext-top", len(out))
+			return out, true
+		}
+	}
 	plan, ok := vol.buildCandidatePlan(pq)
 	if !ok {
 		return nil, false
 	}
 	out := plan.execute()
-	sortCandidateIDs(out, pq, vol.index)
+	if compactCandidateCanSkipEntryMatches(pq, true) && pq.Limit > 0 {
+		out = topCandidateIDsByRank(out, pq.Limit, vol.index, vol.nameOrderRanks())
+	} else {
+		sortCandidateIDs(out, pq, vol.index, vol.nameOrderRanks())
+	}
+	pq.Trace.setSource("planned:"+plan.sourceSummary(), len(out))
 	return out, true
+}
+
+func (vol *serviceVolumeIndex) exactTopPlannedCandidates(pq parsedQuery) ([]int, bool) {
+	if vol == nil || vol.queryIndex == nil || pq.Limit <= 0 ||
+		len(pq.Exts) != 1 || len(pq.Globs) > 0 || len(pq.Dirs) > 0 ||
+		pq.Type != "" || pq.Under != "" || pq.HasModAfter || pq.Exists ||
+		len(pq.SizeFilters) > 0 || len(pq.DateFilters) > 0 ||
+		len(pq.OrGroups) > 0 || len(pq.NotGroups) > 0 {
+		return nil, false
+	}
+	terms := nonVolumeTerms(pq.Terms)
+	if len(terms) > 0 {
+		return vol.extTopPathTermCandidates(pq.Exts[0], terms, pq.Limit)
+	}
+	ids, ok := vol.extTopPosting(pq.Exts[0], pq.Limit)
+	if !ok {
+		return nil, false
+	}
+	return ids, true
+}
+
+func nonVolumeTerms(terms []string) []string {
+	out := make([]string, 0, len(terms))
+	for _, term := range terms {
+		if isVolumeQueryTerm(term) {
+			continue
+		}
+		out = append(out, term)
+	}
+	return out
 }
 
 func (vol *serviceVolumeIndex) plannedCount(pq parsedQuery) (int, bool) {
@@ -287,6 +329,8 @@ func (vol *serviceVolumeIndex) buildCandidatePlan(pq parsedQuery) (candidatePlan
 				if len(underRoots) == 0 {
 					return plan, false
 				}
+			} else if limited, ok := vol.pathPlanTermPostingLimited(term, pq); ok {
+				plan.sources = append(plan.sources, candidatePlanSource{name: "term-limited:" + term, ids: limited})
 			} else if !addRequired("term:"+term, vol.pathPlanTermPosting(term)) {
 				return plan, true
 			}
@@ -365,7 +409,7 @@ func (vol *serviceVolumeIndex) broadPathScanCandidates(pq parsedQuery) ([]int, b
 			id, ok := vol.idForFRN(rec.FRN)
 			return ok && vol.index.compactPathContainsAll(id, terms)
 		})
-		sortCandidateIDs(out, pq, vol.index)
+		sortCandidateIDs(out, pq, vol.index, vol.nameOrderRanks())
 		return capBroadCandidates(out, pq), true
 	}
 
@@ -404,7 +448,7 @@ func (vol *serviceVolumeIndex) broadPathScanCandidates(pq parsedQuery) ([]int, b
 		id, ok := vol.idForFRN(rec.FRN)
 		return ok && vol.index.compactPathContainsAll(id, terms)
 	})
-	sortCandidateIDs(out, pq, vol.index)
+	sortCandidateIDs(out, pq, vol.index, vol.nameOrderRanks())
 	return capBroadCandidates(out, pq), true
 }
 
@@ -526,6 +570,435 @@ func (vol *serviceVolumeIndex) pathPlanTermPosting(term string) []int {
 	return vol.pathTermPosting(term)
 }
 
+func (vol *serviceVolumeIndex) limitedPathTermCandidates(pq parsedQuery) ([]int, bool) {
+	if vol == nil || vol.index == nil || !pq.MatchPath || countNonVolumeTerms(pq.Terms) != 1 {
+		return nil, false
+	}
+	for _, term := range pq.Terms {
+		if isVolumeQueryTerm(term) {
+			continue
+		}
+		candidates, ok := vol.pathPlanTermPostingLimited(term, pq)
+		if !ok {
+			return nil, false
+		}
+		sortCandidateIDs(candidates, pq, vol.index, vol.nameOrderRanks())
+		return candidates, true
+	}
+	return nil, false
+}
+
+func (vol *serviceVolumeIndex) limitedDottedPathScanCandidates(pq parsedQuery) ([]int, bool) {
+	if vol == nil || vol.index == nil || !pq.MatchPath || pq.CountOnly || pq.Limit <= 0 ||
+		pq.CaseSensitive || pq.Under != "" || pq.Type != "" || pq.HasModAfter || pq.Exists ||
+		pq.CWDBias != "" || pq.RootBias != "" ||
+		len(pq.Exts) > 0 || len(pq.Dirs) > 0 || len(pq.Globs) > 0 || len(pq.Regexps) > 0 ||
+		len(pq.SizeFilters) > 0 || len(pq.DateFilters) > 0 ||
+		len(pq.OrGroups) > 0 || len(pq.NotGroups) > 0 ||
+		countNonVolumeTerms(pq.Terms) != 1 {
+		return nil, false
+	}
+	for _, term := range pq.Terms {
+		if isVolumeQueryTerm(term) {
+			continue
+		}
+		if !strings.Contains(term, ".") || strings.ContainsAny(term, `\/*?[]:`) {
+			return nil, false
+		}
+		out := vol.scanPathTermPrefixLimited(pq, term, pq.Limit, 16_384)
+		if len(out) >= pq.Limit {
+			return out, true
+		}
+		out = vol.scanPathTermLimited(pq, term, pq.Limit)
+		if len(out) >= pq.Limit {
+			return out, true
+		}
+		return nil, false
+	}
+	return nil, false
+}
+
+func (vol *serviceVolumeIndex) extensionShapedPathTermCandidates(pq parsedQuery) ([]int, bool) {
+	if vol == nil || vol.index == nil || !pq.MatchPath || pq.CaseSensitive ||
+		pq.Under != "" || len(pq.Dirs) > 0 || len(pq.Regexps) > 0 ||
+		len(pq.OrGroups) > 0 || len(pq.NotGroups) > 0 ||
+		pq.Type != "" || pq.HasModAfter || pq.Exists ||
+		len(pq.Exts) > 0 || len(pq.Globs) > 0 ||
+		len(pq.SizeFilters) > 0 || len(pq.DateFilters) > 0 ||
+		pq.CWDBias != "" || pq.RootBias != "" ||
+		countNonVolumeTerms(pq.Terms) != 1 {
+		return nil, false
+	}
+	term := ""
+	for _, candidate := range pq.Terms {
+		if isVolumeQueryTerm(candidate) {
+			continue
+		}
+		term = candidate
+		break
+	}
+	ext, ok := extensionShapedPathTerm(term)
+	if !ok {
+		return nil, false
+	}
+	base := vol.extPosting(ext)
+	if len(base) == 0 {
+		return nil, false
+	}
+	nameMatches, ok := vol.nameTrigramNameTermPosting(term)
+	if !ok {
+		nameMatches = vol.nameTermPosting(term)
+	}
+	threshold := maxInt(4096, pq.Limit*64)
+	if len(base) > threshold || len(nameMatches) > threshold {
+		return nil, false
+	}
+	estimated := len(base) + len(nameMatches)
+	for _, id := range nameMatches {
+		if id < 0 || id >= vol.index.compactRecordCount() {
+			continue
+		}
+		rec := vol.index.compactRecord(id)
+		if rec.Deleted || rec.Mode&uint32(os.ModeDir) == 0 {
+			continue
+		}
+		estimated += vol.estimatedDescendantOrSelfCount(id)
+		if estimated > serviceComponentTrigramExpansionMaxIDs {
+			return nil, false
+		}
+	}
+	seen := make(map[int]struct{}, estimated)
+	out := make([]int, 0, estimated)
+	add := func(id int) {
+		if id < 0 || id >= vol.index.compactRecordCount() {
+			return
+		}
+		if _, exists := seen[id]; exists {
+			return
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	for _, id := range base {
+		add(id)
+	}
+	for _, id := range nameMatches {
+		add(id)
+		rec := vol.index.compactRecord(id)
+		if rec.Deleted || rec.Mode&uint32(os.ModeDir) == 0 {
+			continue
+		}
+		for _, childID := range vol.underDescendants(id) {
+			add(int(childID))
+			if len(out) > serviceComponentTrigramExpansionMaxIDs {
+				return nil, false
+			}
+		}
+	}
+	sort.Ints(out)
+	return out, true
+}
+
+func (vol *serviceVolumeIndex) extensionShapedPathTopCandidates(pq parsedQuery) ([]int, bool) {
+	if vol == nil || vol.index == nil || !pq.MatchPath || pq.CountOnly || pq.Limit <= 0 ||
+		pq.CaseSensitive || pq.Under != "" || len(pq.Dirs) > 0 || len(pq.Regexps) > 0 ||
+		len(pq.OrGroups) > 0 || len(pq.NotGroups) > 0 ||
+		pq.Type != "" || pq.HasModAfter || pq.Exists ||
+		len(pq.Exts) > 0 || len(pq.Globs) > 0 ||
+		len(pq.SizeFilters) > 0 || len(pq.DateFilters) > 0 ||
+		pq.CWDBias != "" || pq.RootBias != "" ||
+		countNonVolumeTerms(pq.Terms) != 1 {
+		return nil, false
+	}
+	term := ""
+	for _, candidate := range pq.Terms {
+		if isVolumeQueryTerm(candidate) {
+			continue
+		}
+		term = candidate
+		break
+	}
+	ext, ok := extensionShapedPathTerm(term)
+	if !ok {
+		return nil, false
+	}
+	nameMatches, ok := vol.nameTrigramNameTermPosting(term)
+	if !ok {
+		return nil, false
+	}
+	if len(nameMatches) >= pq.Limit && !vol.hasDirectoryCandidate(nameMatches) {
+		return topCandidateIDsByRank(append([]int(nil), nameMatches...), pq.Limit, vol.index, vol.nameOrderRanks()), true
+	}
+	ids, _ := vol.extTopPosting(ext, pq.Limit)
+	seen := make(map[int]struct{}, len(nameMatches)+len(ids))
+	out := make([]int, 0, len(nameMatches)+len(ids))
+	addNameMatch := func(id int) {
+		if id < 0 || id >= vol.index.compactRecordCount() {
+			return
+		}
+		if _, exists := seen[id]; exists {
+			return
+		}
+		rec := vol.index.compactRecord(id)
+		if rec.Deleted {
+			return
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	addPathMatch := func(id int) {
+		if id < 0 || id >= vol.index.compactRecordCount() {
+			return
+		}
+		if _, exists := seen[id]; exists {
+			return
+		}
+		rec := vol.index.compactRecord(id)
+		if rec.Deleted || !vol.index.compactPathContainsTerm(id, term) {
+			return
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	for _, id := range nameMatches {
+		addNameMatch(id)
+		if id < 0 || id >= vol.index.compactRecordCount() {
+			continue
+		}
+		rec := vol.index.compactRecord(id)
+		if rec.Deleted || rec.Mode&uint32(os.ModeDir) == 0 {
+			continue
+		}
+		for _, childID := range vol.underDescendants(id) {
+			addPathMatch(int(childID))
+			if len(out) > serviceComponentTrigramExpansionMaxIDs {
+				return nil, false
+			}
+		}
+	}
+	for _, id := range ids {
+		addPathMatch(id)
+	}
+	if len(out) < pq.Limit {
+		return nil, false
+	}
+	return topCandidateIDsByRank(out, pq.Limit, vol.index, vol.nameOrderRanks()), true
+}
+
+func (vol *serviceVolumeIndex) hasDirectoryCandidate(ids []int) bool {
+	if vol == nil || vol.index == nil {
+		return true
+	}
+	recordCount := vol.index.compactRecordCount()
+	for _, id := range ids {
+		if id < 0 || id >= recordCount {
+			continue
+		}
+		rec := vol.index.compactRecord(id)
+		if !rec.Deleted && rec.Mode&uint32(os.ModeDir) != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func extensionShapedPathTerm(term string) (string, bool) {
+	if len(term) < 2 || term[0] != '.' || strings.ContainsAny(term, `\/*?[]:`) {
+		return "", false
+	}
+	ext := strings.TrimPrefix(term, ".")
+	if ext == "" || strings.Contains(ext, ".") {
+		return "", false
+	}
+	return ext, true
+}
+
+func (vol *serviceVolumeIndex) pathPlanTermPostingLimited(term string, pq parsedQuery) ([]int, bool) {
+	if vol == nil || vol.index == nil || pq.CountOnly || pq.Limit <= 0 || !pq.MatchPath ||
+		pq.Under != "" || pq.Type != "" || pq.CaseSensitive || pq.CWDBias != "" || pq.RootBias != "" ||
+		len(pq.Exts) > 0 || len(pq.Dirs) > 0 || len(pq.Globs) > 0 || len(pq.Regexps) > 0 ||
+		len(pq.OrGroups) > 0 || len(pq.NotGroups) > 0 || pq.HasModAfter || pq.Exists ||
+		countNonVolumeTerms(pq.Terms) != 1 || term == "" || strings.ContainsAny(term, `\/*?[]:`) {
+		return nil, false
+	}
+	roots := vol.pathTermRootIDs(term)
+	if len(roots) == 0 || len(vol.subtreeStart) == 0 || len(vol.subtreeEnd) == 0 || len(vol.subtreeOrder) == 0 {
+		return nil, false
+	}
+	nameMatches, ok := vol.nameTrigramNameTermPostingLimited(term, servicePathNameTrigramCandidateMaxIDs)
+	if !ok {
+		nameMatches = vol.nameTermPosting(term)
+	}
+	if len(nameMatches) > maxInt(128, pq.Limit*4) {
+		return nil, false
+	}
+	intervals := make([]interval, 0, len(roots))
+	recordCount := vol.index.compactRecordCount()
+	for _, rootID := range roots {
+		if rootID < 0 || rootID >= recordCount || rootID >= len(vol.subtreeStart) || rootID >= len(vol.subtreeEnd) {
+			continue
+		}
+		start, end := vol.subtreeStart[rootID], vol.subtreeEnd[rootID]
+		if start == ^uint32(0) || start > end || int(end) > len(vol.subtreeOrder) {
+			continue
+		}
+		intervals = append(intervals, interval{start: int(start), end: int(end)})
+	}
+	if len(intervals) == 0 {
+		return nil, false
+	}
+	intervals = mergeIntervals(intervals)
+	if out, ok := vol.smallPathComponentExpansion(term, pq, intervals, nameMatches); ok {
+		return out, true
+	}
+	return vol.topPathComponentExpansion(term, pq, intervals, nameMatches)
+}
+
+func (vol *serviceVolumeIndex) smallPathComponentExpansion(term string, pq parsedQuery, intervals []interval, nameMatches []int) ([]int, bool) {
+	total := 0
+	for _, iv := range intervals {
+		if iv.end > iv.start {
+			total += iv.end - iv.start
+		}
+	}
+	threshold := maxInt(4096, pq.Limit*64)
+	if total > threshold || len(nameMatches) > threshold {
+		return nil, false
+	}
+	seen := make(map[int]struct{}, total+len(nameMatches))
+	out := make([]int, 0, total+len(nameMatches))
+	add := func(id int) {
+		if id < 0 || id >= vol.index.compactRecordCount() {
+			return
+		}
+		if _, ok := seen[id]; ok {
+			return
+		}
+		rec := vol.index.compactRecord(id)
+		if rec.Deleted || !compactRecordPrecheck(rec, pq, true) {
+			return
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	for _, id := range nameMatches {
+		add(id)
+	}
+	for _, iv := range intervals {
+		for pos := iv.start; pos < iv.end; pos++ {
+			if pos < 0 || pos >= len(vol.subtreeOrder) {
+				continue
+			}
+			add(int(vol.subtreeOrder[pos]))
+		}
+	}
+	if len(out) == 0 {
+		return nil, false
+	}
+	sort.Ints(out)
+	return out, true
+}
+
+func (vol *serviceVolumeIndex) topPathComponentExpansion(term string, pq parsedQuery, intervals []interval, nameMatches []int) ([]int, bool) {
+	if vol == nil || vol.index == nil || pq.Limit <= 0 {
+		return nil, false
+	}
+	rankOf := candidateRanker(vol.index, vol.nameOrderRanks())
+	seen := make(map[int]struct{}, pq.Limit*4)
+	h := make(candidateRankMaxHeap, 0, pq.Limit)
+	add := func(id int) {
+		if id < 0 || id >= vol.index.compactRecordCount() {
+			return
+		}
+		if _, ok := seen[id]; ok {
+			return
+		}
+		rec := vol.index.compactRecord(id)
+		if rec.Deleted || !compactRecordPrecheck(rec, pq, true) {
+			return
+		}
+		seen[id] = struct{}{}
+		item := candidateRankItem{id: id, rank: rankOf(id)}
+		if len(h) < pq.Limit {
+			heap.Push(&h, item)
+			return
+		}
+		if item.rank < h[0].rank {
+			h[0] = item
+			heap.Fix(&h, 0)
+		}
+	}
+	for _, id := range nameMatches {
+		if id >= 0 && id < vol.index.compactRecordCount() && strings.Contains(vol.index.compactLowerNameAt(id), term) {
+			add(id)
+		}
+	}
+	for _, iv := range intervals {
+		for pos := iv.start; pos < iv.end; pos++ {
+			if pos < 0 || pos >= len(vol.subtreeOrder) {
+				continue
+			}
+			add(int(vol.subtreeOrder[pos]))
+		}
+	}
+	if len(h) == 0 {
+		return nil, false
+	}
+	out := make([]int, len(h))
+	for i := range h {
+		out[i] = h[i].id
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return rankOf(out[i]) < rankOf(out[j])
+	})
+	return out, true
+}
+
+func countNonVolumeTerms(terms []string) int {
+	count := 0
+	for _, term := range terms {
+		if isVolumeQueryTerm(term) {
+			continue
+		}
+		count++
+	}
+	return count
+}
+
+func mergeIntervals(intervals []interval) []interval {
+	if len(intervals) <= 1 {
+		return intervals
+	}
+	sort.Slice(intervals, func(i, j int) bool {
+		if intervals[i].start == intervals[j].start {
+			return intervals[i].end < intervals[j].end
+		}
+		return intervals[i].start < intervals[j].start
+	})
+	out := intervals[:1]
+	for _, iv := range intervals[1:] {
+		last := &out[len(out)-1]
+		if iv.start <= last.end {
+			if iv.end > last.end {
+				last.end = iv.end
+			}
+			continue
+		}
+		out = append(out, iv)
+	}
+	return out
+}
+
+func intervalContainsPosition(intervals []interval, pos int) bool {
+	if pos < 0 {
+		return false
+	}
+	i := sort.Search(len(intervals), func(i int) bool {
+		return intervals[i].end > pos
+	})
+	return i < len(intervals) && intervals[i].start <= pos && pos < intervals[i].end
+}
+
 func (plan candidatePlan) execute() []int {
 	if plan.empty {
 		return []int{}
@@ -552,6 +1025,21 @@ func (plan candidatePlan) execute() []int {
 		out = plan.filterUnderPath(out)
 	}
 	return out
+}
+
+func (plan candidatePlan) sourceSummary() string {
+	if plan.empty {
+		return "empty"
+	}
+	if len(plan.sources) == 0 {
+		return "none"
+	}
+	names := make([]string, 0, len(plan.sources))
+	for _, source := range plan.sources {
+		names = append(names, source.name)
+	}
+	sort.Strings(names)
+	return strings.Join(names, "+")
 }
 
 func (plan candidatePlan) filterUnderPath(ids []int) []int {

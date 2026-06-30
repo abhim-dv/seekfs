@@ -120,8 +120,8 @@ func TestPackedRecordsAvoidsRedundantOptionalArrays(t *testing.T) {
 	if len(packed.LowerBlob) != 0 {
 		t.Fatalf("LowerBlob len = %d, want 0 for already-lowercase names", len(packed.LowerBlob))
 	}
-	if packed.Sizes != nil {
-		t.Fatalf("Sizes allocated for zero sizes")
+	if packed.Size32 != nil {
+		t.Fatalf("Size32 allocated for zero sizes")
 	}
 	if packed.ModUnix != nil {
 		t.Fatalf("ModUnix allocated for zero modified times")

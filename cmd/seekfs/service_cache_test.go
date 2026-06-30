@@ -112,25 +112,379 @@ func TestSimpleGlobExtsDeclinesComplexGlobs(t *testing.T) {
 	}
 }
 
-func TestServiceSubtreeIntervalsDisabledByDefault(t *testing.T) {
+func TestServiceSubtreeIntervalsDefaultEnabled(t *testing.T) {
 	t.Setenv("SEEKFS_SUBTREE_INTERVALS", "")
-	if serviceSubtreeIntervalsEnabled() {
-		t.Fatal("subtree intervals should be disabled by default")
-	}
-	t.Setenv("SEEKFS_SUBTREE_INTERVALS", "1")
 	if !serviceSubtreeIntervalsEnabled() {
-		t.Fatal("subtree intervals should be enabled by explicit opt-in")
+		t.Fatal("subtree intervals should be enabled by default")
+	}
+	t.Setenv("SEEKFS_SUBTREE_INTERVALS", "0")
+	if serviceSubtreeIntervalsEnabled() {
+		t.Fatal("subtree intervals should be disabled by explicit opt-out")
 	}
 }
 
-func TestServicePathGramsDisabledByDefault(t *testing.T) {
+func TestServicePathGramsDefaultEnabled(t *testing.T) {
 	t.Setenv("SEEKFS_PATH_GRAMS", "")
-	if servicePathGramsEnabled() {
-		t.Fatal("path grams should be disabled by default")
-	}
-	t.Setenv("SEEKFS_PATH_GRAMS", "true")
 	if !servicePathGramsEnabled() {
-		t.Fatal("path grams should be enabled by explicit opt-in")
+		t.Fatal("path grams should be enabled by default")
+	}
+	t.Setenv("SEEKFS_PATH_GRAMS", "false")
+	if servicePathGramsEnabled() {
+		t.Fatal("path grams should be disabled by explicit opt-out")
+	}
+}
+
+func TestServiceNameOrderDefaultEnabled(t *testing.T) {
+	t.Setenv("SEEKFS_NAME_ORDER", "")
+	if !serviceNameOrderEnabled() {
+		t.Fatal("name order should be enabled by default policy")
+	}
+	vol := newServiceVolumeIndex("fixture.gsi", commonSearchFixture())
+	if got := vol.nameOrderStateString(); got != "ready" {
+		t.Fatalf("small name order state = %q, want ready", got)
+	}
+	if vol.queryIndex == nil || len(vol.queryIndex.nameOrder) == 0 || len(vol.queryIndex.nameRank) == 0 {
+		t.Fatal("small resident name order/rank was not built synchronously")
+	}
+}
+
+func TestCompactChildrenBuildNotNeededAfterVolumeConstruction(t *testing.T) {
+	vol := newServiceVolumeIndex("fixture.gsi", commonSearchFixture())
+	if len(vol.childOffsets) == 0 || len(vol.childIDs) == 0 {
+		t.Fatal("compact child ranges were not built during volume construction")
+	}
+	if vol.needsCompactChildrenBuild() {
+		t.Fatal("volume requested duplicate compact child build")
+	}
+	vol.childOffsets = nil
+	vol.childIDs = nil
+	if !vol.needsCompactChildrenBuild() {
+		t.Fatal("volume did not request compact child rebuild after ranges were invalidated")
+	}
+}
+
+func TestSortFRNIndexEntriesSortsOnlyWhenNeeded(t *testing.T) {
+	sortedFRNs := []uint64{1, 2, 3}
+	sortedIDs := []uint32{10, 20, 30}
+	sortFRNIndexEntries(sortedFRNs, sortedIDs)
+	if !sameUint64s(sortedFRNs, []uint64{1, 2, 3}) || !sameUint32s(sortedIDs, []uint32{10, 20, 30}) {
+		t.Fatalf("sorted entries = %v/%v, want %v/%v", sortedFRNs, sortedIDs, []uint64{1, 2, 3}, []uint32{10, 20, 30})
+	}
+
+	unsortedFRNs := []uint64{3, 1, 2}
+	unsortedIDs := []uint32{30, 10, 20}
+	sortFRNIndexEntries(unsortedFRNs, unsortedIDs)
+	if !sameUint64s(unsortedFRNs, []uint64{1, 2, 3}) || !sameUint32s(unsortedIDs, []uint32{10, 20, 30}) {
+		t.Fatalf("unsorted entries = %v/%v, want %v/%v", unsortedFRNs, unsortedIDs, []uint64{1, 2, 3}, []uint32{10, 20, 30})
+	}
+}
+
+func TestServiceStartupWorkerCount(t *testing.T) {
+	t.Setenv("SEEKFS_STARTUP_WORKERS", "")
+	if got := serviceStartupWorkerCount(0); got != 1 {
+		t.Fatalf("workers for 0 dbs = %d, want 1", got)
+	}
+	if got := serviceStartupWorkerCount(1); got != 1 {
+		t.Fatalf("workers for 1 db = %d, want 1", got)
+	}
+	if got := serviceStartupWorkerCount(3); got != serviceStartupDefaultWorkers {
+		t.Fatalf("default workers for 3 dbs = %d, want %d", got, serviceStartupDefaultWorkers)
+	}
+	t.Setenv("SEEKFS_STARTUP_WORKERS", "8")
+	if got := serviceStartupWorkerCount(3); got != 3 {
+		t.Fatalf("capped workers = %d, want 3", got)
+	}
+	t.Setenv("SEEKFS_STARTUP_WORKERS", "1")
+	if got := serviceStartupWorkerCount(3); got != 1 {
+		t.Fatalf("forced workers = %d, want 1", got)
+	}
+	t.Setenv("SEEKFS_STARTUP_WORKERS", "invalid")
+	if got := serviceStartupWorkerCount(3); got != serviceStartupDefaultWorkers {
+		t.Fatalf("invalid env workers = %d, want %d", got, serviceStartupDefaultWorkers)
+	}
+}
+
+func sameUint64s(a, b []uint64) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func BenchmarkSortFRNIndexEntries(b *testing.B) {
+	const n = 500_000
+	baseSortedFRNs := make([]uint64, n)
+	baseSortedIDs := make([]uint32, n)
+	baseShuffledFRNs := make([]uint64, n)
+	baseShuffledIDs := make([]uint32, n)
+	for i := 0; i < n; i++ {
+		baseSortedFRNs[i] = uint64(i + 1)
+		baseSortedIDs[i] = uint32(i)
+		baseShuffledFRNs[i] = uint64((i*7919)%n + 1)
+		baseShuffledIDs[i] = uint32(i)
+	}
+	b.Run("already-sorted", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			frns := append([]uint64(nil), baseSortedFRNs...)
+			ids := append([]uint32(nil), baseSortedIDs...)
+			sortFRNIndexEntries(frns, ids)
+		}
+	})
+	b.Run("shuffled", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			frns := append([]uint64(nil), baseShuffledFRNs...)
+			ids := append([]uint32(nil), baseShuffledIDs...)
+			sortFRNIndexEntries(frns, ids)
+		}
+	})
+}
+
+func TestServiceNameOrderCanBeDisabledByEnv(t *testing.T) {
+	t.Setenv("SEEKFS_NAME_ORDER", "0")
+	if serviceNameOrderEnabled() {
+		t.Fatal("name order should be disabled by explicit env")
+	}
+	vol := newServiceVolumeIndex("fixture.gsi", commonSearchFixture())
+	if got := vol.nameOrderStateString(); got != "" {
+		t.Fatalf("name order state = %q, want empty when disabled", got)
+	}
+	if vol.queryIndex != nil && (len(vol.queryIndex.nameOrder) != 0 || len(vol.queryIndex.nameRank) != 0) {
+		t.Fatal("name order/rank should not be built when disabled")
+	}
+}
+
+func TestBackgroundNameOrderBuildPublishesResidentView(t *testing.T) {
+	t.Setenv("SEEKFS_NAME_ORDER", "1")
+	idx := commonSearchFixture()
+	vol := newServiceVolumeIndex("fixture.gsi", idx)
+	if vol.queryIndex == nil {
+		t.Fatal("queryIndex was nil")
+	}
+	vol.queryIndex.nameOrder = nil
+	vol.queryIndex.nameRank = nil
+	vol.nameOrderState.Store(nameTrigramStatePending)
+	if got := vol.nameOrderStateString(); got != "pending" {
+		t.Fatalf("initial name order state = %q, want pending", got)
+	}
+	s := &goSearchService{}
+	s.rebuildNameOrderInBackground(vol)
+	if got := vol.nameOrderStateString(); got != "ready" {
+		t.Fatalf("name order state = %q, want ready", got)
+	}
+	if len(vol.queryIndex.nameOrder) == 0 || len(vol.queryIndex.nameRank) != idx.compactRecordCount() {
+		t.Fatalf("name order/rank lengths = %d/%d, records=%d", len(vol.queryIndex.nameOrder), len(vol.queryIndex.nameRank), idx.compactRecordCount())
+	}
+	if vol.nameOrderMillis.Load() < 0 {
+		t.Fatalf("name order build millis = %d, want non-negative", vol.nameOrderMillis.Load())
+	}
+}
+
+func TestBuildExtTopPostingsKeepsTopRankedIDsOnly(t *testing.T) {
+	ext := map[string][]uint32{
+		"json": {9, 1, 8, 2, 7, 3, 6, 4, 5, 0},
+		"go":   {4, 1},
+	}
+	ranks := []uint32{90, 10, 20, 30, 40, 50, 60, 70, 80, 0}
+
+	top := buildExtTopPostings(ext, ranks, 4)
+	if got, want := top["json"], []uint32{9, 1, 2, 3}; !sameUint32s(got, want) {
+		t.Fatalf("json top = %v, want %v", got, want)
+	}
+	if got, want := top["go"], []uint32{1, 4}; !sameUint32s(got, want) {
+		t.Fatalf("go top = %v, want %v", got, want)
+	}
+}
+
+func sameUint32s(a, b []uint32) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func BenchmarkBuildExtTopPostingsBounded(b *testing.B) {
+	const records = 250_000
+	ext := map[string][]uint32{
+		"json": make([]uint32, records),
+		"pdf":  make([]uint32, records/2),
+		"go":   make([]uint32, records/20),
+	}
+	ranks := make([]uint32, records)
+	for i := range ranks {
+		ranks[i] = uint32(records - i)
+	}
+	for key, ids := range ext {
+		offset := 0
+		if key == "pdf" {
+			offset = 1
+		} else if key == "go" {
+			offset = 3
+		}
+		for i := range ids {
+			ids[i] = uint32((i*7 + offset) % records)
+		}
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		top := buildExtTopPostings(ext, ranks, serviceExtTopPostingLimit)
+		if len(top["json"]) != serviceExtTopPostingLimit {
+			b.Fatalf("json top len = %d", len(top["json"]))
+		}
+	}
+}
+
+func TestParallelTopCandidateIDsByRankMatchesSerial(t *testing.T) {
+	const records = serviceRankParallelMinIDs*2 + 123
+	const limit = 20
+	ids := make([]int, records)
+	ranks := make([]int, records)
+	for i := 0; i < records; i++ {
+		id := (i*7919 + 17) % records
+		ids[i] = id
+		ranks[id] = (records - i*3571%records)
+	}
+	rankOf := func(id int) int {
+		if id < 0 || id >= len(ranks) {
+			return records + id
+		}
+		return ranks[id]
+	}
+	serial := topCandidateIDsByRankSerial(ids, limit, rankOf)
+	parallel := topCandidateIDsByRankParallel(ids, limit, rankOf)
+	if !sameIntSlices(serial, parallel) {
+		t.Fatalf("parallel top IDs = %v, serial = %v", parallel, serial)
+	}
+}
+
+func sameIntSlices(a, b []int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func TestServiceNameTrigramsDefaultEnabledUnderCap(t *testing.T) {
+	t.Setenv("SEEKFS_NAME_TRIGRAMS", "")
+	t.Setenv("SEEKFS_NAME_TRIGRAM_MAX_RECORDS", "")
+	if !serviceNameTrigramsEnabled() {
+		t.Fatal("name trigrams should be enabled by default policy")
+	}
+	vol := newServiceVolumeIndex("fixture.gsi", commonSearchFixture())
+	if vol.nameTrigramIndex() != nil {
+		t.Fatal("name trigram resident index built synchronously")
+	}
+	if got := vol.nameTrigramStateString(); got != "pending" {
+		t.Fatalf("name trigram state = %q, want pending", got)
+	}
+}
+
+func TestServiceNameTrigramsCanBeDisabledByEnv(t *testing.T) {
+	t.Setenv("SEEKFS_NAME_TRIGRAMS", "0")
+	if serviceNameTrigramsEnabled() {
+		t.Fatal("name trigrams should be disabled by explicit env")
+	}
+	vol := newServiceVolumeIndex("fixture.gsi", commonSearchFixture())
+	if got := vol.nameTrigramStateString(); got != "" {
+		t.Fatalf("name trigram state = %q, want empty when disabled", got)
+	}
+}
+
+func TestServiceNameTrigramsEnabledStartsPending(t *testing.T) {
+	t.Setenv("SEEKFS_NAME_TRIGRAMS", "1")
+	if !serviceNameTrigramsEnabled() {
+		t.Fatal("name trigrams should be enabled by explicit opt-in")
+	}
+	vol := newServiceVolumeIndex("fixture.gsi", commonSearchFixture())
+	if vol.nameTrigramIndex() != nil {
+		t.Fatal("name trigram resident index built synchronously")
+	}
+	if got := vol.nameTrigramStateString(); got != "pending" {
+		t.Fatalf("name trigram state = %q, want pending", got)
+	}
+}
+
+func TestServiceNameTrigramRecordCapAndForceEnable(t *testing.T) {
+	idx := commonSearchFixture()
+	t.Setenv("SEEKFS_NAME_TRIGRAMS", "")
+	t.Setenv("SEEKFS_NAME_TRIGRAM_MAX_RECORDS", "1")
+	if serviceNameTrigramsEnabledForIndex(idx) {
+		t.Fatal("name trigrams should be disabled over default cap")
+	}
+	t.Setenv("SEEKFS_NAME_TRIGRAMS", "1")
+	if !serviceNameTrigramsEnabledForIndex(idx) {
+		t.Fatal("explicit opt-in should force name trigrams over cap")
+	}
+}
+
+func TestBackgroundNameTrigramBuildPublishesAtomicIndex(t *testing.T) {
+	t.Setenv("SEEKFS_NAME_TRIGRAMS", "1")
+	vol := newServiceVolumeIndex("fixture.gsi", commonSearchFixture())
+	s := &goSearchService{}
+	s.rebuildNameTrigramsInBackground(vol)
+	ti := vol.nameTrigramIndex()
+	if ti == nil || ti.keyCount() == 0 {
+		t.Fatal("background name trigram index was not published")
+	}
+	if got := vol.nameTrigramStateString(); got != "ready" {
+		t.Fatalf("name trigram state = %q, want ready", got)
+	}
+	info := vol.residentMemoryInfo()
+	if info.NameTrigramBytes == 0 || info.NameTrigramKeys == 0 {
+		t.Fatalf("name trigram memory = (%d bytes, %d keys), want populated", info.NameTrigramBytes, info.NameTrigramKeys)
+	}
+	if vol.nameTrigramMillis.Load() < 0 {
+		t.Fatalf("name trigram build millis = %d, want non-negative", vol.nameTrigramMillis.Load())
+	}
+}
+
+func TestResidentBackgroundLoadingTracksPendingAccelerators(t *testing.T) {
+	t.Setenv("SEEKFS_NAME_TRIGRAMS", "1")
+	vol := newServiceVolumeIndex("fixture.gsi", commonSearchFixture())
+	if !serviceResidentBackgroundLoading([]*serviceVolumeIndex{vol}) {
+		t.Fatal("background loading = false with pending name trigrams")
+	}
+	s := &goSearchService{}
+	s.rebuildNameTrigramsInBackground(vol)
+	if serviceResidentBackgroundLoading([]*serviceVolumeIndex{vol}) {
+		t.Fatal("background loading = true after resident accelerators are ready")
+	}
+}
+
+func TestSearchFallsBackWhileNameTrigramsPending(t *testing.T) {
+	t.Setenv("SEEKFS_NAME_TRIGRAMS", "1")
+	idx := pathSyntaxFixture()
+	vol := newServiceVolumeIndex("fixture.gsi", idx)
+	opts := queryOptions{Query: "path:C: .opencode", Limit: 20}
+	if vol.nameTrigramIndex() != nil || vol.nameTrigramStateString() != "pending" {
+		t.Fatalf("unexpected trigram state index=%v state=%q", vol.nameTrigramIndex(), vol.nameTrigramStateString())
+	}
+	fast, err := searchCompactWithCache(idx, opts, false, vol.pathCache, vol.nameTermCandidates)
+	if err != nil {
+		t.Fatal(err)
+	}
+	full, err := searchCompactWithCache(idx, opts, false, make(map[int]string), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := namesOf(fast), namesOf(full); !sameStringSet(got, want) {
+		t.Fatalf("pending trigram fallback names = %v, full names = %v", got, want)
 	}
 }
 
@@ -308,9 +662,14 @@ func TestServiceVolumeIndexResidentMemoryInfoReflectsSkippedViews(t *testing.T) 
 	vol := syntheticServiceVolumeIndexForCacheTests()
 	vol.index.packCompactRecords(true)
 	vol.queryIndex.nameOrder = nil
+	vol.queryIndex.nameRank = nil
 	vol.children = nil
 	vol.childOffsets = nil
 	vol.childIDs = nil
+	vol.rootIDs = nil
+	vol.subtreeOrder = nil
+	vol.subtreeStart = nil
+	vol.subtreeEnd = nil
 
 	info := vol.residentMemoryInfo()
 	if info == nil {
@@ -330,6 +689,19 @@ func TestServiceVolumeIndexResidentMemoryInfoReflectsSkippedViews(t *testing.T) 
 	}
 	if info.FRNIndexBytes == 0 || info.KnownBytes == 0 {
 		t.Fatalf("expected FRN and known memory fields: %+v", info)
+	}
+}
+
+func TestTrimSearchCachesDoesNotForceMemoryRelease(t *testing.T) {
+	vol := syntheticServiceVolumeIndexForCacheTests()
+	for i := 0; i < 32; i++ {
+		vol.trimSearchCachesLocked()
+	}
+	if vol.searchCount != 32 {
+		t.Fatalf("searchCount = %d, want 32", vol.searchCount)
+	}
+	if vol.pathCache == nil {
+		t.Fatal("path cache was cleared unexpectedly")
 	}
 }
 
@@ -465,6 +837,63 @@ func TestExchangeServiceJSONTimesOutHungQuery(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > 150*time.Millisecond {
 		t.Fatalf("timeout elapsed = %s, want under 150ms", elapsed)
+	}
+}
+
+func TestStandaloneServicePipeSearchEndToEnd(t *testing.T) {
+	vol := syntheticServiceVolumeIndexForCacheTests()
+	idx := vol.index
+	pipeName := fmt.Sprintf(`\\.\pipe\seekfs-test-%d-%d`, os.Getpid(), time.Now().UnixNano())
+	svc := &goSearchService{
+		pipeName: pipeName,
+		sddl:     defaultServiceSDDL,
+		stop:     make(chan struct{}),
+		indexes:  []*Index{idx},
+		volumes:  []*serviceVolumeIndex{vol},
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		svc.servePipeListener()
+	}()
+	defer func() {
+		close(svc.stop)
+		if handle, err := openPipeClientWithTimeout(pipeName, 100*time.Millisecond); err == nil {
+			_ = os.NewFile(uintptr(handle), pipeName).Close()
+		}
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("standalone service listener did not stop")
+		}
+	}()
+
+	info, err := callService(pipeName, serviceRequest{Command: "info"})
+	if err != nil {
+		t.Fatalf("info request failed: %v", err)
+	}
+	if !info.OK || info.Entries != idx.entryCount() {
+		t.Fatalf("info response = %+v, want ok entries=%d", info, idx.entryCount())
+	}
+
+	search, err := callService(pipeName, serviceRequestFromOptions(queryOptions{
+		Query: "ext:go",
+		Limit: 20,
+	}, false))
+	if err != nil {
+		t.Fatalf("search request failed: %v", err)
+	}
+	if !search.OK {
+		t.Fatalf("search response = %+v, want ok", search)
+	}
+	if search.Count != 1 || len(search.Rows) != 1 || search.Rows[0].Name != "main.go" {
+		t.Fatalf("search rows = %+v count=%d, want main.go", search.Rows, search.Count)
+	}
+	if search.SearchMS < 0 {
+		t.Fatalf("search_ms = %f, want non-negative", search.SearchMS)
+	}
+	if search.Source == "" || search.Candidates == 0 {
+		t.Fatalf("search trace source=%q candidates=%d, want populated service metadata", search.Source, search.Candidates)
 	}
 }
 

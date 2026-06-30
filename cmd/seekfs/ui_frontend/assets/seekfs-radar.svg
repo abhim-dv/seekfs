@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="seekfs radar sweep icon">
+  <defs>
+    <linearGradient id="seekfs-sweep" x1="82" y1="188" x2="190" y2="70" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#21d4fd"/>
+      <stop offset="1" stop-color="#b7f45d"/>
+    </linearGradient>
+  </defs>
+  <circle cx="128" cy="128" r="86" fill="#14181f"/>
+  <path d="M128 128 185 58A90 90 0 0 1 218 128Z" fill="url(#seekfs-sweep)"/>
+  <path d="M128 42A86 86 0 1 0 214 128h-22a64 64 0 1 1-64-64Z" fill="#2a3039"/>
+  <circle cx="128" cy="128" r="22" fill="#f6fff1"/>
+  <circle cx="128" cy="128" r="11" fill="#14181f"/>
+</svg>

@@ -1,0 +1,187 @@
+:root {
+  color-scheme: dark;
+  font-family: "Segoe UI", system-ui, sans-serif;
+  background: #050505;
+  color: #f2f2f2;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 760px;
+  background: #050505;
+  overflow: hidden;
+}
+
+button,
+input {
+  font: inherit;
+}
+
+.shell {
+  height: 100vh;
+  display: grid;
+  grid-template-rows: 34px 1fr 26px;
+  background: #050505;
+}
+
+.searchbar {
+  padding: 5px 6px 3px;
+  border-bottom: 1px solid #2a2a2a;
+  background: #101010;
+}
+
+.search-input {
+  width: 100%;
+  height: 24px;
+  padding: 0 7px;
+  color: #f6f6f6;
+  background: #050505;
+  border: 1px solid #4a4a4a;
+  border-radius: 0;
+  outline: none;
+}
+
+.search-input:focus {
+  border-color: #777;
+}
+
+.results-wrap {
+  position: relative;
+  overflow: auto;
+}
+
+.results {
+  width: 100%;
+  border-collapse: collapse;
+  table-layout: fixed;
+  font-size: 13px;
+}
+
+th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  height: 25px;
+  padding: 0 8px;
+  color: #f4f4f4;
+  background: #171717;
+  border-right: 1px solid #353535;
+  border-bottom: 1px solid #353535;
+  font-weight: 400;
+  text-align: left;
+}
+
+td {
+  height: 24px;
+  padding: 0 8px;
+  color: #f2f2f2;
+  border: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+tbody tr {
+  cursor: default;
+}
+
+tbody tr:hover {
+  background: #151515;
+}
+
+tbody tr.selected {
+  background: #6d6d6d;
+  outline: 1px dotted #dadada;
+  outline-offset: -2px;
+}
+
+.name-col {
+  width: 33%;
+}
+
+.size-col {
+  width: 108px;
+  text-align: right;
+}
+
+.date-col {
+  width: 190px;
+}
+
+.size-cell {
+  text-align: right;
+}
+
+.path-cell {
+  color: #efefef;
+}
+
+.date-cell {
+  color: #d9d9d9;
+}
+
+.empty {
+  position: absolute;
+  inset: 54px 0 auto;
+  color: #858585;
+  text-align: center;
+  pointer-events: none;
+}
+
+.footer {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: center;
+  gap: 12px;
+  padding: 0 8px;
+  color: #e6e6e6;
+  background: #171717;
+  border-top: 1px solid #303030;
+  font-size: 12px;
+}
+
+.context-menu {
+  position: fixed;
+  z-index: 20;
+  min-width: 184px;
+  display: none;
+  padding: 4px 0;
+  background: #202020;
+  border: 1px solid #565656;
+  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.45);
+}
+
+.context-menu.open {
+  display: block;
+}
+
+.context-menu button {
+  width: 100%;
+  height: 26px;
+  display: block;
+  padding: 0 24px;
+  color: #f4f4f4;
+  background: transparent;
+  border: 0;
+  text-align: left;
+  cursor: default;
+}
+
+.context-menu button:hover {
+  background: #3a3a3a;
+}
+
+.context-menu button.danger {
+  color: #ffd9d9;
+}
+
+.context-menu hr {
+  height: 1px;
+  margin: 4px 0;
+  border: 0;
+  background: #3d3d3d;
+}
