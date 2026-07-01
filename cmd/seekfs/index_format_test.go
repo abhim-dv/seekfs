@@ -79,6 +79,55 @@ func TestCompactIndexV8RoundTripKeepsFRNMetadata(t *testing.T) {
 	}
 }
 
+func TestCompactIndexMMapRoundTripKeepsPathAndMetadata(t *testing.T) {
+	t.Setenv("SEEKFS_MEMORY_MODE", "lowmem")
+	modified := time.Unix(0, 987654321)
+	idx := &Index{
+		Version:    indexVersion,
+		Roots:      []string{`F:\`},
+		BuiltAt:    time.Unix(0, 123456789),
+		Source:     "usn",
+		Volume:     "F:",
+		JournalID:  42,
+		Checkpoint: 99,
+		Compact:    true,
+		Records: []CompactRecord{
+			{FRN: 10, ParentFRN: 10, Parent: -1, Name: ".", Mode: uint32(os.ModeDir), ModUnix: modified.UnixNano()},
+			{FRN: 11, ParentFRN: 10, Parent: 0, Name: "Projects", Mode: uint32(os.ModeDir), ModUnix: modified.Add(time.Second).UnixNano()},
+			{FRN: 12, ParentFRN: 11, Parent: 1, Name: "Scan.NRRD", Size: 4096, ModUnix: modified.Add(2 * time.Second).UnixNano()},
+		},
+	}
+	path := filepath.Join(t.TempDir(), "compact.gsi")
+	if err := saveIndex(path, idx); err != nil {
+		t.Fatalf("saveIndex: %v", err)
+	}
+	got, err := loadIndexMMap(path)
+	if err != nil {
+		t.Fatalf("loadIndexMMap: %v", err)
+	}
+	t.Cleanup(func() {
+		if got.MMapRecords != nil {
+			_ = got.MMapRecords.file.close()
+		}
+	})
+	if got.MMapRecords == nil || got.PackedRecords != nil || len(got.Records) != 0 {
+		t.Fatalf("mmap records not active: mmap=%v packed=%v records=%d", got.MMapRecords != nil, got.PackedRecords != nil, len(got.Records))
+	}
+	if got.compactRecordCount() != 3 || !got.compactHasSize() || !got.compactHasModTime() {
+		t.Fatalf("mmap capabilities count=%d size=%v mod=%v", got.compactRecordCount(), got.compactHasSize(), got.compactHasModTime())
+	}
+	rec := got.compactRecord(2)
+	if rec.Name != "Scan.NRRD" || rec.Size != 4096 || rec.Parent != 1 || rec.ParentFRN != 11 {
+		t.Fatalf("mmap record mismatch: %+v", rec)
+	}
+	if lower := got.compactLowerNameAt(2); lower != "scan.nrrd" {
+		t.Fatalf("lower name = %q", lower)
+	}
+	if path := got.reconstructCompactPath(2); path != `F:\Projects\Scan.NRRD` {
+		t.Fatalf("path = %q", path)
+	}
+}
+
 func TestCompactDiskRecordRefsUseWideEncodingPastNarrowLimit(t *testing.T) {
 	var buf bytes.Buffer
 	parent := uint32(compactNarrowParentSentinel)

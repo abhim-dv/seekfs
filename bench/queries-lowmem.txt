@@ -1,0 +1,20 @@
+.nrrd
+.raw
+.pdf
+.json
+.dll
+.exe
+.opencode
+path:F: .nrrd
+path:F: .raw
+path:F: .pdf
+path:C: .exe
+path:C: Users
+path:C: AppData
+path:F: workspace
+path:Windows
+path:node_modules
+path:Downloads .nrrd
+path:F: Downloads .nrrd
+path:C:.nrrd
+zzzz-no-hit-seekfs

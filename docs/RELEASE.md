@@ -11,6 +11,7 @@ seekfs-windows-amd64.zip
 Contents:
 
 - `seekfs.exe`
+- `seekfs-service.exe`
 - `README.md`
 - `LICENSE`
 - `NOTICE.md`
@@ -20,12 +21,12 @@ Indexes and benchmark output are not included.
 
 ## Current Release
 
-Current release: `v0.8.4`.
+Current release: `v0.9.0`.
 
 Release notes:
 
 ```text
-docs/RELEASE_NOTES_0.8.4.md
+docs/RELEASE_NOTES_0.9.0.md
 ```
 
 ## Signing

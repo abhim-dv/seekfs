@@ -23,7 +23,8 @@ if (Test-Path $Target) {
 New-Item -ItemType Directory -Force -Path $Target | Out-Null
 
 $LdFlags = "-s -w -X main.version=$Version -X main.commit=$Commit -X main.date=$Date"
-go build -trimpath -ldflags $LdFlags -o (Join-Path $Target "seekfs.exe") ./cmd/seekfs
+go build -trimpath -ldflags $LdFlags -o (Join-Path $Target "seekfs-service.exe") ./cmd/seekfs
+go build -trimpath -tags "seekfs_ui production" -ldflags $LdFlags -o (Join-Path $Target "seekfs.exe") ./cmd/seekfs
 
 Copy-Item README.md,LICENSE,NOTICE.md -Destination $Target
 
