@@ -294,10 +294,17 @@ func (vol *serviceVolumeIndex) buildCandidatePlan(pq parsedQuery) (candidatePlan
 			return plan, true
 		}
 	}
-	// When ext/glob/dir/type already gives us an indexed candidate source, keep
-	// path terms as verification filters. Building a cold path-term posting for
-	// a folder like "Downloads" can require walking a massive subtree before we
-	// ever intersect with a selective extension source.
+	if len(plan.sources) == 0 && pq.MatchPath && hasNonVolumeTerm(pq.Terms) {
+		for _, term := range pathPlanProbeTerms(pq.Terms) {
+			ids, ok := vol.boundedPathTermPlanSource(term)
+			if !ok {
+				continue
+			}
+			if !addRequired("path-term:"+term, ids) {
+				return plan, true
+			}
+		}
+	}
 
 	// OR groups: a record must match at least one alternative, so the candidate
 	// source is the union of each alternative's posting. We only build a posting
@@ -362,6 +369,164 @@ func (vol *serviceVolumeIndex) buildCandidatePlan(pq parsedQuery) (candidatePlan
 		return plan, false
 	}
 	return plan, true
+}
+
+func (vol *serviceVolumeIndex) boundedPathTermPlanSource(term string) ([]int, bool) {
+	if vol == nil || vol.index == nil || term == "" || isVolumeQueryTerm(term) ||
+		strings.ContainsAny(term, `\/*?[]:`) || len(term) < 3 {
+		return nil, false
+	}
+	ids, ok := vol.completeNameTrigramPathTermPosting(term)
+	if ok && len(ids) <= serviceComponentTrigramExpansionMaxIDs {
+		return ids, true
+	}
+	if vol.index.compactRecordCount() > serviceResidentChildRangeMaxRecords {
+		return nil, false
+	}
+	ids, ok = vol.scannedNamePathTermPosting(term)
+	if !ok || len(ids) > serviceComponentTrigramExpansionMaxIDs {
+		return nil, false
+	}
+	return ids, true
+}
+
+func (vol *serviceVolumeIndex) completeNameTrigramNameTermPostingLimited(term string, maxIDs int) ([]int, bool) {
+	trigrams := vol.nameTrigramIndex()
+	if vol == nil || trigrams == nil {
+		return nil, false
+	}
+	cacheKey := "\x00complete-ngram-name:" + term
+	vol.termMu.Lock()
+	if vol.termCache != nil {
+		if list, ok := vol.termCache[cacheKey]; ok {
+			seq := vol.termSeq[cacheKey]
+			vol.termMu.Unlock()
+			return vol.withRecentCandidates(list, seq, func(rec CompactRecord) bool {
+				id, ok := vol.idForFRN(rec.FRN)
+				return ok && vol.nameTrigramCandidateMatches(id, term)
+			}), true
+		}
+	}
+	vol.termMu.Unlock()
+
+	ids, ok, missing := trigrams.selectiveCandidateIDs(term, maxIDs)
+	if len(term) >= 6 {
+		ids, ok, missing = trigrams.selectiveIntersectCandidateIDs(term, maxIDs)
+	}
+	if !ok {
+		return nil, false
+	}
+	if missing {
+		return vol.nameTrigramRecentMatches(term), true
+	}
+	out := uniqueSortedInts(vol.verifyNameTrigramCandidateIDs(ids, term))
+	vol.cacheNamePosting(cacheKey, out)
+	return vol.withNameTrigramRecentCandidates(out, term), true
+}
+
+func (vol *serviceVolumeIndex) completeNameTrigramPathTermPosting(term string) ([]int, bool) {
+	if vol == nil || vol.index == nil {
+		return nil, false
+	}
+	cacheKey := "\x00complete-trigram-path:" + term
+	vol.termMu.Lock()
+	if vol.pathTermCache != nil {
+		if list, ok := vol.pathTermCache[cacheKey]; ok {
+			seq := vol.pathTermSeq[cacheKey]
+			vol.termMu.Unlock()
+			return vol.withRecentCandidates(list, seq, func(rec CompactRecord) bool {
+				id, ok := vol.idForFRN(rec.FRN)
+				return ok && vol.index.compactPathContainsTerm(id, term)
+			}), true
+		}
+	}
+	vol.termMu.Unlock()
+
+	nameMatches, ok := vol.completeNameTrigramNameTermPostingLimited(term, servicePathNameTrigramCandidateMaxIDs)
+	if !ok {
+		return nil, false
+	}
+	return vol.expandNameMatchesToPathTermPosting(cacheKey, term, nameMatches)
+}
+
+func (vol *serviceVolumeIndex) scannedNamePathTermPosting(term string) ([]int, bool) {
+	if vol == nil || vol.index == nil {
+		return nil, false
+	}
+	cacheKey := "\x00scan-name-path:" + term
+	vol.termMu.Lock()
+	if vol.pathTermCache != nil {
+		if list, ok := vol.pathTermCache[cacheKey]; ok {
+			seq := vol.pathTermSeq[cacheKey]
+			vol.termMu.Unlock()
+			return vol.withRecentCandidates(list, seq, func(rec CompactRecord) bool {
+				id, ok := vol.idForFRN(rec.FRN)
+				return ok && vol.index.compactPathContainsTerm(id, term)
+			}), true
+		}
+	}
+	vol.termMu.Unlock()
+
+	nameMatches := vol.nameTermPosting(term)
+	if len(nameMatches) > servicePathNameTrigramCandidateMaxIDs {
+		return nil, false
+	}
+	return vol.expandNameMatchesToPathTermPosting(cacheKey, term, nameMatches)
+}
+
+func (vol *serviceVolumeIndex) expandNameMatchesToPathTermPosting(cacheKey, term string, nameMatches []int) ([]int, bool) {
+	if vol == nil || vol.index == nil {
+		return nil, false
+	}
+	seen := make(map[int]struct{}, len(nameMatches))
+	out := make([]int, 0, len(nameMatches))
+	estimated := 0
+	for _, id := range nameMatches {
+		if id < 0 || id >= vol.index.compactRecordCount() {
+			continue
+		}
+		rec := vol.index.compactRecord(id)
+		if rec.Deleted {
+			continue
+		}
+		if rec.Mode&uint32(os.ModeDir) == 0 {
+			estimated++
+		} else {
+			estimated += vol.estimatedDescendantOrSelfCount(id)
+		}
+		if estimated > serviceComponentTrigramExpansionMaxIDs {
+			return nil, false
+		}
+	}
+	for _, id := range nameMatches {
+		if id < 0 || id >= vol.index.compactRecordCount() {
+			continue
+		}
+		if _, exists := seen[id]; !exists {
+			seen[id] = struct{}{}
+			out = append(out, id)
+		}
+		rec := vol.index.compactRecord(id)
+		if rec.Deleted || rec.Mode&uint32(os.ModeDir) == 0 {
+			continue
+		}
+		for _, childID := range vol.underDescendants(id) {
+			child := int(childID)
+			if _, exists := seen[child]; exists {
+				continue
+			}
+			seen[child] = struct{}{}
+			out = append(out, child)
+			if len(out) > serviceComponentTrigramExpansionMaxIDs {
+				return nil, false
+			}
+		}
+	}
+	sort.Ints(out)
+	if cacheKey != "" {
+		vol.cachePathPosting(cacheKey, out)
+	}
+	return out, true
 }
 
 // broadPathScanCandidates handles broad path-substring queries (e.g.

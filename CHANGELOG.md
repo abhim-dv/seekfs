@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.9.0 - Low-Memory mmap Engine and UI Binary Split
+
+### Added
+
+- Added a mmap-backed compact record load path for low-memory resident service
+  mode.
+- Added compressed, segmented name trigram indexes with bounded build and
+  query-time verification.
+- Added deterministic high-fanout path fixtures and generated multi-part path
+  syntax matrices covering volume tokens, `path:` token placement, dotted
+  extension promotion, `ext:`, `glob:`, negative terms, and service-volume
+  routing.
+- Added release packaging for both `seekfs.exe` and `seekfs-service.exe`.
+
+### Changed
+
+- `seekfs.exe` is now the desktop UI binary; `seekfs-service.exe` is the
+  backend/CLI/service binary.
+- Extension-bounded path searches verify path terms against compact parent
+  chains before reconstructing full path strings.
+- Low-memory trigram posting retention keeps selective broad path terms usable
+  without returning to the prior large in-heap representation.
+- Updated the UI window/taskbar icon and in-app logo assets.
+
+### Fixed
+
+- Fixed service timeouts for multi-part extension-bounded path searches such as
+  `path:C: pretraining DVT .nrrd`.
+- Prevented broad extension candidate sets from forcing thousands of full path
+  reconstructions before path-term rejection.
+- Hardened no-hit and volume-scoped multi-part path queries in low-memory mode.
+
+### Validation
+
+- `go test -count=1 ./...`
+- `go build -trimpath -o seekfs-service.exe ./cmd/seekfs`
+- `go build -trimpath -tags "seekfs_ui production" -o seekfs.exe ./cmd/seekfs`
+
 ## 0.8.4 - Backend Query Semantics and Service Parity
 
 ### Added

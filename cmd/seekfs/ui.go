@@ -259,6 +259,7 @@ func (a *UIApp) startStandaloneService(dbs []string) error {
 		return err
 	}
 	cmd := exec.Command(exe, uiServiceArgs(a.pipeName, dbs)...)
+	configureUIServiceEnvironment(cmd)
 	prepareUIServiceCommand(cmd)
 	if err := cmd.Start(); err != nil {
 		a.serviceStart.Store(false)
@@ -293,11 +294,30 @@ func uiDBArgs(dbs []string) string {
 }
 
 func uiServiceArgs(pipeName string, dbs []string) []string {
-	args := []string{"service", "-pipe", pipeName, "-sddl", defaultServiceSDDL}
+	args := []string{"service", "-lowmem", "-skip-startup-sync", "-pipe", pipeName, "-sddl", defaultServiceSDDL}
 	for _, db := range dbs {
 		args = append(args, "-db", db)
 	}
 	return args
+}
+
+func configureUIServiceEnvironment(cmd *exec.Cmd) {
+	env := os.Environ()
+	env = upsertEnv(env, "SEEKFS_MEMORY_MODE", "lowmem")
+	env = upsertEnv(env, "SEEKFS_LOW_MEMORY_SKIP_WAL", "1")
+	env = upsertEnv(env, "SEEKFS_STARTUP_WORKERS", "1")
+	cmd.Env = env
+}
+
+func upsertEnv(env []string, key, value string) []string {
+	prefix := key + "="
+	for i, item := range env {
+		if strings.HasPrefix(item, prefix) {
+			env[i] = prefix + value
+			return env
+		}
+	}
+	return append(env, prefix+value)
 }
 
 func (a *UIApp) searchServiceUI(query string, req UISearchRequest, limit int, seq int64) (serviceResponse, error) {

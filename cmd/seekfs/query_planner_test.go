@@ -46,6 +46,19 @@ func TestPlannedCandidatesMatchFullSearchForStructuralFilters(t *testing.T) {
 	}
 }
 
+func TestNilCandidateProviderMeansEmptyCandidateSet(t *testing.T) {
+	idx := commonSearchFixture()
+	got, err := searchCompactWithCache(idx, queryOptions{Query: "main", Limit: 20}, false, make(map[int]string), func(parsedQuery) ([]int, bool) {
+		return nil, true
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("nil candidate provider returned %d matches, want 0", len(got))
+	}
+}
+
 func TestExactTopCandidatesFilterPathTerms(t *testing.T) {
 	idx := commonSearchFixture()
 	vol := newServiceVolumeIndex("fixture.gsi", idx)
@@ -231,7 +244,7 @@ func TestPathOnlyDottedExtensionUsesPathPostingCandidate(t *testing.T) {
 	if !ok || len(pathPlan.sources) == 0 {
 		t.Fatalf("path:.nrrd plan = %+v ok=%v, want path-term candidate source", pathPlan.sources, ok)
 	}
-	if pathPlan.sources[0].name != "term:.nrrd" {
+	if pathPlan.sources[0].name != "term:.nrrd" && pathPlan.sources[0].name != "path-term:.nrrd" {
 		t.Fatalf("path:.nrrd source = %q, want path term source", pathPlan.sources[0].name)
 	}
 	extPlan, ok := vol.buildCandidatePlan(extPQ)
@@ -651,6 +664,15 @@ func TestBroadPathSearchAndCountParityMatrix(t *testing.T) {
 		{Query: "path:workspace .nrrd", Limit: 25},
 		{Query: "path:workspace ext:nrrd|json", Limit: 25},
 		{Query: "path:dataset ext:json", Limit: 25},
+		{Query: "path:pretraining .nrrd", Limit: 25},
+		{Query: "path:pretraining DVT .nrrd", Limit: 25},
+		{Query: "path:DVT pretraining .nrrd", Limit: 25},
+		{Query: ".nrrd path:pretraining DVT", Limit: 25},
+		{Query: "path:pretraining path:DVT .nrrd", Limit: 25},
+		{Query: "path:workspace pretraining DVT .nrrd", Limit: 25},
+		{Query: "path:pretraining DVT ext:nrrd", Limit: 25},
+		{Query: "path:pretraining DVT glob:*.nrrd", Limit: 25},
+		{Query: "path:pretraining missing .nrrd", Limit: 25},
 		{Query: "path:.nrrd ext:nrrd|json", Limit: 50},
 		{Query: "path:.nrrd !metadata", Limit: 50},
 		{Query: "path:.nrrd", Under: `C:\workspace\dataset-000000.nrrd`, Limit: 25},
@@ -692,8 +714,21 @@ func TestBroadPathSearchAndCountParityMatrix(t *testing.T) {
 func TestGeneratedBroadPathQueryParity(t *testing.T) {
 	idx := dottedPathBenchmarkIndex(800)
 	vol := newServiceVolumeIndex("fixture.gsi", idx)
-	pathTerms := []string{"path:.nrrd", "path:nrrd", "path:cache", "path:dataset", "path:workspace"}
+	vol.rebuildNameTrigramsLocked()
+	pathTerms := []string{
+		"path:.nrrd",
+		"path:nrrd",
+		"path:cache",
+		"path:dataset",
+		"path:workspace",
+		"path:pretraining",
+		"path:pretraining DVT",
+		"path:DVT pretraining",
+		"path:workspace pretraining DVT",
+		"path:missing DVT",
+	}
 	filters := []string{"", "ext:nrrd", "ext:json", "type:file", "glob:*.json", "!backup", "!metadata", "ext:nrrd|json"}
+	filters = append(filters, ".nrrd", "glob:*.nrrd")
 	limits := []int{1, 5, 25, 100}
 	unders := []string{"", `C:\workspace`, `C:\workspace\nrrd-cache`, `C:\workspace\dataset-000000.nrrd`}
 	for _, term := range pathTerms {
@@ -718,6 +753,189 @@ func TestGeneratedBroadPathQueryParity(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+func TestMultiPartPathQueriesUseBoundedCandidateSources(t *testing.T) {
+	t.Setenv("SEEKFS_MEMORY_MODE", "lowmem")
+	idx := dottedPathBenchmarkIndex(2000)
+	vol := newServiceVolumeIndex("fixture.gsi", idx)
+	vol.rebuildNameTrigramsLocked()
+	queries := []queryOptions{
+		{Query: "path:pretraining DVT .nrrd", Limit: 25},
+		{Query: "path:DVT pretraining .nrrd", Limit: 25},
+		{Query: ".nrrd path:pretraining DVT", Limit: 25},
+		{Query: "path:pretraining path:DVT .nrrd", Limit: 25},
+		{Query: "path:workspace pretraining DVT .nrrd", Limit: 25},
+		{Query: "path:pretraining DVT ext:nrrd", Limit: 25},
+		{Query: "path:pretraining DVT glob:*.nrrd", Limit: 25},
+		{Query: "path:pretraining missing .nrrd", Limit: 25},
+	}
+	for _, opts := range queries {
+		t.Run(opts.Query, func(t *testing.T) {
+			pq := mustParseQuery(t, opts)
+			pq.Limit = normalizedLimit(opts.Limit, false)
+			plan, ok := vol.buildCandidatePlan(pq)
+			if !ok {
+				t.Fatal("buildCandidatePlan declined multi-part path query")
+			}
+			summary := plan.sourceSummary()
+			if !plan.empty && !strings.Contains(summary, "path-term:") &&
+				!strings.Contains(summary, "ext:") && !strings.Contains(summary, "glob-ext:") {
+				t.Fatalf("plan sources = %s, want a bounded path, extension, or glob source", summary)
+			}
+			full, err := searchCompactWithCache(idx, opts, false, make(map[int]string), nil)
+			if err != nil {
+				t.Fatalf("full search: %v", err)
+			}
+			fast, err := searchCompactWithCache(idx, opts, false, vol.pathCache, vol.nameTermCandidates)
+			if err != nil {
+				t.Fatalf("candidate search: %v", err)
+			}
+			if got, want := pathsOf(fast), pathsOf(full); !sameOrderedStrings(got, want) {
+				t.Fatalf("candidate paths = %v, full paths = %v", got, want)
+			}
+		})
+	}
+}
+
+func TestExtensionBoundedPathTermsAvoidBroadPathReconstruction(t *testing.T) {
+	idx := highExtensionFanoutPathIndex(3500)
+	vol := newServiceVolumeIndex("fixture.gsi", idx)
+	queries := []queryOptions{
+		{Query: "path:pretraining DVT ext:nrrd", Limit: 20},
+		{Query: "path:pretraining DVT .nrrd", Limit: 20},
+		{Query: "path:absent DVT ext:nrrd", Limit: 20},
+		{Query: "path:absent DVT .nrrd", Limit: 20},
+	}
+	for _, opts := range queries {
+		t.Run(opts.Query, func(t *testing.T) {
+			pq := mustParseQuery(t, opts)
+			dropSatisfiedVolumeTerms(&pq, idx.Volume)
+			pq.Limit = normalizedLimit(opts.Limit, false)
+			plan, ok := vol.buildCandidatePlan(pq)
+			if !ok || plan.empty {
+				t.Fatalf("plan = %+v, ok=%v, want extension-bounded candidate plan", plan, ok)
+			}
+			summary := plan.sourceSummary()
+			if !strings.Contains(summary, "ext:nrrd") {
+				t.Fatalf("plan sources = %s, want ext:nrrd source", summary)
+			}
+
+			full, err := searchCompactWithCache(idx, opts, false, make(map[int]string), nil)
+			if err != nil {
+				t.Fatalf("full search: %v", err)
+			}
+			pathCache := make(map[int]string)
+			fast, err := searchCompactWithCache(idx, opts, false, pathCache, vol.nameTermCandidates)
+			if err != nil {
+				t.Fatalf("candidate search: %v", err)
+			}
+			if got, want := pathsOf(fast), pathsOf(full); !sameOrderedStrings(got, want) {
+				t.Fatalf("candidate paths = %v, full paths = %v", got, want)
+			}
+			if len(pathCache) > 32 {
+				t.Fatalf("path cache grew to %d entries for %q; path terms should be verified before broad path reconstruction", len(pathCache), opts.Query)
+			}
+		})
+	}
+}
+
+func TestGeneratedMultiPartPathSyntaxParityMatrix(t *testing.T) {
+	t.Setenv("SEEKFS_MEMORY_MODE", "lowmem")
+	idx := highExtensionFanoutPathIndex(1200)
+	vol := newServiceVolumeIndex("fixture.gsi", idx)
+	vol.rebuildNameTrigramsLocked()
+	pathPhrases := []string{
+		"path:pretraining DVT",
+		"path:DVT pretraining",
+		"pretraining path:DVT",
+		"path:pretraining path:DVT",
+		"path:workspace pretraining DVT",
+		"path:absent DVT",
+	}
+	extForms := []string{".nrrd", "ext:nrrd", "glob:*.nrrd"}
+	volumeForms := []string{"", "path:C:"}
+	negativeForms := []string{"", "!backup", "!metadata"}
+	limits := []int{1, 5, 20}
+	for _, volume := range volumeForms {
+		for _, phrase := range pathPhrases {
+			for _, ext := range extForms {
+				for _, neg := range negativeForms {
+					for _, limit := range limits {
+						query := strings.Join(nonEmptyStrings(volume, phrase, ext, neg), " ")
+						opts := queryOptions{Query: query, Limit: limit}
+						t.Run(fmt.Sprintf("%s/limit:%d", query, limit), func(t *testing.T) {
+							full, err := searchCompactWithCache(idx, opts, false, make(map[int]string), nil)
+							if err != nil {
+								t.Fatalf("full search: %v", err)
+							}
+							fast, err := searchCompactWithCache(idx, opts, false, vol.pathCache, vol.nameTermCandidates)
+							if err != nil {
+								t.Fatalf("candidate search: %v", err)
+							}
+							if got, want := pathsOf(fast), pathsOf(full); !sameOrderedStrings(got, want) {
+								t.Fatalf("candidate paths = %v, full paths = %v", got, want)
+							}
+						})
+					}
+				}
+			}
+		}
+	}
+}
+
+func TestServiceVolumesHighFanoutMultiPartPathQueries(t *testing.T) {
+	t.Setenv("SEEKFS_MEMORY_MODE", "lowmem")
+	cIdx := highExtensionFanoutPathIndex(2500)
+	fIdx := highExtensionFanoutPathIndex(2500)
+	fIdx.Volume = "F:"
+	volumes := []*serviceVolumeIndex{
+		newServiceVolumeIndex("c-high-fanout.gsi", cIdx),
+		newServiceVolumeIndex("f-high-fanout.gsi", fIdx),
+	}
+	for _, vol := range volumes {
+		vol.rebuildNameTrigramsLocked()
+	}
+	queries := []queryOptions{
+		{Query: "path:C: pretraining DVT .nrrd", Limit: 20},
+		{Query: "path:F: pretraining DVT .nrrd", Limit: 20},
+		{Query: "path:pretraining DVT .nrrd", Limit: 20},
+		{Query: "path:C: absent DVT .nrrd", Limit: 20},
+		{Query: "path:F: absent DVT .nrrd", Limit: 20},
+	}
+	for _, opts := range queries {
+		t.Run(opts.Query, func(t *testing.T) {
+			got, err := searchServiceVolumes(volumes, opts, false)
+			if err != nil {
+				t.Fatalf("service search: %v", err)
+			}
+			var full []Entry
+			for _, vol := range volumes {
+				if selected, err := serviceVolumesForQuery([]*serviceVolumeIndex{vol}, opts); err != nil || len(selected) == 0 {
+					continue
+				}
+				matches, err := searchCompactWithCache(vol.index, opts, false, make(map[int]string), nil)
+				if err != nil {
+					t.Fatalf("full search %s: %v", vol.volume, err)
+				}
+				full = append(full, matches...)
+			}
+			if len(full) > opts.Limit {
+				full = full[:opts.Limit]
+			}
+			if gotPaths, wantPaths := pathsOf(got), pathsOf(full); !sameOrderedStrings(gotPaths, wantPaths) {
+				t.Fatalf("service paths = %v, full paths = %v", gotPaths, wantPaths)
+			}
+			for _, entry := range got {
+				if strings.Contains(opts.Query, "path:C:") && !strings.HasPrefix(strings.ToUpper(entry.Path), `C:\`) {
+					t.Fatalf("C:-scoped query returned %q", entry.Path)
+				}
+				if strings.Contains(opts.Query, "path:F:") && !strings.HasPrefix(strings.ToUpper(entry.Path), `F:\`) {
+					t.Fatalf("F:-scoped query returned %q", entry.Path)
+				}
+			}
+		})
 	}
 }
 
@@ -821,6 +1039,12 @@ func TestGeneratedBroadPathQueryParityAcrossResidentVariants(t *testing.T) {
 		{Query: "path:workspace ext:nrrd|json", Limit: 25},
 		{Query: `workspace\dataset-000000.nrrd\metadata-000000.json`, Limit: 25},
 		{Query: `workspace/nrrd-cache/cache-000097.json`, Limit: 25},
+		{Query: "path:pretraining DVT .nrrd", Limit: 25},
+		{Query: "path:DVT pretraining .nrrd", Limit: 25},
+		{Query: "path:workspace pretraining DVT .nrrd", Limit: 25},
+		{Query: "path:pretraining DVT ext:nrrd", Limit: 25},
+		{Query: "path:pretraining DVT glob:*.nrrd", Limit: 25},
+		{Query: "path:pretraining missing .nrrd", Limit: 25},
 	}
 	variants := []struct {
 		name   string
@@ -853,6 +1077,7 @@ func TestGeneratedBroadPathQueryParityAcrossResidentVariants(t *testing.T) {
 	}
 	for _, variant := range variants {
 		vol := newServiceVolumeIndex("fixture.gsi", idx)
+		vol.rebuildNameTrigramsLocked()
 		if variant.mutate != nil {
 			variant.mutate(vol)
 		}
@@ -917,8 +1142,9 @@ func TestLimitedPathComponentPostingMatchesFullSearch(t *testing.T) {
 		t.Fatalf("limited candidates = %d, want 1..%d", len(limited), opts.Limit)
 	}
 	plan, ok := vol.buildCandidatePlan(pq)
-	if !ok || len(plan.sources) != 1 || !strings.HasPrefix(plan.sources[0].name, "term-limited:") {
-		t.Fatalf("plan = %+v, ok=%v, want term-limited source", plan, ok)
+	if !ok || len(plan.sources) != 1 ||
+		(!strings.HasPrefix(plan.sources[0].name, "term-limited:") && !strings.HasPrefix(plan.sources[0].name, "path-term:")) {
+		t.Fatalf("plan = %+v, ok=%v, want bounded path source", plan, ok)
 	}
 	full, err := searchCompactWithCache(idx, opts, false, make(map[int]string), nil)
 	if err != nil {
@@ -972,6 +1198,68 @@ func TestLargePlainComponentRootUsesBoundedTopSource(t *testing.T) {
 	}
 	if names := namesOf(entriesForIDs(idx, candidates)); !containsString(names, "workspace") {
 		t.Fatalf("candidate names = %v, want workspace root included", names)
+	}
+}
+
+func TestLowMemoryDeterministicQueryMatrixUnderTarget(t *testing.T) {
+	t.Setenv("SEEKFS_MEMORY_MODE", "lowmem")
+	cIdx := dottedPathBenchmarkIndex(100_000)
+	fIdx := dottedPathBenchmarkIndex(100_000)
+	fIdx.Volume = "F:"
+	volumes := []*serviceVolumeIndex{
+		newServiceVolumeIndex("lowmem-c.gsi", cIdx),
+		newServiceVolumeIndex("lowmem-f.gsi", fIdx),
+	}
+	for _, vol := range volumes {
+		vol.rebuildNameTrigramsLocked()
+	}
+	queries := []string{
+		".nrrd",
+		".raw",
+		".pdf",
+		".json",
+		".dll",
+		".exe",
+		".opencode",
+		"path:F: .nrrd",
+		"path:F: .raw",
+		"path:F: .pdf",
+		"path:C: .exe",
+		"path:C: Users",
+		"path:C: AppData",
+		"path:F: workspace",
+		"path:Windows",
+		"path:node_modules",
+		"path:Downloads .nrrd",
+		"path:F: Downloads .nrrd",
+		"path:C: pretraining DVT .nrrd",
+		"path:F: pretraining DVT .nrrd",
+		"path:C: workspace pretraining DVT .nrrd",
+		"path:F: workspace pretraining DVT .nrrd",
+		"path:C: pretraining DVT ext:nrrd",
+		"path:C: pretraining DVT glob:*.nrrd",
+		"path:C: missing DVT .nrrd",
+		"path:F: missing DVT .nrrd",
+		"path:C:.nrrd",
+		"zzzz-no-hit-seekfs",
+	}
+	const iterations = 5
+	all := make([]float64, 0, len(queries)*iterations)
+	perQuery := make(map[string][]float64, len(queries))
+	for i := 0; i < iterations; i++ {
+		for _, query := range queries {
+			start := time.Now()
+			_, err := searchServiceVolumes(volumes, queryOptions{Query: query, Limit: 100}, false)
+			if err != nil {
+				t.Fatalf("query %q failed: %v", query, err)
+			}
+			ms := float64(time.Since(start).Microseconds()) / 1000
+			all = append(all, ms)
+			perQuery[query] = append(perQuery[query], ms)
+		}
+	}
+	if p95 := percentile(append([]float64(nil), all...), 0.95); p95 > 100 {
+		t.Fatalf("lowmem deterministic query matrix p95 = %.3fms, want <= 100ms; per-query=%v", p95, perQuery)
 	}
 }
 
@@ -1207,8 +1495,8 @@ func TestPlannerUsesSelectiveExtensionBeforePathVerification(t *testing.T) {
 	for _, source := range plan.sources {
 		sourceNames = append(sourceNames, source.name)
 	}
-	if !sameStringSet(sourceNames, []string{"ext:raw"}) {
-		t.Fatalf("plan sources = %v, want only ext:raw with Downloads verified after candidate selection", sourceNames)
+	if !sameStringSet(sourceNames, []string{"ext:raw"}) && !sameStringSet(sourceNames, []string{"ext:raw", "path-term:downloads"}) {
+		t.Fatalf("plan sources = %v, want ext:raw plus optional bounded Downloads path source", sourceNames)
 	}
 	got, err := searchCompactWithCache(idx, queryOptions{Query: "Downloads ext:raw", MatchPath: true, Limit: 20}, false, vol.pathCache, vol.nameTermCandidates)
 	if err != nil {
@@ -1507,7 +1795,15 @@ func dottedPathBenchmarkIndex(n int) *Index {
 	workspace := add(2, 1, root, "workspace", uint32(os.ModeDir))
 	cacheDir := add(3, 2, workspace, "nrrd-cache", uint32(os.ModeDir))
 	add(4, 2, workspace, "ai.opencode.desktop", uint32(os.ModeDir))
-	nextFRN := uint64(10)
+	pretraining := add(5, 2, workspace, "pretraining", uint32(os.ModeDir))
+	dvt := add(6, 5, pretraining, "DVT", uint32(os.ModeDir))
+	add(7, 6, dvt, "sample-volume.nrrd", 0)
+	add(8, 6, dvt, "sample-labels.raw", 0)
+	otherPretraining := add(9, 5, pretraining, "control", uint32(os.ModeDir))
+	add(10, 9, otherPretraining, "control-volume.nrrd", 0)
+	dvtElsewhere := add(11, 2, workspace, "DVT-archive", uint32(os.ModeDir))
+	add(12, 11, dvtElsewhere, "archive-volume.nrrd", 0)
+	nextFRN := uint64(20)
 	for i := 0; i < n; i++ {
 		parent := workspace
 		parentFRN := uint64(2)
@@ -1538,6 +1834,57 @@ func dottedPathBenchmarkIndex(n int) *Index {
 	}
 	buildOrders(idx)
 	return idx
+}
+
+func highExtensionFanoutPathIndex(n int) *Index {
+	idx := &Index{
+		Source:  "usn",
+		Volume:  "C:",
+		Compact: true,
+		Records: make([]CompactRecord, 0, n+16),
+	}
+	add := func(frn, parentFRN uint64, parent int32, name string, mode uint32) int32 {
+		idx.Records = append(idx.Records, CompactRecord{
+			FRN:       frn,
+			ParentFRN: parentFRN,
+			Parent:    parent,
+			Name:      name,
+			Mode:      mode,
+			Size:      1024,
+			ModUnix:   time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC).UnixNano(),
+		})
+		return int32(len(idx.Records) - 1)
+	}
+	root := add(1, 1, -1, ".", uint32(os.ModeDir))
+	workspace := add(2, 1, root, "workspace", uint32(os.ModeDir))
+	bulk := add(3, 2, workspace, "bulk", uint32(os.ModeDir))
+	pretraining := add(4, 2, workspace, "pretraining", uint32(os.ModeDir))
+	dvt := add(5, 4, pretraining, "DVT", uint32(os.ModeDir))
+	add(6, 5, dvt, "target-volume.nrrd", 0)
+	add(7, 5, dvt, "target-metadata.json", 0)
+	otherPretraining := add(8, 4, pretraining, "control", uint32(os.ModeDir))
+	add(9, 8, otherPretraining, "control-volume.nrrd", 0)
+	nextFRN := uint64(20)
+	for i := 0; i < n; i++ {
+		name := fmt.Sprintf("unrelated-%06d.nrrd", i)
+		if i%211 == 0 {
+			name = fmt.Sprintf("backup-%06d.nrrd", i)
+		}
+		add(nextFRN, 3, bulk, name, 0)
+		nextFRN++
+	}
+	buildOrders(idx)
+	return idx
+}
+
+func nonEmptyStrings(values ...string) []string {
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			out = append(out, value)
+		}
+	}
+	return out
 }
 
 func orderedLimitedBenchmarkIndex(n int) *Index {

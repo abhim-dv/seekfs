@@ -42,6 +42,17 @@ func TestServiceVolumeIndexAfterPersistClearsRecentAndSearchCaches(t *testing.T)
 	}
 }
 
+func TestCompactMMapEntryCountUsesMappedRecordCount(t *testing.T) {
+	idx := &Index{
+		Compact:     true,
+		MMapRecords: &MMapRecords{count: 42},
+	}
+
+	if got := idx.entryCount(); got != 42 {
+		t.Fatalf("entryCount() = %d, want mmap record count", got)
+	}
+}
+
 func TestServiceVolumeIndexTrimSearchCachesLockedClearsOversizedCaches(t *testing.T) {
 	vol := syntheticServiceVolumeIndexForCacheTests()
 	for i := 0; i <= servicePathCacheLimit; i++ {
@@ -689,6 +700,35 @@ func TestServiceVolumeIndexResidentMemoryInfoReflectsSkippedViews(t *testing.T) 
 	}
 	if info.FRNIndexBytes == 0 || info.KnownBytes == 0 {
 		t.Fatalf("expected FRN and known memory fields: %+v", info)
+	}
+}
+
+func TestLowMemoryModeSkipsResidentAcceleratorsByDefault(t *testing.T) {
+	t.Setenv("SEEKFS_MEMORY_MODE", "lowmem")
+	idx := dottedPathBenchmarkIndex(1000)
+	vol := newServiceVolumeIndex("test.gsi", idx)
+
+	if vol.index.PackedRecords == nil || len(vol.index.Records) != 0 {
+		t.Fatalf("lowmem synthetic index was not packed: packed=%v records=%d", vol.index.PackedRecords != nil, len(vol.index.Records))
+	}
+	if len(vol.frns) != 0 || len(vol.frnRecordIDs) != 0 {
+		t.Fatalf("lowmem built resident FRN arrays: frns=%d ids=%d", len(vol.frns), len(vol.frnRecordIDs))
+	}
+	if len(vol.childOffsets) != 0 || len(vol.childIDs) != 0 || len(vol.subtreeOrder) != 0 {
+		t.Fatalf("lowmem built child/subtree views by default: offsets=%d ids=%d subtree=%d", len(vol.childOffsets), len(vol.childIDs), len(vol.subtreeOrder))
+	}
+	if got := vol.nameOrderStateString(); got != "" {
+		t.Fatalf("lowmem name order state = %q, want empty", got)
+	}
+	if got := vol.nameTrigramStateString(); got != "pending" {
+		t.Fatalf("lowmem trigram state = %q, want pending", got)
+	}
+	if vol.queryIndex == nil || len(vol.queryIndex.ext) == 0 || len(vol.queryIndex.components) == 0 || len(vol.queryIndex.pathGrams) != 0 {
+		t.Fatal("lowmem should keep extension/component postings and skip path grams by default")
+	}
+	info := vol.residentMemoryInfo()
+	if info == nil || info.NameOrderBytes != 0 || info.NameTrigramBytes != 0 || info.ChildBytes != 0 || info.FRNIndexBytes != 0 {
+		t.Fatalf("lowmem memory still includes skipped accelerators: %+v", info)
 	}
 }
 
