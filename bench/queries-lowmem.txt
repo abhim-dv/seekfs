@@ -5,9 +5,25 @@
 .dll
 .exe
 .opencode
+nrrd
+raw
+pdf
+pvsm
+F: nrrd
+F: raw
+F: pdf
+C: pvsm
+trainingdata Dataset nrrd
+Dataset trainingdata nrrd
+workspace trainingdata Dataset nrrd
 path:F: .nrrd
+path:F: nrrd
 path:F: .raw
+path:F: raw
 path:F: .pdf
+path:F: pdf
+path:C: pvsm
+path:C: .pvsm
 path:C: .exe
 path:C: Users
 path:C: AppData

@@ -1,0 +1,11 @@
+# Copy this file to bench/real-indexes.local.txt, then replace the placeholders
+# with local .gsi indexes. The local file is gitignored.
+#
+# Gated real-index tests are skipped by default:
+# - SEEKFS_REAL_INDEX_LOAD_MATRIX=1 loads these paths directly in-process.
+# - SEEKFS_REAL_SERVICE_MATRIX=1 uses the resident service's loaded indexes and
+#   does not read this file.
+#
+# Example:
+# X:\path\to\seekfs_volume_1.gsi
+# Y:\path\to\seekfs_volume_2.gsi

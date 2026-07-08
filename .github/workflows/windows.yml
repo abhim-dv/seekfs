@@ -22,3 +22,17 @@ jobs:
       - name: CLI integration test
         shell: pwsh
         run: powershell -ExecutionPolicy Bypass -File .\test_seekfs_cli.ps1
+  race:
+    runs-on: windows-latest
+    env:
+      SEEKFS_QUERY_MATRIX_SEED: "1"
+      CGO_ENABLED: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Install race compiler
+        run: choco install mingw -y --no-progress
+      - name: Go race test subset
+        run: go test -race ./cmd/seekfs -run "TestSeededQueryOracleMatrix|TestSecondOracleSeededSubsample|TestEngineV9OverlayMutationStateMachineMatchesFreshOracle|TestEngineV9ConcurrentChurnQueryStress|TestEngineV9OverlayMergeFillsLimitAndRanksCreates|TestEngineV9OverlayCountOnlySearchIncludesCreatesAndExcludesTombstones|TestStandaloneServicePipeSearchEndToEnd|TestBroadPathScanCancellationPropagates"

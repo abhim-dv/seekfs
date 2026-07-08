@@ -24,13 +24,32 @@ correct.
 
 ## Current Limitations
 
-- The service now writes v8 USN indexes with persistent FRN and parent FRN
-  metadata, but the mutation model is still early.
+- The default writer still emits v8 USN indexes with persistent FRN and parent
+  FRN metadata. With `SEEKFS_ENGINE_V9=1`, new or upgraded compact indexes use
+  the gated v9 container and append mapped derived sections for name rank,
+  children, subtree intervals, FRN lookup, lowercase names, and posting
+  metadata.
 - The service builds a FRN map for loaded USN indexes.
 - The service can validate and replay a saved checkpoint on startup.
 - The service runs a simple per-volume background journal reader.
-- Background replay currently uses coarse locking and saves after applied
-  batches; this favors correctness over peak throughput.
+- Background replay still uses the service index lock for mutation and
+  compaction. With `SEEKFS_ENGINE_V9=1`, service search builds per-query
+  read views from the published snapshot and releases the service index lock
+  before executing the query; the legacy v8 path keeps the older coarse read
+  lock.
+- The gated v9 overlay/snapshot path records USN changes without mutating the
+  mapped base index; service search merges published overlay records and filters
+  tombstoned or shadowed base paths. The older v8 path still uses the mutable
+  resident structures.
+- With `SEEKFS_ENGINE_V9=1`, service search read views use fresh per-query
+  caches stamped by the published snapshot generation instead of sharing the
+  legacy recent-sequence cache state across queries.
+- With `SEEKFS_ENGINE_V9=1`, new WAL appends use length-prefixed binary frames
+  with CRC32. The replay path still accepts the previous JSON WAL format for
+  compatibility.
+- With `SEEKFS_ENGINE_V9=1`, the continuous NTFS replay loop uses
+  `FSCTL_READ_USN_JOURNAL` wait fields (`BytesToWaitFor` plus a 5 second
+  timeout) instead of relying only on a fixed polling sleep.
 - `status` does not expose checkpoint lag, stale state, or rebuild state.
 - Background full rebuild after journal invalidation is not implemented yet.
 
@@ -38,7 +57,7 @@ correct.
 
 ### Persisted Metadata
 
-Add a v8 index format with per-record NTFS identity:
+The v8 index format stores per-record NTFS identity:
 
 - `frn`
 - `parent_frn`
@@ -56,8 +75,10 @@ Per-volume metadata:
 - build time
 - index source
 
-The packed v7 format can remain readable for migration, but new USN indexes
-should write v8.
+The packed v7 format can remain readable for migration. New default USN indexes
+write v8; gated v9 indexes keep the same compact record payload and append a
+section table for derived structures. Use `seekfs upgrade-index -db <path>` with
+`SEEKFS_ENGINE_V9=1` for offline conversion.
 
 ### Mutable Service Index
 
@@ -189,7 +210,8 @@ Initial thresholds:
 9. Done: add background continuous reader goroutines per volume.
 10. Partial: flush after applied batches with checkpoint persistence.
 11. Todo: add journal invalidation detection and background rebuild fallback.
-12. Partial: extend `loaded --json` with state and FRN record counts.
+12. Partial: extend `loaded --json` with state, FRN record counts, and gated v9
+    derived-section metadata.
 13. Todo: add service integration tests for live updates and restart catch-up.
 14. Partial: add benchmark scripts for update latency and query latency under update load.
 15. Todo: update service, benchmark, and security docs after full rebuild fallback lands.

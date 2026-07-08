@@ -1,0 +1,15 @@
+# User-shaped regression queries for service/direct parity and perf checks.
+# Keep this separate from public generic query suites; these are allowed to
+# reflect real bug reports and natural UI input.
+Downloads nrrd
+Downloads .nrrd
+path:Downloads nrrd
+path:Downloads .nrrd
+Downloads fixturemetrics
+path:Downloads fixturemetrics
+ext:nrrd path:Downloads
+dir:Downloads nrrd
+Desktop pdf
+Documents invoice
+raw preview nrrd
+zzzz-no-hit-seekfs

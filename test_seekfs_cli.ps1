@@ -76,6 +76,59 @@ try {
     throw "info output missing entries"
   }
 
+  $Pipe = "\\.\pipe\seekfs-test-$([guid]::NewGuid().ToString("N"))"
+  $Service = $null
+  try {
+    $ResolvedExe = (Resolve-Path $Exe).Path
+    $Service = Start-Process -FilePath $ResolvedExe -ArgumentList @("service", "-db", $Db, "-pipe", $Pipe, "-lowmem") -PassThru -WindowStyle Hidden
+    $loaded = $false
+    for ($i = 0; $i -lt 40; $i++) {
+      try {
+        $loadedInfo = & $Exe loaded -pipe $Pipe --json | ConvertFrom-Json
+        if ($loadedInfo.ok -and $loadedInfo.entries -ge 5) {
+          $loaded = $true
+          break
+        }
+      } catch {
+        Start-Sleep -Milliseconds 250
+      }
+    }
+    if (-not $loaded) {
+      throw "resident service did not report loaded test index"
+    }
+
+    $serviceNeedle = & $Exe search -service -pipe $Pipe -path -n 10 needle
+    if (($serviceNeedle | Measure-Object).Count -ne 2) {
+      throw "expected 2 service path results for needle"
+    }
+
+    $serviceCount = (& $Exe count -service -pipe $Pipe needle).Trim()
+    if ($serviceCount -ne "2") {
+      throw "expected service count 2, got $serviceCount"
+    }
+
+    $serviceUnder = & $Exe search -service -pipe $Pipe -path -n 10 --under (Join-Path $Root "subdir") needle
+    if (($serviceUnder | Measure-Object).Count -ne 1) {
+      throw "expected one service --under needle result"
+    }
+
+    $serviceGo = & $Exe search -service -pipe $Pipe -path --json -n 10 "ext:go" | ConvertFrom-Json
+    if (-not $serviceGo.ok -or ($serviceGo.results | Measure-Object).Count -ne 1) {
+      throw "expected one service ext:go json result"
+    }
+
+    $serviceGlob = & $Exe search -service -pipe $Pipe -path --json -n 10 "glob:*.py" | ConvertFrom-Json
+    if (-not $serviceGlob.ok -or ($serviceGlob.results | Measure-Object).Count -ne 1) {
+      throw "expected one service glob:*.py json result"
+    }
+  }
+  finally {
+    if ($null -ne $Service -and -not $Service.HasExited) {
+      Stop-Process -Id $Service.Id -Force -ErrorAction SilentlyContinue
+      $Service.WaitForExit(5000) | Out-Null
+    }
+  }
+
   Write-Host "seekfs CLI integration test passed"
 }
 finally {
