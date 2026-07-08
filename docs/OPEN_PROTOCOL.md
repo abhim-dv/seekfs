@@ -82,7 +82,9 @@ pipe plus each loaded database and its incremental state.
       "journal_id": 133234659009607417,
       "checkpoint_usn": 903307872656,
       "state": "ready",
-      "frn_records": 8166043
+      "frn_records": 8166043,
+      "derived_sections": ["RANK", "CHLD", "SUBT", "FRNS", "LOWR", "PEXT", "PCMP", "PNGR"],
+      "derived_bytes": 293977548
     }
   ]
 }
@@ -91,6 +93,14 @@ pipe plus each loaded database and its incremental state.
 `state` is `ready` when journal replay is active. It is `stale` when the
 service can still answer from the loaded index but could not validate or read
 the NTFS journal; `stale_reason` contains the failure.
+
+`derived_sections` and `derived_bytes` are present for gated v9 indexes created
+or converted with `SEEKFS_ENGINE_V9=1`. Older v8 indexes omit these fields and
+fall back to the service's runtime secondary-index builds. `PEXT`, `PCMP`, and
+`PNGR` are consumed by service startup for extension, component, and name
+trigram lookups. Extension, component, and name-trigram candidate paths prefer
+keyed mapped lookups; broader planner block-iterator cleanup remains gated
+implementation work.
 
 ## Error Response
 

@@ -2,8 +2,9 @@ param(
   [string]$Seekfs = ".\seekfs.exe",
   [string]$Es = "",
   [string]$EsInstance = "",
-  [string]$Root = "F:\seekfs_bench_sandbox\incremental",
-  [string]$OutDir = "F:\seekfs_bench_results\incremental",
+  [string]$Pipe = "\\.\pipe\seekfs-service",
+  [string]$Root = (Join-Path ([IO.Path]::GetTempPath()) "seekfs_bench_sandbox\incremental"),
+  [string]$OutDir = (Join-Path ([IO.Path]::GetTempPath()) "seekfs_bench_results\incremental"),
   [int]$Iterations = 25,
   [int]$TimeoutSeconds = 30
 )
@@ -46,7 +47,7 @@ function Wait-SeekfsCount {
   param([string]$Query, [int]$Expected)
   $sw = [Diagnostics.Stopwatch]::StartNew()
   do {
-    $result = Invoke-Json $Seekfs @("count", "-service", "--json", "-path", $Query)
+    $result = Invoke-Json $Seekfs @("count", "-service", "-pipe", $Pipe, "--json", "-path", $Query)
     if ($result.count -eq $Expected) {
       $sw.Stop()
       return $sw.Elapsed.TotalMilliseconds
@@ -112,6 +113,7 @@ $summary = [ordered]@{
   iterations = $Iterations
   failures = $failures
   root = $Root
+  pipe = $Pipe
   seekfs = @{
     create_visible_ms = New-Stats $seekfsCreate.ToArray()
     delete_hidden_ms = New-Stats $seekfsDelete.ToArray()

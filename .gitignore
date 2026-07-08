@@ -12,6 +12,7 @@
 docs/V0.8_RESIDENT_INDEX_REFACTOR.md
 docs/V0.8_REVIEW_VS_EVERYTHING.md
 bench/deploy_sizes.ps1
+bench/real-indexes.local.txt
 bench-results/
 benchmark-results/
 tmp-admin-logs/
