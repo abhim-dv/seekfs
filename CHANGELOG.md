@@ -1,5 +1,46 @@
 # Changelog
 
+## 0.10.0 - Mapped Query Index and Lazy Planner Sources
+
+### Added
+
+- Added v9 mapped query index sections for name ranks, child ranges, subtree
+  intervals, FRN lookup, lowercase names, and extension/component/name-gram
+  postings.
+- Added lazy planner posting sources so extension, component, bounded-root, and
+  mapped name-gram filters can be intersected without eagerly materializing
+  broad candidate sets.
+- Added service/direct acceptance coverage for real persisted indexes, active
+  overlay state, service identity, and mapped low-memory query parity.
+- Added deterministic benchmark harnesses for broad and selective query families
+  across warm planner, mapped planner, and fallback scan paths.
+
+### Changed
+
+- Low-memory service startup can map persisted derived query sections instead of
+  rebuilding the resident query index when v9 data is available.
+- Broad path and extension-family planning now keeps more work in sorted posting
+  iterators before row hydration or path reconstruction.
+- Active v9 overlay search/count handling accounts for tombstoned and shadowed
+  base rows while preserving live overlay records.
+- The desktop UI verifies backend binary identity and handles stale standalone
+  services more defensively when launching or reconnecting.
+
+### Fixed
+
+- Reduced cold-start and post-persist query latency cliffs caused by silently
+  rebuilding derived planner structures in the background.
+- Fixed mapped count/search parity gaps around overlay deletes, renames, and
+  bounded directory scopes.
+- Hardened test fixtures so public coverage avoids machine-specific paths and
+  private search terms.
+
+### Validation
+
+- `go test ./cmd/seekfs -count=1`
+- `go build -trimpath -o seekfs-service.exe ./cmd/seekfs`
+- `go build -trimpath -tags "seekfs_ui production" -o seekfs.exe ./cmd/seekfs`
+
 ## 0.9.0 - Low-Memory mmap Engine and UI Binary Split
 
 ### Added
