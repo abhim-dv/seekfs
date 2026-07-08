@@ -128,6 +128,15 @@ func TestPathFilterEnablesPathMatching(t *testing.T) {
 	}
 }
 
+func TestLooseMultiTermQueryInfersPathMode(t *testing.T) {
+	if !queryLooksLoosePathScoped("Downloads nrrd") {
+		t.Fatal("Downloads nrrd should infer path mode at the request layer")
+	}
+	if queryLooksLoosePathScoped("ext:raw !path:Assets") {
+		t.Fatal("negated path filters should not force top-level path mode")
+	}
+}
+
 func TestPathExtensionSyntaxMatrixMatchesAcrossSearchPaths(t *testing.T) {
 	idx := pathSyntaxFixture()
 	vol := newServiceVolumeIndex("fixture.gsi", idx)
@@ -195,6 +204,26 @@ func TestPathExtensionSyntaxMatrixMatchesAcrossSearchPaths(t *testing.T) {
 			name:      "middle dotted substring is not extension",
 			opts:      queryOptions{Query: ".opencode", Limit: 20},
 			wantNames: []string{"ai.opencode.desktop"},
+		},
+		{
+			name:      "name mode dotted extension remains substring",
+			opts:      queryOptions{Query: ".pdf", Limit: 20},
+			wantNames: []string{"manual.pdf", "manual.pdf.bak"},
+		},
+		{
+			name:      "path mode bare dotted extension is exact extension",
+			opts:      queryOptions{Query: "path:.pdf", Limit: 20},
+			wantNames: []string{"manual.pdf"},
+		},
+		{
+			name:      "path term and dotted extension is exact extension",
+			opts:      queryOptions{Query: "path:Reports .pdf", Limit: 20},
+			wantNames: []string{"manual.pdf"},
+		},
+		{
+			name:      "dir filter and dotted extension is exact extension",
+			opts:      queryOptions{Query: "dir:Reports .pdf", Limit: 20},
+			wantNames: []string{"manual.pdf"},
 		},
 		{
 			name:      "drive scoped middle dotted substring",
@@ -332,8 +361,8 @@ func TestPathFilterParsingPropagatesThroughNestedSyntax(t *testing.T) {
 		{
 			query:     "path:.nrrd",
 			wantPath:  true,
-			wantTerms: []string{".nrrd"},
-			wantExts:  nil,
+			wantTerms: nil,
+			wantExts:  []string{"nrrd"},
 		},
 		{
 			query:    "path:Downloads|path:Assets ext:raw",
@@ -655,6 +684,9 @@ func pathSyntaxFixture() *Index {
 	add(10, 9, 8, "lab.raw", 0)
 	add(11, 2, 1, "ai.opencode.desktop", uint32(os.ModeDir))
 	add(12, 11, 10, "settings.json", 0)
+	add(13, 2, 1, "Reports", uint32(os.ModeDir))
+	add(14, 13, 12, "manual.pdf", 0)
+	add(15, 13, 12, "manual.pdf.bak", 0)
 	buildOrders(idx)
 	return idx
 }

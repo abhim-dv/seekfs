@@ -3,6 +3,9 @@
 package main
 
 import (
+	"encoding/json"
+	"errors"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -24,6 +27,7 @@ func TestUIServiceArgsUseCurrentPipeAndDBs(t *testing.T) {
 	args := uiServiceArgs(`\\.\pipe\seekfs-test`, []string{`C:\idx\c.gsi`, `F:\idx\f.gsi`})
 	want := []string{
 		"service",
+		"-lowmem",
 		"-pipe", `\\.\pipe\seekfs-test`,
 		"-sddl", defaultServiceSDDL,
 		"-db", `C:\idx\c.gsi`,
@@ -51,7 +55,7 @@ func TestNormalizeUIQueryForServiceEverythingAliases(t *testing.T) {
 		{"folder:regex:^src$", "type:dir regex:^src$", false},
 		{"sz:>10mb", "size:>10mb", false},
 		{"date-modified:today", "dm:today", false},
-		{"location:Downloads", "dir:Downloads", false},
+		{"location:Downloads", "dir:Downloads", true},
 		{"name:main.go", "main.go", false},
 	}
 	for _, tc := range cases {
@@ -116,6 +120,34 @@ func TestUISearchDoesNotContactServiceForIncompleteQuery(t *testing.T) {
 	}
 }
 
+func TestRunNoArgsLaunchesUI(t *testing.T) {
+	old := cmdUIRun
+	t.Cleanup(func() { cmdUIRun = old })
+	var got []string
+	cmdUIRun = func(args []string) error {
+		got = append([]string(nil), args...)
+		return nil
+	}
+	if err := run(nil); err != nil {
+		t.Fatalf("run(nil): %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("cmdUI args = %v, want no args", got)
+	}
+}
+
+func TestRunNoArgsReturnsUIError(t *testing.T) {
+	old := cmdUIRun
+	t.Cleanup(func() { cmdUIRun = old })
+	want := errors.New("ui failed")
+	cmdUIRun = func(args []string) error {
+		return want
+	}
+	if err := run(nil); !errors.Is(err, want) {
+		t.Fatalf("run(nil) error = %v, want %v", err, want)
+	}
+}
+
 func TestUIServiceSequenceIsSessionScoped(t *testing.T) {
 	app := &UIApp{uiSeqBase: 10_000}
 	if got := app.serviceUISeq(1); got != 10_001 {
@@ -126,6 +158,135 @@ func TestUIServiceSequenceIsSessionScoped(t *testing.T) {
 	}
 	if got := app.serviceUISeq(0); got != 0 {
 		t.Fatalf("serviceUISeq(0) = %d, want 0 for synchronous calls", got)
+	}
+}
+
+func TestServiceIdentityMatchesSameDevBuildHash(t *testing.T) {
+	expected := testServiceIdentityExpectation(`C:\dev\seekfs.exe`)
+	resp := testFreshServiceResponse(expected)
+	if !serviceIdentityMatchesExpected(resp, expected) {
+		t.Fatalf("serviceIdentityMatchesExpected = false, want true for same dev build hash")
+	}
+}
+
+func TestServiceIdentityRejectsSamePathDifferentDevBuildHash(t *testing.T) {
+	expected := testServiceIdentityExpectation(`C:\dev\seekfs.exe`)
+	resp := testFreshServiceResponse(expected)
+	resp.ExecutableHash = "old-hash"
+	if serviceIdentityMatchesExpected(resp, expected) {
+		t.Fatal("serviceIdentityMatchesExpected = true, want false for same path with different dev build hash")
+	}
+}
+
+func TestServiceIdentityRejectsStaleExecutablePath(t *testing.T) {
+	expected := testServiceIdentityExpectation(`C:\dev\seekfs.exe`)
+	resp := testFreshServiceResponse(expected)
+	resp.Executable = `C:\installed\seekfs.exe`
+	if serviceIdentityMatchesExpected(resp, expected) {
+		t.Fatal("serviceIdentityMatchesExpected = true, want false for stale executable path")
+	}
+}
+
+func TestServiceIdentityRejectsMissingIdentityFields(t *testing.T) {
+	expected := testServiceIdentityExpectation(`C:\dev\seekfs.exe`)
+	resp := testFreshServiceResponse(expected)
+	resp.ExecutableHash = ""
+	if serviceIdentityMatchesExpected(resp, expected) {
+		t.Fatal("missing executable hash was treated as fresh")
+	}
+	resp = testFreshServiceResponse(expected)
+	resp.Date = ""
+	if serviceIdentityMatchesExpected(resp, expected) {
+		t.Fatal("missing build date was treated as fresh")
+	}
+	resp = testFreshServiceResponse(expected)
+	resp.PipeName = ""
+	if serviceIdentityMatchesExpected(resp, expected) {
+		t.Fatal("missing pipe name was treated as fresh")
+	}
+	resp = testFreshServiceResponse(expected)
+	resp.PID = 0
+	if serviceIdentityMatchesExpected(resp, expected) {
+		t.Fatal("missing pid was treated as fresh")
+	}
+}
+
+func TestServiceIdentityRejectsSCMBinaryMismatch(t *testing.T) {
+	expected := testServiceIdentityExpectation(`C:\dev\seekfs.exe`)
+	resp := testFreshServiceResponse(expected)
+	resp.ProcessMode = "windows-service"
+	resp.Executable = `C:\Program Files\seekfs\seekfs.exe`
+	resp.ExecutableHash = "installed-hash"
+	if serviceIdentityMatchesExpected(resp, expected) {
+		t.Fatal("SCM service with mismatched binary was treated as fresh")
+	}
+}
+
+func TestServiceResponseIsVerifiedStandalone(t *testing.T) {
+	if !serviceResponseIsVerifiedStandalone(serviceResponse{ProcessMode: "standalone"}) {
+		t.Fatal("standalone service was not verified")
+	}
+	for _, mode := range []string{"", "windows-service"} {
+		if serviceResponseIsVerifiedStandalone(serviceResponse{ProcessMode: mode}) {
+			t.Fatalf("process mode %q was treated as verified standalone", mode)
+		}
+	}
+}
+
+func TestServiceInfoResponseIncludesIdentity(t *testing.T) {
+	resp := serviceInfoResponseFor(serviceResponse{OK: true}, `\\.\pipe\seekfs-test`, "standalone")
+	if resp.PID <= 0 || resp.Executable == "" || resp.ExecutableHash == "" {
+		t.Fatalf("service identity missing pid/executable/hash: %+v", resp)
+	}
+	if resp.Version == "" || resp.Commit == "" || resp.Date == "" || resp.BuildFlavor == "" {
+		t.Fatalf("service build identity missing: %+v", resp)
+	}
+	if resp.PipeName != `\\.\pipe\seekfs-test` || resp.ProcessMode != "standalone" {
+		t.Fatalf("service pipe/mode = (%q, %q), want test pipe/standalone", resp.PipeName, resp.ProcessMode)
+	}
+}
+
+func TestExchangeServiceJSONHalfOpenPipeReturnsError(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer server.Close()
+		var req serviceRequest
+		_ = json.NewDecoder(server).Decode(&req)
+	}()
+	_, err := exchangeServiceJSON(client, serviceRequest{Command: "info"}, 250*time.Millisecond)
+	<-done
+	if err == nil {
+		t.Fatal("exchangeServiceJSON returned nil error for half-open pipe")
+	}
+}
+
+func testServiceIdentityExpectation(exe string) serviceIdentityExpectation {
+	return serviceIdentityExpectation{
+		Executable:     exe,
+		ExecutableHash: "current-hash",
+		Version:        "dev",
+		Commit:         "unknown",
+		Date:           "unknown",
+		BuildFlavor:    "cli,service,lowmem",
+		PipeName:       `\\.\pipe\seekfs-test`,
+	}
+}
+
+func testFreshServiceResponse(expected serviceIdentityExpectation) serviceResponse {
+	return serviceResponse{
+		OK:             true,
+		PID:            1234,
+		Executable:     expected.Executable,
+		ExecutableHash: expected.ExecutableHash,
+		Version:        expected.Version,
+		Commit:         expected.Commit,
+		Date:           expected.Date,
+		BuildFlavor:    expected.BuildFlavor,
+		PipeName:       expected.PipeName,
+		ProcessMode:    "standalone",
 	}
 }
 
@@ -154,6 +315,7 @@ func TestUIEverythingQueriesMatchServiceSearchFixture(t *testing.T) {
 		{
 			raw:       "location:Assets extension:.dat",
 			wantQuery: "dir:Assets ext:dat",
+			wantPath:  true,
 			wantNames: []string{"sample.dat"},
 		},
 		{
@@ -175,6 +337,12 @@ func TestUIEverythingQueriesMatchServiceSearchFixture(t *testing.T) {
 		{
 			raw:       "path:Downloads .nrrd",
 			wantQuery: "Downloads .nrrd",
+			wantPath:  true,
+			wantNames: []string{"scan.nrrd"},
+		},
+		{
+			raw:       "Downloads nrrd",
+			wantQuery: "Downloads nrrd",
 			wantPath:  true,
 			wantNames: []string{"scan.nrrd"},
 		},
@@ -229,6 +397,10 @@ func TestUIStrictSpaceSplitDoesNotInferFusedPathExtensions(t *testing.T) {
 		{"path:C:.NRRD", "C:.NRRD", true},
 		{"path:.nrrd", "path:.nrrd", true},
 		{"path:Downloads.nrrd", "Downloads.nrrd", true},
+		{"F: nrrd", "F: nrrd", true},
+		{"pretraining DVT nrrd", "pretraining DVT nrrd", true},
+		{"nrrd", "nrrd", false},
+		{"ext:nrrd", "ext:nrrd", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.raw, func(t *testing.T) {
@@ -237,6 +409,57 @@ func TestUIStrictSpaceSplitDoesNotInferFusedPathExtensions(t *testing.T) {
 				t.Fatalf("normalizeUIQueryForService(%q) = (%q, %v), want (%q, %v)", tc.raw, gotQuery, gotPath, tc.wantQuery, tc.wantPath)
 			}
 		})
+	}
+}
+
+func TestServiceIdentityMatchesReleaseBuild(t *testing.T) {
+	expected := testServiceIdentityExpectation(filepath.Join(t.TempDir(), "seekfs.exe"))
+	expected.Version = "1.2.3"
+	expected.Commit = "abc123"
+	expected.Date = "2026-07-07T10:00:00Z"
+	resp := testFreshServiceResponse(expected)
+	if !serviceIdentityMatchesExpected(resp, expected) {
+		t.Fatal("matching release identity was rejected")
+	}
+}
+
+func TestServiceIdentityRejectsUnknownDevBuildWithoutHash(t *testing.T) {
+	expected := testServiceIdentityExpectation(filepath.Join(t.TempDir(), "seekfs.exe"))
+	resp := testFreshServiceResponse(expected)
+	resp.ExecutableHash = ""
+	if serviceIdentityMatchesExpected(resp, expected) {
+		t.Fatal("unknown dev identity without executable hash was accepted as fresh")
+	}
+}
+
+func TestServiceIdentityRejectsDateMismatch(t *testing.T) {
+	expected := testServiceIdentityExpectation(filepath.Join(t.TempDir(), "seekfs.exe"))
+	expected.Version = "1.2.3"
+	expected.Commit = "abc123"
+	expected.Date = "2026-07-07T10:00:00Z"
+	resp := testFreshServiceResponse(expected)
+	resp.Date = "2026-07-07T09:00:00Z"
+	if serviceIdentityMatchesExpected(resp, expected) {
+		t.Fatal("date-mismatched service identity was accepted as fresh")
+	}
+}
+
+func TestServiceIdentityRejectsMissingExecutable(t *testing.T) {
+	expected := testServiceIdentityExpectation(filepath.Join(t.TempDir(), "seekfs.exe"))
+	resp := testFreshServiceResponse(expected)
+	resp.Executable = ""
+	if serviceIdentityMatchesExpected(resp, expected) {
+		t.Fatal("service identity without executable was accepted as fresh")
+	}
+}
+
+func TestServiceIdentityRejectsExecutableMismatch(t *testing.T) {
+	dir := t.TempDir()
+	expected := testServiceIdentityExpectation(filepath.Join(dir, "seekfs.exe"))
+	resp := testFreshServiceResponse(expected)
+	resp.Executable = filepath.Join(dir, "old.exe")
+	if serviceIdentityMatchesExpected(resp, expected) {
+		t.Fatal("service identity with executable mismatch was accepted as fresh")
 	}
 }
 

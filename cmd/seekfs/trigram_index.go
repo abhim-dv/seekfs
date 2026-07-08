@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/binary"
-	"os"
 	"runtime"
 	"runtime/debug"
 	"sort"
@@ -43,8 +42,7 @@ type compressedTrigramIndex struct {
 	counts       map[uint32]int
 	countKeys    []uint32
 	countValues  []int
-	postingBlob  *mappedIndexFile
-	postingPath  string
+	mappedGrams  *mappedPostingSection
 	gramSize     int
 	recordCount  int
 	postingBytes int
@@ -411,6 +409,24 @@ func (ti *compressedTrigramIndex) candidateIDs(term string) ([]int, bool) {
 	if !ti.hasAllGrams(grams) {
 		return nil, true
 	}
+	if ti.mappedGrams != nil {
+		var candidates []uint32
+		for i, gram := range grams {
+			ids := ti.idsForGram(gram)
+			if len(ids) == 0 {
+				return nil, true
+			}
+			if i == 0 {
+				candidates = ids
+				continue
+			}
+			candidates = intersectSortedUint32s(candidates, ids)
+			if len(candidates) == 0 {
+				return nil, true
+			}
+		}
+		return uint32sToInts(candidates), true
+	}
 	out := make([]int, 0, ti.countForGram(grams[0]))
 	for _, segment := range ti.segments {
 		ids := ti.segmentCandidateIDs(segment, grams)
@@ -476,6 +492,30 @@ func (ti *compressedTrigramIndex) selectiveIntersectCandidateIDs(term string, ma
 	if maxIDs > 0 && ti.countForGram(stored[0]) > maxIDs {
 		return nil, false, false
 	}
+	if ti.mappedGrams != nil {
+		firstIt, firstCount, ok := ti.mappedGrams.gramPostingIterator(stored[0])
+		if !ok {
+			return nil, true, false
+		}
+		candidates := materializePostingBlockIterator(firstIt, firstCount)
+		if len(candidates) == 0 {
+			return nil, true, false
+		}
+		for _, gram := range stored[1:] {
+			it, _, ok := ti.mappedGrams.gramPostingIterator(gram)
+			if !ok {
+				return nil, true, false
+			}
+			candidates = intersectSortedUint32sWithPostingIterator(candidates, it)
+			if len(candidates) == 0 {
+				return nil, true, false
+			}
+			if maxIDs > 0 && len(candidates) > maxIDs {
+				return nil, false, false
+			}
+		}
+		return uint32sToInts(candidates), true, false
+	}
 	out := make([]int, 0, ti.countForGram(stored[0]))
 	for _, segment := range ti.segments {
 		ids := ti.segmentCandidateIDs(segment, stored)
@@ -493,6 +533,9 @@ func (ti *compressedTrigramIndex) selectiveIntersectCandidateIDs(term string, ma
 func (ti *compressedTrigramIndex) hasStoredPosting(gram uint32) bool {
 	if ti == nil {
 		return false
+	}
+	if ti.mappedGrams != nil {
+		return ti.countForGram(gram) > 0
 	}
 	for _, segment := range ti.segments {
 		if segment.postingForGram(gram).count > 0 {
@@ -670,88 +713,14 @@ func (ti *compressedTrigramIndex) compactForLowMemory() {
 		}
 		segment.postings = nil
 	}
-	ti.mmapPostingData()
 	debug.FreeOSMemory()
-}
-
-func (ti *compressedTrigramIndex) mmapPostingData() {
-	if ti == nil || ti.postingBytes <= 0 {
-		return
-	}
-	tmp, err := os.CreateTemp("", "seekfs-name-trigrams-*.bin")
-	if err != nil {
-		return
-	}
-	path := tmp.Name()
-	var offset uint64
-	var writeErr error
-	for i := range ti.segments {
-		segment := &ti.segments[i]
-		for j := range segment.postingList {
-			posting := &segment.postingList[j]
-			if len(posting.data) == 0 {
-				continue
-			}
-			posting.offset = offset
-			posting.size = uint32(len(posting.data))
-			if _, writeErr = tmp.Write(posting.data); writeErr != nil {
-				break
-			}
-			offset += uint64(len(posting.data))
-		}
-		if writeErr != nil {
-			break
-		}
-	}
-	if closeErr := tmp.Close(); writeErr == nil {
-		writeErr = closeErr
-	}
-	if writeErr != nil {
-		_ = os.Remove(path)
-		return
-	}
-	mapped, err := mapIndexFile(path)
-	if err != nil {
-		_ = os.Remove(path)
-		return
-	}
-	ti.postingBlob = mapped
-	ti.postingPath = path
-	for i := range ti.segments {
-		segment := &ti.segments[i]
-		segment.flatPostings = make([]flatPosting, len(segment.postingList))
-		for j, posting := range segment.postingList {
-			segment.flatPostings[j] = flatPosting{
-				count:  posting.count,
-				offset: posting.offset,
-				size:   posting.size,
-			}
-		}
-		segment.postingList = nil
-	}
-	runtime.SetFinalizer(ti, func(ti *compressedTrigramIndex) {
-		if ti.postingBlob != nil {
-			_ = ti.postingBlob.close()
-		}
-		if ti.postingPath != "" {
-			_ = os.Remove(ti.postingPath)
-		}
-	})
 }
 
 func (ti *compressedTrigramIndex) postingData(posting compressedPosting) []byte {
 	if len(posting.data) > 0 {
 		return posting.data
 	}
-	if ti == nil || ti.postingBlob == nil || posting.size == 0 {
-		return nil
-	}
-	start := int(posting.offset)
-	end := start + int(posting.size)
-	if start < 0 || end < start || end > len(ti.postingBlob.data) {
-		return nil
-	}
-	return ti.postingBlob.data[start:end]
+	return nil
 }
 
 func (ti *compressedTrigramIndex) segmentCandidateIDs(segment trigramSegment, grams []uint32) []uint32 {
@@ -781,6 +750,9 @@ func (ti *compressedTrigramIndex) idsForGram(gram uint32) []uint32 {
 	total := ti.countForGram(gram)
 	if total == 0 {
 		return nil
+	}
+	if ti.mappedGrams != nil {
+		return ti.mappedGrams.gramPosting(gram)
 	}
 	out := make([]uint32, 0, total)
 	for _, segment := range ti.segments {
