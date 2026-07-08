@@ -2,12 +2,17 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"container/heap"
+	"container/list"
+	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"io/fs"
 	"os"
@@ -30,10 +35,8 @@ import (
 )
 
 const indexVersion = 8
+const indexVersionV9 = 9
 const servicePathCacheLimit = 25_000
-const serviceTermCacheLimit = 64
-const serviceCachedPostingMaxIDs = 50_000
-const serviceRecentRebuildThreshold = 100_000
 const serviceStartupDefaultWorkers = 2
 const serviceResidentNameOrderMaxRecords = 2_000_000
 const serviceBackgroundNameOrderMaxRecords = 30_000_000
@@ -44,6 +47,7 @@ const serviceNameTrigramCandidateMaxIDs = 25_000
 const servicePathNameTrigramCandidateMaxIDs = 250_000
 const serviceComponentTrigramCandidateMaxIDs = 10_000
 const serviceComponentTrigramExpansionMaxIDs = 25_000
+const serviceComponentMultiTermScanMaxIDs = 500_000
 const serviceTrigramParallelVerifyMinIDs = 4_096
 const serviceRankParallelMinIDs = 500_000
 const serviceNameTrigramDefaultMaxRecords = 20_000_000
@@ -58,6 +62,23 @@ const (
 )
 
 var indexMagic = [8]byte{'G', 'O', 'S', 'R', 'C', 'H', '0', '8'}
+var indexMagicV9 = [8]byte{'G', 'O', 'S', 'R', 'C', 'H', '0', '9'}
+var walMagicV1 = []byte{'S', 'W', 'A', 'L', '1'}
+
+const (
+	indexSectionRANK uint32 = 'R'<<24 | 'A'<<16 | 'N'<<8 | 'K'
+	indexSectionSUBT uint32 = 'S'<<24 | 'U'<<16 | 'B'<<8 | 'T'
+	indexSectionCHLD uint32 = 'C'<<24 | 'H'<<16 | 'L'<<8 | 'D'
+	indexSectionFRNS uint32 = 'F'<<24 | 'R'<<16 | 'N'<<8 | 'S'
+	indexSectionLOWR uint32 = 'L'<<24 | 'O'<<16 | 'W'<<8 | 'R'
+	indexSectionPEXT uint32 = 'P'<<24 | 'E'<<16 | 'X'<<8 | 'T'
+	indexSectionPCMP uint32 = 'P'<<24 | 'C'<<16 | 'M'<<8 | 'P'
+	indexSectionPNGR uint32 = 'P'<<24 | 'N'<<16 | 'G'<<8 | 'R'
+)
+
+func engineV9Enabled() bool {
+	return envBool("SEEKFS_ENGINE_V9")
+}
 
 var (
 	version = "dev"
@@ -79,8 +100,12 @@ const (
 	serviceName                 = "seekfs"
 	defaultServicePipe          = `\\.\pipe\seekfs-service`
 	defaultServiceSDDL          = `D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)`
-	serviceQueryTimeout         = 10 * time.Second
+	serviceQueryTimeout         = 30 * time.Second
 	persistDebounce             = 5 * time.Minute
+	overlayCompactionDirtyAge   = 30 * time.Minute
+	overlayCompactionMaxSlots   = 64 * 1024
+	overlayCompactionMaxWAL     = 64 * 1024 * 1024
+	overlayCompactionTombstoneP = 5
 	compactDiskRecordBytes      = 43
 	compactWideDiskRecordBytes  = 45
 	compactDiskFlag             = 1
@@ -119,11 +144,15 @@ type jsonResult struct {
 }
 
 type jsonSearchResponse struct {
-	OK      bool         `json:"ok"`
-	Query   string       `json:"query"`
-	Count   int          `json:"count"`
-	Limit   int          `json:"limit,omitempty"`
-	Results []jsonResult `json:"results,omitempty"`
+	OK         bool         `json:"ok"`
+	Query      string       `json:"query"`
+	Count      int          `json:"count"`
+	Limit      int          `json:"limit,omitempty"`
+	SearchMS   float64      `json:"search_ms,omitempty"`
+	Source     string       `json:"source,omitempty"`
+	Decline    string       `json:"decline,omitempty"`
+	Candidates int          `json:"candidates,omitempty"`
+	Results    []jsonResult `json:"results,omitempty"`
 }
 
 type jsonInfoResponse struct {
@@ -209,8 +238,55 @@ type Index struct {
 	MMapRecords      *MMapRecords
 	CompactNameOrder []int
 	NameBlob         []byte
+	Derived          indexDerivedSections
 	DBPath           string
 }
+
+type indexDerivedSections struct {
+	NameOrder    []uint32
+	NameRank     []uint32
+	ChildOffsets []uint32
+	ChildIDs     []uint32
+	RootIDs      []uint32
+	SubtreeStart []uint32
+	SubtreeEnd   []uint32
+	SubtreeOrder []uint32
+	FRNs         []uint64
+	FRNRecordIDs []uint32
+	LowerBlob    []byte
+	LowerOffs    []uint32
+	LowerLens    []uint16
+	Postings     map[uint32]mappedPostingSection
+	NameTrigrams *compressedTrigramIndex
+}
+
+type mappedPostingSection struct {
+	EntryCount int
+	BlockCount int
+	Bytes      int
+	Data       []byte
+}
+
+type postingBlockCacheKey struct {
+	base  uintptr
+	bytes int
+	block int
+}
+
+type postingBlockCacheEntry struct {
+	key   postingBlockCacheKey
+	ids   []uint32
+	bytes int64
+}
+
+type postingBlockLRU struct {
+	mu    sync.Mutex
+	ll    list.List
+	items map[postingBlockCacheKey]*list.Element
+	bytes int64
+}
+
+var servicePostingBlockCache postingBlockLRU
 
 type appConfig struct {
 	DBs          []string
@@ -425,7 +501,7 @@ func wantsJSON(args []string) bool {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return usage()
+		return cmdDefault(args)
 	}
 	switch args[0] {
 	case "index":
@@ -434,6 +510,10 @@ func run(args []string) error {
 		return cmdIndexUSN(args[1:])
 	case "index-volumes":
 		return cmdIndexVolumes(args[1:])
+	case "upgrade-index":
+		return cmdUpgradeIndex(args[1:])
+	case "compact-index":
+		return cmdCompactIndex(args[1:])
 	case "service":
 		return cmdService(args[1:])
 	case "install":
@@ -555,6 +635,8 @@ func printUsage(w io.Writer) {
   seekfs index -root <path> [-root <path>...] [-db seekfs.db]
   seekfs index-usn -volume C: [-db seekfs.db]
   seekfs index-volumes [-volume C:] [-volume F:] [-index-dir path] [-launch]
+  seekfs upgrade-index -db seekfs.gsi
+  seekfs compact-index -db seekfs.gsi
   seekfs launch [-db index.gsi...] [--json]
   seekfs install [-pipe \\.\pipe\seekfs-service] [-sddl <sddl>] [-db index.gsi...]
   seekfs start|stop|restart
@@ -774,6 +856,64 @@ func cmdIndexUSN(args []string) error {
 		return err
 	}
 	fmt.Printf("indexed %d entries from %s via USN in %s\n", len(idx.Entries), *volume, time.Since(start).Round(time.Millisecond))
+	return nil
+}
+
+func cmdUpgradeIndex(args []string) error {
+	fs := flag.NewFlagSet("upgrade-index", flag.ContinueOnError)
+	db := fs.String("db", "", "index database path to upgrade")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *db == "" {
+		return errors.New("upgrade-index requires -db")
+	}
+	if !engineV9Enabled() {
+		return errors.New("upgrade-index writes the gated v9 format only when SEEKFS_ENGINE_V9=1")
+	}
+	idx, err := loadIndex(*db)
+	if err != nil {
+		return err
+	}
+	ensureCompactIndexForService(idx)
+	if !idx.Compact {
+		return errors.New("upgrade-index requires a compact-capable index")
+	}
+	idx.Version = indexVersionV9
+	if err := saveIndex(*db, idx); err != nil {
+		return err
+	}
+	fmt.Printf("upgraded %s to v9 derived-section format\n", *db)
+	return nil
+}
+
+func cmdCompactIndex(args []string) error {
+	fs := flag.NewFlagSet("compact-index", flag.ContinueOnError)
+	db := fs.String("db", "", "index database path whose WAL overlay should be compacted")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *db == "" {
+		return errors.New("compact-index requires -db")
+	}
+	if !engineV9Enabled() {
+		return errors.New("compact-index writes the gated v9 format only when SEEKFS_ENGINE_V9=1")
+	}
+	idx, err := loadIndexForService(*db)
+	if err != nil {
+		return err
+	}
+	vol := newServiceVolumeIndex(*db, idx)
+	if err := vol.replayWAL(); err != nil {
+		return err
+	}
+	if err := vol.compactOverlayLocked(); err != nil {
+		return err
+	}
+	if err := removeWAL(*db); err != nil {
+		return err
+	}
+	fmt.Printf("compacted WAL overlay into %s\n", *db)
 	return nil
 }
 
@@ -1094,17 +1234,14 @@ func enumUSN(handle windows.Handle, highUSN int64) (map[uint64]usnNode, error) {
 }
 
 func readUSNChanges(handle windows.Handle, journalID uint64, startUSN int64, buffer []byte) (int64, []usnChange, error) {
+	return readUSNChangesWait(handle, journalID, startUSN, buffer, 0, 0)
+}
+
+func readUSNChangesWait(handle windows.Handle, journalID uint64, startUSN int64, buffer []byte, timeout time.Duration, bytesToWaitFor uint64) (int64, []usnChange, error) {
 	if len(buffer) < 4096 {
 		buffer = make([]byte, 4096)
 	}
-	req := readUSNJournalDataV0{
-		StartUsn:          startUSN,
-		ReasonMask:        0xffffffff,
-		ReturnOnlyOnClose: 0,
-		Timeout:           0,
-		BytesToWaitFor:    0,
-		UsnJournalID:      journalID,
-	}
+	req := makeReadUSNJournalRequest(journalID, startUSN, timeout, bytesToWaitFor)
 	var bytesReturned uint32
 	err := windows.DeviceIoControl(
 		handle,
@@ -1123,6 +1260,24 @@ func readUSNChanges(handle windows.Handle, journalID uint64, startUSN int64, buf
 		return startUSN, nil, err
 	}
 	return parseUSNChangeBuffer(buffer[:bytesReturned])
+}
+
+func makeReadUSNJournalRequest(journalID uint64, startUSN int64, timeout time.Duration, bytesToWaitFor uint64) readUSNJournalDataV0 {
+	timeoutSeconds := uint64(0)
+	if timeout > 0 {
+		timeoutSeconds = uint64(timeout.Round(time.Second) / time.Second)
+		if timeoutSeconds == 0 {
+			timeoutSeconds = 1
+		}
+	}
+	return readUSNJournalDataV0{
+		StartUsn:          startUSN,
+		ReasonMask:        0xffffffff,
+		ReturnOnlyOnClose: 0,
+		Timeout:           timeoutSeconds,
+		BytesToWaitFor:    bytesToWaitFor,
+		UsnJournalID:      journalID,
+	}
 }
 
 func parseUSNChangeBuffer(buffer []byte) (int64, []usnChange, error) {
@@ -1409,7 +1564,7 @@ func cmdSearch(args []string, countOnly bool) error {
 	}
 	opts := queryOptions{
 		Query:         query,
-		MatchPath:     *matchPath,
+		MatchPath:     *matchPath || queryLooksLoosePathScoped(query),
 		Limit:         *limit,
 		Under:         *under,
 		Exists:        *exists,
@@ -1730,14 +1885,14 @@ func cmdBenchAgent(args []string) error {
 		return writeJSON(os.Stdout, summary)
 	}
 	fmt.Printf("mode: %s\niterations: %d\nqueries: %d\nfailures: %d\n", summary.Mode, summary.Iterations, summary.Queries, summary.Failures)
-	for _, key := range []string{"min", "median", "p90", "p95", "max"} {
+	for _, key := range []string{"min", "median", "p90", "p95", "p99", "max"} {
 		fmt.Printf("%s_ms: %.3f\n", key, summary.Stats[key])
 	}
 	for _, item := range summary.PerQuery {
 		if item.Backend != nil {
-			fmt.Printf("query=%q iterations=%d failures=%d median_ms=%.3f backend_median_ms=%.3f p90_ms=%.3f max_ms=%.3f candidates_median=%.0f sources=%v\n", item.Query, item.Iterations, item.Failures, item.Stats["median"], item.Backend["median"], item.Stats["p90"], item.Stats["max"], item.Candidates["median"], item.Sources)
+			fmt.Printf("query=%q iterations=%d failures=%d median_ms=%.3f backend_median_ms=%.3f p90_ms=%.3f p99_ms=%.3f max_ms=%.3f candidates_median=%.0f sources=%v\n", item.Query, item.Iterations, item.Failures, item.Stats["median"], item.Backend["median"], item.Stats["p90"], item.Stats["p99"], item.Stats["max"], item.Candidates["median"], item.Sources)
 		} else {
-			fmt.Printf("query=%q iterations=%d failures=%d median_ms=%.3f p90_ms=%.3f max_ms=%.3f candidates_median=%.0f sources=%v\n", item.Query, item.Iterations, item.Failures, item.Stats["median"], item.Stats["p90"], item.Stats["max"], item.Candidates["median"], item.Sources)
+			fmt.Printf("query=%q iterations=%d failures=%d median_ms=%.3f p90_ms=%.3f p99_ms=%.3f max_ms=%.3f candidates_median=%.0f sources=%v\n", item.Query, item.Iterations, item.Failures, item.Stats["median"], item.Stats["p90"], item.Stats["p99"], item.Stats["max"], item.Candidates["median"], item.Sources)
 		}
 	}
 	return nil
@@ -1843,7 +1998,7 @@ func benchServiceQuery(pipeName string, opts queryOptions) (serviceResponse, err
 }
 
 func latencyStats(values []float64) map[string]float64 {
-	stats := map[string]float64{"min": 0, "median": 0, "p90": 0, "p95": 0, "max": 0}
+	stats := map[string]float64{"min": 0, "median": 0, "p90": 0, "p95": 0, "p99": 0, "max": 0}
 	if len(values) == 0 {
 		return stats
 	}
@@ -1853,6 +2008,7 @@ func latencyStats(values []float64) map[string]float64 {
 	stats["median"] = percentile(sorted, 0.50)
 	stats["p90"] = percentile(sorted, 0.90)
 	stats["p95"] = percentile(sorted, 0.95)
+	stats["p99"] = percentile(sorted, 0.99)
 	stats["max"] = sorted[len(sorted)-1]
 	return stats
 }
@@ -1891,20 +2047,73 @@ type serviceRequest struct {
 }
 
 type serviceResponse struct {
-	OK         bool               `json:"ok"`
-	Message    string             `json:"message,omitempty"`
-	PID        int                `json:"pid,omitempty"`
-	Entries    int                `json:"entries,omitempty"`
-	Loading    bool               `json:"loading,omitempty"`
-	Count      int                `json:"count,omitempty"`
-	SearchMS   float64            `json:"search_ms,omitempty"`
-	Source     string             `json:"source,omitempty"`
-	Decline    string             `json:"decline,omitempty"`
-	Candidates int                `json:"candidates,omitempty"`
-	Results    []string           `json:"results,omitempty"`
-	Rows       []jsonResult       `json:"rows,omitempty"`
-	DBs        []dbInfo           `json:"dbs,omitempty"`
-	Runtime    *runtimeMemoryInfo `json:"runtime,omitempty"`
+	OK             bool               `json:"ok"`
+	Message        string             `json:"message,omitempty"`
+	PID            int                `json:"pid,omitempty"`
+	Executable     string             `json:"executable,omitempty"`
+	ExecutableHash string             `json:"executable_hash,omitempty"`
+	Version        string             `json:"version,omitempty"`
+	Commit         string             `json:"commit,omitempty"`
+	Date           string             `json:"date,omitempty"`
+	BuildFlavor    string             `json:"build_flavor,omitempty"`
+	PipeName       string             `json:"pipe_name,omitempty"`
+	ProcessMode    string             `json:"process_mode,omitempty"`
+	Entries        int                `json:"entries,omitempty"`
+	Loading        bool               `json:"loading,omitempty"`
+	Count          int                `json:"count,omitempty"`
+	SearchMS       float64            `json:"search_ms,omitempty"`
+	Source         string             `json:"source,omitempty"`
+	Decline        string             `json:"decline,omitempty"`
+	Candidates     int                `json:"candidates,omitempty"`
+	Results        []string           `json:"results,omitempty"`
+	Rows           []jsonResult       `json:"rows,omitempty"`
+	DBs            []dbInfo           `json:"dbs,omitempty"`
+	Runtime        *runtimeMemoryInfo `json:"runtime,omitempty"`
+}
+
+func serviceInfoResponse(resp serviceResponse) serviceResponse {
+	return serviceInfoResponseFor(resp, "", "")
+}
+
+func serviceInfoResponseFor(resp serviceResponse, pipeName, processMode string) serviceResponse {
+	resp.PID = os.Getpid()
+	resp.Version = version
+	resp.Commit = commit
+	resp.Date = date
+	resp.BuildFlavor = serviceBuildFlavor()
+	resp.PipeName = pipeName
+	resp.ProcessMode = processMode
+	if exe, err := os.Executable(); err == nil {
+		resp.Executable = exe
+		resp.ExecutableHash = executableContentHash(exe)
+	}
+	return resp
+}
+
+func executableContentHash(path string) string {
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return ""
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+func serviceBuildFlavor() string {
+	return serviceBuildFlavorForMemoryMode(os.Getenv("SEEKFS_MEMORY_MODE"))
+}
+
+func serviceBuildFlavorForMemoryMode(memoryMode string) string {
+	parts := []string{"cli", "service"}
+	switch strings.ToLower(strings.TrimSpace(memoryMode)) {
+	case "lowmem", "mmap", "low-memory":
+		parts = append(parts, "lowmem")
+	}
+	return strings.Join(parts, ",")
 }
 
 type dbInfo struct {
@@ -1935,6 +2144,8 @@ type dbInfo struct {
 	NameOrderMillis   int64               `json:"name_order_build_ms,omitempty"`
 	NameTrigramState  string              `json:"name_trigram_state,omitempty"`
 	NameTrigramMillis int64               `json:"name_trigram_build_ms,omitempty"`
+	DerivedSections   []string            `json:"derived_sections,omitempty"`
+	DerivedBytes      int                 `json:"derived_bytes,omitempty"`
 	Memory            *residentMemoryInfo `json:"memory,omitempty"`
 }
 
@@ -1968,16 +2179,17 @@ type runtimeMemoryInfo struct {
 }
 
 type goSearchService struct {
-	pipeName   string
-	sddl       string
-	stop       chan struct{}
-	dbs        []string
-	indexes    []*Index
-	volumes    []*serviceVolumeIndex
-	loading    bool
-	loadErr    string
-	indexMu    sync.RWMutex
-	requestSeq atomic.Int64
+	pipeName    string
+	sddl        string
+	processMode string
+	stop        chan struct{}
+	dbs         []string
+	indexes     []*Index
+	volumes     []*serviceVolumeIndex
+	loading     bool
+	loadErr     string
+	indexMu     sync.RWMutex
+	requestSeq  atomic.Int64
 }
 
 type serviceVolumeIndex struct {
@@ -2009,24 +2221,47 @@ type serviceVolumeIndex struct {
 	nameTrigramMillis atomic.Int64
 	searchMu          sync.Mutex
 	termMu            sync.Mutex
-	termCache         map[string][]int
-	pathTermCache     map[string][]int
-	extCache          map[string][]int
+	walkMu            sync.Mutex
+	termCache         map[string]postingCacheEntry
+	pathTermCache     map[string]postingCacheEntry
+	extCache          map[string]postingCacheEntry
 	recentIDs         map[int]struct{}
 	nameTrigramRecent map[int]struct{}
 	recentSeq         uint64
-	termSeq           map[string]uint64
-	pathTermSeq       map[string]uint64
-	extSeq            map[string]uint64
-	underCache        map[int][]int
-	underSeq          map[int]uint64
-	underRootCache    map[string][]int
+	underCache        map[int]postingCacheEntry
+	underRootCache    map[string]postingCacheEntry
 	dirty             bool
 	lastPersist       time.Time
 	persistFailures   int
 	persistRetryAfter time.Time
 	lastPersistErr    string
 	searchCount       uint64
+	overlay           *overlaySegment
+	snap              atomic.Pointer[volumeSnapshot]
+	snapshotGen       atomic.Uint64
+}
+
+type overlaySegment struct {
+	records   []CompactRecord
+	byFRN     map[uint64]int32
+	tombstone overlayBaseIDSet
+	shadowed  overlayBaseIDSet
+	watermark atomic.Int32
+}
+
+type overlayBaseIDSet struct {
+	bits  []uint64
+	ids   []int32
+	count int
+}
+
+type volumeSnapshot struct {
+	base         *Index
+	records      []CompactRecord
+	tombstoneIDs []int32
+	shadowedIDs  []int32
+	watermark    int32
+	gen          uint64
 }
 
 type residentQueryIndex struct {
@@ -2037,6 +2272,12 @@ type residentQueryIndex struct {
 	nameOrder  []uint32
 	nameRank   []uint32
 	dirs       []uint32
+	dirsReady  bool
+}
+
+type postingCacheEntry struct {
+	ids []int
+	gen uint64
 }
 
 func serviceLog(format string, args ...any) {
@@ -2060,7 +2301,7 @@ func cmdService(args []string) error {
 	pipeName := fs.String("pipe", defaultServicePipe, "service named pipe")
 	sddl := fs.String("sddl", defaultServiceSDDL, "pipe security descriptor SDDL")
 	lowMemory := fs.Bool("lowmem", false, "run service in low-memory mmap mode")
-	skipStartupSync := fs.Bool("skip-startup-sync", false, "skip WAL replay and USN catch-up on startup")
+	skipStartupSync := fs.Bool("skip-startup-sync", false, "deprecated no-op; startup replay and catch-up always run")
 	fs.Var(&dbs, "db", "index database path to load for service search; repeatable")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -2068,9 +2309,7 @@ func cmdService(args []string) error {
 	if *lowMemory {
 		_ = os.Setenv("SEEKFS_MEMORY_MODE", "lowmem")
 	}
-	if *skipStartupSync {
-		_ = os.Setenv("SEEKFS_LOW_MEMORY_SKIP_WAL", "1")
-	}
+	_ = *skipStartupSync
 	cfg, err := loadConfig(*configPath)
 	if err != nil {
 		return err
@@ -2085,7 +2324,11 @@ func cmdService(args []string) error {
 	if err != nil {
 		return err
 	}
-	handler := &goSearchService{pipeName: *pipeName, sddl: *sddl, stop: make(chan struct{}), dbs: dbs}
+	processMode := "standalone"
+	if isService {
+		processMode = "windows-service"
+	}
+	handler := &goSearchService{pipeName: *pipeName, sddl: *sddl, processMode: processMode, stop: make(chan struct{}), dbs: dbs}
 	if isService {
 		return svc.Run(serviceName, handler)
 	}
@@ -2700,7 +2943,9 @@ func waitForDoctor(pipeName string, timeout time.Duration) doctorResponse {
 		if resp.OK || time.Now().After(deadline) {
 			return resp
 		}
-		time.Sleep(500 * time.Millisecond)
+		if !engineV9Enabled() {
+			time.Sleep(500 * time.Millisecond)
+		}
 	}
 }
 
@@ -2847,6 +3092,9 @@ func openPipeClientWithTimeout(pipeName string, timeout time.Duration) (windows.
 }
 
 func (s *goSearchService) Execute(args []string, r <-chan svc.ChangeRequest, changes chan<- svc.Status) (bool, uint32) {
+	if s.processMode == "" {
+		s.processMode = "windows-service"
+	}
 	changes <- svc.Status{State: svc.StartPending}
 	done := make(chan struct{})
 	go func() {
@@ -2879,6 +3127,9 @@ func (s *goSearchService) Execute(args []string, r <-chan svc.ChangeRequest, cha
 }
 
 func (s *goSearchService) runStandalone() error {
+	if s.processMode == "" {
+		s.processMode = "standalone"
+	}
 	fmt.Fprintf(os.Stderr, "seekfs privileged service listening on %s\n", s.pipeName)
 	go func() {
 		defer func() {
@@ -2924,14 +3175,12 @@ func (s *goSearchService) loadConfiguredIndexes() error {
 	debug.FreeOSMemory()
 	s.startBackgroundNameOrderBuilds(volumes)
 	s.startBackgroundNameTrigramBuilds(volumes)
-	if serviceSkipLowMemoryStartupSync() {
-		serviceLog("lowmem live replay skipped for %d volumes", len(volumes))
-	} else {
-		for _, vol := range volumes {
-			if vol.state == "ready" && vol.index.Compact && vol.index.Source == "usn" {
-				go s.replayVolumeLoop(vol)
-				go s.persistVolumeLoop(vol)
-			}
+	for _, vol := range volumes {
+		if vol.state == "ready" && vol.index.Compact && vol.index.Source == "usn" {
+			go s.replayVolumeLoop(vol)
+			go s.persistVolumeLoop(vol)
+		} else if vol.state == "ready" && vol.index.Source == "walk" {
+			s.startWalkWatchers(vol)
 		}
 	}
 	serviceLog("loaded %d dbs entries=%d elapsed=%s", len(indexes), total, time.Since(start).Round(time.Millisecond))
@@ -2996,37 +3245,33 @@ func loadConfiguredVolume(dbPath string) (*Index, *serviceVolumeIndex, error) {
 	}
 	idx.DBPath = dbPath
 	vol := newServiceVolumeIndex(dbPath, idx)
-	if serviceSkipLowMemoryStartupSync() {
-		serviceLog("lowmem startup sync skipped volume=%s db=%s", vol.volume, vol.dbPath)
-	} else {
-		if err := vol.replayWAL(); err != nil {
-			serviceLog("startup wal replay skipped volume=%s db=%s err=%v", vol.volume, vol.dbPath, err)
-			vol.state = "stale"
-			vol.staleReason = err.Error()
-			if shouldRebuildStaleIndex(err) {
-				if rebuilt, rebuildErr := rebuildServiceVolumeIndex(vol); rebuildErr == nil {
-					serviceLog("startup wal rebuild complete volume=%s db=%s entries=%d", rebuilt.volume, rebuilt.dbPath, rebuilt.index.entryCount())
-					vol = rebuilt
-					idx = rebuilt.index
-				} else {
-					serviceLog("startup wal rebuild failed volume=%s db=%s err=%v", vol.volume, vol.dbPath, rebuildErr)
-				}
-			}
-		}
-		if err := catchUpServiceVolume(vol); err != nil {
-			serviceLog("startup catch-up skipped volume=%s db=%s err=%v", vol.volume, vol.dbPath, err)
-			if shouldRebuildStaleIndex(err) {
-				if rebuilt, rebuildErr := rebuildServiceVolumeIndex(vol); rebuildErr == nil {
-					serviceLog("startup stale rebuild complete volume=%s db=%s entries=%d", rebuilt.volume, rebuilt.dbPath, rebuilt.index.entryCount())
-					vol = rebuilt
-					idx = rebuilt.index
-				} else {
-					serviceLog("startup stale rebuild failed volume=%s db=%s err=%v", vol.volume, vol.dbPath, rebuildErr)
-				}
+	if err := vol.replayWAL(); err != nil {
+		serviceLog("startup wal replay skipped volume=%s db=%s err=%v", vol.volume, vol.dbPath, err)
+		vol.state = "stale"
+		vol.staleReason = err.Error()
+		if shouldRebuildStaleIndex(err) {
+			if rebuilt, rebuildErr := rebuildServiceVolumeIndex(vol); rebuildErr == nil {
+				serviceLog("startup wal rebuild complete volume=%s db=%s entries=%d", rebuilt.volume, rebuilt.dbPath, rebuilt.index.entryCount())
+				vol = rebuilt
+				idx = rebuilt.index
+			} else {
+				serviceLog("startup wal rebuild failed volume=%s db=%s err=%v", vol.volume, vol.dbPath, rebuildErr)
 			}
 		}
 	}
-	if serviceLowMemoryMode() && idx.Compact && idx.MMapRecords == nil {
+	if err := catchUpServiceVolume(vol); err != nil {
+		serviceLog("startup catch-up skipped volume=%s db=%s err=%v", vol.volume, vol.dbPath, err)
+		if shouldRebuildStaleIndex(err) {
+			if rebuilt, rebuildErr := rebuildServiceVolumeIndex(vol); rebuildErr == nil {
+				serviceLog("startup stale rebuild complete volume=%s db=%s entries=%d", rebuilt.volume, rebuilt.dbPath, rebuilt.index.entryCount())
+				vol = rebuilt
+				idx = rebuilt.index
+			} else {
+				serviceLog("startup stale rebuild failed volume=%s db=%s err=%v", vol.volume, vol.dbPath, rebuildErr)
+			}
+		}
+	}
+	if engineV9Enabled() && serviceLowMemoryMode() && idx.Compact && idx.MMapRecords == nil {
 		if mmapIdx, mmapErr := loadIndexMMap(dbPath); mmapErr == nil {
 			idx = mmapIdx
 			vol = newServiceVolumeIndex(dbPath, idx)
@@ -3046,18 +3291,95 @@ func loadConfiguredVolume(dbPath string) (*Index, *serviceVolumeIndex, error) {
 
 func loadIndexForService(dbPath string) (*Index, error) {
 	if !serviceLowMemoryMode() {
-		return loadIndex(dbPath)
+		idx, err := loadIndex(dbPath)
+		if err != nil {
+			return nil, err
+		}
+		ensureCompactIndexForService(idx)
+		return idx, nil
+	}
+	if !engineV9Enabled() {
+		idx, err := loadIndex(dbPath)
+		if err != nil {
+			return nil, err
+		}
+		ensureCompactIndexForService(idx)
+		return idx, nil
 	}
 	idx, err := loadIndexMMap(dbPath)
 	if err == nil {
+		ensureCompactIndexForService(idx)
 		return idx, nil
 	}
 	serviceLog("lowmem mmap initial load fallback db=%s err=%v", dbPath, err)
-	return loadIndex(dbPath)
+	idx, err = loadIndex(dbPath)
+	if err != nil {
+		return nil, err
+	}
+	ensureCompactIndexForService(idx)
+	return idx, nil
 }
 
-func serviceSkipLowMemoryStartupSync() bool {
-	return serviceLowMemoryMode() && envBool("SEEKFS_LOW_MEMORY_SKIP_WAL")
+func ensureCompactIndexForService(idx *Index) {
+	if idx == nil || idx.Compact || len(idx.Entries) == 0 {
+		return
+	}
+	records := make([]CompactRecord, 0, len(idx.Entries))
+	idByPath := make(map[string]int32, len(idx.Entries))
+	if idx.Volume == "" {
+		for _, entry := range idx.Entries {
+			if vol := filepath.VolumeName(entry.Path); vol != "" {
+				idx.Volume = vol
+				break
+			}
+		}
+	}
+	for i, entry := range idx.Entries {
+		path := filepath.Clean(entry.Path)
+		name := entry.Name
+		if name == "" {
+			name = filepath.Base(path)
+		}
+		if name == "." || name == string(filepath.Separator) || name == "" {
+			name = filepath.VolumeName(path)
+			if name == "" {
+				name = "."
+			}
+		}
+		rec := CompactRecord{
+			FRN:       uint64(i + 1),
+			ParentFRN: uint64(i + 1),
+			Parent:    -1,
+			Name:      name,
+			Mode:      entry.Mode,
+			Size:      entry.Size,
+			ModUnix:   entry.ModUnix,
+		}
+		records = append(records, rec)
+		idByPath[strings.ToLower(path)] = int32(i)
+	}
+	for i, entry := range idx.Entries {
+		path := filepath.Clean(entry.Path)
+		parentPath := filepath.Dir(path)
+		if parentPath == path || parentPath == "." {
+			continue
+		}
+		parent, ok := idByPath[strings.ToLower(parentPath)]
+		if !ok {
+			continue
+		}
+		records[i].Parent = parent
+		records[i].ParentFRN = records[parent].FRN
+	}
+	idx.Records = records
+	idx.Entries = nil
+	idx.NameOrder = nil
+	idx.PathOrder = nil
+	idx.Compact = true
+	buildOrders(idx)
+	if serviceLowMemoryMode() {
+		idx.packCompactRecords(true)
+	}
 }
 
 func newServiceVolumeIndex(dbPath string, idx *Index) *serviceVolumeIndex {
@@ -3091,30 +3413,136 @@ func newServiceVolumeIndex(dbPath string, idx *Index) *serviceVolumeIndex {
 			vol.children = make(map[uint64]map[int]struct{}, recordCount)
 			vol.exactNames = make(map[string][]int, recordCount/2)
 		}
-		for i := 0; i < recordCount; i++ {
-			rec := idx.compactRecord(i)
-			if vol.frns != nil && rec.FRN != 0 {
-				vol.frns = append(vol.frns, rec.FRN)
-				vol.frnRecordIDs = append(vol.frnRecordIDs, uint32(i))
-			}
-			if vol.children != nil && rec.ParentFRN != 0 && rec.ParentFRN != rec.FRN {
-				vol.addChild(rec.ParentFRN, i)
-			}
-			if name := idx.compactLowerNameAt(i); vol.exactNames != nil && !rec.Deleted && name != "" {
-				vol.exactNames[name] = append(vol.exactNames[name], i)
+		if vol.frns != nil || vol.children != nil || vol.exactNames != nil {
+			for i := 0; i < recordCount; i++ {
+				rec := idx.compactRecord(i)
+				if vol.frns != nil && rec.FRN != 0 {
+					vol.frns = append(vol.frns, rec.FRN)
+					vol.frnRecordIDs = append(vol.frnRecordIDs, uint32(i))
+				}
+				if vol.children != nil && rec.ParentFRN != 0 && rec.ParentFRN != rec.FRN {
+					vol.addChild(rec.ParentFRN, i)
+				}
+				if name := idx.compactLowerNameAt(i); vol.exactNames != nil && !rec.Deleted && name != "" {
+					vol.exactNames[name] = append(vol.exactNames[name], i)
+				}
 			}
 		}
 		if vol.frns != nil {
 			sortFRNIndexEntries(vol.frns, vol.frnRecordIDs)
 		}
 		vol.queryIndex = buildResidentQueryIndex(vol)
+		vol.applyDerivedSections()
 		vol.resetNameOrderBuild()
 		vol.resetNameTrigrams()
 		if vol.needsCompactChildrenBuild() {
 			vol.buildCompactChildren()
 		}
 	}
+	if engineV9Enabled() {
+		vol.overlay = newOverlaySegment()
+		vol.publishSnapshot()
+	}
 	return vol
+}
+
+func newOverlaySegment() *overlaySegment {
+	return &overlaySegment{
+		byFRN: make(map[uint64]int32),
+	}
+}
+
+func (set *overlayBaseIDSet) add(id int32) {
+	if id < 0 {
+		return
+	}
+	word := int(id) / 64
+	bit := uint(id) % 64
+	if word >= len(set.bits) {
+		grown := make([]uint64, word+1)
+		copy(grown, set.bits)
+		set.bits = grown
+	}
+	mask := uint64(1) << bit
+	if set.bits[word]&mask != 0 {
+		return
+	}
+	set.bits[word] |= mask
+	set.ids = append(set.ids, id)
+	set.count++
+}
+
+func (set *overlayBaseIDSet) contains(id int32) bool {
+	if id < 0 {
+		return false
+	}
+	word := int(id) / 64
+	if word >= len(set.bits) {
+		return false
+	}
+	return set.bits[word]&(uint64(1)<<(uint(id)%64)) != 0
+}
+
+func (set *overlayBaseIDSet) len() int {
+	if set == nil {
+		return 0
+	}
+	return set.count
+}
+
+func (vol *serviceVolumeIndex) publishSnapshot() {
+	if vol == nil || !engineV9Enabled() {
+		return
+	}
+	gen := vol.snapshotGen.Add(1)
+	watermark := int32(0)
+	var records []CompactRecord
+	var tombstoneIDs []int32
+	var shadowedIDs []int32
+	if vol.overlay != nil {
+		watermark = vol.overlay.watermark.Load()
+		records = vol.overlay.records
+		tombstoneIDs = sortedInt32Snapshot(vol.overlay.tombstone.ids)
+		shadowedIDs = sortedInt32Snapshot(vol.overlay.shadowed.ids)
+	}
+	vol.snap.Store(&volumeSnapshot{base: vol.index, records: records, tombstoneIDs: tombstoneIDs, shadowedIDs: shadowedIDs, watermark: watermark, gen: gen})
+}
+
+func sortedInt32Snapshot(ids []int32) []int32 {
+	if len(ids) == 0 {
+		return nil
+	}
+	out := append([]int32(nil), ids...)
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
+}
+
+func (vol *serviceVolumeIndex) applyDerivedSections() {
+	if vol == nil || vol.index == nil {
+		return
+	}
+	derived := vol.index.Derived
+	if len(derived.NameOrder) > 0 && len(derived.NameRank) > 0 {
+		if vol.queryIndex == nil {
+			vol.queryIndex = &residentQueryIndex{}
+		}
+		vol.queryIndex.nameOrder = derived.NameOrder
+		vol.queryIndex.nameRank = derived.NameRank
+	}
+	if len(derived.ChildOffsets) > 0 && len(derived.ChildIDs) > 0 {
+		vol.childOffsets = derived.ChildOffsets
+		vol.childIDs = derived.ChildIDs
+		vol.rootIDs = derived.RootIDs
+	}
+	if len(derived.SubtreeStart) > 0 && len(derived.SubtreeEnd) > 0 && len(derived.SubtreeOrder) > 0 {
+		vol.subtreeStart = derived.SubtreeStart
+		vol.subtreeEnd = derived.SubtreeEnd
+		vol.subtreeOrder = derived.SubtreeOrder
+	}
+	if len(derived.FRNs) > 0 && len(derived.FRNRecordIDs) == len(derived.FRNs) {
+		vol.frns = derived.FRNs
+		vol.frnRecordIDs = derived.FRNRecordIDs
+	}
 }
 
 func sortFRNIndexEntries(frns []uint64, ids []uint32) {
@@ -3184,20 +3612,31 @@ func catchUpServiceVolume(vol *serviceVolumeIndex) error {
 		if nextUSN <= vol.checkpoint {
 			break
 		}
+		if engineV9Enabled() {
+			if err := appendWAL(vol.dbPath, nextUSN, changes); err != nil {
+				vol.state = "stale"
+				vol.staleReason = err.Error()
+				return err
+			}
+		}
 		vol.applyUSNChanges(changes)
 		vol.checkpoint = nextUSN
 		vol.index.Checkpoint = nextUSN
 	}
 	if vol.dbPath != "" {
-		if err := saveIndex(vol.dbPath, vol.index); err != nil {
-			vol.state = "stale"
-			vol.staleReason = err.Error()
-			return err
-		}
-		vol.repackResidentRecordsIfBloated()
-		releaseServiceMemoryAfterSave()
-		if err := removeWAL(vol.dbPath); err != nil {
-			serviceLog("wal cleanup error volume=%s db=%s err=%v", vol.volume, vol.dbPath, err)
+		if engineV9Enabled() {
+			vol.dirty = true
+		} else {
+			if err := saveIndex(vol.dbPath, vol.index); err != nil {
+				vol.state = "stale"
+				vol.staleReason = err.Error()
+				return err
+			}
+			vol.repackResidentRecordsIfBloated()
+			releaseServiceMemoryAfterSave()
+			if err := removeWAL(vol.dbPath); err != nil {
+				serviceLog("wal cleanup error volume=%s db=%s err=%v", vol.volume, vol.dbPath, err)
+			}
 		}
 	}
 	vol.state = "ready"
@@ -3284,7 +3723,14 @@ func (s *goSearchService) replayVolumeOnce(vol *serviceVolumeIndex, buffer []byt
 		return err
 	}
 
-	nextUSN, changes, err := readUSNChanges(handle, journalID, startUSN, buffer)
+	var nextUSN int64
+	var changes []usnChange
+	err = nil
+	if engineV9Enabled() {
+		nextUSN, changes, err = readUSNChangesWait(handle, journalID, startUSN, buffer, 5*time.Second, 1)
+	} else {
+		nextUSN, changes, err = readUSNChanges(handle, journalID, startUSN, buffer)
+	}
 	if err != nil {
 		return err
 	}
@@ -3298,9 +3744,7 @@ func (s *goSearchService) replayVolumeOnce(vol *serviceVolumeIndex, buffer []byt
 		s.indexMu.Unlock()
 		return err
 	}
-	if !s.indexMu.TryLock() {
-		return nil
-	}
+	s.indexMu.Lock()
 	if vol.checkpoint != startUSN {
 		s.indexMu.Unlock()
 		return nil
@@ -3333,27 +3777,49 @@ func (s *goSearchService) persistVolumeIfDue(vol *serviceVolumeIndex, force bool
 	if vol.dbPath == "" {
 		return
 	}
+	if !force && envBool("SEEKFS_DISABLE_BACKGROUND_PERSIST") {
+		return
+	}
 	now := time.Now()
 	s.indexMu.RLock()
 	dirty := vol.dirty
 	retryAfter := vol.persistRetryAfter
-	due := force || (now.Sub(vol.lastPersist) >= persistDebounce && (retryAfter.IsZero() || !now.Before(retryAfter)))
+	due := force || vol.compactionDue(now)
+	if !engineV9Enabled() {
+		due = force || (now.Sub(vol.lastPersist) >= persistDebounce && (retryAfter.IsZero() || !now.Before(retryAfter)))
+	} else if !retryAfter.IsZero() && now.Before(retryAfter) {
+		due = false
+	}
 	s.indexMu.RUnlock()
 	if !dirty || !due {
 		return
 	}
 	s.indexMu.Lock()
 	now = time.Now()
-	if !vol.dirty || (!force && (now.Sub(vol.lastPersist) < persistDebounce || (!vol.persistRetryAfter.IsZero() && now.Before(vol.persistRetryAfter)))) {
+	due = force || vol.compactionDue(now)
+	if !engineV9Enabled() {
+		due = force || (now.Sub(vol.lastPersist) >= persistDebounce && (vol.persistRetryAfter.IsZero() || !now.Before(vol.persistRetryAfter)))
+	} else if !vol.persistRetryAfter.IsZero() && now.Before(vol.persistRetryAfter) {
+		due = false
+	}
+	if !vol.dirty || !due {
 		s.indexMu.Unlock()
 		return
 	}
 	saved := false
-	if err := saveIndex(vol.dbPath, vol.index); err != nil {
+	var err error
+	if engineV9Enabled() && vol.overlay != nil {
+		err = s.compactOverlayVolumeLocked(vol)
+	} else {
+		err = saveIndex(vol.dbPath, vol.index)
+	}
+	if err != nil {
 		vol.notePersistFailureLocked(err, now)
 		serviceLog("background persist error volume=%s db=%s failures=%d retry_after=%s err=%v", vol.volume, vol.dbPath, vol.persistFailures, vol.persistRetryAfter.Format(time.RFC3339Nano), err)
 	} else {
-		vol.repackResidentRecordsIfBloated()
+		if !engineV9Enabled() {
+			vol.repackResidentRecordsIfBloated()
+		}
 		if err := removeWAL(vol.dbPath); err != nil {
 			serviceLog("wal cleanup error volume=%s db=%s err=%v", vol.volume, vol.dbPath, err)
 		}
@@ -3362,7 +3828,9 @@ func (s *goSearchService) persistVolumeIfDue(vol *serviceVolumeIndex, force bool
 		vol.persistFailures = 0
 		vol.persistRetryAfter = time.Time{}
 		vol.lastPersistErr = ""
-		vol.afterPersist()
+		if !engineV9Enabled() {
+			vol.afterPersist()
+		}
 		saved = true
 	}
 	s.indexMu.Unlock()
@@ -3373,6 +3841,31 @@ func (s *goSearchService) persistVolumeIfDue(vol *serviceVolumeIndex, force bool
 	}
 }
 
+func (vol *serviceVolumeIndex) compactionDue(now time.Time) bool {
+	if vol == nil || !engineV9Enabled() {
+		return false
+	}
+	if vol.overlay != nil {
+		watermark := int(vol.overlay.watermark.Load())
+		if watermark >= overlayCompactionMaxSlots {
+			return true
+		}
+		baseCount := 0
+		if vol.index != nil {
+			baseCount = vol.index.compactRecordCount()
+		}
+		if baseCount > 0 && vol.overlay.tombstone.len()*100 >= baseCount*overlayCompactionTombstoneP {
+			return true
+		}
+	}
+	if vol.dbPath != "" {
+		if info, err := os.Stat(walPath(vol.dbPath)); err == nil && info.Size() >= overlayCompactionMaxWAL {
+			return true
+		}
+	}
+	return !vol.lastPersist.IsZero() && now.Sub(vol.lastPersist) >= overlayCompactionDirtyAge
+}
+
 func (vol *serviceVolumeIndex) notePersistFailureLocked(err error, now time.Time) {
 	if vol == nil || err == nil {
 		return
@@ -3380,6 +3873,135 @@ func (vol *serviceVolumeIndex) notePersistFailureLocked(err error, now time.Time
 	vol.persistFailures++
 	vol.persistRetryAfter = now.Add(persistFailureBackoff(vol.persistFailures))
 	vol.lastPersistErr = err.Error()
+}
+
+func (s *goSearchService) compactOverlayVolumeLocked(vol *serviceVolumeIndex) error {
+	if vol == nil || vol.index == nil || vol.dbPath == "" {
+		return nil
+	}
+	if err := vol.compactOverlayLocked(); err != nil {
+		return err
+	}
+	for i, existing := range s.volumes {
+		if existing == vol {
+			s.indexes[i] = vol.index
+			break
+		}
+	}
+	return nil
+}
+
+func (vol *serviceVolumeIndex) compactOverlayLocked() error {
+	if vol == nil || vol.index == nil || vol.dbPath == "" {
+		return nil
+	}
+	compacted := compactOverlayIndex(vol)
+	if err := closeIndexMMapRecords(vol.index); err != nil {
+		return err
+	}
+	if err := saveIndex(vol.dbPath, compacted); err != nil {
+		return err
+	}
+	loaded, err := loadIndexForService(vol.dbPath)
+	if err != nil {
+		return err
+	}
+	replacement := newServiceVolumeIndex(vol.dbPath, loaded)
+	replacement.state = "ready"
+	replacement.staleReason = ""
+	replacement.dirty = false
+	replacement.lastPersist = time.Now()
+	replaceServiceVolumeContents(vol, replacement)
+	return nil
+}
+
+func closeIndexMMapRecords(idx *Index) error {
+	if idx == nil || idx.MMapRecords == nil || idx.MMapRecords.file == nil {
+		return nil
+	}
+	if err := idx.MMapRecords.file.close(); err != nil {
+		return err
+	}
+	idx.MMapRecords = nil
+	return nil
+}
+
+func compactOverlayIndex(vol *serviceVolumeIndex) *Index {
+	base := vol.index
+	out := &Index{
+		Version:     indexVersion,
+		Roots:       append([]string(nil), base.Roots...),
+		BuiltAt:     time.Now(),
+		Source:      base.Source,
+		Volume:      base.Volume,
+		JournalID:   base.JournalID,
+		Checkpoint:  vol.checkpoint,
+		ContentHash: base.ContentHash,
+		Compact:     true,
+	}
+	if engineV9Enabled() {
+		out.Version = indexVersionV9
+	}
+	if out.Volume == "" {
+		out.Volume = vol.volume
+	}
+	records := make([]CompactRecord, 0, base.compactRecordCount()+len(vol.overlay.records))
+	if vol.overlay == nil {
+		for id := 0; id < base.compactRecordCount(); id++ {
+			rec := base.compactRecord(id)
+			if !rec.Deleted {
+				rec.Parent = -1
+				records = append(records, rec)
+			}
+		}
+	} else {
+		for id := 0; id < base.compactRecordCount(); id++ {
+			if vol.overlay.tombstone.contains(int32(id)) {
+				continue
+			}
+			if vol.overlay.shadowed.contains(int32(id)) {
+				continue
+			}
+			rec := base.compactRecord(id)
+			if rec.Deleted {
+				continue
+			}
+			rec.Parent = -1
+			records = append(records, rec)
+		}
+		watermark := int(vol.overlay.watermark.Load())
+		if watermark > len(vol.overlay.records) {
+			watermark = len(vol.overlay.records)
+		}
+		for slot := 0; slot < watermark; slot++ {
+			rec := vol.overlay.records[slot]
+			if current, ok := vol.overlay.byFRN[rec.FRN]; ok && current != int32(slot) {
+				continue
+			}
+			if rec.Deleted {
+				continue
+			}
+			rec.Parent = -1
+			records = append(records, rec)
+		}
+	}
+	idByFRN := make(map[uint64]int32, len(records))
+	for i, rec := range records {
+		idByFRN[rec.FRN] = int32(i)
+	}
+	for i := range records {
+		parentFRN := records[i].ParentFRN
+		if parentFRN == 0 || parentFRN == records[i].FRN {
+			records[i].Parent = -1
+			continue
+		}
+		if parent, ok := idByFRN[parentFRN]; ok {
+			records[i].Parent = parent
+		}
+	}
+	out.Records = records
+	buildOrders(out)
+	return out
 }
 
 func persistFailureBackoff(failures int) time.Duration {
@@ -3486,6 +4108,9 @@ func rebuildServiceVolumeIndex(vol *serviceVolumeIndex) (*serviceVolumeIndex, er
 		return nil, err
 	}
 	buildOrders(idx)
+	if err := closeIndexMMapRecords(vol.index); err != nil {
+		return nil, err
+	}
 	if err := saveIndex(vol.dbPath, idx); err != nil {
 		return nil, err
 	}
@@ -3499,6 +4124,69 @@ func rebuildServiceVolumeIndex(vol *serviceVolumeIndex) (*serviceVolumeIndex, er
 	return rebuilt, nil
 }
 
+func rebuildWalkIndex(vol *serviceVolumeIndex) (*Index, error) {
+	if vol == nil || vol.index == nil || len(vol.index.Roots) == 0 {
+		return nil, errors.New("walk index rebuild requires roots")
+	}
+	idx := &Index{
+		Version: vol.index.Version,
+		Roots:   append([]string(nil), vol.index.Roots...),
+		BuiltAt: time.Now(),
+		Source:  "walk",
+	}
+	if idx.Version == 0 {
+		idx.Version = indexVersion
+	}
+	for _, root := range idx.Roots {
+		if err := walkRoot(root, idx); err != nil {
+			serviceLog("walk watcher rebuild root error root=%s db=%s err=%v", root, vol.dbPath, err)
+		}
+	}
+	buildOrders(idx)
+	return idx, nil
+}
+
+func (s *goSearchService) rebuildWalkVolumeInPlace(vol *serviceVolumeIndex, reason string) error {
+	if vol == nil || vol.dbPath == "" {
+		return errors.New("walk index rebuild requires a db path")
+	}
+	vol.walkMu.Lock()
+	defer vol.walkMu.Unlock()
+	idx, err := rebuildWalkIndex(vol)
+	if err != nil {
+		return err
+	}
+	s.indexMu.Lock()
+	if err := closeIndexMMapRecords(vol.index); err != nil {
+		s.indexMu.Unlock()
+		return err
+	}
+	if err := saveIndex(vol.dbPath, idx); err != nil {
+		s.indexMu.Unlock()
+		return err
+	}
+	loaded, err := loadIndexForService(vol.dbPath)
+	if err != nil {
+		s.indexMu.Unlock()
+		return err
+	}
+	rebuilt := newServiceVolumeIndex(vol.dbPath, loaded)
+	rebuilt.state = "ready"
+	rebuilt.staleReason = ""
+	replaceServiceVolumeContents(vol, rebuilt)
+	for i, existing := range s.volumes {
+		if existing == vol {
+			s.indexes[i] = vol.index
+			break
+		}
+	}
+	s.indexMu.Unlock()
+	releaseServiceMemoryAfterSave()
+	s.startBackgroundNameTrigramBuilds([]*serviceVolumeIndex{vol})
+	serviceLog("rebuilt walk index db=%s entries=%d reason=%s", vol.dbPath, loaded.entryCount(), reason)
+	return nil
+}
+
 func (s *goSearchService) rebuildVolumeInPlace(vol *serviceVolumeIndex) error {
 	if vol == nil || vol.volume == "" || vol.dbPath == "" {
 		return errors.New("stale index rebuild requires a volume and db path")
@@ -3510,6 +4198,10 @@ func (s *goSearchService) rebuildVolumeInPlace(vol *serviceVolumeIndex) error {
 	buildOrders(idx)
 
 	s.indexMu.Lock()
+	if err := closeIndexMMapRecords(vol.index); err != nil {
+		s.indexMu.Unlock()
+		return err
+	}
 	if err := saveIndex(vol.dbPath, idx); err != nil {
 		s.indexMu.Unlock()
 		return err
@@ -3534,11 +4226,110 @@ func (s *goSearchService) rebuildVolumeInPlace(vol *serviceVolumeIndex) error {
 	return nil
 }
 
+func (s *goSearchService) startWalkWatchers(vol *serviceVolumeIndex) {
+	if vol == nil || vol.index == nil || vol.index.Source != "walk" {
+		return
+	}
+	for _, root := range vol.index.Roots {
+		root := root
+		go s.watchWalkRoot(vol, root)
+	}
+}
+
+func (s *goSearchService) watchWalkRoot(vol *serviceVolumeIndex, root string) {
+	handle, err := openDirectoryForChanges(root)
+	if err != nil {
+		serviceLog("walk watcher disabled root=%s db=%s err=%v", root, vol.dbPath, err)
+		return
+	}
+	defer windows.CloseHandle(handle)
+	buffer := make([]byte, 64*1024)
+	mask := uint32(windows.FILE_NOTIFY_CHANGE_FILE_NAME |
+		windows.FILE_NOTIFY_CHANGE_DIR_NAME |
+		windows.FILE_NOTIFY_CHANGE_ATTRIBUTES |
+		windows.FILE_NOTIFY_CHANGE_SIZE |
+		windows.FILE_NOTIFY_CHANGE_LAST_WRITE |
+		windows.FILE_NOTIFY_CHANGE_CREATION)
+	for {
+		select {
+		case <-s.stop:
+			return
+		default:
+		}
+		var bytesReturned uint32
+		err := windows.ReadDirectoryChanges(handle, &buffer[0], uint32(len(buffer)), true, mask, &bytesReturned, nil, 0)
+		if err != nil {
+			if errors.Is(err, windows.ERROR_OPERATION_ABORTED) {
+				return
+			}
+			if errors.Is(err, windows.ERROR_NOTIFY_ENUM_DIR) {
+				_ = s.rebuildWalkVolumeInPlace(vol, "watch-overflow")
+				continue
+			}
+			serviceLog("walk watcher read error root=%s db=%s err=%v", root, vol.dbPath, err)
+			select {
+			case <-s.stop:
+				return
+			case <-time.After(5 * time.Second):
+				continue
+			}
+		}
+		reason := "watch-change"
+		if bytesReturned == 0 {
+			reason = "watch-overflow"
+		}
+		select {
+		case <-s.stop:
+			return
+		case <-time.After(250 * time.Millisecond):
+		}
+		if err := s.rebuildWalkVolumeInPlace(vol, reason); err != nil {
+			serviceLog("walk watcher rebuild error root=%s db=%s err=%v", root, vol.dbPath, err)
+		}
+	}
+}
+
+func openDirectoryForChanges(root string) (windows.Handle, error) {
+	abs, err := filepath.Abs(root)
+	if err != nil {
+		return windows.InvalidHandle, err
+	}
+	ptr, err := windows.UTF16PtrFromString(abs)
+	if err != nil {
+		return windows.InvalidHandle, err
+	}
+	return windows.CreateFile(
+		ptr,
+		windows.FILE_LIST_DIRECTORY,
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
+		nil,
+		windows.OPEN_EXISTING,
+		windows.FILE_FLAG_BACKUP_SEMANTICS,
+		0,
+	)
+}
+
 func (vol *serviceVolumeIndex) applyUSNChanges(changes []usnChange) {
+	if engineV9Enabled() {
+		for _, change := range changes {
+			if change.FRN == 0 {
+				continue
+			}
+			vol.recordOverlayChange(change)
+			if change.USN > vol.checkpoint {
+				vol.checkpoint = change.USN
+			}
+		}
+		vol.index.Checkpoint = vol.checkpoint
+		vol.dirty = true
+		vol.publishSnapshot()
+		return
+	}
 	for _, change := range changes {
 		if change.FRN == 0 {
 			continue
 		}
+		vol.recordOverlayChange(change)
 		if change.Reason&usnReasonRenameOld != 0 && change.Reason&usnReasonRenameNew == 0 {
 			continue
 		}
@@ -3592,13 +4383,225 @@ func (vol *serviceVolumeIndex) applyUSNChanges(changes []usnChange) {
 	}
 	vol.index.Checkpoint = vol.checkpoint
 	vol.pathCache = make(map[int]string)
-	if len(vol.recentIDs) > serviceRecentRebuildThreshold {
-		vol.queryIndex = buildResidentQueryIndex(vol)
-		vol.resetNameOrderBuild()
-		vol.resetNameTrigrams()
-		vol.recentIDs = nil
-		vol.recentSeq++
-		vol.clearSearchCachesLocked()
+	vol.publishSnapshot()
+}
+
+func (vol *serviceVolumeIndex) recordOverlayChange(change usnChange) {
+	if vol == nil || !engineV9Enabled() {
+		return
+	}
+	if vol.overlay == nil {
+		vol.overlay = newOverlaySegment()
+	}
+	overlay := vol.overlay
+	if change.Reason&usnReasonRenameOld != 0 && change.Reason&usnReasonRenameNew == 0 {
+		return
+	}
+	if change.Reason&usnReasonFileDelete != 0 {
+		rec := CompactRecord{FRN: change.FRN, ParentFRN: change.ParentFRN, Name: change.Name, Deleted: true}
+		// Only directories can have descendants, so the O(overlay) cascade
+		// below is skipped when the deleted FRN is PROVABLY a plain file:
+		// some record for it exists (base or prior live overlay slot) and
+		// no available record says directory. The overlay slot is fresher
+		// than the base record (it shadows it), so a live overlay dir
+		// create on a reused FRN must veto stale base file evidence. If
+		// dir-ness cannot be determined at all, cascade conservatively:
+		// correctness wins. This keeps mass file-delete churn (e.g. a
+		// node_modules removal WITH per-child USN records) at O(deletes)
+		// on the apply path instead of O(deletes x overlay).
+		baseID, hasBase := vol.idForFRN(change.FRN)
+		provenFile := hasBase && vol.index.compactRecord(baseID).Mode&uint32(os.ModeDir) == 0
+		if slot, ok := overlay.byFRN[change.FRN]; ok && slot >= 0 && int(slot) < len(overlay.records) {
+			prev := overlay.records[slot]
+			if rec.Name == "" {
+				rec.Name = prev.Name
+			}
+			if rec.ParentFRN == 0 {
+				rec.ParentFRN = prev.ParentFRN
+			}
+			if !prev.Deleted {
+				if prev.Mode&uint32(os.ModeDir) != 0 {
+					provenFile = false
+				} else if !hasBase {
+					provenFile = true
+				}
+			}
+		}
+		slot := int32(len(overlay.records))
+		overlay.byFRN[change.FRN] = slot
+		overlay.records = append(overlay.records, rec)
+		if hasBase {
+			vol.tombstoneBaseSubtree(baseID)
+		}
+		if !provenFile {
+			vol.cascadeOverlayDelete(change.FRN)
+		}
+		overlay.watermark.Store(int32(len(overlay.records)))
+		return
+	}
+	rec := CompactRecord{
+		FRN:       change.FRN,
+		ParentFRN: change.ParentFRN,
+		Parent:    -1,
+		Name:      change.Name,
+		Mode:      modeFromAttrs(change.Attr),
+	}
+	if baseID, ok := vol.idForFRN(change.FRN); ok {
+		overlay.shadowed.add(int32(baseID))
+		base := vol.index.compactRecord(baseID)
+		if rec.Name == "" {
+			rec.Name = base.Name
+		}
+		if rec.ParentFRN == 0 {
+			rec.ParentFRN = base.ParentFRN
+		}
+	}
+	slot := int32(len(overlay.records))
+	overlay.byFRN[change.FRN] = slot
+	overlay.records = append(overlay.records, rec)
+	overlay.watermark.Store(int32(len(overlay.records)))
+}
+
+func (vol *serviceVolumeIndex) tombstoneBaseSubtree(rootID int) {
+	if vol == nil || vol.overlay == nil || vol.index == nil || rootID < 0 || rootID >= vol.index.compactRecordCount() {
+		return
+	}
+	if rootID < len(vol.subtreeStart) && rootID < len(vol.subtreeEnd) && len(vol.subtreeOrder) > 0 {
+		start, end := vol.subtreeStart[rootID], vol.subtreeEnd[rootID]
+		if start != ^uint32(0) && start <= end && int(end) <= len(vol.subtreeOrder) {
+			for _, id32 := range vol.subtreeOrder[start:end] {
+				vol.overlay.tombstone.add(int32(id32))
+			}
+			return
+		}
+	}
+	stack := []int{rootID}
+	for len(stack) > 0 {
+		last := len(stack) - 1
+		id := stack[last]
+		stack = stack[:last]
+		if id < 0 || id >= vol.index.compactRecordCount() || vol.overlay.tombstone.contains(int32(id)) {
+			continue
+		}
+		vol.overlay.tombstone.add(int32(id))
+		for _, childID := range vol.childIDsForRecord(id) {
+			stack = append(stack, int(childID))
+		}
+	}
+}
+
+// cascadeOverlayDelete handles the case a plain base-subtree tombstone
+// cannot: overlay-only descendants (created purely via USN, never
+// persisted) whose parent chain passes through deletedFRN or through a
+// base id that tombstoneBaseSubtree just marked. Those descendants have
+// no overlay slot of their own that got tombstoned by the delete branch
+// above (only deletedFRN's own slot did), and overlayRecordPath falls
+// back to the base index for any ancestor FRN without a live overlay
+// slot — which does not consult vol.overlay.tombstone. So without this
+// cascade an overlay-only child parented (directly or transitively)
+// under a deleted base directory stays visible forever.
+//
+// This runs at apply time, once per delete, and is append-only: for
+// every live overlay slot whose ancestor chain is doomed, it appends a
+// new Deleted record for that FRN (mirroring the manual delete branch),
+// never mutating overlay.records in place. Cost is O(overlay slots x
+// chain depth) with per-FRN memoization, which is acceptable because the
+// overlay is bounded (~64k slots before compaction) and directory
+// deletes are rare; this trades a bounded amount of apply-time work for
+// avoiding any read-path (per-query) traversal, which is the failure
+// mode reviews F1/G1 flagged.
+func (vol *serviceVolumeIndex) cascadeOverlayDelete(deletedFRN uint64) {
+	if vol == nil || vol.overlay == nil || vol.index == nil {
+		return
+	}
+	overlay := vol.overlay
+	if len(overlay.records) == 0 {
+		return
+	}
+	latest := latestOverlaySlotsByFRN(overlay.records)
+
+	// doomed memoizes, per FRN visited during this cascade, whether that
+	// FRN's own identity (i.e. treating it as an ancestor) is dead: either
+	// it IS deletedFRN, or it resolves (via live overlay slot, else base
+	// id) to a base id in vol.overlay.tombstone, or its own parent chain
+	// is doomed.
+	doomed := make(map[uint64]bool, 8)
+	var resolve func(frn uint64, seen map[uint64]struct{}) bool
+	resolve = func(frn uint64, seen map[uint64]struct{}) bool {
+		if frn == 0 {
+			return false
+		}
+		if frn == deletedFRN {
+			return true
+		}
+		if v, ok := doomed[frn]; ok {
+			return v
+		}
+		if _, cyc := seen[frn]; cyc {
+			// Cycle in parent chain (shouldn't happen); treat as not doomed
+			// rather than infinite-looping.
+			return false
+		}
+		seen[frn] = struct{}{}
+
+		result := false
+		if slot, ok := latest[frn]; ok && slot >= 0 && int(slot) < len(overlay.records) {
+			rec := overlay.records[slot]
+			if rec.Deleted {
+				result = true
+			} else if rec.ParentFRN != 0 && rec.ParentFRN != frn {
+				result = resolve(rec.ParentFRN, seen)
+			}
+		} else if baseID, ok := vol.idForFRN(frn); ok {
+			if overlay.tombstone.contains(int32(baseID)) {
+				result = true
+			} else if baseID >= 0 && baseID < vol.index.compactRecordCount() {
+				rec := vol.index.compactRecord(baseID)
+				if rec.ParentFRN != 0 && rec.ParentFRN != frn {
+					result = resolve(rec.ParentFRN, seen)
+				}
+			}
+		}
+		doomed[frn] = result
+		return result
+	}
+
+	type victim struct {
+		frn  uint64
+		name string
+	}
+	var victims []victim
+	for frn, slot := range latest {
+		if frn == 0 || frn == deletedFRN {
+			continue
+		}
+		rec := overlay.records[slot]
+		if rec.Deleted {
+			continue
+		}
+		if rec.ParentFRN == 0 || rec.ParentFRN == frn {
+			continue
+		}
+		if resolve(rec.ParentFRN, map[uint64]struct{}{frn: {}}) {
+			victims = append(victims, victim{frn: frn, name: rec.Name})
+		}
+	}
+	if len(victims) == 0 {
+		return
+	}
+	// Deterministic append order so replay from WAL is reproducible.
+	sort.Slice(victims, func(i, j int) bool { return victims[i].frn < victims[j].frn })
+	for _, v := range victims {
+		slot := latest[v.frn]
+		prev := overlay.records[slot]
+		newSlot := int32(len(overlay.records))
+		overlay.byFRN[v.frn] = newSlot
+		overlay.records = append(overlay.records, CompactRecord{
+			FRN:       v.frn,
+			ParentFRN: prev.ParentFRN,
+			Name:      v.name,
+			Deleted:   true,
+		})
 	}
 }
 
@@ -3626,7 +4629,13 @@ func (vol *serviceVolumeIndex) replayWALWithLimit(maxBytes int64) error {
 			}
 		}
 	}
-	dec := json.NewDecoder(bufio.NewReaderSize(f, 1024*1024))
+	br := bufio.NewReaderSize(f, 1024*1024)
+	prefix, err := br.Peek(len(walMagicV1))
+	if err == nil && bytes.Equal(prefix, walMagicV1) {
+		_, _ = br.Discard(len(walMagicV1))
+		return vol.replayBinaryWAL(br)
+	}
+	dec := json.NewDecoder(br)
 	applied := 0
 	for {
 		var batch walBatch
@@ -3651,6 +4660,46 @@ func (vol *serviceVolumeIndex) replayWALWithLimit(maxBytes int64) error {
 	return nil
 }
 
+func (vol *serviceVolumeIndex) replayBinaryWAL(r io.Reader) error {
+	applied := 0
+	for {
+		var header [8]byte
+		if _, err := io.ReadFull(r, header[:]); err != nil {
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) && applied == 0 {
+				return nil
+			}
+			if errors.Is(err, io.ErrUnexpectedEOF) {
+				return err
+			}
+			return err
+		}
+		length := binary.LittleEndian.Uint32(header[0:4])
+		wantCRC := binary.LittleEndian.Uint32(header[4:8])
+		if length == 0 || length > 64*1024*1024 {
+			return fmt.Errorf("invalid wal frame length %d", length)
+		}
+		payload := make([]byte, length)
+		if _, err := io.ReadFull(r, payload); err != nil {
+			return err
+		}
+		if got := crc32.ChecksumIEEE(payload); got != wantCRC {
+			return fmt.Errorf("wal frame crc mismatch got=%08x want=%08x", got, wantCRC)
+		}
+		batch, err := decodeBinaryWALBatch(payload)
+		if err != nil {
+			return err
+		}
+		if batch.NextUSN <= vol.checkpoint {
+			continue
+		}
+		vol.applyUSNChanges(batch.Changes)
+		vol.checkpoint = batch.NextUSN
+		vol.index.Checkpoint = batch.NextUSN
+		vol.dirty = true
+		applied++
+	}
+}
+
 func walPath(dbPath string) string {
 	return dbPath + ".wal"
 }
@@ -3666,8 +4715,13 @@ func appendWAL(dbPath string, nextUSN int64, changes []usnChange) error {
 	if err != nil {
 		return err
 	}
-	enc := json.NewEncoder(f)
-	err = enc.Encode(walBatch{NextUSN: nextUSN, Changes: changes})
+	err = nil
+	if engineV9Enabled() {
+		err = appendBinaryWALFrame(f, nextUSN, changes)
+	} else {
+		enc := json.NewEncoder(f)
+		err = enc.Encode(walBatch{NextUSN: nextUSN, Changes: changes})
+	}
 	if syncErr := f.Sync(); err == nil {
 		err = syncErr
 	}
@@ -3675,6 +4729,93 @@ func appendWAL(dbPath string, nextUSN int64, changes []usnChange) error {
 		err = closeErr
 	}
 	return err
+}
+
+func appendBinaryWALFrame(f *os.File, nextUSN int64, changes []usnChange) error {
+	info, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	if info.Size() == 0 {
+		if _, err := f.Write(walMagicV1); err != nil {
+			return err
+		}
+	}
+	payload, err := encodeBinaryWALBatch(nextUSN, changes)
+	if err != nil {
+		return err
+	}
+	var header [8]byte
+	binary.LittleEndian.PutUint32(header[0:4], uint32(len(payload)))
+	binary.LittleEndian.PutUint32(header[4:8], crc32.ChecksumIEEE(payload))
+	if _, err := f.Write(header[:]); err != nil {
+		return err
+	}
+	_, err = f.Write(payload)
+	return err
+}
+
+func encodeBinaryWALBatch(nextUSN int64, changes []usnChange) ([]byte, error) {
+	var buf bytes.Buffer
+	_ = binary.Write(&buf, binary.LittleEndian, nextUSN)
+	_ = binary.Write(&buf, binary.LittleEndian, uint32(len(changes)))
+	for _, change := range changes {
+		if len(change.Name) > int(^uint16(0)) {
+			return nil, errors.New("wal change name too large")
+		}
+		_ = binary.Write(&buf, binary.LittleEndian, change.FRN)
+		_ = binary.Write(&buf, binary.LittleEndian, change.ParentFRN)
+		_ = binary.Write(&buf, binary.LittleEndian, change.USN)
+		_ = binary.Write(&buf, binary.LittleEndian, change.Reason)
+		_ = binary.Write(&buf, binary.LittleEndian, change.Attr)
+		_ = binary.Write(&buf, binary.LittleEndian, uint16(len(change.Name)))
+		_, _ = buf.WriteString(change.Name)
+	}
+	return buf.Bytes(), nil
+}
+
+func decodeBinaryWALBatch(payload []byte) (walBatch, error) {
+	var batch walBatch
+	if len(payload) < 12 {
+		return batch, errors.New("wal frame too small")
+	}
+	off := 0
+	batch.NextUSN = int64(binary.LittleEndian.Uint64(payload[off:]))
+	off += 8
+	count := int(binary.LittleEndian.Uint32(payload[off:]))
+	off += 4
+	if count < 0 {
+		return batch, errors.New("invalid wal change count")
+	}
+	batch.Changes = make([]usnChange, 0, count)
+	for i := 0; i < count; i++ {
+		if off+34 > len(payload) {
+			return batch, errors.New("truncated wal change")
+		}
+		change := usnChange{}
+		change.FRN = binary.LittleEndian.Uint64(payload[off:])
+		off += 8
+		change.ParentFRN = binary.LittleEndian.Uint64(payload[off:])
+		off += 8
+		change.USN = int64(binary.LittleEndian.Uint64(payload[off:]))
+		off += 8
+		change.Reason = binary.LittleEndian.Uint32(payload[off:])
+		off += 4
+		change.Attr = binary.LittleEndian.Uint32(payload[off:])
+		off += 4
+		nameLen := int(binary.LittleEndian.Uint16(payload[off:]))
+		off += 2
+		if off+nameLen < off || off+nameLen > len(payload) {
+			return batch, errors.New("truncated wal change name")
+		}
+		change.Name = string(payload[off : off+nameLen])
+		off += nameLen
+		batch.Changes = append(batch.Changes, change)
+	}
+	if off != len(payload) {
+		return batch, errors.New("wal frame has trailing bytes")
+	}
+	return batch, nil
 }
 
 func removeWAL(dbPath string) error {
@@ -3841,9 +4982,9 @@ func (vol *serviceVolumeIndex) needsCompactChildrenBuild() bool {
 		vol.index != nil &&
 		vol.index.Compact &&
 		vol.index.Source == "usn" &&
-		serviceSubtreeIntervalsEnabled() &&
 		len(vol.childOffsets) == 0 &&
-		len(vol.childIDs) == 0
+		len(vol.childIDs) == 0 &&
+		len(vol.index.Derived.ChildOffsets) == 0
 }
 
 func serviceSubtreeIntervalsEnabled() bool {
@@ -3857,7 +4998,7 @@ func serviceSubtreeIntervalsEnabled() bool {
 func servicePathGramsEnabled() bool {
 	v := strings.ToLower(strings.TrimSpace(os.Getenv("SEEKFS_PATH_GRAMS")))
 	if serviceLowMemoryMode() && v == "" {
-		return false
+		return true
 	}
 	return v != "0" && v != "false" && v != "no" && v != "off"
 }
@@ -3971,8 +5112,6 @@ func (s *goSearchService) rebuildNameOrderInBackground(vol *serviceVolumeIndex) 
 	if vol == nil || !vol.nameOrderState.CompareAndSwap(nameTrigramStatePending, nameTrigramStateBuilding) {
 		return
 	}
-	s.indexMu.RLock()
-	defer s.indexMu.RUnlock()
 	vol.rebuildNameOrderLocked()
 }
 
@@ -3980,8 +5119,6 @@ func (s *goSearchService) rebuildNameTrigramsInBackground(vol *serviceVolumeInde
 	if vol == nil || !vol.nameTrigramState.CompareAndSwap(nameTrigramStatePending, nameTrigramStateBuilding) {
 		return
 	}
-	s.indexMu.RLock()
-	defer s.indexMu.RUnlock()
 	vol.rebuildNameTrigramsLocked()
 }
 
@@ -4059,12 +5196,19 @@ func buildCompactNameOrderRank(idx *Index) ([]uint32, []uint32) {
 }
 
 func buildExtTopPostings(ext map[string][]uint32, ranks []uint32, limit int) map[string][]uint32 {
-	if len(ext) == 0 || len(ranks) == 0 || limit <= 0 {
+	return buildExtTopPostingsMin(ext, ranks, limit, 1)
+}
+
+func buildExtTopPostingsMin(ext map[string][]uint32, ranks []uint32, limit int, minIDs int) map[string][]uint32 {
+	if len(ext) == 0 || limit <= 0 {
 		return nil
+	}
+	if minIDs <= 0 {
+		minIDs = 1
 	}
 	out := make(map[string][]uint32, len(ext))
 	for key, ids := range ext {
-		if len(ids) == 0 {
+		if len(ids) < minIDs {
 			continue
 		}
 		if len(ids) <= limit {
@@ -4197,6 +5341,14 @@ func (vol *serviceVolumeIndex) resetNameTrigrams() {
 	if vol == nil {
 		return
 	}
+	if vol.index != nil && vol.index.Derived.NameTrigrams != nil {
+		vol.nameTrigrams.Store(vol.index.Derived.NameTrigrams)
+		vol.nameQuadgrams.Store(nil)
+		vol.nameTrigramMillis.Store(0)
+		vol.nameTrigramRecent = nil
+		vol.nameTrigramState.Store(nameTrigramStateReady)
+		return
+	}
 	vol.nameTrigrams.Store(nil)
 	vol.nameQuadgrams.Store(nil)
 	vol.nameTrigramMillis.Store(0)
@@ -4280,35 +5432,58 @@ func (vol *serviceVolumeIndex) childIDsForRecord(id int) []uint32 {
 
 func buildResidentQueryIndex(vol *serviceVolumeIndex) *residentQueryIndex {
 	recordCount := vol.index.compactRecordCount()
-	qi := &residentQueryIndex{
-		ext:        make(map[string][]uint32),
-		components: make(map[string][]uint32),
-		dirs:       make([]uint32, 0, recordCount/8),
+	hasMappedExt := false
+	hasMappedComponents := false
+	if postings := vol.index.Derived.Postings; postings != nil {
+		if section := postings[indexSectionPEXT]; len(section.Data) > 0 {
+			hasMappedExt = true
+		}
+		if section := postings[indexSectionPCMP]; len(section.Data) > 0 {
+			hasMappedComponents = true
+		}
 	}
-	if servicePathGramsEnabled() {
+	mappedLowmem := serviceLowMemoryMode() && vol.index.MMapRecords != nil &&
+		len(vol.index.Derived.NameOrder) > 0 && len(vol.index.Derived.NameRank) > 0 &&
+		hasMappedExt && hasMappedComponents
+	qi := &residentQueryIndex{}
+	if !hasMappedExt {
+		qi.ext = make(map[string][]uint32)
+	}
+	if !hasMappedComponents {
+		qi.components = make(map[string][]uint32)
+	}
+	if !mappedLowmem {
+		qi.dirs = make([]uint32, 0, recordCount/8)
+		qi.dirsReady = true
+	}
+	if servicePathGramsEnabled() && !mappedLowmem {
 		qi.pathGrams = make(map[string][]uint32)
 	}
-	for id := 0; id < recordCount; id++ {
-		rec := vol.index.compactRecord(id)
-		if rec.Deleted {
-			continue
-		}
-		name := vol.index.compactLowerNameAt(id)
-		if rec.Mode&uint32(os.ModeDir) != 0 {
-			qi.dirs = append(qi.dirs, uint32(id))
-			if name != "" && name != "." {
-				qi.components[name] = append(qi.components[name], uint32(id))
+	if !mappedLowmem {
+		for id := 0; id < recordCount; id++ {
+			rec := vol.index.compactRecord(id)
+			if rec.Deleted {
+				continue
 			}
-			if qi.pathGrams != nil && name != "" && name != "." {
-				for _, gram := range componentGrams(name) {
-					qi.pathGrams[gram] = append(qi.pathGrams[gram], uint32(id))
+			name := vol.index.compactLowerNameAt(id)
+			if rec.Mode&uint32(os.ModeDir) != 0 {
+				qi.dirs = append(qi.dirs, uint32(id))
+				if !hasMappedComponents && name != "" && name != "." {
+					qi.components[name] = append(qi.components[name], uint32(id))
+				}
+				if qi.pathGrams != nil && name != "" && name != "." {
+					for _, gram := range componentGrams(name) {
+						qi.pathGrams[gram] = append(qi.pathGrams[gram], uint32(id))
+					}
 				}
 			}
-		}
-		actualExt := strings.TrimPrefix(filepath.Ext(rec.Name), ".")
-		if actualExt != "" {
-			ext := strings.ToLower(actualExt)
-			qi.ext[ext] = append(qi.ext[ext], uint32(id))
+			if !hasMappedExt {
+				actualExt := strings.TrimPrefix(filepath.Ext(rec.Name), ".")
+				if actualExt != "" {
+					ext := strings.ToLower(actualExt)
+					qi.ext[ext] = append(qi.ext[ext], uint32(id))
+				}
+			}
 		}
 	}
 	sortResidentPostings(qi.ext)
@@ -4317,9 +5492,14 @@ func buildResidentQueryIndex(vol *serviceVolumeIndex) *residentQueryIndex {
 	}
 	sortResidentPostings(qi.components)
 	sortUint32s(qi.dirs)
-	if serviceNameOrderEnabled() && recordCount <= serviceResidentNameOrderMaxRecords {
+	if len(vol.index.Derived.NameOrder) > 0 && len(vol.index.Derived.NameRank) > 0 {
+		qi.nameOrder, qi.nameRank = vol.index.Derived.NameOrder, vol.index.Derived.NameRank
+		qi.extTop = buildExtTopPostings(qi.ext, qi.nameRank, serviceExtTopPostingLimit)
+	} else if serviceNameOrderEnabled() && recordCount <= serviceResidentNameOrderMaxRecords {
 		qi.nameOrder, qi.nameRank = buildCompactNameOrderRank(vol.index)
 		qi.extTop = buildExtTopPostings(qi.ext, qi.nameRank, serviceExtTopPostingLimit)
+	} else {
+		qi.extTop = buildExtTopPostingsMin(qi.ext, nil, serviceExtTopPostingLimit, serviceExtTopPostingLimit)
 	}
 	return qi
 }
@@ -4329,11 +5509,7 @@ func (vol *serviceVolumeIndex) clearSearchCachesLocked() {
 	vol.termCache = nil
 	vol.pathTermCache = nil
 	vol.extCache = nil
-	vol.termSeq = nil
-	vol.pathTermSeq = nil
-	vol.extSeq = nil
 	vol.underCache = nil
-	vol.underSeq = nil
 	vol.underRootCache = nil
 }
 
@@ -4341,15 +5517,13 @@ func (vol *serviceVolumeIndex) trimSearchCachesLocked() {
 	if len(vol.pathCache) > servicePathCacheLimit {
 		vol.pathCache = make(map[int]string)
 	}
-	if len(vol.termCache) > serviceTermCacheLimit || len(vol.pathTermCache) > serviceTermCacheLimit || len(vol.extCache) > serviceTermCacheLimit {
+	vol.termMu.Lock()
+	defer vol.termMu.Unlock()
+	if vol.postingListCacheBytesLocked() > postingListCacheMaxBytes() {
 		vol.termCache = nil
 		vol.pathTermCache = nil
 		vol.extCache = nil
-		vol.termSeq = nil
-		vol.pathTermSeq = nil
-		vol.extSeq = nil
 		vol.underCache = nil
-		vol.underSeq = nil
 		vol.underRootCache = nil
 	}
 	vol.searchCount++
@@ -4618,6 +5792,27 @@ func (m *MMapRecords) At(i int) CompactRecord {
 }
 
 func (m *MMapRecords) lowerNameAt(i int) string {
+	if m != nil && i >= 0 && i < m.count {
+		derived := m.fileDerived()
+		if len(derived.LowerOffs) > 0 && len(derived.LowerLens) == len(derived.LowerOffs) {
+			base, ok := m.recordOffset(i)
+			if ok {
+				_, nameID := m.recordRefs(base + 16)
+				token := int(nameID)
+				if token >= 0 && token < len(derived.LowerOffs) {
+					off := derived.LowerOffs[token]
+					if off == packedLowerSameAsName {
+						return m.nameAtRecord(i)
+					}
+					length := derived.LowerLens[token]
+					end := int(off) + int(length)
+					if end >= int(off) && end <= len(derived.LowerBlob) {
+						return stringView(derived.LowerBlob[int(off):end])
+					}
+				}
+			}
+		}
+	}
 	name := m.nameAtRecord(i)
 	if name == "" {
 		return ""
@@ -4626,16 +5821,27 @@ func (m *MMapRecords) lowerNameAt(i int) string {
 }
 
 func (m *MMapRecords) nameAtRecord(i int) string {
+	name, _ := m.nameAtRecordWithLen(i)
+	return name
+}
+
+func (m *MMapRecords) nameAtRecordWithLen(i int) (string, uint16) {
 	if m == nil || i < 0 || i >= m.count {
-		return ""
+		return "", 0
 	}
 	base, ok := m.recordOffset(i)
 	if !ok {
-		return ""
+		return "", 0
 	}
 	_, nameID := m.recordRefs(base + 16)
-	name, _ := m.nameByID(nameID)
-	return name
+	return m.nameByID(nameID)
+}
+
+func (m *MMapRecords) fileDerived() indexDerivedSections {
+	if m == nil || m.file == nil {
+		return indexDerivedSections{}
+	}
+	return m.file.derived
 }
 
 func (m *MMapRecords) recordOffset(i int) (int, bool) {
@@ -5276,6 +6482,7 @@ func handleServiceConn(conn *os.File, s *goSearchService) {
 			info.NameOrderMillis = vol.nameOrderMillis.Load()
 			info.NameTrigramState = vol.nameTrigramStateString()
 			info.NameTrigramMillis = vol.nameTrigramMillis.Load()
+			info.DerivedSections, info.DerivedBytes = derivedSectionInfo(idx.Derived)
 			info.Memory = vol.residentMemoryInfo()
 			infos = append(infos, info)
 		}
@@ -5288,7 +6495,7 @@ func handleServiceConn(conn *os.File, s *goSearchService) {
 		} else if loadErr != "" {
 			message = loadErr
 		}
-		_ = json.NewEncoder(conn).Encode(serviceResponse{OK: loadErr == "", Message: message, PID: os.Getpid(), Entries: total, Loading: loading, DBs: infos, Runtime: runtimeMemorySnapshot()})
+		_ = json.NewEncoder(conn).Encode(serviceInfoResponseFor(serviceResponse{OK: loadErr == "", Message: message, Entries: total, Loading: loading, DBs: infos, Runtime: runtimeMemorySnapshot()}, s.pipeName, s.processMode))
 	case "search":
 		s.indexMu.RLock()
 		if len(s.indexes) == 0 {
@@ -5305,6 +6512,9 @@ func handleServiceConn(conn *os.File, s *goSearchService) {
 			return
 		}
 		opts := requestToOptionsFromService(req)
+		if opts.DeadlineUnix == 0 {
+			opts.DeadlineUnix = time.Now().Add(serviceQueryTimeout - 250*time.Millisecond).UnixNano()
+		}
 		trace := &searchTrace{}
 		opts.Trace = trace
 		if req.RequestSeq > 0 {
@@ -5322,9 +6532,18 @@ func handleServiceConn(conn *os.File, s *goSearchService) {
 		var err error
 		searchStart := time.Now()
 		if len(s.volumes) == len(s.indexes) {
+			volumes := s.volumes
+			unlockedForSearch := false
+			if engineV9Enabled() {
+				volumes = snapshotServiceVolumesForSearch(s.volumes)
+				s.indexMu.RUnlock()
+				unlockedForSearch = true
+			}
 			if req.CountOnly {
-				if count, ok, countErr := countServiceVolumes(s.volumes, opts); ok {
-					s.indexMu.RUnlock()
+				if count, ok, countErr := countServiceVolumes(volumes, opts); ok {
+					if !unlockedForSearch {
+						s.indexMu.RUnlock()
+					}
 					searchMS := float64(time.Since(searchStart).Nanoseconds()) / 1_000_000
 					if countErr != nil {
 						_ = json.NewEncoder(conn).Encode(serviceResponse{OK: false, Message: countErr.Error()})
@@ -5335,12 +6554,15 @@ func handleServiceConn(conn *os.File, s *goSearchService) {
 					return
 				}
 			}
-			matches, err = searchServiceVolumes(s.volumes, opts, req.CountOnly)
+			matches, err = searchServiceVolumes(volumes, opts, req.CountOnly)
+			if !unlockedForSearch {
+				s.indexMu.RUnlock()
+			}
 		} else {
 			matches, err = searchAll(s.indexes, opts, req.CountOnly)
+			s.indexMu.RUnlock()
 		}
 		searchMS := float64(time.Since(searchStart).Nanoseconds()) / 1_000_000
-		s.indexMu.RUnlock()
 		if err != nil {
 			_ = json.NewEncoder(conn).Encode(serviceResponse{OK: false, Message: err.Error()})
 			return
@@ -5383,7 +6605,7 @@ func handleServiceConn(conn *os.File, s *goSearchService) {
 		serviceLog("index-usn complete volume=%s entries=%d", req.Volume, idx.entryCount())
 		_ = json.NewEncoder(conn).Encode(serviceResponse{OK: true, Message: "indexed", Entries: idx.entryCount()})
 	case "status":
-		_ = json.NewEncoder(conn).Encode(serviceResponse{OK: true, Message: "service running", PID: os.Getpid()})
+		_ = json.NewEncoder(conn).Encode(serviceInfoResponseFor(serviceResponse{OK: true, Message: "service running"}, s.pipeName, s.processMode))
 	default:
 		_ = json.NewEncoder(conn).Encode(serviceResponse{OK: false, Message: "unknown command"})
 	}
@@ -5470,15 +6692,82 @@ func replaceServiceVolumeContents(dst, src *serviceVolumeIndex) {
 	dst.recentIDs = src.recentIDs
 	dst.nameTrigramRecent = src.nameTrigramRecent
 	dst.recentSeq = src.recentSeq
-	dst.termSeq = src.termSeq
-	dst.pathTermSeq = src.pathTermSeq
-	dst.extSeq = src.extSeq
 	dst.underCache = src.underCache
-	dst.underSeq = src.underSeq
 	dst.underRootCache = src.underRootCache
+	dst.overlay = src.overlay
+	dst.snap.Store(src.snap.Load())
+	dst.snapshotGen.Store(src.snapshotGen.Load())
 	dst.dirty = src.dirty
 	dst.lastPersist = src.lastPersist
 	dst.searchCount = src.searchCount
+}
+
+func snapshotServiceVolumesForSearch(volumes []*serviceVolumeIndex) []*serviceVolumeIndex {
+	out := make([]*serviceVolumeIndex, 0, len(volumes))
+	for _, vol := range volumes {
+		out = append(out, snapshotServiceVolumeForSearch(vol))
+	}
+	return out
+}
+
+func snapshotServiceVolumeForSearch(vol *serviceVolumeIndex) *serviceVolumeIndex {
+	if vol == nil {
+		return nil
+	}
+	snap := vol.snap.Load()
+	idx := vol.index
+	if snap != nil && snap.base != nil {
+		idx = snap.base
+	}
+	view := &serviceVolumeIndex{
+		dbPath:            vol.dbPath,
+		index:             idx,
+		volume:            vol.volume,
+		journalID:         vol.journalID,
+		checkpoint:        vol.checkpoint,
+		state:             vol.state,
+		staleReason:       vol.staleReason,
+		frnToID:           vol.frnToID,
+		frns:              vol.frns,
+		frnRecordIDs:      vol.frnRecordIDs,
+		children:          vol.children,
+		childOffsets:      vol.childOffsets,
+		childIDs:          vol.childIDs,
+		rootIDs:           vol.rootIDs,
+		subtreeOrder:      vol.subtreeOrder,
+		subtreeStart:      vol.subtreeStart,
+		subtreeEnd:        vol.subtreeEnd,
+		exactNames:        vol.exactNames,
+		pathCache:         make(map[int]string),
+		queryIndex:        vol.queryIndex,
+		termCache:         make(map[string]postingCacheEntry),
+		pathTermCache:     make(map[string]postingCacheEntry),
+		extCache:          make(map[string]postingCacheEntry),
+		underCache:        make(map[int]postingCacheEntry),
+		underRootCache:    make(map[string]postingCacheEntry),
+		dirty:             vol.dirty,
+		lastPersist:       vol.lastPersist,
+		persistFailures:   vol.persistFailures,
+		persistRetryAfter: vol.persistRetryAfter,
+		lastPersistErr:    vol.lastPersistErr,
+	}
+	if snap != nil {
+		view.recentSeq = snap.gen
+		view.snap.Store(snap)
+	} else {
+		view.recentSeq = vol.cacheGeneration()
+	}
+	if trigrams := vol.nameTrigramIndex(); trigrams != nil {
+		view.nameTrigrams.Store(trigrams)
+	}
+	if quadgrams := vol.nameQuadgramIndex(); quadgrams != nil {
+		view.nameQuadgrams.Store(quadgrams)
+	}
+	view.nameOrderState.Store(vol.nameOrderState.Load())
+	view.nameOrderMillis.Store(vol.nameOrderMillis.Load())
+	view.nameTrigramState.Store(vol.nameTrigramState.Load())
+	view.nameTrigramMillis.Store(vol.nameTrigramMillis.Load())
+	return view
 }
 
 func searchService(pipeName string, opts queryOptions, countOnly bool, jsonOut bool) error {
@@ -5491,10 +6780,14 @@ func searchService(pipeName string, opts queryOptions, countOnly bool, jsonOut b
 	}
 	if jsonOut {
 		jsonResp := jsonSearchResponse{
-			OK:    true,
-			Query: opts.Query,
-			Count: resp.Count,
-			Limit: opts.Limit,
+			OK:         true,
+			Query:      opts.Query,
+			Count:      resp.Count,
+			Limit:      opts.Limit,
+			SearchMS:   resp.SearchMS,
+			Source:     resp.Source,
+			Decline:    resp.Decline,
+			Candidates: resp.Candidates,
 		}
 		if !countOnly {
 			if len(resp.Rows) > 0 {
@@ -5520,7 +6813,7 @@ func serviceRequestFromOptions(opts queryOptions, countOnly bool) serviceRequest
 	return serviceRequest{
 		Command:       "search",
 		Query:         opts.Query,
-		MatchPath:     opts.MatchPath || queryLooksPathScoped(opts.Query),
+		MatchPath:     opts.MatchPath || queryLooksLoosePathScoped(opts.Query),
 		Limit:         opts.Limit,
 		CountOnly:     countOnly,
 		Under:         opts.Under,
@@ -5722,14 +7015,29 @@ func searchServiceVolumes(volumes []*serviceVolumeIndex, opts queryOptions, coun
 	if err != nil {
 		return nil, err
 	}
+	volumes = prioritizeServiceVolumesForPathTerms(volumes, opts)
 	if len(volumes) == 1 {
 		vol := volumes[0]
-		if !lockVolumeSearch(vol, opts) {
+		locked, ok := lockVolumeSearch(vol, opts)
+		if !ok {
 			return nil, errQueryCanceled
 		}
-		matches, err := searchCompactWithCache(vol.index, opts, countOnly, vol.pathCache, vol.nameTermCandidates)
+		pathCache := make(map[int]string)
+		hidden := vol.snapshotHiddenBaseIDs()
+		candidateFn := vol.nameTermCandidates
+		if vol.hasActiveOverlay() && !countOnly {
+			if hidden.empty() {
+				candidateFn = vol.overlayAwareNameTermCandidates
+			} else {
+				candidateFn = nil
+			}
+		}
+		matches, err := searchCompactWithCacheHidden(vol.index, opts, countOnly, pathCache, candidateFn, hidden)
+		matches = vol.mergeOverlayMatches(matches, opts, countOnly, pathCache)
 		vol.trimSearchCachesLocked()
-		vol.searchMu.Unlock()
+		if locked {
+			vol.searchMu.Unlock()
+		}
 		matches = filterImplicitUnderExisting(matches, opts, countOnly)
 		if err == nil && len(matches) == 0 {
 			if fallback, ok := filesystemUnderFallbackSearch(opts, countOnly); ok {
@@ -5741,6 +7049,12 @@ func searchServiceVolumes(volumes []*serviceVolumeIndex, opts queryOptions, coun
 	}
 	limit := normalizedLimit(opts.Limit, countOnly)
 	results := make([]Entry, 0, min(limit, 1024))
+	stopAfterFirstHit := false
+	if !countOnly && opts.Under == "" && (opts.RequestSeq > 0 || opts.DeadlineUnix > 0) {
+		if pq, err := parseQuery(opts); err == nil && queryVolumeConstraint(opts) == "" && multiTermEarlyStopEligible(pq.Terms) {
+			stopAfterFirstHit = true
+		}
+	}
 	for _, vol := range volumes {
 		perIndexLimit := limit
 		if !countOnly && limit > 0 {
@@ -5751,16 +7065,57 @@ func searchServiceVolumes(volumes []*serviceVolumeIndex, opts queryOptions, coun
 		}
 		childOpts := opts
 		childOpts.Limit = perIndexLimit
-		if !lockVolumeSearch(vol, childOpts) {
+		if stopAfterFirstHit && childOpts.DeadlineUnix > 0 {
+			volumeDeadline := time.Now().Add(250 * time.Millisecond).UnixNano()
+			if volumeDeadline < childOpts.DeadlineUnix {
+				childOpts.DeadlineUnix = volumeDeadline
+			}
+		}
+		if !countOnly && len(results) > 0 && childOpts.DeadlineUnix > 0 {
+			partialDeadline := time.Now().Add(75 * time.Millisecond).UnixNano()
+			if partialDeadline < childOpts.DeadlineUnix {
+				childOpts.DeadlineUnix = partialDeadline
+			}
+		}
+		locked, ok := lockVolumeSearch(vol, childOpts)
+		if !ok {
+			if stopAfterFirstHit && len(results) == 0 {
+				continue
+			}
+			if !countOnly && len(results) > 0 {
+				return filterImplicitUnderExisting(results, opts, countOnly), nil
+			}
 			return nil, errQueryCanceled
 		}
-		matches, err := searchCompactWithCache(vol.index, childOpts, countOnly, vol.pathCache, vol.nameTermCandidates)
+		pathCache := make(map[int]string)
+		hidden := vol.snapshotHiddenBaseIDs()
+		candidateFn := vol.nameTermCandidates
+		if vol.hasActiveOverlay() && !countOnly {
+			if hidden.empty() {
+				candidateFn = vol.overlayAwareNameTermCandidates
+			} else {
+				candidateFn = nil
+			}
+		}
+		matches, err := searchCompactWithCacheHidden(vol.index, childOpts, countOnly, pathCache, candidateFn, hidden)
+		matches = vol.mergeOverlayMatches(matches, childOpts, countOnly, pathCache)
 		vol.trimSearchCachesLocked()
-		vol.searchMu.Unlock()
+		if locked {
+			vol.searchMu.Unlock()
+		}
 		if err != nil {
+			if !countOnly && err == errQueryCanceled && len(results) > 0 {
+				return filterImplicitUnderExisting(results, opts, countOnly), nil
+			}
+			if stopAfterFirstHit && err == errQueryCanceled && len(results) == 0 {
+				continue
+			}
 			return nil, err
 		}
 		results = append(results, matches...)
+		if stopAfterFirstHit && len(results) > 0 {
+			break
+		}
 	}
 	results = filterImplicitUnderExisting(results, opts, countOnly)
 	if len(results) == 0 {
@@ -5772,25 +7127,398 @@ func searchServiceVolumes(volumes []*serviceVolumeIndex, opts queryOptions, coun
 	return filterImplicitUnderExisting(results, opts, countOnly), nil
 }
 
-func lockVolumeSearch(vol *serviceVolumeIndex, opts queryOptions) bool {
+func multiTermEarlyStopEligible(terms []string) bool {
+	count := 0
+	for _, term := range terms {
+		if isVolumeQueryTerm(term) {
+			continue
+		}
+		if len(term) < 3 || strings.ContainsAny(term, `\/*?[]:`) {
+			return false
+		}
+		count++
+	}
+	return count >= 2
+}
+
+func (vol *serviceVolumeIndex) mergeOverlayMatches(base []Entry, opts queryOptions, countOnly bool, pathCache map[int]string) []Entry {
+	if vol == nil || !engineV9Enabled() {
+		return base
+	}
+	snap := vol.snap.Load()
+	if snap == nil || len(snap.records) == 0 {
+		return base
+	}
+	pq, err := parseQuery(opts)
+	if err != nil {
+		return base
+	}
+	limit := normalizedLimit(opts.Limit, countOnly)
+	records := snap.records
+	watermark := int(snap.watermark)
+	if watermark > len(records) {
+		watermark = len(records)
+	}
+	records = records[:watermark]
+	latest := latestOverlaySlotsByFRN(records)
+	overlay := make([]rankedOverlayEntry, 0, len(records))
+	for slot := 0; slot < len(records); slot++ {
+		entry, ok := vol.overlayEntry(records, latest, slot, map[int32]struct{}{}, pathCache)
+		if !ok {
+			continue
+		}
+		if entryMatches(entry, pq, pq.MatchPath) {
+			overlay = append(overlay, rankedOverlayEntry{entry: entry, rank: vol.overlayEntryNameRank(entry)})
+		}
+	}
+	sort.SliceStable(overlay, func(i, j int) bool {
+		if overlay[i].rank == overlay[j].rank {
+			in, jn := overlay[i].entry.LowerName, overlay[j].entry.LowerName
+			if in == "" {
+				in = strings.ToLower(overlay[i].entry.Name)
+			}
+			if jn == "" {
+				jn = strings.ToLower(overlay[j].entry.Name)
+			}
+			if in == jn {
+				return overlay[i].entry.Path < overlay[j].entry.Path
+			}
+			return in < jn
+		}
+		return overlay[i].rank < overlay[j].rank
+	})
+	out := vol.mergeRankedOverlayEntries(base, overlay, limit, countOnly)
+	if !countOnly && limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out
+}
+
+func (vol *serviceVolumeIndex) snapshotHiddenBaseIDs() hiddenBaseIDs {
+	if vol == nil || !engineV9Enabled() {
+		return hiddenBaseIDs{}
+	}
+	snap := vol.snap.Load()
+	if snap == nil {
+		return hiddenBaseIDs{}
+	}
+	return hiddenBaseIDs{tombstone: snap.tombstoneIDs, shadowed: snap.shadowedIDs}
+}
+
+// overlayLiveMatchCount counts live (non-deleted, latest-slot-per-FRN) overlay
+// records matching pq, reading only through the given snapshot's records
+// slice up to watermark — the same walk mergeOverlayMatches performs for a
+// full search, but without allocating/ranking Entry results since callers
+// only need len(). It reuses latestOverlaySlotsByFRN/overlayEntry/
+// entryMatches so overlay entry construction and match semantics never
+// diverge from the search path (review G6: snapshot slices only, never
+// vol.overlay maps, on this read path).
+func (vol *serviceVolumeIndex) overlayLiveMatchCount(snap *volumeSnapshot, pq parsedQuery) int {
+	if vol == nil || snap == nil || len(snap.records) == 0 {
+		return 0
+	}
+	watermark := int(snap.watermark)
+	records := snap.records
+	if watermark > len(records) {
+		watermark = len(records)
+	}
+	records = records[:watermark]
+	if len(records) == 0 {
+		return 0
+	}
+	latest := latestOverlaySlotsByFRN(records)
+	pathCache := make(map[int]string)
+	count := 0
+	for slot := 0; slot < len(records); slot++ {
+		entry, ok := vol.overlayEntry(records, latest, slot, map[int32]struct{}{}, pathCache)
+		if !ok {
+			continue
+		}
+		if entryMatches(entry, pq, pq.MatchPath) {
+			count++
+		}
+	}
+	return count
+}
+
+type rankedOverlayEntry struct {
+	entry Entry
+	rank  int
+}
+
+func (vol *serviceVolumeIndex) mergeRankedOverlayEntries(base []Entry, overlay []rankedOverlayEntry, limit int, countOnly bool) []Entry {
+	if len(overlay) == 0 {
+		return base
+	}
+	out := make([]Entry, 0, len(base)+len(overlay))
+	overlayPos := 0
+	for _, entry := range base {
+		baseRank := vol.baseEntryNameRank(entry)
+		for overlayPos < len(overlay) && overlay[overlayPos].rank <= baseRank {
+			out = append(out, overlay[overlayPos].entry)
+			overlayPos++
+			if !countOnly && limit > 0 && len(out) >= limit {
+				return out
+			}
+		}
+		out = append(out, entry)
+		if !countOnly && limit > 0 && len(out) >= limit {
+			return out
+		}
+	}
+	for overlayPos < len(overlay) {
+		out = append(out, overlay[overlayPos].entry)
+		overlayPos++
+		if !countOnly && limit > 0 && len(out) >= limit {
+			return out
+		}
+	}
+	return out
+}
+
+func (vol *serviceVolumeIndex) overlayEntryNameRank(entry Entry) int {
+	name := entry.LowerName
+	if name == "" {
+		name = strings.ToLower(entry.Name)
+	}
+	if vol == nil || vol.index == nil {
+		return 0
+	}
+	order := vol.mappedOrCompactNameOrder()
+	recordCount := vol.index.compactRecordCount()
+	pos := sort.Search(len(order), func(i int) bool {
+		id := int(order[i])
+		if id < 0 || id >= recordCount {
+			return false
+		}
+		return vol.index.compactLowerNameAt(id) >= name
+	})
+	if pos < len(order) {
+		id := int(order[pos])
+		if id >= 0 && id < recordCount && vol.index.compactLowerNameAt(id) == name {
+			return pos*2 + 1
+		}
+	}
+	return pos*2 - 1
+}
+
+func (vol *serviceVolumeIndex) baseEntryNameRank(entry Entry) int {
+	name := entry.LowerName
+	if name == "" {
+		name = strings.ToLower(entry.Name)
+	}
+	if vol == nil || vol.index == nil {
+		return 0
+	}
+	order := vol.mappedOrCompactNameOrder()
+	recordCount := vol.index.compactRecordCount()
+	pos := sort.Search(len(order), func(i int) bool {
+		id := int(order[i])
+		if id < 0 || id >= recordCount {
+			return false
+		}
+		return vol.index.compactLowerNameAt(id) >= name
+	})
+	return pos * 2
+}
+
+func (vol *serviceVolumeIndex) mappedOrCompactNameOrder() []uint32 {
+	if vol != nil && vol.queryIndex != nil && len(vol.queryIndex.nameOrder) > 0 {
+		return vol.queryIndex.nameOrder
+	}
+	if vol == nil || vol.index == nil {
+		return nil
+	}
+	if len(vol.index.CompactNameOrder) == 0 {
+		return nil
+	}
+	out := make([]uint32, len(vol.index.CompactNameOrder))
+	for i, id := range vol.index.CompactNameOrder {
+		out[i] = uint32(id)
+	}
+	return out
+}
+
+func latestOverlaySlotsByFRN(records []CompactRecord) map[uint64]int32 {
+	latest := make(map[uint64]int32, len(records))
+	for i := len(records) - 1; i >= 0; i-- {
+		frn := records[i].FRN
+		if frn == 0 {
+			continue
+		}
+		if _, exists := latest[frn]; !exists {
+			latest[frn] = int32(i)
+		}
+	}
+	return latest
+}
+
+func (vol *serviceVolumeIndex) overlayEntry(records []CompactRecord, latest map[uint64]int32, slot int, seen map[int32]struct{}, pathCache map[int]string) (Entry, bool) {
+	if vol == nil || slot < 0 || slot >= len(records) {
+		return Entry{}, false
+	}
+	if _, ok := seen[int32(slot)]; ok {
+		return Entry{}, false
+	}
+	seen[int32(slot)] = struct{}{}
+	rec := records[slot]
+	if latestSlot := latest[rec.FRN]; latestSlot != int32(slot) {
+		return Entry{}, false
+	}
+	if rec.Deleted {
+		return Entry{}, false
+	}
+	path := vol.overlayRecordPath(records, latest, slot, seen, pathCache)
+	if path == "" {
+		return Entry{}, false
+	}
+	return Entry{
+		Path:        path,
+		Name:        rec.Name,
+		LowerName:   strings.ToLower(rec.Name),
+		LowerPath:   strings.ToLower(path),
+		Mode:        rec.Mode,
+		Size:        rec.Size,
+		ModUnix:     rec.ModUnix,
+		IndexSource: vol.index.Source,
+	}, true
+}
+
+func (vol *serviceVolumeIndex) overlayRecordPath(records []CompactRecord, latest map[uint64]int32, slot int, seen map[int32]struct{}, pathCache map[int]string) string {
+	if pathCache == nil {
+		pathCache = make(map[int]string)
+	}
+	if slot < 0 || slot >= len(records) {
+		return ""
+	}
+	rec := records[slot]
+	if rec.Deleted {
+		return ""
+	}
+	name := rec.Name
+	if name == "" {
+		name = "."
+	}
+	if rec.ParentFRN == 0 || rec.ParentFRN == rec.FRN {
+		if vol.volume != "" && name != "." {
+			return vol.volume + `\` + name
+		}
+		if vol.volume != "" {
+			return vol.volume + `\`
+		}
+		return name
+	}
+	if parentSlot, ok := latest[rec.ParentFRN]; ok && parentSlot >= 0 {
+		if _, ok := seen[parentSlot]; ok {
+			return ""
+		}
+		parentPath := vol.overlayRecordPath(records, latest, int(parentSlot), seen, pathCache)
+		if parentPath != "" {
+			return joinOverlayPath(parentPath, name)
+		}
+		return ""
+	}
+	if parentID, ok := vol.idForFRN(rec.ParentFRN); ok {
+		parentPath := vol.index.reconstructCompactPathCached(parentID, pathCache)
+		if parentPath != "" {
+			return joinOverlayPath(parentPath, name)
+		}
+	}
+	if vol.volume != "" {
+		return vol.volume + `\` + name
+	}
+	return name
+}
+
+func joinOverlayPath(parentPath, name string) string {
+	if parentPath == "" {
+		return name
+	}
+	if strings.HasSuffix(parentPath, `\`) || strings.HasSuffix(parentPath, `/`) {
+		return parentPath + name
+	}
+	if vol := filepath.VolumeName(parentPath); vol != "" && strings.EqualFold(parentPath, vol) {
+		return parentPath + `\` + name
+	}
+	return filepath.Join(parentPath, name)
+}
+
+func prioritizeServiceVolumesForPathTerms(volumes []*serviceVolumeIndex, opts queryOptions) []*serviceVolumeIndex {
+	if len(volumes) < 2 || opts.Under != "" {
+		return volumes
+	}
+	pq, err := parseQuery(opts)
+	if err != nil || !pq.MatchPath {
+		return volumes
+	}
+	type scoredVolume struct {
+		vol   *serviceVolumeIndex
+		score int
+		pos   int
+	}
+	scored := make([]scoredVolume, 0, len(volumes))
+	hasScore := false
+	for i, vol := range volumes {
+		score := 0
+		if vol != nil && vol.queryIndex != nil {
+			for _, term := range pq.Terms {
+				if len(term) < 3 || isVolumeQueryTerm(term) || strings.ContainsAny(term, `\/*?[]:`) {
+					continue
+				}
+				if hits := vol.componentPostingCount(term); hits > 0 {
+					score += 1_000_000 / max(1, hits)
+				}
+				if ext := strings.TrimPrefix(term, "."); ext != "" && bareExtensionCandidateTerm(ext) {
+					if hits := vol.extPostingCount(ext); hits > 0 {
+						score += 10_000_000 + 2_000_000/max(1, hits)
+					}
+				}
+			}
+		}
+		if score > 0 {
+			hasScore = true
+		}
+		scored = append(scored, scoredVolume{vol: vol, score: score, pos: i})
+	}
+	if !hasScore {
+		return volumes
+	}
+	sort.SliceStable(scored, func(i, j int) bool {
+		if scored[i].score == scored[j].score {
+			return scored[i].pos < scored[j].pos
+		}
+		return scored[i].score > scored[j].score
+	})
+	out := make([]*serviceVolumeIndex, len(scored))
+	for i, item := range scored {
+		out[i] = item.vol
+	}
+	return out
+}
+
+func lockVolumeSearch(vol *serviceVolumeIndex, opts queryOptions) (bool, bool) {
 	if vol == nil {
-		return false
+		return false, false
+	}
+	if engineV9Enabled() {
+		pq := parsedQuery{DeadlineUnix: opts.DeadlineUnix, Cancel: opts.Cancel}
+		return false, !queryCanceled(pq)
 	}
 	if opts.Cancel == nil && opts.DeadlineUnix == 0 {
 		vol.searchMu.Lock()
-		return true
+		return true, true
 	}
 	pq := parsedQuery{DeadlineUnix: opts.DeadlineUnix, Cancel: opts.Cancel}
 	for {
 		if queryCanceled(pq) {
-			return false
+			return false, false
 		}
 		if vol.searchMu.TryLock() {
 			if queryCanceled(pq) {
 				vol.searchMu.Unlock()
-				return false
+				return false, false
 			}
-			return true
+			return true, true
 		}
 		time.Sleep(2 * time.Millisecond)
 	}
@@ -5911,15 +7639,80 @@ func countServiceVolumes(volumes []*serviceVolumeIndex, opts queryOptions) (int,
 	}
 	total := 0
 	for _, vol := range volumes {
-		vol.searchMu.Lock()
+		if vol != nil && vol.hasActiveOverlay() {
+			if count, ok := vol.overlayAwareFastCount(pq); ok {
+				total += count
+				continue
+			}
+			pathCache := make(map[int]string)
+			matches, err := searchCompactWithCacheHidden(vol.index, opts, true, pathCache, vol.nameTermCandidates, vol.snapshotHiddenBaseIDs())
+			if err != nil {
+				return 0, true, err
+			}
+			matches = vol.mergeOverlayMatches(matches, opts, true, pathCache)
+			total += len(matches)
+			continue
+		}
+		locked := false
+		if !engineV9Enabled() {
+			vol.searchMu.Lock()
+			locked = true
+		}
 		count, ok := vol.fastPostingCount(pq)
-		vol.searchMu.Unlock()
+		if locked {
+			vol.searchMu.Unlock()
+		}
 		if !ok {
 			return 0, false, nil
 		}
 		total += count
 	}
 	return total, true, nil
+}
+
+// overlayAwareFastCount is the review-G7 / plan-R2.6 sanctioned stopgap: it
+// answers a count query exactly while a v9 overlay is active, without
+// falling back to the full search+merge path. It is
+//
+//	(base fast posting count, filtered against tombstoned/shadowed base ids)
+//	+ (linear count of live overlay records matching pq)
+//
+// It reads the volume's snapshot exactly once and only touches snapshot
+// slices (records[:watermark], tombstoneIDs, shadowedIDs) — never
+// vol.overlay's live maps, which the apply goroutine mutates concurrently
+// (review G6). If the base fast-count route cannot evaluate pq (same decline
+// conditions as fastPostingCount today), this declines too (ok=false) rather
+// than guess, per the R2.6 invariant: any route that can't see the overlay
+// exactly must decline, not answer stale/wrong.
+func (vol *serviceVolumeIndex) overlayAwareFastCount(pq parsedQuery) (int, bool) {
+	if vol == nil || vol.index == nil {
+		return 0, false
+	}
+	snap := vol.snap.Load()
+	if snap == nil {
+		// No snapshot published yet even though hasActiveOverlay() said the
+		// overlay was active (e.g. legacy overlay.watermark path without a
+		// published snapshot) -- decline rather than risk reading the live
+		// overlay maps outside the snapshot.
+		return 0, false
+	}
+	hidden := hiddenBaseIDs{tombstone: snap.tombstoneIDs, shadowed: snap.shadowedIDs}
+	baseCount, ok := vol.fastPostingCountHidden(pq, hidden)
+	if !ok {
+		return 0, false
+	}
+	overlayCount := vol.overlayLiveMatchCount(snap, pq)
+	return baseCount + overlayCount, true
+}
+
+func (vol *serviceVolumeIndex) hasActiveOverlay() bool {
+	if !engineV9Enabled() || vol == nil {
+		return false
+	}
+	if snap := vol.snap.Load(); snap != nil {
+		return snap.watermark > 0
+	}
+	return vol.overlay != nil && vol.overlay.watermark.Load() > 0
 }
 
 func serviceVolumesForQuery(volumes []*serviceVolumeIndex, opts queryOptions) ([]*serviceVolumeIndex, error) {
@@ -5933,7 +7726,7 @@ func serviceVolumesForQuery(volumes []*serviceVolumeIndex, opts queryOptions) ([
 		if vol == nil || vol.index == nil {
 			continue
 		}
-		if wantVolume != "" && !strings.EqualFold(vol.index.Volume, wantVolume) {
+		if wantVolume != "" && !serviceVolumeMatchesConstraint(vol, wantVolume) {
 			continue
 		}
 		if vol.state != "" && vol.state != "ready" {
@@ -5951,6 +7744,21 @@ func serviceVolumesForQuery(volumes []*serviceVolumeIndex, opts queryOptions) ([
 		return nil, fmt.Errorf("no loaded search index for volume %s", wantVolume)
 	}
 	return nil, errors.New("service has no ready search indexes loaded")
+}
+
+func serviceVolumeMatchesConstraint(vol *serviceVolumeIndex, wantVolume string) bool {
+	if vol == nil || vol.index == nil || wantVolume == "" {
+		return true
+	}
+	if vol.index.Volume != "" {
+		return strings.EqualFold(vol.index.Volume, wantVolume)
+	}
+	for _, root := range vol.index.Roots {
+		if strings.EqualFold(filepath.VolumeName(filepath.Clean(root)), wantVolume) {
+			return true
+		}
+	}
+	return false
 }
 
 func queryVolumeConstraint(opts queryOptions) string {
@@ -5979,25 +7787,37 @@ func queryVolumeConstraint(opts queryOptions) string {
 }
 
 func (vol *serviceVolumeIndex) fastPostingCount(pq parsedQuery) (int, bool) {
-	if count, ok := vol.plannedCount(pq); ok {
+	return vol.fastPostingCountHidden(pq, hiddenBaseIDs{})
+}
+
+// fastPostingCountHidden is fastPostingCount plus an id-level exclusion set
+// for base records tombstoned/shadowed by the active v9 overlay. Every
+// candidate-id loop below checks hidden before counting, so the result stays
+// exact while an overlay is active instead of being a stale base-only count
+// (review G7 / plan R2.6).
+func (vol *serviceVolumeIndex) fastPostingCountHidden(pq parsedQuery, hidden hiddenBaseIDs) (int, bool) {
+	if count, ok := vol.plannedCountHidden(pq, hidden); ok {
+		return count, true
+	}
+	if count, ok := vol.fastBareExtensionPathCountHidden(pq, hidden); ok {
 		return count, true
 	}
 	globExts, globsOK := simpleGlobExts(pq.Globs)
 	if vol == nil || vol.index == nil || vol.queryIndex == nil || pq.CaseSensitive || pq.Under != "" || pq.Exists || pq.HasModAfter || len(pq.Regexps) > 0 || !globsOK || len(pq.Dirs) > 0 {
 		return 0, false
 	}
-	lists := make([][]uint32, 0, len(pq.Exts)+len(globExts)+len(pq.Terms)+1)
+	lists := make([]postingCountCandidate, 0, len(pq.Exts)+len(globExts)+len(pq.Terms)+1)
 	for _, ext := range pq.Exts {
-		list := vol.queryIndex.ext[strings.ToLower(ext)]
-		if len(list) == 0 {
-			return vol.countRecentOnly(pq), true
+		list, ok := vol.extPostingCountCandidate(ext)
+		if !ok || list.len() == 0 {
+			return vol.countRecentOnlyHidden(pq, hidden), true
 		}
 		lists = append(lists, list)
 	}
 	for _, ext := range globExts {
-		list := vol.queryIndex.ext[ext]
-		if len(list) == 0 {
-			return vol.countRecentOnly(pq), true
+		list, ok := vol.extPostingCountCandidate(ext)
+		if !ok || list.len() == 0 {
+			return vol.countRecentOnlyHidden(pq, hidden), true
 		}
 		lists = append(lists, list)
 	}
@@ -6008,7 +7828,7 @@ func (vol *serviceVolumeIndex) fastPostingCount(pq parsedQuery) (int, bool) {
 			return 0, false
 		}
 	case "dir":
-		lists = append(lists, vol.queryIndex.dirs)
+		lists = append(lists, postingCountCandidate{ids: vol.queryIndex.dirs})
 	default:
 		return 0, false
 	}
@@ -6017,16 +7837,20 @@ func (vol *serviceVolumeIndex) fastPostingCount(pq parsedQuery) (int, bool) {
 			return 0, false
 		}
 		if !strings.EqualFold(term, vol.volume) {
-			return vol.countRecentOnly(pq), true
+			return vol.countRecentOnlyHidden(pq, hidden), true
 		}
 	}
 	if len(lists) == 0 {
 		return 0, false
 	}
-	sort.Slice(lists, func(i, j int) bool { return len(lists[i]) < len(lists[j]) })
-	candidates := append([]uint32(nil), lists[0]...)
+	sort.Slice(lists, func(i, j int) bool { return lists[i].len() < lists[j].len() })
+	candidates := lists[0].materialize()
 	for _, list := range lists[1:] {
-		candidates = intersectSortedUint32s(candidates, list)
+		if list.mapped {
+			candidates = intersectSortedUint32sWithPostingIterator(candidates, list.it)
+		} else {
+			candidates = intersectSortedUint32s(candidates, list.ids)
+		}
 		if len(candidates) == 0 {
 			break
 		}
@@ -6037,10 +7861,16 @@ func (vol *serviceVolumeIndex) fastPostingCount(pq parsedQuery) (int, bool) {
 		if _, ok := recent[int(id)]; ok {
 			continue
 		}
+		if !hidden.empty() && hidden.contains(int(id)) {
+			continue
+		}
 		count++
 	}
 	for id := range recent {
 		if id < 0 || id >= vol.index.compactRecordCount() {
+			continue
+		}
+		if !hidden.empty() && hidden.contains(id) {
 			continue
 		}
 		rec := vol.index.compactRecord(id)
@@ -6049,6 +7879,116 @@ func (vol *serviceVolumeIndex) fastPostingCount(pq parsedQuery) (int, bool) {
 		}
 	}
 	return count, true
+}
+
+func (vol *serviceVolumeIndex) fastBareExtensionPathCountHidden(pq parsedQuery, hidden hiddenBaseIDs) (int, bool) {
+	if vol == nil || vol.index == nil || !pq.MatchPath || pq.CaseSensitive ||
+		pq.Under != "" || pq.Exists || pq.HasModAfter ||
+		len(pq.Exts) > 0 || len(pq.Globs) > 0 || len(pq.Dirs) > 0 || len(pq.Regexps) > 0 ||
+		len(pq.OrGroups) > 0 || len(pq.NotGroups) > 0 ||
+		len(pq.SizeFilters) > 0 || len(pq.DateFilters) > 0 ||
+		pq.Type == "dir" || countNonVolumeTerms(pq.Terms) < 2 {
+		return 0, false
+	}
+	hasAnchor := false
+	var bestExt string
+	var best postingCountCandidate
+	bestSet := false
+	for _, term := range pq.Terms {
+		if isVolumeQueryTerm(term) {
+			continue
+		}
+		if strings.ContainsAny(term, `\/*?[]:`) {
+			return 0, false
+		}
+		if ext, ok := pathExtensionCandidateTerm(term); ok && vol.pathTermIsUsableExtensionCandidate(term) {
+			candidate, ok := vol.extPostingCountCandidate(ext)
+			if !ok {
+				continue
+			}
+			if candidate.len() == 0 {
+				return vol.countRecentOnlyHidden(pq, hidden), true
+			}
+			if candidate.len() > serviceComponentMultiTermScanMaxIDs {
+				continue
+			}
+			if !bestSet || candidate.len() < best.len() {
+				bestExt = ext
+				best = candidate
+				bestSet = true
+			}
+			continue
+		}
+		if len(term) >= 4 {
+			hasAnchor = true
+		}
+	}
+	if !hasAnchor || !bestSet {
+		return 0, false
+	}
+	matchesExt := func(rec CompactRecord) bool {
+		actual := strings.TrimPrefix(filepath.Ext(rec.Name), ".")
+		return strings.EqualFold(actual, bestExt)
+	}
+	pathCache := make(map[int]string)
+	recent := vol.recentIDs
+	count := 0
+	for _, id32 := range best.materialize() {
+		id := int(id32)
+		if _, ok := recent[id]; ok {
+			continue
+		}
+		if !hidden.empty() && hidden.contains(id) {
+			continue
+		}
+		if id < 0 || id >= vol.index.compactRecordCount() {
+			continue
+		}
+		rec := vol.index.compactRecord(id)
+		if rec.Deleted || !matchesExt(rec) {
+			continue
+		}
+		if _, ok := compactCandidateEntryIfMatch(vol.index, pq, id, pathCache, true, false); ok {
+			count++
+		}
+	}
+	for id := range recent {
+		if id < 0 || id >= vol.index.compactRecordCount() {
+			continue
+		}
+		if !hidden.empty() && hidden.contains(id) {
+			continue
+		}
+		rec := vol.index.compactRecord(id)
+		if rec.Deleted || !matchesExt(rec) {
+			continue
+		}
+		if _, ok := compactCandidateEntryIfMatch(vol.index, pq, id, pathCache, true, false); ok {
+			count++
+		}
+	}
+	return count, true
+}
+
+type postingCountCandidate struct {
+	ids    []uint32
+	it     postingBlockIterator
+	count  int
+	mapped bool
+}
+
+func (candidate postingCountCandidate) len() int {
+	if candidate.mapped {
+		return candidate.count
+	}
+	return len(candidate.ids)
+}
+
+func (candidate postingCountCandidate) materialize() []uint32 {
+	if candidate.mapped {
+		return materializePostingBlockIterator(candidate.it, candidate.count)
+	}
+	return append([]uint32(nil), candidate.ids...)
 }
 
 func isVolumeQueryTerm(term string) bool {
@@ -6060,9 +8000,16 @@ func isVolumeQueryTerm(term string) bool {
 }
 
 func (vol *serviceVolumeIndex) countRecentOnly(pq parsedQuery) int {
+	return vol.countRecentOnlyHidden(pq, hiddenBaseIDs{})
+}
+
+func (vol *serviceVolumeIndex) countRecentOnlyHidden(pq parsedQuery, hidden hiddenBaseIDs) int {
 	count := 0
 	for id := range vol.recentIDs {
 		if id < 0 || id >= vol.index.compactRecordCount() {
+			continue
+		}
+		if !hidden.empty() && hidden.contains(id) {
 			continue
 		}
 		rec := vol.index.compactRecord(id)
@@ -6174,7 +8121,7 @@ func (idx *Index) compactLowerNameAt(i int) string {
 
 func (idx *Index) setCompactRecord(i int, rec CompactRecord) {
 	if idx.MMapRecords != nil {
-		idx.materializeMMapRecords()
+		return
 	}
 	if idx.PackedRecords != nil {
 		idx.PackedRecords.Set(i, rec)
@@ -6187,7 +8134,7 @@ func (idx *Index) setCompactRecord(i int, rec CompactRecord) {
 func (idx *Index) appendCompactRecord(rec CompactRecord) int {
 	id := idx.compactRecordCount()
 	if idx.MMapRecords != nil {
-		idx.materializeMMapRecords()
+		return -1
 	}
 	if idx.PackedRecords != nil {
 		idx.PackedRecords.Append(rec)
@@ -6198,24 +8145,34 @@ func (idx *Index) appendCompactRecord(rec CompactRecord) int {
 	return id
 }
 
-func (idx *Index) materializeMMapRecords() {
-	if idx == nil || idx.MMapRecords == nil {
-		return
-	}
-	count := idx.MMapRecords.Len()
-	records := make([]CompactRecord, count)
-	for i := range records {
-		records[i] = idx.MMapRecords.At(i)
-		records[i].Name = strings.Clone(records[i].Name)
-	}
-	_ = idx.MMapRecords.file.close()
-	idx.MMapRecords = nil
-	idx.PackedRecords = newPackedRecords(records)
-	idx.Records = nil
-	idx.CompactNameOrder = nil
+func searchCompactWithCache(idx *Index, opts queryOptions, countOnly bool, pathCache map[int]string, candidateFn func(parsedQuery) ([]int, bool)) ([]Entry, error) {
+	return searchCompactWithCacheHidden(idx, opts, countOnly, pathCache, candidateFn, hiddenBaseIDs{})
 }
 
-func searchCompactWithCache(idx *Index, opts queryOptions, countOnly bool, pathCache map[int]string, candidateFn func(parsedQuery) ([]int, bool)) ([]Entry, error) {
+type hiddenBaseIDs struct {
+	tombstone []int32
+	shadowed  []int32
+}
+
+func (h hiddenBaseIDs) empty() bool {
+	return len(h.tombstone) == 0 && len(h.shadowed) == 0
+}
+
+func (h hiddenBaseIDs) contains(id int) bool {
+	if id < 0 {
+		return false
+	}
+	id32 := int32(id)
+	if pos := sort.Search(len(h.tombstone), func(i int) bool { return h.tombstone[i] >= id32 }); pos < len(h.tombstone) && h.tombstone[pos] == id32 {
+		return true
+	}
+	if pos := sort.Search(len(h.shadowed), func(i int) bool { return h.shadowed[i] >= id32 }); pos < len(h.shadowed) && h.shadowed[pos] == id32 {
+		return true
+	}
+	return false
+}
+
+func searchCompactWithCacheHidden(idx *Index, opts queryOptions, countOnly bool, pathCache map[int]string, candidateFn func(parsedQuery) ([]int, bool), hidden hiddenBaseIDs) ([]Entry, error) {
 	pq, err := parseQuery(opts)
 	if err != nil {
 		return nil, err
@@ -6238,6 +8195,9 @@ func searchCompactWithCache(idx *Index, opts queryOptions, countOnly bool, pathC
 			usedCandidates = true
 		}
 	}
+	if !usedCandidates && queryCanceled(pq) {
+		return nil, errQueryCanceled
+	}
 	if !usedCandidates {
 		pq.Trace.setSource("compact-name-order-scan", compactOrderLen(order, idx.compactRecordCount()))
 	}
@@ -6250,13 +8210,16 @@ func searchCompactWithCache(idx *Index, opts queryOptions, countOnly bool, pathC
 	}
 	skipEntryMatches := compactCandidateCanSkipEntryMatches(pq, usedCandidates)
 	if usedCandidates && !countOnly && len(order) >= serviceTrigramParallelVerifyMinIDs {
-		return verifyCompactCandidateOrderParallel(idx, pq, order, pathCache, limit, skipEntryMatches)
+		return verifyCompactCandidateOrderParallel(idx, pq, order, pathCache, limit, skipEntryMatches, hidden)
 	}
 	for pos := 0; pos < compactOrderLen(order, idx.compactRecordCount()); pos++ {
 		if pos&1023 == 0 && queryCanceled(pq) {
 			return nil, errQueryCanceled
 		}
 		recIndex := compactOrderAt(order, pos)
+		if hidden.contains(recIndex) {
+			continue
+		}
 		rec := idx.compactRecord(recIndex)
 		if rec.Deleted {
 			continue
@@ -6264,7 +8227,7 @@ func searchCompactWithCache(idx *Index, opts queryOptions, countOnly bool, pathC
 		if !compactRecordPrecheck(rec, pq, pq.MatchPath) {
 			continue
 		}
-		if pq.MatchPath && len(pq.Terms) > 0 && !idx.compactPathContainsAll(recIndex, pq.Terms) {
+		if queryPathTermPrecheckSafe(pq) && !idx.compactPathContainsAll(recIndex, pq.Terms) {
 			continue
 		}
 		if skipEntryMatches {
@@ -6319,7 +8282,11 @@ func compactCandidateCanSkipEntryMatches(pq parsedQuery, usedCandidates bool) bo
 		return false
 	}
 	if len(pq.Terms) == 0 {
-		return true
+		return len(pq.Globs) == 0 &&
+			pq.Type == "" &&
+			!pq.HasModAfter &&
+			pq.CWDBias == "" &&
+			pq.RootBias == ""
 	}
 	return pq.MatchPath &&
 		countNonVolumeTerms(pq.Terms) == 1 &&
@@ -6348,13 +8315,13 @@ func compactEntryFromRecord(idx *Index, recIndex int, rec CompactRecord, pathCac
 	return entry
 }
 
-func verifyCompactCandidateOrderParallel(idx *Index, pq parsedQuery, order []int, pathCache map[int]string, limit int, skipEntryMatches bool) ([]Entry, error) {
+func verifyCompactCandidateOrderParallel(idx *Index, pq parsedQuery, order []int, pathCache map[int]string, limit int, skipEntryMatches bool, hidden hiddenBaseIDs) ([]Entry, error) {
 	if len(order) == 0 || limit <= 0 {
 		return nil, nil
 	}
 	workers := min(runtime.GOMAXPROCS(0), max(1, len(order)/serviceTrigramParallelVerifyMinIDs))
 	if workers <= 1 {
-		return verifyCompactCandidateOrderRange(idx, pq, order, pathCache, limit, skipEntryMatches)
+		return verifyCompactCandidateOrderRange(idx, pq, order, pathCache, limit, skipEntryMatches, hidden)
 	}
 	parts := make([][]Entry, workers)
 	var canceled atomic.Bool
@@ -6372,7 +8339,11 @@ func verifyCompactCandidateOrderParallel(idx *Index, pq parsedQuery, order []int
 					canceled.Store(true)
 					return
 				}
-				if entry, ok := compactCandidateEntryIfMatch(idx, pq, order[pos], localCache, true, skipEntryMatches); ok {
+				recIndex := order[pos]
+				if hidden.contains(recIndex) {
+					continue
+				}
+				if entry, ok := compactCandidateEntryIfMatch(idx, pq, recIndex, localCache, true, skipEntryMatches); ok {
 					local = append(local, entry)
 					if len(local) >= limit {
 						break
@@ -6398,11 +8369,14 @@ func verifyCompactCandidateOrderParallel(idx *Index, pq parsedQuery, order []int
 	return out, nil
 }
 
-func verifyCompactCandidateOrderRange(idx *Index, pq parsedQuery, order []int, pathCache map[int]string, limit int, skipEntryMatches bool) ([]Entry, error) {
+func verifyCompactCandidateOrderRange(idx *Index, pq parsedQuery, order []int, pathCache map[int]string, limit int, skipEntryMatches bool, hidden hiddenBaseIDs) ([]Entry, error) {
 	out := make([]Entry, 0, min(limit, 1024))
 	for pos, recIndex := range order {
 		if pos&1023 == 0 && queryCanceled(pq) {
 			return nil, errQueryCanceled
+		}
+		if hidden.contains(recIndex) {
+			continue
 		}
 		if entry, ok := compactCandidateEntryIfMatch(idx, pq, recIndex, pathCache, true, skipEntryMatches); ok {
 			out = append(out, entry)
@@ -6422,7 +8396,7 @@ func compactCandidateEntryIfMatch(idx *Index, pq parsedQuery, recIndex int, path
 	if !compactRecordPrecheck(rec, pq, pq.MatchPath) {
 		return Entry{}, false
 	}
-	if pq.MatchPath && len(pq.Terms) > 0 && !idx.compactPathContainsAll(recIndex, pq.Terms) {
+	if queryPathTermPrecheckSafe(pq) && !idx.compactPathContainsAll(recIndex, pq.Terms) {
 		return Entry{}, false
 	}
 	if skipEntryMatches {
@@ -6528,17 +8502,55 @@ func compactRecordPrecheck(rec CompactRecord, pq parsedQuery, matchPath bool) bo
 }
 
 func (vol *serviceVolumeIndex) nameTermCandidates(pq parsedQuery) ([]int, bool) {
+	if pq.CountOnly {
+		if candidates, ok := vol.boundedScanCandidates(pq); ok {
+			pq.Trace.setSource("bounded-scan", len(candidates))
+			return candidates, true
+		}
+	}
+	if len(pq.Terms) == 0 && len(pq.Exts) == 0 && len(pq.Globs) == 0 && len(pq.OrGroups) == 0 {
+		if candidates, ok := vol.boundedScanCandidates(pq); ok {
+			pq.Trace.setSource("bounded-scan", len(candidates))
+			return candidates, true
+		}
+	}
+	if queryHasNonASCIIPlainTerm(pq) {
+		if candidates, ok := vol.boundedScanCandidates(pq); ok {
+			pq.Trace.setSource("bounded-scan", len(candidates))
+			return candidates, true
+		}
+	}
 	if pq.MatchPath {
 		if candidates, ok := vol.extensionShapedPathTopCandidates(pq); ok {
 			pq.Trace.setSource("path-extension-top", len(candidates))
+			return candidates, true
+		}
+		if candidates, ok := vol.bareExtensionMultiPathTopCandidates(pq); ok {
+			pq.Trace.setSource("path-bare-extension-multi-top", len(candidates))
+			return candidates, true
+		}
+		if candidates, ok := vol.selectiveNamePathTermCandidates(pq); ok {
+			pq.Trace.setSource("path-selective-name-term", len(candidates))
+			return candidates, true
+		}
+		if candidates, ok := vol.pathDirectoryTermTopCandidates(pq); ok {
+			pq.Trace.setSource("path-directory-term-top", len(candidates))
+			return candidates, true
+		}
+		if candidates, ok := vol.componentDirectTopCandidates(pq); ok {
+			pq.Trace.setSource("path-component-direct-top", len(candidates))
 			return candidates, true
 		}
 		if candidates, ok := vol.componentRootTopCandidates(pq); ok {
 			pq.Trace.setSource("path-component-root-top", len(candidates))
 			return candidates, true
 		}
-		if candidates, ok := vol.componentDirectTopCandidates(pq); ok {
-			pq.Trace.setSource("path-component-direct-top", len(candidates))
+		if candidates, ok := vol.componentMultiTermTopCandidates(pq); ok {
+			pq.Trace.setSource("path-component-multi-top", len(candidates))
+			return candidates, true
+		}
+		if candidates, ok := vol.multiTermEmptyPathCandidates(pq); ok {
+			pq.Trace.setSource("path-multi-empty", len(candidates))
 			return candidates, true
 		}
 		if candidates, ok := vol.nameTrigramCandidates(pq); ok {
@@ -6604,8 +8616,8 @@ func (vol *serviceVolumeIndex) nameTermCandidates(pq parsedQuery) ([]int, bool) 
 		pq.Trace.setSource("under", len(candidates))
 		return candidates, true
 	}
-	if candidates, ok := vol.broadPathScanCandidates(pq); ok {
-		pq.Trace.setSource("broad-path-scan", len(candidates))
+	if candidates, ok := vol.boundedScanCandidates(pq); ok {
+		pq.Trace.setSource("bounded-scan", len(candidates))
 		return candidates, true
 	}
 	if candidates, ok := vol.plannerCandidates(pq); ok {
@@ -6676,6 +8688,44 @@ func (vol *serviceVolumeIndex) nameTermCandidates(pq parsedQuery) ([]int, bool) 
 	return candidates, true
 }
 
+func (vol *serviceVolumeIndex) overlayAwareNameTermCandidates(pq parsedQuery) ([]int, bool) {
+	candidates, ok := vol.nameTermCandidates(pq)
+	if !ok {
+		return nil, false
+	}
+	if len(candidates) == 0 {
+		return nil, false
+	}
+	return candidates, true
+}
+
+func queryHasNonASCIIPlainTerm(pq parsedQuery) bool {
+	for _, term := range pq.Terms {
+		for _, r := range term {
+			if r > 127 {
+				return true
+			}
+		}
+	}
+	for _, group := range pq.OrGroups {
+		for _, alt := range group {
+			if queryHasNonASCIIPlainTerm(alt) {
+				return true
+			}
+		}
+	}
+	for _, neg := range pq.NotGroups {
+		if queryHasNonASCIIPlainTerm(neg) {
+			return true
+		}
+	}
+	return false
+}
+
+func queryPathTermPrecheckSafe(pq parsedQuery) bool {
+	return pq.MatchPath && len(pq.Terms) > 0 && !queryHasNonASCIIPlainTerm(pq)
+}
+
 func (vol *serviceVolumeIndex) componentRootTopCandidates(pq parsedQuery) ([]int, bool) {
 	if vol == nil || vol.index == nil || !pq.MatchPath || pq.CountOnly || pq.Limit <= 0 ||
 		pq.CaseSensitive || pq.Under != "" || pq.Type != "" || len(pq.Exts) > 0 ||
@@ -6696,22 +8746,57 @@ func (vol *serviceVolumeIndex) componentRootTopCandidates(pq parsedQuery) ([]int
 	if term == "" || strings.ContainsAny(term, `\/*?[]:.-`) {
 		return nil, false
 	}
-	roots := vol.pathComponentRootIDs(term)
+	var roots []int
+	if it, _, ok := vol.componentPostingBlockIterator(term); ok {
+		ordinal := 0
+		for it.next < it.end {
+			block, _, ok := it.nextBlock()
+			if !ok {
+				return nil, false
+			}
+			for _, id32 := range block {
+				if ordinal&1023 == 0 && queryCanceled(pq) {
+					return nil, false
+				}
+				ordinal++
+				rootID := int(id32)
+				if vol.estimatedDescendantOrSelfCount(rootID) >= 100_000 {
+					roots = append(roots, rootID)
+					if len(roots) >= pq.Limit*4 {
+						break
+					}
+				}
+			}
+			if len(roots) >= pq.Limit*4 {
+				break
+			}
+		}
+	} else {
+		for i, id32 := range vol.componentPosting32(term) {
+			if i&1023 == 0 && queryCanceled(pq) {
+				return nil, false
+			}
+			rootID := int(id32)
+			if vol.estimatedDescendantOrSelfCount(rootID) >= 100_000 {
+				roots = append(roots, rootID)
+				if len(roots) >= pq.Limit*4 {
+					break
+				}
+			}
+		}
+	}
+	if len(roots) == 0 && vol.queryIndex == nil {
+		for _, rootID := range vol.pathComponentRootIDs(term) {
+			if vol.estimatedDescendantOrSelfCount(rootID) >= 100_000 {
+				roots = append(roots, rootID)
+			}
+		}
+	}
 	if len(roots) == 0 {
 		return nil, false
 	}
 	if serviceLowMemoryMode() && (len(vol.subtreeStart) == 0 || len(vol.subtreeEnd) == 0 || len(vol.subtreeOrder) == 0) {
 		return topCandidateIDsByRank(roots, pq.Limit, vol.index, vol.nameOrderRanks()), true
-	}
-	largeRoots := roots[:0]
-	for _, rootID := range roots {
-		if vol.estimatedDescendantOrSelfCount(rootID) >= 100_000 {
-			largeRoots = append(largeRoots, rootID)
-		}
-	}
-	roots = largeRoots
-	if len(roots) == 0 {
-		return nil, false
 	}
 	recordCount := vol.index.compactRecordCount()
 	out := make([]int, 0, pq.Limit)
@@ -6731,7 +8816,10 @@ func (vol *serviceVolumeIndex) componentRootTopCandidates(pq parsedQuery) ([]int
 		out = append(out, id)
 		return len(out) >= pq.Limit
 	}
-	for _, rootID := range roots {
+	for rootPos, rootID := range roots {
+		if rootPos&127 == 0 && queryCanceled(pq) {
+			return nil, false
+		}
 		if add(rootID) {
 			return out, true
 		}
@@ -6743,6 +8831,9 @@ func (vol *serviceVolumeIndex) componentRootTopCandidates(pq parsedQuery) ([]int
 			continue
 		}
 		for pos := start; pos < end; pos++ {
+			if pos&4095 == 0 && queryCanceled(pq) {
+				return nil, false
+			}
 			if add(int(vol.subtreeOrder[pos])) {
 				return out, true
 			}
@@ -6752,7 +8843,7 @@ func (vol *serviceVolumeIndex) componentRootTopCandidates(pq parsedQuery) ([]int
 }
 
 func (vol *serviceVolumeIndex) componentDirectTopCandidates(pq parsedQuery) ([]int, bool) {
-	if vol == nil || vol.index == nil || vol.queryIndex == nil || len(vol.queryIndex.pathGrams) == 0 ||
+	if vol == nil || vol.index == nil || vol.queryIndex == nil ||
 		!serviceLowMemoryMode() || !pq.MatchPath || pq.CountOnly || pq.Limit <= 0 || pq.CaseSensitive ||
 		pq.Under != "" || pq.Type != "" || len(pq.Exts) > 0 || len(pq.Globs) > 0 ||
 		len(pq.Dirs) > 0 || len(pq.Regexps) > 0 || len(pq.SizeFilters) > 0 ||
@@ -6769,11 +8860,17 @@ func (vol *serviceVolumeIndex) componentDirectTopCandidates(pq parsedQuery) ([]i
 		term = candidate
 		break
 	}
-	if len(term) < 3 || !strings.Contains(term, "_") || strings.ContainsAny(term, `\/*?[]:`) {
+	if len(term) < 3 || strings.ContainsAny(term, `\/*?[]:`) {
 		return nil, false
 	}
-	candidates := vol.queryIndex.components[term]
+	candidates := vol.componentPosting32(term)
 	if len(candidates) == 0 {
+		if len(vol.extPosting32(term)) > 0 {
+			return nil, false
+		}
+		if len(vol.queryIndex.pathGrams) == 0 {
+			return nil, false
+		}
 		grams := uniqueTrigramKeys(term)
 		if len(grams) == 0 {
 			return nil, false
@@ -6836,7 +8933,297 @@ func (vol *serviceVolumeIndex) componentDirectTopCandidates(pq parsedQuery) ([]i
 			}
 		}
 	}
+	if len(out) > 0 && len(out) < pq.Limit && len(vol.subtreeOrder) == 0 {
+		roots := append([]int(nil), out...)
+		scanned := vol.scanOrderedLimited(pq, pq.Limit-len(out), func(id int) bool {
+			if _, ok := seen[id]; ok {
+				return false
+			}
+			return vol.isDescendantOrSelfAnyFast(id, roots) && vol.index.compactPathContainsTerm(id, term)
+		})
+		for _, id := range scanned {
+			if add(id) {
+				return out, true
+			}
+		}
+	}
 	return out, len(out) > 0
+}
+
+func (vol *serviceVolumeIndex) componentMultiTermTopCandidates(pq parsedQuery) ([]int, bool) {
+	if vol == nil || vol.index == nil || vol.queryIndex == nil || !vol.hasDescendantIndex() ||
+		!serviceLowMemoryMode() || !pq.MatchPath || pq.CountOnly || pq.Limit <= 0 || pq.CaseSensitive ||
+		pq.Under != "" || pq.Type != "" || len(pq.Exts) > 0 || len(pq.Globs) > 0 ||
+		len(pq.Dirs) > 0 || len(pq.Regexps) > 0 || len(pq.SizeFilters) > 0 ||
+		len(pq.DateFilters) > 0 || len(pq.OrGroups) > 0 || len(pq.NotGroups) > 0 ||
+		pq.HasModAfter || pq.Exists || pq.CWDBias != "" || pq.RootBias != "" ||
+		countNonVolumeTerms(pq.Terms) < 2 {
+		return nil, false
+	}
+	var best []int
+	bestEstimate := int(^uint(0) >> 1)
+	for _, term := range pq.Terms {
+		if len(term) < 3 || isVolumeQueryTerm(term) || strings.ContainsAny(term, `\/*?[]:.`) ||
+			vol.pathTermIsUsableExtensionCandidate(term) {
+			continue
+		}
+		nameMatches, roots, complete := vol.pathDirectoryTermSource(term)
+		if complete && len(nameMatches) == 0 {
+			return []int{}, true
+		}
+		if len(roots) == 0 {
+			for _, id32 := range vol.componentPosting32(term) {
+				roots = append(roots, int(id32))
+			}
+		}
+		if len(roots) == 0 {
+			continue
+		}
+		estimate := 0
+		for _, id := range roots {
+			if id < 0 || id >= vol.index.compactRecordCount() {
+				continue
+			}
+			if len(vol.subtreeOrder) == 0 && (len(vol.childOffsets) > 0 || vol.children != nil) {
+				estimate += len(vol.underDescendantsLimited(id, serviceComponentMultiTermScanMaxIDs+1))
+			} else {
+				estimate += vol.estimatedDescendantOrSelfCount(id)
+			}
+			if estimate > bestEstimate {
+				break
+			}
+		}
+		if estimate > 0 && estimate < bestEstimate {
+			best = roots
+			bestEstimate = estimate
+		}
+	}
+	if len(best) == 0 {
+		return nil, false
+	}
+	if len(vol.subtreeOrder) == 0 {
+		var bestTerm string
+		for _, term := range pq.Terms {
+			if len(term) < 3 || isVolumeQueryTerm(term) || strings.ContainsAny(term, `\/*?[]:.`) ||
+				vol.pathTermIsUsableExtensionCandidate(term) {
+				continue
+			}
+			_, roots, _ := vol.pathDirectoryTermSource(term)
+			if len(roots) == 0 {
+				for _, id32 := range vol.componentPosting32(term) {
+					roots = append(roots, int(id32))
+				}
+			}
+			if len(roots) == len(best) {
+				same := true
+				for i := range roots {
+					if roots[i] != best[i] {
+						same = false
+						break
+					}
+				}
+				if same {
+					bestTerm = term
+					break
+				}
+			}
+		}
+		if bestTerm != "" && bestEstimate <= serviceComponentMultiTermScanMaxIDs {
+			seenCandidates := make(map[int]struct{}, len(best))
+			candidates := make([]int, 0, min(bestEstimate, serviceComponentMultiTermScanMaxIDs))
+			for _, id := range best {
+				for _, candidate := range vol.underDescendantsLimited(id, serviceComponentMultiTermScanMaxIDs+1) {
+					if _, ok := seenCandidates[candidate]; ok {
+						continue
+					}
+					seenCandidates[candidate] = struct{}{}
+					candidates = append(candidates, candidate)
+				}
+			}
+			out := make([]int, 0, min(len(candidates), pq.Limit))
+			for _, id := range candidates {
+				if id < 0 || id >= vol.index.compactRecordCount() {
+					continue
+				}
+				rec := vol.index.compactRecord(id)
+				if rec.Deleted || !vol.index.compactPathContainsAll(id, pq.Terms) {
+					continue
+				}
+				out = append(out, id)
+			}
+			if len(out) > 0 {
+				sortCandidateIDs(out, pq, vol.index, vol.nameOrderRanks())
+				return out, true
+			}
+		}
+		roots := make([]int, 0, min(len(best), 16))
+		for _, id := range best {
+			if id >= 0 && id < vol.index.compactRecordCount() {
+				roots = append(roots, id)
+				if len(roots) >= 16 {
+					break
+				}
+			}
+		}
+		if len(roots) == 0 {
+			return nil, false
+		}
+		out := vol.scanOrderedLimited(pq, pq.Limit, func(id int) bool {
+			if !vol.isDescendantOrSelfAnyFast(id, roots) {
+				return false
+			}
+			rec := vol.index.compactRecord(id)
+			return !rec.Deleted && vol.index.compactPathContainsAll(id, pq.Terms)
+		})
+		if len(out) >= pq.Limit {
+			return out, true
+		}
+		return nil, false
+	}
+	recordCount := vol.index.compactRecordCount()
+	out := make([]int, 0, pq.Limit)
+	seen := make(map[int]struct{}, pq.Limit)
+	scanned := 0
+	add := func(id int) bool {
+		if id < 0 || id >= recordCount {
+			return false
+		}
+		scanned++
+		if _, ok := seen[id]; ok {
+			return false
+		}
+		rec := vol.index.compactRecord(id)
+		if rec.Deleted || !vol.index.compactPathContainsAll(id, pq.Terms) {
+			return false
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+		return len(out) >= pq.Limit
+	}
+	for rootIndex, id := range best {
+		if rootIndex&127 == 0 && queryCanceled(pq) {
+			return nil, false
+		}
+		if add(id) {
+			return out, true
+		}
+		if id < 0 || id >= len(vol.subtreeStart) || id >= len(vol.subtreeEnd) || len(vol.subtreeOrder) == 0 {
+			continue
+		}
+		start, end := vol.subtreeStart[id], vol.subtreeEnd[id]
+		if start == ^uint32(0) || start > end || int(end) > len(vol.subtreeOrder) {
+			continue
+		}
+		for pos := start; pos < end; pos++ {
+			if bestEstimate > serviceComponentTrigramExpansionMaxIDs && scanned >= serviceComponentMultiTermScanMaxIDs {
+				if len(out) >= pq.Limit {
+					return out, true
+				}
+				return nil, false
+			}
+			if pos&4095 == 0 && queryCanceled(pq) {
+				return nil, false
+			}
+			if add(int(vol.subtreeOrder[pos])) {
+				return out, true
+			}
+		}
+	}
+	if len(out) == 0 {
+		return nil, false
+	}
+	return out, true
+}
+
+func (vol *serviceVolumeIndex) selectiveNamePathTermCandidates(pq parsedQuery) ([]int, bool) {
+	if vol == nil || vol.index == nil || !pq.MatchPath || pq.CountOnly || pq.Limit <= 0 || pq.CaseSensitive ||
+		pq.Under != "" || pq.Type != "" || len(pq.Exts) > 0 || len(pq.Globs) > 0 ||
+		len(pq.Dirs) > 0 || len(pq.Regexps) > 0 || len(pq.SizeFilters) > 0 ||
+		len(pq.DateFilters) > 0 || len(pq.OrGroups) > 0 || len(pq.NotGroups) > 0 ||
+		pq.HasModAfter || pq.Exists || pq.CWDBias != "" || pq.RootBias != "" ||
+		countNonVolumeTerms(pq.Terms) < 2 {
+		return nil, false
+	}
+	bestTerm := ""
+	bestIDs := []int(nil)
+	for _, term := range pq.Terms {
+		if len(term) < 4 || isVolumeQueryTerm(term) || strings.ContainsAny(term, `\/*?[]:`) || !filenameLikePathTerm(term) {
+			continue
+		}
+		ids, ok := vol.nameTrigramNameTermPostingLimited(term, servicePathNameTrigramCandidateMaxIDs)
+		if !ok || len(ids) > serviceComponentTrigramExpansionMaxIDs {
+			continue
+		}
+		if vol.hasDirectoryCandidate(ids) {
+			continue
+		}
+		if bestTerm == "" || len(ids) < len(bestIDs) {
+			bestTerm = term
+			bestIDs = ids
+		}
+	}
+	if bestTerm == "" {
+		return nil, false
+	}
+	out := make([]int, 0, min(pq.Limit, len(bestIDs)))
+	for _, id := range bestIDs {
+		if id < 0 || id >= vol.index.compactRecordCount() {
+			continue
+		}
+		rec := vol.index.compactRecord(id)
+		if rec.Deleted || !vol.index.compactPathContainsAll(id, pq.Terms) {
+			continue
+		}
+		out = append(out, id)
+		if len(out) >= pq.Limit {
+			break
+		}
+	}
+	if len(out) == 0 {
+		return []int{}, true
+	}
+	return topCandidateIDsByRank(out, pq.Limit, vol.index, vol.nameOrderRanks()), true
+}
+
+func filenameLikePathTerm(term string) bool {
+	return strings.ContainsAny(term, "._-")
+}
+
+func asciiOnlyString(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= 0x80 {
+			return false
+		}
+	}
+	return true
+}
+
+func (vol *serviceVolumeIndex) multiTermEmptyPathCandidates(pq parsedQuery) ([]int, bool) {
+	if vol == nil || vol.index == nil || !pq.MatchPath || pq.CountOnly || pq.CaseSensitive ||
+		pq.Under != "" || pq.Type != "" || len(pq.Exts) > 0 || len(pq.Globs) > 0 ||
+		len(pq.Dirs) > 0 || len(pq.Regexps) > 0 || len(pq.SizeFilters) > 0 ||
+		len(pq.DateFilters) > 0 || len(pq.OrGroups) > 0 || len(pq.NotGroups) > 0 ||
+		pq.HasModAfter || pq.Exists || pq.CWDBias != "" || pq.RootBias != "" ||
+		countNonVolumeTerms(pq.Terms) < 2 {
+		return nil, false
+	}
+	for _, term := range pq.Terms {
+		if len(term) < 3 || isVolumeQueryTerm(term) || strings.ContainsAny(term, `\/*?[]:`) {
+			continue
+		}
+		if !asciiOnlyString(term) {
+			return nil, false
+		}
+		if len(term) >= 6 && vol.queryIndex != nil && len(vol.componentPosting32(term)) == 0 {
+			if trigrams := vol.nameTrigramIndex(); trigrams != nil {
+				_, ok, missing := trigrams.selectiveIntersectCandidateIDs(term, servicePathNameTrigramCandidateMaxIDs)
+				if ok && missing {
+					return []int{}, true
+				}
+			}
+		}
+	}
+	return nil, false
 }
 
 func (vol *serviceVolumeIndex) nameTrigramCandidates(pq parsedQuery) ([]int, bool) {
@@ -6868,6 +9255,9 @@ func (vol *serviceVolumeIndex) filenameNgramCandidates(pq parsedQuery, trigrams 
 	for _, term := range pq.Terms {
 		if len(term) < max(3, trigrams.gramSize) {
 			continue
+		}
+		if !asciiOnlyString(term) {
+			return nil, false
 		}
 		count, ok := trigrams.postingCount(term)
 		if !ok {
@@ -6924,6 +9314,10 @@ func (vol *serviceVolumeIndex) componentTrigramCandidates(pq parsedQuery) ([]int
 		}
 		if len(term) < 3 {
 			continue
+		}
+		if !asciiOnlyString(term) {
+			pq.Trace.setDecline("component-trigram:non-ascii-term")
+			return nil, false
 		}
 		count, ok := trigrams.postingCount(term)
 		if !ok {
@@ -6995,13 +9389,14 @@ func (vol *serviceVolumeIndex) nameTrigramPathNameTopCandidates(pq parsedQuery) 
 		pq.Trace.replaceDecline("path-name-trigram-top:bad-term")
 		return nil, false
 	}
-	nameMatches, ok := vol.nameTrigramNameTermTopPosting(term, servicePathNameTrigramCandidateMaxIDs, pq.Limit*4)
+	nameMatches, ok := vol.nameTrigramNameTermTopPosting(term, servicePathNameTrigramCandidateMaxIDs, servicePathNameTrigramCandidateMaxIDs)
 	if !ok || len(nameMatches) == 0 {
 		pq.Trace.replaceDecline("path-name-trigram-top:name-posting-declined")
 		return nil, false
 	}
 	direct := make([]int, 0, len(nameMatches))
 	seen := make(map[int]struct{}, len(nameMatches)+pq.Limit)
+	sawUnexpandedDir := false
 	for _, id := range nameMatches {
 		if id < 0 || id >= vol.index.compactRecordCount() {
 			continue
@@ -7016,7 +9411,13 @@ func (vol *serviceVolumeIndex) nameTrigramPathNameTopCandidates(pq parsedQuery) 
 		}
 		if rec.Mode&uint32(os.ModeDir) != 0 && vol.estimatedDescendantOrSelfCount(id) > serviceComponentTrigramExpansionMaxIDs {
 			direct = vol.appendTopSubtreeCandidatesByRank(direct, seen, id, pq.Limit*4)
+		} else if rec.Mode&uint32(os.ModeDir) != 0 {
+			sawUnexpandedDir = true
 		}
+	}
+	if sawUnexpandedDir {
+		pq.Trace.replaceDecline("path-name-trigram-top:directory-needs-expansion")
+		return nil, false
 	}
 	if len(direct) < pq.Limit {
 		pq.Trace.replaceDecline("path-name-trigram-top:too-few-direct")
@@ -7027,7 +9428,7 @@ func (vol *serviceVolumeIndex) nameTrigramPathNameTopCandidates(pq parsedQuery) 
 
 func (vol *serviceVolumeIndex) nameTrigramNameTermTopPosting(term string, maxIDs, limit int) ([]int, bool) {
 	trigrams := vol.nameTrigramIndex()
-	if vol == nil || trigrams == nil || limit <= 0 {
+	if vol == nil || trigrams == nil || limit <= 0 || !asciiOnlyString(term) {
 		return nil, false
 	}
 	ids, ok, missing := trigrams.selectiveCandidateIDs(term, maxIDs)
@@ -7112,19 +9513,20 @@ func (vol *serviceVolumeIndex) nameTrigramNameTermPostingLimited(term string, ma
 }
 
 func (vol *serviceVolumeIndex) nameNgramNameTermPosting(term string, trigrams *compressedTrigramIndex, maxIDs int) ([]int, bool) {
-	if vol == nil || trigrams == nil {
+	if vol == nil || trigrams == nil || !asciiOnlyString(term) {
 		return nil, false
 	}
 	cacheKey := fmt.Sprintf("\x00ngram%dname:%s", trigrams.gramSize, term)
 	vol.termMu.Lock()
 	if vol.termCache != nil {
-		if list, ok := vol.termCache[cacheKey]; ok {
-			seq := vol.termSeq[cacheKey]
-			vol.termMu.Unlock()
-			return vol.withRecentCandidates(list, seq, func(rec CompactRecord) bool {
-				id, ok := vol.idForFRN(rec.FRN)
-				return ok && vol.nameTrigramCandidateMatches(id, term)
-			}), true
+		if entry, ok := vol.termCache[cacheKey]; ok {
+			if vol.cacheStampValid(entry.gen) {
+				vol.termMu.Unlock()
+				return vol.withRecentCandidates(entry.ids, entry.gen, func(rec CompactRecord) bool {
+					id, ok := vol.idForFRN(rec.FRN)
+					return ok && vol.nameTrigramCandidateMatches(id, term)
+				}), true
+			}
 		}
 	}
 	vol.termMu.Unlock()
@@ -7246,13 +9648,14 @@ func (vol *serviceVolumeIndex) nameTrigramPathTermPosting(term string) ([]int, b
 	cacheKey := "\x00trigrampath:" + term
 	vol.termMu.Lock()
 	if vol.pathTermCache != nil {
-		if list, ok := vol.pathTermCache[cacheKey]; ok {
-			seq := vol.pathTermSeq[cacheKey]
-			vol.termMu.Unlock()
-			return vol.withRecentCandidates(list, seq, func(rec CompactRecord) bool {
-				id, ok := vol.idForFRN(rec.FRN)
-				return ok && vol.index.compactPathContainsTerm(id, term)
-			}), true
+		if entry, ok := vol.pathTermCache[cacheKey]; ok {
+			if vol.cacheStampValid(entry.gen) {
+				vol.termMu.Unlock()
+				return vol.withRecentCandidates(entry.ids, entry.gen, func(rec CompactRecord) bool {
+					id, ok := vol.idForFRN(rec.FRN)
+					return ok && vol.index.compactPathContainsTerm(id, term)
+				}), true
+			}
 		}
 	}
 	vol.termMu.Unlock()
@@ -7274,6 +9677,9 @@ func (vol *serviceVolumeIndex) nameTrigramPathTermPosting(term string) ([]int, b
 		if rec.Mode&uint32(os.ModeDir) == 0 {
 			estimated++
 		} else {
+			if !vol.hasDescendantIndex() {
+				return nil, false
+			}
 			estimated += vol.estimatedDescendantOrSelfCount(id)
 		}
 		if estimated > serviceComponentTrigramExpansionMaxIDs {
@@ -7292,6 +9698,9 @@ func (vol *serviceVolumeIndex) nameTrigramPathTermPosting(term string) ([]int, b
 		if rec.Deleted || rec.Mode&uint32(os.ModeDir) == 0 {
 			continue
 		}
+		if !vol.hasDescendantIndex() {
+			return nil, false
+		}
 		for _, childID := range vol.underDescendants(id) {
 			child := int(childID)
 			if _, exists := seen[child]; exists {
@@ -7309,6 +9718,10 @@ func (vol *serviceVolumeIndex) nameTrigramPathTermPosting(term string) ([]int, b
 	return out, true
 }
 
+func (vol *serviceVolumeIndex) hasDescendantIndex() bool {
+	return vol != nil && (len(vol.subtreeOrder) > 0 || len(vol.childOffsets) > 0 || vol.children != nil)
+}
+
 func (vol *serviceVolumeIndex) estimatedDescendantOrSelfCount(rootID int) int {
 	if vol == nil || vol.index == nil || rootID < 0 || rootID >= vol.index.compactRecordCount() {
 		return 0
@@ -7319,11 +9732,14 @@ func (vol *serviceVolumeIndex) estimatedDescendantOrSelfCount(rootID int) int {
 			return int(end - start)
 		}
 	}
+	vol.termMu.Lock()
 	if vol.underCache != nil {
 		if cached, ok := vol.underCache[rootID]; ok {
-			return len(cached)
+			vol.termMu.Unlock()
+			return len(cached.ids)
 		}
 	}
+	vol.termMu.Unlock()
 	return len(vol.underDescendantsLimited(rootID, serviceComponentTrigramExpansionMaxIDs+1))
 }
 
@@ -7340,9 +9756,6 @@ func (vol *serviceVolumeIndex) limitedSingleTermCandidates(pq parsedQuery) ([]in
 	}
 	if len(pq.Terms) == 0 && len(pq.Dirs) == 1 {
 		return vol.scanPathTermLimited(pq, pq.Dirs[0], pq.Limit), true
-	}
-	if pq.MatchPath && len(pq.Terms) == 1 && len(pq.Dirs) == 0 {
-		return vol.scanPathTermLimited(pq, pq.Terms[0], pq.Limit), true
 	}
 	return nil, false
 }
@@ -7456,20 +9869,24 @@ func (vol *serviceVolumeIndex) scanOrderedLimitedRange(pq parsedQuery, start, en
 
 func (vol *serviceVolumeIndex) cachedMultiNameTermCandidates(terms []string) ([]int, bool) {
 	vol.termMu.Lock()
-	if vol.termCache == nil || vol.termSeq == nil {
+	if vol.termCache == nil {
 		vol.termMu.Unlock()
 		return nil, false
 	}
 	lists := make([][]int, 0, len(terms))
 	seqs := make([]uint64, 0, len(terms))
 	for _, term := range terms {
-		list, ok := vol.termCache[term]
+		entry, ok := vol.termCache[term]
 		if !ok {
 			vol.termMu.Unlock()
 			return nil, false
 		}
-		lists = append(lists, append([]int(nil), list...))
-		seqs = append(seqs, vol.termSeq[term])
+		if !vol.cacheStampValid(entry.gen) {
+			vol.termMu.Unlock()
+			return nil, false
+		}
+		lists = append(lists, append([]int(nil), entry.ids...))
+		seqs = append(seqs, entry.gen)
 	}
 	vol.termMu.Unlock()
 	for i, term := range terms {
@@ -7714,11 +10131,16 @@ func (vol *serviceVolumeIndex) underRootIDs(under string) []int {
 		return nil
 	}
 	cacheKey := strings.ToLower(filepath.Clean(under))
+	vol.termMu.Lock()
 	if vol.underRootCache != nil {
-		if roots, ok := vol.underRootCache[cacheKey]; ok {
-			return append([]int(nil), roots...)
+		if entry, ok := vol.underRootCache[cacheKey]; ok {
+			if vol.cacheStampValid(entry.gen) {
+				vol.termMu.Unlock()
+				return append([]int(nil), entry.ids...)
+			}
 		}
 	}
+	vol.termMu.Unlock()
 	var roots []int
 	volume := filepath.VolumeName(under)
 	rest := strings.TrimPrefix(under, volume)
@@ -7794,10 +10216,12 @@ func (vol *serviceVolumeIndex) cacheUnderRoots(key string, roots []int) {
 	if key == "" {
 		return
 	}
+	vol.termMu.Lock()
+	defer vol.termMu.Unlock()
 	if vol.underRootCache == nil {
-		vol.underRootCache = make(map[string][]int)
+		vol.underRootCache = make(map[string]postingCacheEntry)
 	}
-	vol.underRootCache[key] = append([]int(nil), roots...)
+	vol.underRootCache[key] = postingCacheEntry{ids: append([]int(nil), roots...), gen: vol.cacheGeneration()}
 }
 
 func (vol *serviceVolumeIndex) underLimitedTermCandidates(roots []int, pq parsedQuery) ([]int, bool) {
@@ -7961,6 +10385,7 @@ func (vol *serviceVolumeIndex) underRootIDsByBasename(under string) []int {
 
 func (vol *serviceVolumeIndex) filterUnderRootCandidates(candidates []int, base, cleanUnder string) []int {
 	out := make([]int, 0, 1)
+	pathCache := make(map[int]string)
 	for _, id := range candidates {
 		if id < 0 || id >= vol.index.compactRecordCount() {
 			continue
@@ -7969,7 +10394,7 @@ func (vol *serviceVolumeIndex) filterUnderRootCandidates(candidates []int, base,
 		if rec.Deleted || rec.Mode&uint32(os.ModeDir) == 0 || vol.index.compactLowerNameAt(id) != base {
 			continue
 		}
-		path := vol.index.reconstructCompactPathCached(id, vol.pathCache)
+		path := vol.index.reconstructCompactPathCached(id, pathCache)
 		if strings.EqualFold(filepath.Clean(path), cleanUnder) {
 			out = append(out, id)
 		}
@@ -8047,19 +10472,47 @@ func (vol *serviceVolumeIndex) isDescendantOrSelf(id, rootID int) bool {
 	return false
 }
 
+func (vol *serviceVolumeIndex) isDescendantOrSelfAnyFast(id int, roots []int) bool {
+	if vol == nil || vol.index == nil || id < 0 || len(roots) == 0 {
+		return false
+	}
+	recordCount := vol.index.compactRecordCount()
+	cur := id
+	for depth := 0; depth < 1024; depth++ {
+		if cur < 0 || cur >= recordCount {
+			return false
+		}
+		for _, rootID := range roots {
+			if cur == rootID {
+				return true
+			}
+		}
+		parent := int(vol.index.compactRecord(cur).Parent)
+		if parent < 0 || parent == cur {
+			return false
+		}
+		cur = parent
+	}
+	return false
+}
+
 func (vol *serviceVolumeIndex) underDescendants(rootID int) []int {
 	if vol == nil || vol.index == nil || rootID < 0 || rootID >= vol.index.compactRecordCount() {
 		return nil
 	}
+	vol.termMu.Lock()
 	if vol.underCache != nil {
-		if cached, ok := vol.underCache[rootID]; ok {
-			seq := vol.underSeq[rootID]
-			return vol.withRecentCandidates(cached, seq, func(rec CompactRecord) bool {
-				id, ok := vol.idForFRN(rec.FRN)
-				return ok && vol.isDescendantOrSelf(id, rootID)
-			})
+		if entry, ok := vol.underCache[rootID]; ok {
+			if vol.cacheStampValid(entry.gen) {
+				vol.termMu.Unlock()
+				return vol.withRecentCandidates(entry.ids, entry.gen, func(rec CompactRecord) bool {
+					id, ok := vol.idForFRN(rec.FRN)
+					return ok && vol.isDescendantOrSelf(id, rootID)
+				})
+			}
 		}
 	}
+	vol.termMu.Unlock()
 	recordCount := vol.index.compactRecordCount()
 	out := make([]int, 0, 256)
 	if rootID < len(vol.subtreeStart) && rootID < len(vol.subtreeEnd) && len(vol.subtreeOrder) > 0 {
@@ -8110,15 +10563,13 @@ func (vol *serviceVolumeIndex) underDescendants(rootID int) []int {
 		return out
 	}
 	sort.Ints(out)
-	if len(out) <= serviceCachedPostingMaxIDs {
+	if vol.shouldCachePosting(out) {
+		vol.termMu.Lock()
 		if vol.underCache == nil {
-			vol.underCache = make(map[int][]int)
+			vol.underCache = make(map[int]postingCacheEntry)
 		}
-		if vol.underSeq == nil {
-			vol.underSeq = make(map[int]uint64)
-		}
-		vol.underCache[rootID] = out
-		vol.underSeq[rootID] = vol.recentSeq
+		vol.underCache[rootID] = postingCacheEntry{ids: out, gen: vol.cacheGeneration()}
+		vol.termMu.Unlock()
 	}
 	return out
 }
@@ -8800,13 +11251,14 @@ func (vol *serviceVolumeIndex) exactNameIDs(name string) []int {
 	cacheKey := "\x00exact:" + name
 	vol.termMu.Lock()
 	if vol.termCache != nil {
-		if list, ok := vol.termCache[cacheKey]; ok {
-			seq := vol.termSeq[cacheKey]
-			vol.termMu.Unlock()
-			return vol.withRecentCandidates(list, seq, func(rec CompactRecord) bool {
-				id, ok := vol.idForFRN(rec.FRN)
-				return ok && vol.index.compactLowerNameAt(id) == name
-			})
+		if entry, ok := vol.termCache[cacheKey]; ok {
+			if vol.cacheStampValid(entry.gen) {
+				vol.termMu.Unlock()
+				return vol.withRecentCandidates(entry.ids, entry.gen, func(rec CompactRecord) bool {
+					id, ok := vol.idForFRN(rec.FRN)
+					return ok && vol.index.compactLowerNameAt(id) == name
+				})
+			}
 		}
 	}
 	vol.termMu.Unlock()
@@ -8846,7 +11298,7 @@ func (vol *serviceVolumeIndex) exactNameIDs(name string) []int {
 
 func (vol *serviceVolumeIndex) scanExactNameIDs(name string) []int {
 	if ext := strings.TrimPrefix(filepath.Ext(name), "."); ext != "" && vol.queryIndex != nil {
-		if extIDs := vol.queryIndex.ext[strings.ToLower(ext)]; len(extIDs) > 0 {
+		if extIDs := vol.extPosting32(ext); len(extIDs) > 0 {
 			out := make([]int, 0, 4)
 			for _, id32 := range extIDs {
 				id := int(id32)
@@ -8885,15 +11337,16 @@ func (vol *serviceVolumeIndex) scanExactNameIDs(name string) []int {
 func (vol *serviceVolumeIndex) nameTermPosting(term string) []int {
 	vol.termMu.Lock()
 	if vol.termCache == nil {
-		vol.termCache = make(map[string][]int)
+		vol.termCache = make(map[string]postingCacheEntry)
 	}
-	if list, ok := vol.termCache[term]; ok {
-		seq := vol.termSeq[term]
-		vol.termMu.Unlock()
-		return vol.withRecentCandidates(list, seq, func(rec CompactRecord) bool {
-			id, ok := vol.idForFRN(rec.FRN)
-			return ok && strings.Contains(vol.index.compactLowerNameAt(id), term)
-		})
+	if entry, ok := vol.termCache[term]; ok {
+		if vol.cacheStampValid(entry.gen) {
+			vol.termMu.Unlock()
+			return vol.withRecentCandidates(entry.ids, entry.gen, func(rec CompactRecord) bool {
+				id, ok := vol.idForFRN(rec.FRN)
+				return ok && strings.Contains(vol.index.compactLowerNameAt(id), term)
+			})
+		}
 	}
 	vol.termMu.Unlock()
 	list := vol.scanNameTermPosting(term)
@@ -8901,8 +11354,48 @@ func (vol *serviceVolumeIndex) nameTermPosting(term string) []int {
 	return list
 }
 
+func postingListCacheMaxBytes() int64 {
+	maxBytes := postingBlockCacheMaxBytes()
+	if maxBytes <= 0 {
+		return 0
+	}
+	return maxBytes / 4
+}
+
+func postingListBytes(list []int) int64 {
+	return int64(len(list)) * int64(unsafe.Sizeof(int(0)))
+}
+
 func (vol *serviceVolumeIndex) shouldCachePosting(list []int) bool {
-	return len(list) <= serviceCachedPostingMaxIDs
+	maxBytes := postingListCacheMaxBytes()
+	return maxBytes > 0 && postingListBytes(list) <= maxBytes
+}
+
+func postingEntryCacheBytes(cache map[string]postingCacheEntry) int64 {
+	var total int64
+	for _, entry := range cache {
+		total += postingListBytes(entry.ids)
+	}
+	return total
+}
+
+func postingRootCacheBytes(cache map[int]postingCacheEntry) int64 {
+	var total int64
+	for _, entry := range cache {
+		total += postingListBytes(entry.ids)
+	}
+	return total
+}
+
+func (vol *serviceVolumeIndex) postingListCacheBytesLocked() int64 {
+	if vol == nil {
+		return 0
+	}
+	return postingEntryCacheBytes(vol.termCache) +
+		postingEntryCacheBytes(vol.pathTermCache) +
+		postingEntryCacheBytes(vol.extCache) +
+		postingEntryCacheBytes(vol.underRootCache) +
+		postingRootCacheBytes(vol.underCache)
 }
 
 func (vol *serviceVolumeIndex) cacheNamePosting(term string, list []int) {
@@ -8911,13 +11404,9 @@ func (vol *serviceVolumeIndex) cacheNamePosting(term string, list []int) {
 	}
 	vol.termMu.Lock()
 	if vol.termCache == nil {
-		vol.termCache = make(map[string][]int)
+		vol.termCache = make(map[string]postingCacheEntry)
 	}
-	vol.termCache[term] = list
-	if vol.termSeq == nil {
-		vol.termSeq = make(map[string]uint64)
-	}
-	vol.termSeq[term] = vol.recentSeq
+	vol.termCache[term] = postingCacheEntry{ids: list, gen: vol.cacheGeneration()}
 	vol.termMu.Unlock()
 }
 
@@ -8927,13 +11416,9 @@ func (vol *serviceVolumeIndex) cachePathPosting(term string, list []int) {
 	}
 	vol.termMu.Lock()
 	if vol.pathTermCache == nil {
-		vol.pathTermCache = make(map[string][]int)
+		vol.pathTermCache = make(map[string]postingCacheEntry)
 	}
-	vol.pathTermCache[term] = list
-	if vol.pathTermSeq == nil {
-		vol.pathTermSeq = make(map[string]uint64)
-	}
-	vol.pathTermSeq[term] = vol.recentSeq
+	vol.pathTermCache[term] = postingCacheEntry{ids: list, gen: vol.cacheGeneration()}
 	vol.termMu.Unlock()
 }
 
@@ -8943,13 +11428,9 @@ func (vol *serviceVolumeIndex) cacheExtPosting(ext string, list []int) {
 	}
 	vol.termMu.Lock()
 	if vol.extCache == nil {
-		vol.extCache = make(map[string][]int)
+		vol.extCache = make(map[string]postingCacheEntry)
 	}
-	vol.extCache[ext] = list
-	if vol.extSeq == nil {
-		vol.extSeq = make(map[string]uint64)
-	}
-	vol.extSeq[ext] = vol.recentSeq
+	vol.extCache[ext] = postingCacheEntry{ids: list, gen: vol.cacheGeneration()}
 	vol.termMu.Unlock()
 }
 
@@ -9005,15 +11486,16 @@ func (vol *serviceVolumeIndex) scanNameTermPosting(term string) []int {
 func (vol *serviceVolumeIndex) pathTermPosting(term string) []int {
 	vol.termMu.Lock()
 	if vol.pathTermCache == nil {
-		vol.pathTermCache = make(map[string][]int)
+		vol.pathTermCache = make(map[string]postingCacheEntry)
 	}
-	if list, ok := vol.pathTermCache[term]; ok {
-		seq := vol.pathTermSeq[term]
-		vol.termMu.Unlock()
-		return vol.withRecentCandidates(list, seq, func(rec CompactRecord) bool {
-			id, ok := vol.idForFRN(rec.FRN)
-			return ok && vol.index.compactPathContainsTerm(id, term)
-		})
+	if entry, ok := vol.pathTermCache[term]; ok {
+		if vol.cacheStampValid(entry.gen) {
+			vol.termMu.Unlock()
+			return vol.withRecentCandidates(entry.ids, entry.gen, func(rec CompactRecord) bool {
+				id, ok := vol.idForFRN(rec.FRN)
+				return ok && vol.index.compactPathContainsTerm(id, term)
+			})
+		}
 	}
 	vol.termMu.Unlock()
 
@@ -9075,13 +11557,14 @@ func (vol *serviceVolumeIndex) pathComponentPosting(term string) []int {
 	cacheKey := "\x00pathcomponent:" + term
 	vol.termMu.Lock()
 	if vol.pathTermCache != nil {
-		if list, ok := vol.pathTermCache[cacheKey]; ok {
-			seq := vol.pathTermSeq[cacheKey]
-			vol.termMu.Unlock()
-			return vol.withRecentCandidates(list, seq, func(rec CompactRecord) bool {
-				id, ok := vol.idForFRN(rec.FRN)
-				return ok && vol.index.compactPathContainsTerm(id, term)
-			})
+		if entry, ok := vol.pathTermCache[cacheKey]; ok {
+			if vol.cacheStampValid(entry.gen) {
+				vol.termMu.Unlock()
+				return vol.withRecentCandidates(entry.ids, entry.gen, func(rec CompactRecord) bool {
+					id, ok := vol.idForFRN(rec.FRN)
+					return ok && vol.index.compactPathContainsTerm(id, term)
+				})
+			}
 		}
 	}
 	vol.termMu.Unlock()
@@ -9107,11 +11590,34 @@ func (vol *serviceVolumeIndex) pathComponentPosting(term string) []int {
 	return out
 }
 
+func (vol *serviceVolumeIndex) pathComponentPostingAvailable(term string) bool {
+	if vol == nil || vol.index == nil || term == "" {
+		return false
+	}
+	if strings.ContainsAny(term, `\/*?[]:`) {
+		return true
+	}
+	if len(vol.componentPosting32(term)) > 0 {
+		return true
+	}
+	if len(vol.exactNameIDs(strings.ToLower(term))) > 0 {
+		return true
+	}
+	return vol.queryIndex != nil && vol.queryIndex.pathGrams != nil
+}
+
 func (vol *serviceVolumeIndex) pathComponentRootIDs(term string) []int {
 	if vol == nil || vol.index == nil || term == "" {
 		return nil
 	}
 	term = strings.ToLower(term)
+	if ids := vol.componentPosting32(term); len(ids) > 0 {
+		out := make([]int, 0, len(ids))
+		for _, id := range ids {
+			out = append(out, int(id))
+		}
+		return out
+	}
 	if vol.queryIndex == nil {
 		return vol.exactNameIDs(term)
 	}
@@ -9225,30 +11731,28 @@ func (vol *serviceVolumeIndex) pathTermRootIDs(term string) []int {
 }
 
 func (vol *serviceVolumeIndex) extPosting(ext string) []int {
-	if vol.queryIndex != nil && vol.queryIndex.ext != nil {
-		if ids32, ok := vol.queryIndex.ext[strings.ToLower(ext)]; ok {
-			list := make([]int, 0, len(ids32))
-			for _, id := range ids32 {
-				list = append(list, int(id))
-			}
-			return vol.withRecentCandidates(list, 0, func(rec CompactRecord) bool {
+	if ids32 := vol.extPosting32(ext); ids32 != nil {
+		list := make([]int, 0, len(ids32))
+		for _, id := range ids32 {
+			list = append(list, int(id))
+		}
+		return vol.withRecentCandidates(list, 0, func(rec CompactRecord) bool {
+			actual := strings.TrimPrefix(filepath.Ext(rec.Name), ".")
+			return strings.EqualFold(actual, ext)
+		})
+	}
+	vol.termMu.Lock()
+	if vol.extCache == nil {
+		vol.extCache = make(map[string]postingCacheEntry)
+	}
+	if entry, ok := vol.extCache[ext]; ok {
+		if vol.cacheStampValid(entry.gen) {
+			vol.termMu.Unlock()
+			return vol.withRecentCandidates(entry.ids, entry.gen, func(rec CompactRecord) bool {
 				actual := strings.TrimPrefix(filepath.Ext(rec.Name), ".")
 				return strings.EqualFold(actual, ext)
 			})
 		}
-		return nil
-	}
-	vol.termMu.Lock()
-	if vol.extCache == nil {
-		vol.extCache = make(map[string][]int)
-	}
-	if list, ok := vol.extCache[ext]; ok {
-		seq := vol.extSeq[ext]
-		vol.termMu.Unlock()
-		return vol.withRecentCandidates(list, seq, func(rec CompactRecord) bool {
-			actual := strings.TrimPrefix(filepath.Ext(rec.Name), ".")
-			return strings.EqualFold(actual, ext)
-		})
 	}
 	vol.termMu.Unlock()
 
@@ -9267,32 +11771,219 @@ func (vol *serviceVolumeIndex) extPosting(ext string) []int {
 	return list
 }
 
+func (vol *serviceVolumeIndex) extPosting32(ext string) []uint32 {
+	if vol == nil {
+		return nil
+	}
+	key := strings.ToLower(ext)
+	if vol.index != nil && vol.index.Derived.Postings != nil {
+		if ids := vol.index.Derived.Postings[indexSectionPEXT].stringPosting(key); ids != nil {
+			return ids
+		}
+	}
+	if vol.queryIndex != nil && vol.queryIndex.ext != nil {
+		if ids, ok := vol.queryIndex.ext[key]; ok {
+			return ids
+		}
+	}
+	return nil
+}
+
+func (vol *serviceVolumeIndex) extPostingCountCandidate(ext string) (postingCountCandidate, bool) {
+	if vol == nil {
+		return postingCountCandidate{}, false
+	}
+	key := strings.ToLower(ext)
+	if vol.index != nil && vol.index.Derived.Postings != nil {
+		if section, exists := vol.index.Derived.Postings[indexSectionPEXT]; exists {
+			if it, count, ok := section.stringPostingIterator(key); ok {
+				return postingCountCandidate{it: it, count: count, mapped: true}, true
+			}
+			return postingCountCandidate{mapped: true}, true
+		}
+	}
+	if vol.queryIndex != nil && vol.queryIndex.ext != nil {
+		if ids, ok := vol.queryIndex.ext[key]; ok {
+			return postingCountCandidate{ids: ids}, true
+		}
+		return postingCountCandidate{}, true
+	}
+	return postingCountCandidate{}, false
+}
+
+func (vol *serviceVolumeIndex) extPostingCount(ext string) int {
+	candidate, ok := vol.extPostingCountCandidate(ext)
+	if !ok {
+		return 0
+	}
+	return candidate.len()
+}
+
+func (vol *serviceVolumeIndex) componentPosting32(component string) []uint32 {
+	if vol == nil {
+		return nil
+	}
+	key := strings.ToLower(component)
+	if vol.index != nil && vol.index.Derived.Postings != nil {
+		if ids := vol.index.Derived.Postings[indexSectionPCMP].stringPosting(key); ids != nil {
+			return ids
+		}
+	}
+	if vol.queryIndex != nil && vol.queryIndex.components != nil {
+		if ids, ok := vol.queryIndex.components[key]; ok {
+			return ids
+		}
+	}
+	return nil
+}
+
+func (vol *serviceVolumeIndex) componentPostingBlockIterator(component string) (postingBlockIterator, int, bool) {
+	if vol == nil || vol.index == nil || vol.index.Derived.Postings == nil {
+		return postingBlockIterator{}, 0, false
+	}
+	key := strings.ToLower(component)
+	return vol.index.Derived.Postings[indexSectionPCMP].stringPostingIterator(key)
+}
+
+func (vol *serviceVolumeIndex) componentPostingCount(component string) int {
+	candidate, ok := vol.componentPostingCountCandidate(component)
+	if !ok {
+		return 0
+	}
+	return candidate.len()
+}
+
+func (vol *serviceVolumeIndex) componentPostingCountCandidate(component string) (postingCountCandidate, bool) {
+	if vol == nil {
+		return postingCountCandidate{}, false
+	}
+	key := strings.ToLower(component)
+	if vol.index != nil && vol.index.Derived.Postings != nil {
+		if section, exists := vol.index.Derived.Postings[indexSectionPCMP]; exists {
+			if it, count, ok := section.stringPostingIterator(key); ok {
+				return postingCountCandidate{it: it, count: count, mapped: true}, true
+			}
+			return postingCountCandidate{mapped: true}, true
+		}
+	}
+	if vol.queryIndex != nil && vol.queryIndex.components != nil {
+		if ids, ok := vol.queryIndex.components[key]; ok {
+			return postingCountCandidate{ids: ids}, true
+		}
+		return postingCountCandidate{}, true
+	}
+	return postingCountCandidate{}, false
+}
+
 func (vol *serviceVolumeIndex) extTopPosting(ext string, limit int) ([]int, bool) {
-	if vol == nil || vol.queryIndex == nil || vol.queryIndex.extTop == nil || limit <= 0 {
+	if vol == nil || vol.queryIndex == nil || limit <= 0 {
 		return nil, false
 	}
-	ids32, ok := vol.queryIndex.extTop[strings.ToLower(ext)]
-	if !ok || len(ids32) < limit {
+	if vol.queryIndex.extTop != nil {
+		ids32, ok := vol.queryIndex.extTop[strings.ToLower(ext)]
+		if !ok || len(ids32) < limit {
+			return nil, false
+		}
+		list := make([]int, 0, len(ids32)+len(vol.recentIDs))
+		seen := make(map[int]struct{}, len(ids32)+len(vol.recentIDs))
+		for _, id32 := range ids32 {
+			id := int(id32)
+			list = append(list, id)
+			seen[id] = struct{}{}
+		}
+		for id := range vol.recentIDs {
+			if _, exists := seen[id]; exists || id < 0 || id >= vol.index.compactRecordCount() {
+				continue
+			}
+			rec := vol.index.compactRecord(id)
+			actual := strings.TrimPrefix(filepath.Ext(rec.Name), ".")
+			if strings.EqualFold(actual, ext) {
+				list = append(list, id)
+			}
+		}
+		return topCandidateIDsByRank(list, limit, vol.index, vol.nameOrderRanks()), true
+	}
+	if ids, ok := vol.mappedExtTopPosting(ext, limit); ok {
+		return ids, true
+	}
+	return nil, false
+}
+
+func (vol *serviceVolumeIndex) mappedExtTopPosting(ext string, limit int) ([]int, bool) {
+	if limit <= 0 || limit > serviceExtTopPostingLimit {
 		return nil, false
 	}
-	list := make([]int, 0, len(ids32)+len(vol.recentIDs))
-	seen := make(map[int]struct{}, len(ids32)+len(vol.recentIDs))
-	for _, id32 := range ids32 {
-		id := int(id32)
-		list = append(list, id)
-		seen[id] = struct{}{}
+	candidate, ok := vol.extPostingCountCandidate(ext)
+	if !ok || !candidate.mapped || candidate.len() == 0 {
+		return nil, false
+	}
+	ranks := vol.nameOrderRanks()
+	blocks := candidate.it.rankOrderedBlockRefs()
+	if len(blocks) == 0 {
+		return nil, false
+	}
+	h := make(extRankMaxHeap, 0, limit)
+	recordCount := vol.index.compactRecordCount()
+	for _, ref := range blocks {
+		if len(h) >= limit && ref.meta.minRank > h[0].rank {
+			break
+		}
+		ids, _, ok := candidate.it.blockAt(ref.index)
+		if !ok {
+			return nil, false
+		}
+		for _, id := range ids {
+			if int(id) < 0 || int(id) >= recordCount {
+				continue
+			}
+			rec := vol.index.compactRecord(int(id))
+			if rec.Deleted {
+				continue
+			}
+			item := extRankItem{id: id, rank: extRankOf(id, ranks)}
+			if len(h) < limit {
+				heap.Push(&h, item)
+				continue
+			}
+			if extRankLess(item, h[0]) {
+				h[0] = item
+				heap.Fix(&h, 0)
+			}
+		}
+	}
+	if len(h) == 0 {
+		return []int{}, true
+	}
+	top := make([]uint32, len(h), len(h)+len(vol.recentIDs))
+	seen := make(map[uint32]struct{}, len(h)+len(vol.recentIDs))
+	for i := range h {
+		top[i] = h[i].id
+		seen[h[i].id] = struct{}{}
 	}
 	for id := range vol.recentIDs {
-		if _, exists := seen[id]; exists || id < 0 || id >= vol.index.compactRecordCount() {
+		if id < 0 || id >= recordCount {
+			continue
+		}
+		id32 := uint32(id)
+		if _, exists := seen[id32]; exists {
 			continue
 		}
 		rec := vol.index.compactRecord(id)
 		actual := strings.TrimPrefix(filepath.Ext(rec.Name), ".")
-		if strings.EqualFold(actual, ext) {
-			list = append(list, id)
+		if rec.Deleted || !strings.EqualFold(actual, ext) {
+			continue
 		}
+		top = append(top, id32)
 	}
-	return topCandidateIDsByRank(list, limit, vol.index, vol.nameOrderRanks()), true
+	sortExtTopByRank(top, ranks)
+	if len(top) > limit {
+		top = top[:limit]
+	}
+	out := make([]int, len(top))
+	for i, id := range top {
+		out[i] = int(id)
+	}
+	return out, true
 }
 
 func (vol *serviceVolumeIndex) extTopPathTermCandidates(ext string, terms []string, limit int) ([]int, bool) {
@@ -9331,13 +12022,47 @@ func (vol *serviceVolumeIndex) extTopPathTermCandidates(ext string, terms []stri
 		}
 		out = append(out, id)
 	}
-	if len(out) < limit {
+	if len(out) < limit && len(ids32) >= serviceExtTopPostingLimit {
 		return nil, false
 	}
 	return topCandidateIDsByRank(out, limit, vol.index, vol.nameOrderRanks()), true
 }
 
+func (vol *serviceVolumeIndex) extPostingPathTermCandidates(ext string, terms []string, limit int) ([]int, bool) {
+	if vol == nil || vol.index == nil || limit <= 0 || len(terms) == 0 {
+		return nil, false
+	}
+	ids := vol.extPosting(ext)
+	if len(ids) == 0 || len(ids) > serviceComponentMultiTermScanMaxIDs {
+		return nil, false
+	}
+	out := make([]int, 0, min(limit, len(ids)))
+	for _, id := range ids {
+		if id < 0 || id >= vol.index.compactRecordCount() {
+			continue
+		}
+		rec := vol.index.compactRecord(id)
+		if rec.Deleted || !vol.index.compactPathContainsAll(id, terms) {
+			continue
+		}
+		out = append(out, id)
+	}
+	if len(out) == 0 {
+		return []int{}, true
+	}
+	return topCandidateIDsByRank(out, limit, vol.index, vol.nameOrderRanks()), true
+}
+
 func (vol *serviceVolumeIndex) withRecentCandidates(base []int, seq uint64, keep func(CompactRecord) bool) []int {
+	if vol == nil {
+		return base
+	}
+	if engineV9Enabled() {
+		if seq == 0 || seq == vol.cacheGeneration() {
+			return base
+		}
+		return base
+	}
 	if len(vol.recentIDs) == 0 || seq == vol.recentSeq {
 		return base
 	}
@@ -9357,6 +12082,26 @@ func (vol *serviceVolumeIndex) withRecentCandidates(base []int, seq uint64, keep
 	}
 	sort.Ints(out)
 	return out
+}
+
+func (vol *serviceVolumeIndex) cacheGeneration() uint64 {
+	if vol == nil {
+		return 0
+	}
+	if engineV9Enabled() {
+		if snap := vol.snap.Load(); snap != nil {
+			return snap.gen
+		}
+		return vol.snapshotGen.Load()
+	}
+	return vol.recentSeq
+}
+
+func (vol *serviceVolumeIndex) cacheStampValid(stamp uint64) bool {
+	if vol == nil || !engineV9Enabled() {
+		return true
+	}
+	return stamp == vol.cacheGeneration()
 }
 
 func intersectSortedInts(a, b []int) []int {
@@ -9390,6 +12135,69 @@ func intersectSortedUint32s(a, b []uint32) []uint32 {
 			i++
 		default:
 			j++
+		}
+	}
+	return out
+}
+
+func materializePostingBlockIterator(it postingBlockIterator, count int) []uint32 {
+	if count <= 0 {
+		return nil
+	}
+	out := make([]uint32, 0, count)
+	for it.next < it.end {
+		ids, _, ok := it.nextBlock()
+		if !ok {
+			return nil
+		}
+		out = append(out, ids...)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func intersectSortedUint32sWithPostingIterator(a []uint32, it postingBlockIterator) []uint32 {
+	out := a[:0]
+	cursor := 0
+	for cursor < len(a) && it.next < it.end {
+		block, meta, ok := it.nextBlock()
+		if !ok {
+			return nil
+		}
+		if len(block) == 0 {
+			continue
+		}
+		for cursor < len(a) && a[cursor] < meta.minID {
+			cursor++
+		}
+		if cursor >= len(a) {
+			break
+		}
+		if a[cursor] > meta.maxID {
+			continue
+		}
+		j := 0
+		for cursor < len(a) && j < len(block) {
+			av := a[cursor]
+			if av > meta.maxID {
+				break
+			}
+			bv := block[j]
+			switch {
+			case av == bv:
+				out = append(out, av)
+				cursor++
+				j++
+			case av < bv:
+				cursor++
+			default:
+				j++
+			}
+		}
+		for cursor < len(a) && a[cursor] <= meta.maxID {
+			cursor++
 		}
 	}
 	return out
@@ -9498,7 +12306,7 @@ func parseQuery(opts queryOptions) (parsedQuery, error) {
 }
 
 func promotePathExtensionTerms(pq *parsedQuery) {
-	if pq == nil || !pq.MatchPath || len(pq.Terms) < 2 {
+	if pq == nil || (!pq.MatchPath && len(pq.Dirs) == 0 && pq.Under == "") {
 		return
 	}
 	terms := pq.Terms[:0]
@@ -9510,15 +12318,87 @@ func promotePathExtensionTerms(pq *parsedQuery) {
 		terms = append(terms, term)
 	}
 	pq.Terms = terms
+	promotePathBareExtensionTerms(pq)
+}
+
+func promotePathBareExtensionTerms(pq *parsedQuery) {
+	if pq == nil || (!pq.MatchPath && len(pq.Dirs) == 0 && pq.Under == "") {
+		return
+	}
+	hasPathAnchor := pq.Under != "" || len(pq.Dirs) > 0
+	for _, term := range pq.Terms {
+		if isVolumeQueryTerm(term) || commonPathBareExtensionTerm(term) || strings.ContainsAny(term, `\/*?[]:.`) {
+			continue
+		}
+		if len(term) >= 3 {
+			hasPathAnchor = true
+			break
+		}
+	}
+	if !hasPathAnchor {
+		return
+	}
+	terms := pq.Terms[:0]
+	for _, term := range pq.Terms {
+		if commonPathBareExtensionTerm(term) {
+			pq.Exts = append(pq.Exts, term)
+			continue
+		}
+		terms = append(terms, term)
+	}
+	pq.Terms = terms
+}
+
+func commonPathBareExtensionTerm(term string) bool {
+	switch strings.ToLower(term) {
+	case "md", "nrrd", "raw", "pdf", "json", "go", "py", "txt", "csv", "tsv",
+		"doc", "docx", "xls", "xlsx", "ppt", "pptx", "png", "jpg", "jpeg",
+		"zip", "whl", "toml", "yaml", "yml", "xml", "html", "css", "js", "ts":
+		return true
+	default:
+		return false
+	}
 }
 
 func queryLooksPathScoped(query string) bool {
 	for _, field := range strings.Fields(query) {
+		if isVolumeQueryTerm(field) {
+			return true
+		}
 		if strings.ContainsAny(field, `\/`) {
 			return true
 		}
 	}
 	return false
+}
+
+func queryLooksLoosePathScoped(query string) bool {
+	fields := strings.Fields(query)
+	plain := 0
+	for _, field := range fields {
+		if strings.HasPrefix(field, "!") || strings.HasPrefix(field, "-") {
+			continue
+		}
+		raw := strings.TrimLeft(field, "!-")
+		if raw == "" {
+			continue
+		}
+		key, value, hasPrefix := strings.Cut(raw, ":")
+		if hasPrefix {
+			switch strings.ToLower(strings.TrimSpace(key)) {
+			case "path", "fullpath", "full-path", "full_path", "fullpathname", "full-path-name", "location":
+				return true
+			case "ext", "extension", "glob", "regex", "size", "sz", "dm", "date", "date-modified", "datemodified", "modified", "type", "case":
+				continue
+			}
+			if value != "" {
+				plain++
+			}
+			continue
+		}
+		plain++
+	}
+	return plain >= 2
 }
 
 func dottedExtensionTerm(term string) (string, bool) {
@@ -10421,17 +13301,22 @@ func readIndex(r io.Reader) (*Index, error) {
 	if err := binary.Read(r, binary.LittleEndian, &header); err != nil {
 		return nil, err
 	}
-	if header.Magic != indexMagic {
+	sectionTableOffset := uint64(0)
+	if header.Magic == indexMagicV9 {
+		if err := binary.Read(r, binary.LittleEndian, &sectionTableOffset); err != nil {
+			return nil, err
+		}
+	} else if header.Magic != indexMagic {
 		return nil, errors.New("unsupported index format")
 	}
-	if header.Version != indexVersion {
+	if header.Version != indexVersion && header.Version != indexVersionV9 {
 		return nil, fmt.Errorf("unsupported index version %d", header.Version)
 	}
 	if header.EntryCount > uint64(^uint(0)>>1) || header.RootCount > uint64(^uint(0)>>1) {
 		return nil, errors.New("index too large")
 	}
 	idx := &Index{
-		Version:    indexVersion,
+		Version:    int(header.Version),
 		BuiltAt:    time.Unix(0, header.BuiltUnix),
 		Roots:      make([]string, int(header.RootCount)),
 		JournalID:  header.JournalID,
@@ -10523,6 +13408,7 @@ func readIndex(r io.Reader) (*Index, error) {
 		for i := range idx.CompactNameOrder {
 			idx.CompactNameOrder[i] = i
 		}
+		_ = sectionTableOffset
 		return idx, nil
 	}
 	idx.Entries = make([]Entry, int(header.EntryCount))
@@ -10697,10 +13583,14 @@ func saveIndex(path string, idx *Index) error {
 		return err
 	}
 	tmp := f.Name()
-	bw := bufio.NewWriterSize(f, 16*1024*1024)
-	err = writeIndex(bw, idx)
-	if flushErr := bw.Flush(); err == nil {
-		err = flushErr
+	if engineV9Enabled() && idx.Compact {
+		err = writeIndexV9File(f, idx)
+	} else {
+		bw := bufio.NewWriterSize(f, 16*1024*1024)
+		err = writeIndex(bw, idx)
+		if flushErr := bw.Flush(); err == nil {
+			err = flushErr
+		}
 	}
 	syncErr := f.Sync()
 	closeErr := f.Close()
@@ -10729,6 +13619,517 @@ func saveIndex(path string, idx *Index) error {
 		_ = dir.Close()
 	}
 	return nil
+}
+
+type countingWriter struct {
+	w io.Writer
+	n int64
+}
+
+func (cw *countingWriter) Write(p []byte) (int, error) {
+	n, err := cw.w.Write(p)
+	cw.n += int64(n)
+	return n, err
+}
+
+type indexSectionBlob struct {
+	tag   uint32
+	data  []byte
+	flags uint32
+}
+
+func writeIndexV9File(f *os.File, idx *Index) error {
+	bw := bufio.NewWriterSize(f, 16*1024*1024)
+	cw := &countingWriter{w: bw}
+	sectionOffsetPatch := int64(binary.Size(diskHeader{}))
+	header := diskHeader{
+		Magic:      indexMagicV9,
+		Version:    indexVersionV9,
+		EntryCount: uint64(idx.compactRecordCount()),
+		RootCount:  uint64(len(idx.Roots)),
+		BuiltUnix:  idx.BuiltAt.UnixNano(),
+		JournalID:  idx.JournalID,
+		Checkpoint: idx.Checkpoint,
+		Compact:    compactDiskFlag,
+	}
+	recordCount := idx.compactRecordCount()
+	nameIDs := make(map[string]uint32, max(1, recordCount/2))
+	nameBlob := make([]byte, 0, recordCount*16)
+	nameOffs := make([]uint32, 0, recordCount)
+	nameLens := make([]uint16, 0, recordCount)
+	nameTokens := make([]string, 0, recordCount)
+	nameIDForRecord := make([]uint32, recordCount)
+	for i := 0; i < recordCount; i++ {
+		rec := idx.compactRecord(i)
+		if len(rec.Name) > int(^uint16(0)) {
+			return errors.New("compact name too large")
+		}
+		id, ok := nameIDs[rec.Name]
+		if !ok {
+			id = uint32(len(nameOffs))
+			nameIDs[rec.Name] = id
+			nameOffs = append(nameOffs, uint32(len(nameBlob)))
+			nameLens = append(nameLens, uint16(len(rec.Name)))
+			nameTokens = append(nameTokens, rec.Name)
+			nameBlob = append(nameBlob, rec.Name...)
+		}
+		nameIDForRecord[i] = id
+	}
+	header.NameBlobLen = uint64(len(nameBlob))
+	header.TokenCount = uint64(len(nameOffs))
+	if compactNeedsWideDiskRecords(recordCount, len(nameOffs)) {
+		header.Compact |= compactDiskWideRefsFlag
+	}
+	if err := binary.Write(cw, binary.LittleEndian, header); err != nil {
+		return err
+	}
+	if err := binary.Write(cw, binary.LittleEndian, uint64(0)); err != nil {
+		return err
+	}
+	for _, s := range []string{idx.Source, idx.Volume, idx.ContentHash} {
+		if err := writeString(cw, s); err != nil {
+			return err
+		}
+	}
+	for _, root := range idx.Roots {
+		if err := writeString(cw, root); err != nil {
+			return err
+		}
+	}
+	wideRefs := header.Compact&compactDiskWideRefsFlag != 0
+	if _, err := cw.Write(nameBlob); err != nil {
+		return err
+	}
+	for i := range nameOffs {
+		if err := binary.Write(cw, binary.LittleEndian, nameOffs[i]); err != nil {
+			return err
+		}
+		if err := binary.Write(cw, binary.LittleEndian, nameLens[i]); err != nil {
+			return err
+		}
+	}
+	for i := 0; i < recordCount; i++ {
+		rec := idx.compactRecord(i)
+		rec.NameOff = nameIDForRecord[i]
+		parent := uint32(compactNarrowParentSentinel)
+		if wideRefs {
+			parent = compactWideParentSentinel
+		}
+		if rec.Parent >= 0 {
+			if !wideRefs && uint32(rec.Parent) >= compactNarrowParentSentinel {
+				return errors.New("compact index too large for packed record format")
+			}
+			parent = uint32(rec.Parent)
+		}
+		if err := binary.Write(cw, binary.LittleEndian, rec.FRN); err != nil {
+			return err
+		}
+		if err := binary.Write(cw, binary.LittleEndian, rec.ParentFRN); err != nil {
+			return err
+		}
+		if err := writeCompactRecordRefs(cw, parent, rec.NameOff, wideRefs); err != nil {
+			return err
+		}
+		if err := binary.Write(cw, binary.LittleEndian, rec.Mode); err != nil {
+			return err
+		}
+		if err := binary.Write(cw, binary.LittleEndian, rec.Size); err != nil {
+			return err
+		}
+		if err := binary.Write(cw, binary.LittleEndian, rec.ModUnix); err != nil {
+			return err
+		}
+		deleted := uint8(0)
+		if rec.Deleted {
+			deleted = 1
+		}
+		if err := binary.Write(cw, binary.LittleEndian, deleted); err != nil {
+			return err
+		}
+	}
+	sections := buildDerivedSectionBlobs(idx, nameTokens)
+	type tableEntry struct {
+		tag    uint32
+		offset uint64
+		length uint64
+		flags  uint32
+	}
+	table := make([]tableEntry, 0, len(sections))
+	for _, section := range sections {
+		if len(section.data) == 0 {
+			continue
+		}
+		if err := writeAlignment(cw, 8); err != nil {
+			return err
+		}
+		offset := uint64(cw.n)
+		if _, err := cw.Write(section.data); err != nil {
+			return err
+		}
+		table = append(table, tableEntry{tag: section.tag, offset: offset, length: uint64(len(section.data)), flags: section.flags})
+	}
+	if err := writeAlignment(cw, 8); err != nil {
+		return err
+	}
+	sectionTableOffset := uint64(cw.n)
+	if err := binary.Write(cw, binary.LittleEndian, uint32(len(table))); err != nil {
+		return err
+	}
+	for _, entry := range table {
+		if err := binary.Write(cw, binary.LittleEndian, entry.tag); err != nil {
+			return err
+		}
+		if err := binary.Write(cw, binary.LittleEndian, entry.offset); err != nil {
+			return err
+		}
+		if err := binary.Write(cw, binary.LittleEndian, entry.length); err != nil {
+			return err
+		}
+		if err := binary.Write(cw, binary.LittleEndian, entry.flags); err != nil {
+			return err
+		}
+	}
+	if err := bw.Flush(); err != nil {
+		return err
+	}
+	if _, err := f.Seek(sectionOffsetPatch, io.SeekStart); err != nil {
+		return err
+	}
+	var patch [8]byte
+	binary.LittleEndian.PutUint64(patch[:], sectionTableOffset)
+	if _, err := f.Write(patch[:]); err != nil {
+		return err
+	}
+	_, err := f.Seek(0, io.SeekEnd)
+	return err
+}
+
+func writeAlignment(w io.Writer, align int64) error {
+	if align <= 1 {
+		return nil
+	}
+	if cw, ok := w.(*countingWriter); ok {
+		pad := int((align - (cw.n % align)) % align)
+		if pad == 0 {
+			return nil
+		}
+		_, err := cw.Write(make([]byte, pad))
+		return err
+	}
+	return nil
+}
+
+func buildDerivedSectionBlobs(idx *Index, nameTokens []string) []indexSectionBlob {
+	if idx == nil || !idx.Compact {
+		return nil
+	}
+	vol := newServiceVolumeIndex("", idx)
+	if vol.queryIndex == nil {
+		vol.queryIndex = buildResidentQueryIndex(vol)
+	}
+	if len(vol.queryIndex.nameOrder) == 0 || len(vol.queryIndex.nameRank) == 0 {
+		vol.queryIndex.nameOrder, vol.queryIndex.nameRank = buildCompactNameOrderRank(idx)
+	}
+	if len(vol.childOffsets) == 0 || len(vol.childIDs) == 0 {
+		vol.buildCompactChildren()
+	}
+	out := make([]indexSectionBlob, 0, 5)
+	out = append(out, indexSectionBlob{tag: indexSectionRANK, data: encodeUint32Section(vol.queryIndex.nameOrder, vol.queryIndex.nameRank)})
+	out = append(out, indexSectionBlob{tag: indexSectionCHLD, data: encodeUint32Section(vol.childOffsets, vol.childIDs, vol.rootIDs)})
+	out = append(out, indexSectionBlob{tag: indexSectionSUBT, data: encodeUint32Section(vol.subtreeStart, vol.subtreeEnd, vol.subtreeOrder)})
+	out = append(out, indexSectionBlob{tag: indexSectionFRNS, data: encodeFRNSection(vol.frns, vol.frnRecordIDs)})
+	out = append(out, indexSectionBlob{tag: indexSectionLOWR, data: encodeLowerSection(nameTokens)})
+	out = append(out, indexSectionBlob{tag: indexSectionPEXT, data: encodeStringPostingSection(vol.queryIndex.ext, vol.queryIndex.nameRank)})
+	out = append(out, indexSectionBlob{tag: indexSectionPCMP, data: encodeStringPostingSection(vol.queryIndex.components, vol.queryIndex.nameRank)})
+	nameGrams := buildSelectiveNameTrigramIndex(idx, serviceLowMemoryTrigramStoredPostingMax())
+	out = append(out, indexSectionBlob{tag: indexSectionPNGR, data: encodeGramPostingSection(nameGrams, vol.queryIndex.nameRank)})
+	return out
+}
+
+func derivedSectionInfo(derived indexDerivedSections) ([]string, int) {
+	sections := make([]string, 0, 4)
+	bytes := 0
+	if len(derived.NameOrder) > 0 || len(derived.NameRank) > 0 {
+		sections = append(sections, "RANK")
+		bytes += 4 * (len(derived.NameOrder) + len(derived.NameRank))
+	}
+	if len(derived.ChildOffsets) > 0 || len(derived.ChildIDs) > 0 || len(derived.RootIDs) > 0 {
+		sections = append(sections, "CHLD")
+		bytes += 4 * (len(derived.ChildOffsets) + len(derived.ChildIDs) + len(derived.RootIDs))
+	}
+	if len(derived.SubtreeStart) > 0 || len(derived.SubtreeEnd) > 0 || len(derived.SubtreeOrder) > 0 {
+		sections = append(sections, "SUBT")
+		bytes += 4 * (len(derived.SubtreeStart) + len(derived.SubtreeEnd) + len(derived.SubtreeOrder))
+	}
+	if len(derived.FRNs) > 0 || len(derived.FRNRecordIDs) > 0 {
+		sections = append(sections, "FRNS")
+		bytes += 8*len(derived.FRNs) + 4*len(derived.FRNRecordIDs)
+	}
+	if len(derived.LowerOffs) > 0 || len(derived.LowerBlob) > 0 {
+		sections = append(sections, "LOWR")
+		bytes += 6*len(derived.LowerOffs) + len(derived.LowerBlob)
+	}
+	for _, item := range []struct {
+		tag  uint32
+		name string
+	}{
+		{indexSectionPEXT, "PEXT"},
+		{indexSectionPCMP, "PCMP"},
+		{indexSectionPNGR, "PNGR"},
+	} {
+		if posting, ok := derived.Postings[item.tag]; ok && posting.EntryCount > 0 {
+			sections = append(sections, item.name)
+			bytes += posting.Bytes
+		}
+	}
+	return sections, bytes
+}
+
+func encodeUint32Section(parts ...[]uint32) []byte {
+	var buf bytes.Buffer
+	for _, part := range parts {
+		_ = binary.Write(&buf, binary.LittleEndian, uint32(len(part)))
+		_ = binary.Write(&buf, binary.LittleEndian, part)
+	}
+	return buf.Bytes()
+}
+
+func encodeFRNSection(frns []uint64, ids []uint32) []byte {
+	if len(frns) == 0 || len(frns) != len(ids) {
+		return nil
+	}
+	var buf bytes.Buffer
+	_ = binary.Write(&buf, binary.LittleEndian, uint32(len(frns)))
+	_ = binary.Write(&buf, binary.LittleEndian, frns)
+	_ = binary.Write(&buf, binary.LittleEndian, uint32(len(ids)))
+	_ = binary.Write(&buf, binary.LittleEndian, ids)
+	return buf.Bytes()
+}
+
+func encodeLowerSection(nameTokens []string) []byte {
+	if len(nameTokens) == 0 {
+		return nil
+	}
+	offs := make([]uint32, len(nameTokens))
+	lens := make([]uint16, len(nameTokens))
+	blob := make([]byte, 0, len(nameTokens)*8)
+	refs := make(map[string]uint32, max(1, len(nameTokens)/2))
+	lengths := make(map[string]uint16, max(1, len(nameTokens)/2))
+	for i, name := range nameTokens {
+		lower := strings.ToLower(name)
+		if len(lower) > int(^uint16(0)) {
+			lower = lower[:int(^uint16(0))]
+		}
+		lens[i] = uint16(len(lower))
+		if lower == name {
+			offs[i] = packedLowerSameAsName
+			continue
+		}
+		if off, ok := refs[lower]; ok {
+			offs[i] = off
+			lens[i] = lengths[lower]
+			continue
+		}
+		off := uint32(len(blob))
+		refs[lower] = off
+		lengths[lower] = uint16(len(lower))
+		offs[i] = off
+		blob = append(blob, lower...)
+	}
+	var buf bytes.Buffer
+	_ = binary.Write(&buf, binary.LittleEndian, uint32(len(nameTokens)))
+	_ = binary.Write(&buf, binary.LittleEndian, uint32(len(blob)))
+	_ = binary.Write(&buf, binary.LittleEndian, offs)
+	_ = binary.Write(&buf, binary.LittleEndian, lens)
+	_, _ = buf.Write(blob)
+	return buf.Bytes()
+}
+
+type postingBlockMeta struct {
+	offset  uint64
+	length  uint32
+	count   uint32
+	minID   uint32
+	maxID   uint32
+	minRank uint32
+}
+
+type stringPostingEntry struct {
+	keyOff     uint32
+	keyLen     uint16
+	count      uint32
+	firstBlock uint32
+	blockCount uint32
+}
+
+type gramPostingEntry struct {
+	key        uint32
+	count      uint32
+	firstBlock uint32
+	blockCount uint32
+}
+
+func encodeStringPostingSection(postings map[string][]uint32, ranks []uint32) []byte {
+	if len(postings) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(postings))
+	for key, ids := range postings {
+		if key != "" && len(ids) > 0 {
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys)
+	entries := make([]stringPostingEntry, 0, len(keys))
+	var keyBlob bytes.Buffer
+	var blockBlob bytes.Buffer
+	blocks := make([]postingBlockMeta, 0, len(keys))
+	for _, key := range keys {
+		if len(key) > int(^uint16(0)) {
+			continue
+		}
+		ids := uniqueSortedUint32s(append([]uint32(nil), postings[key]...))
+		if len(ids) == 0 {
+			continue
+		}
+		entry := stringPostingEntry{
+			keyOff:     uint32(keyBlob.Len()),
+			keyLen:     uint16(len(key)),
+			count:      uint32(len(ids)),
+			firstBlock: uint32(len(blocks)),
+		}
+		_, _ = keyBlob.WriteString(key)
+		blocks = appendPostingBlocks(blocks, &blockBlob, ids, ranks)
+		entry.blockCount = uint32(len(blocks)) - entry.firstBlock
+		entries = append(entries, entry)
+	}
+	if len(entries) == 0 {
+		return nil
+	}
+	var buf bytes.Buffer
+	_ = binary.Write(&buf, binary.LittleEndian, uint32(len(entries)))
+	_ = binary.Write(&buf, binary.LittleEndian, uint32(keyBlob.Len()))
+	_ = binary.Write(&buf, binary.LittleEndian, uint32(len(blocks)))
+	_ = binary.Write(&buf, binary.LittleEndian, uint32(blockBlob.Len()))
+	for _, entry := range entries {
+		_ = binary.Write(&buf, binary.LittleEndian, entry.keyOff)
+		_ = binary.Write(&buf, binary.LittleEndian, entry.keyLen)
+		_ = binary.Write(&buf, binary.LittleEndian, uint16(0))
+		_ = binary.Write(&buf, binary.LittleEndian, entry.count)
+		_ = binary.Write(&buf, binary.LittleEndian, entry.firstBlock)
+		_ = binary.Write(&buf, binary.LittleEndian, entry.blockCount)
+	}
+	writePostingBlockMetas(&buf, blocks)
+	_, _ = buf.Write(keyBlob.Bytes())
+	_, _ = buf.Write(blockBlob.Bytes())
+	return buf.Bytes()
+}
+
+func encodeGramPostingSection(ti *compressedTrigramIndex, ranks []uint32) []byte {
+	if ti == nil {
+		return nil
+	}
+	keys := make([]uint32, 0)
+	ti.forEachCount(func(gram uint32, count int) {
+		if count > 0 {
+			keys = append(keys, gram)
+		}
+	})
+	sortUint32s(keys)
+	entries := make([]gramPostingEntry, 0, len(keys))
+	var blockBlob bytes.Buffer
+	blocks := make([]postingBlockMeta, 0, len(keys))
+	for _, key := range keys {
+		ids := trigramPostingIDs(ti, key)
+		if len(ids) == 0 {
+			continue
+		}
+		entry := gramPostingEntry{
+			key:        key,
+			count:      uint32(len(ids)),
+			firstBlock: uint32(len(blocks)),
+		}
+		blocks = appendPostingBlocks(blocks, &blockBlob, ids, ranks)
+		entry.blockCount = uint32(len(blocks)) - entry.firstBlock
+		entries = append(entries, entry)
+	}
+	if len(entries) == 0 {
+		return nil
+	}
+	var buf bytes.Buffer
+	_ = binary.Write(&buf, binary.LittleEndian, uint32(len(entries)))
+	_ = binary.Write(&buf, binary.LittleEndian, uint32(0))
+	_ = binary.Write(&buf, binary.LittleEndian, uint32(len(blocks)))
+	_ = binary.Write(&buf, binary.LittleEndian, uint32(blockBlob.Len()))
+	for _, entry := range entries {
+		_ = binary.Write(&buf, binary.LittleEndian, entry.key)
+		_ = binary.Write(&buf, binary.LittleEndian, entry.count)
+		_ = binary.Write(&buf, binary.LittleEndian, entry.firstBlock)
+		_ = binary.Write(&buf, binary.LittleEndian, entry.blockCount)
+	}
+	writePostingBlockMetas(&buf, blocks)
+	_, _ = buf.Write(blockBlob.Bytes())
+	return buf.Bytes()
+}
+
+func appendPostingBlocks(blocks []postingBlockMeta, blob *bytes.Buffer, ids []uint32, ranks []uint32) []postingBlockMeta {
+	const blockSize = 1024
+	for start := 0; start < len(ids); start += blockSize {
+		end := min(len(ids), start+blockSize)
+		chunk := ids[start:end]
+		encoded := encodeDeltaUvarint32(chunk)
+		offset := uint64(blob.Len())
+		_, _ = blob.Write(encoded)
+		minRank := uint32(^uint32(0))
+		for _, id := range chunk {
+			rank := extRankOf(id, ranks)
+			if rank < minRank {
+				minRank = rank
+			}
+		}
+		if minRank == uint32(^uint32(0)) {
+			minRank = 0
+		}
+		blocks = append(blocks, postingBlockMeta{
+			offset:  offset,
+			length:  uint32(len(encoded)),
+			count:   uint32(len(chunk)),
+			minID:   chunk[0],
+			maxID:   chunk[len(chunk)-1],
+			minRank: minRank,
+		})
+	}
+	return blocks
+}
+
+func writePostingBlockMetas(buf *bytes.Buffer, blocks []postingBlockMeta) {
+	for _, block := range blocks {
+		_ = binary.Write(buf, binary.LittleEndian, block.offset)
+		_ = binary.Write(buf, binary.LittleEndian, block.length)
+		_ = binary.Write(buf, binary.LittleEndian, block.count)
+		_ = binary.Write(buf, binary.LittleEndian, block.minID)
+		_ = binary.Write(buf, binary.LittleEndian, block.maxID)
+		_ = binary.Write(buf, binary.LittleEndian, block.minRank)
+	}
+}
+
+func trigramPostingIDs(ti *compressedTrigramIndex, gram uint32) []uint32 {
+	if ti == nil {
+		return nil
+	}
+	var out []uint32
+	for _, segment := range ti.segments {
+		posting := segment.postingForGram(gram)
+		if posting.count == 0 {
+			continue
+		}
+		out = append(out, decodeDeltaUvarint32(ti.postingData(posting), posting.count)...)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	sortUint32s(out)
+	return uniqueSortedUint32s(out)
 }
 
 func (vol *serviceVolumeIndex) buildSubtreeRanges() {
@@ -10812,10 +14213,17 @@ func readIndexMMap(mapped *mappedIndexFile) (*Index, error) {
 		NameBlobLen: binary.LittleEndian.Uint64(data[56:]),
 		TokenCount:  binary.LittleEndian.Uint64(data[64:]),
 	}
-	if header.Magic != indexMagic {
+	sectionTableOffset := uint64(0)
+	if header.Magic == indexMagicV9 {
+		if len(data) < headerSize+8 {
+			return nil, errors.New("invalid mapped v9 index")
+		}
+		sectionTableOffset = binary.LittleEndian.Uint64(data[headerSize:])
+		headerSize += 8
+	} else if header.Magic != indexMagic {
 		return nil, errors.New("unsupported index format")
 	}
-	if header.Version != indexVersion {
+	if header.Version != indexVersion && header.Version != indexVersionV9 {
 		return nil, fmt.Errorf("unsupported index version %d", header.Version)
 	}
 	if header.Compact == 0 {
@@ -10827,7 +14235,7 @@ func readIndexMMap(mapped *mappedIndexFile) (*Index, error) {
 	}
 	off := headerSize
 	idx := &Index{
-		Version:    indexVersion,
+		Version:    int(header.Version),
 		BuiltAt:    time.Unix(0, header.BuiltUnix),
 		Roots:      make([]string, int(header.RootCount)),
 		JournalID:  header.JournalID,
@@ -10879,7 +14287,596 @@ func readIndexMMap(mapped *mappedIndexFile) (*Index, error) {
 	}
 	mappedRecords.scanCapabilities()
 	idx.MMapRecords = mappedRecords
+	if sectionTableOffset != 0 {
+		idx.Derived = parseMappedDerivedSections(data, sectionTableOffset, int(header.EntryCount))
+		mapped.derived = idx.Derived
+	}
 	return idx, nil
+}
+
+func parseMappedDerivedSections(data []byte, sectionTableOffset uint64, recordCount int) indexDerivedSections {
+	var out indexDerivedSections
+	if sectionTableOffset > uint64(len(data)) || sectionTableOffset+4 > uint64(len(data)) {
+		return out
+	}
+	off := int(sectionTableOffset)
+	count := int(binary.LittleEndian.Uint32(data[off:]))
+	off += 4
+	const entrySize = 24
+	if count < 0 || off+count*entrySize < off || off+count*entrySize > len(data) {
+		return out
+	}
+	for i := 0; i < count; i++ {
+		tag := binary.LittleEndian.Uint32(data[off:])
+		sectionOff := binary.LittleEndian.Uint64(data[off+4:])
+		length := binary.LittleEndian.Uint64(data[off+12:])
+		off += entrySize
+		if sectionOff > uint64(len(data)) || length > uint64(len(data)) || sectionOff+length < sectionOff || sectionOff+length > uint64(len(data)) {
+			continue
+		}
+		section := data[int(sectionOff):int(sectionOff+length)]
+		switch tag {
+		case indexSectionRANK:
+			parts := decodeUint32Section(section, 2)
+			if len(parts) == 2 {
+				out.NameOrder, out.NameRank = parts[0], parts[1]
+			}
+		case indexSectionCHLD:
+			parts := decodeUint32Section(section, 3)
+			if len(parts) == 3 {
+				out.ChildOffsets, out.ChildIDs, out.RootIDs = parts[0], parts[1], parts[2]
+			}
+		case indexSectionSUBT:
+			parts := decodeUint32Section(section, 3)
+			if len(parts) == 3 {
+				out.SubtreeStart, out.SubtreeEnd, out.SubtreeOrder = parts[0], parts[1], parts[2]
+			}
+		case indexSectionFRNS:
+			frns, ids := decodeFRNSection(section)
+			out.FRNs, out.FRNRecordIDs = frns, ids
+		case indexSectionLOWR:
+			out.LowerBlob, out.LowerOffs, out.LowerLens = decodeLowerSection(section)
+		case indexSectionPEXT, indexSectionPCMP, indexSectionPNGR:
+			if out.Postings == nil {
+				out.Postings = make(map[uint32]mappedPostingSection)
+			}
+			out.Postings[tag] = decodePostingSection(section)
+			if tag == indexSectionPNGR {
+				out.NameTrigrams = decodeGramPostingIndex(section, recordCount)
+			}
+		}
+	}
+	return out
+}
+
+func decodeUint32Section(data []byte, parts int) [][]uint32 {
+	out := make([][]uint32, 0, parts)
+	off := 0
+	for i := 0; i < parts; i++ {
+		if off+4 > len(data) {
+			return nil
+		}
+		n := int(binary.LittleEndian.Uint32(data[off:]))
+		off += 4
+		bytesLen := n * 4
+		if n < 0 || bytesLen/4 != n || off+bytesLen < off || off+bytesLen > len(data) {
+			return nil
+		}
+		values := mappedUint32Slice(data[off : off+bytesLen])
+		off += bytesLen
+		out = append(out, values)
+	}
+	return out
+}
+
+func decodeFRNSection(data []byte) ([]uint64, []uint32) {
+	off := 0
+	if off+4 > len(data) {
+		return nil, nil
+	}
+	frnCount := int(binary.LittleEndian.Uint32(data[off:]))
+	off += 4
+	frnBytes := frnCount * 8
+	if frnCount < 0 || frnBytes/8 != frnCount || off+frnBytes < off || off+frnBytes > len(data) {
+		return nil, nil
+	}
+	frns := mappedUint64Slice(data[off : off+frnBytes])
+	off += frnBytes
+	if off+4 > len(data) {
+		return nil, nil
+	}
+	idCount := int(binary.LittleEndian.Uint32(data[off:]))
+	off += 4
+	idBytes := idCount * 4
+	if idCount < 0 || idBytes/4 != idCount || idCount != frnCount || off+idBytes < off || off+idBytes > len(data) {
+		return nil, nil
+	}
+	ids := mappedUint32Slice(data[off : off+idBytes])
+	return frns, ids
+}
+
+func decodeLowerSection(data []byte) ([]byte, []uint32, []uint16) {
+	if len(data) < 8 {
+		return nil, nil, nil
+	}
+	count := int(binary.LittleEndian.Uint32(data[0:]))
+	blobLen := int(binary.LittleEndian.Uint32(data[4:]))
+	off := 8
+	offsBytes := count * 4
+	if count < 0 || blobLen < 0 || offsBytes/4 != count || off+offsBytes < off || off+offsBytes > len(data) {
+		return nil, nil, nil
+	}
+	offs := mappedUint32Slice(data[off : off+offsBytes])
+	off += offsBytes
+	lensBytes := count * 2
+	if lensBytes/2 != count || off+lensBytes < off || off+lensBytes > len(data) {
+		return nil, nil, nil
+	}
+	lens := mappedUint16Slice(data[off : off+lensBytes])
+	off += lensBytes
+	if off+blobLen < off || off+blobLen > len(data) {
+		return nil, nil, nil
+	}
+	return data[off : off+blobLen], offs, lens
+}
+
+func mappedUint16Slice(data []byte) []uint16 {
+	if len(data) == 0 {
+		return nil
+	}
+	return unsafe.Slice((*uint16)(unsafe.Pointer(&data[0])), len(data)/2)
+}
+
+func mappedUint32Slice(data []byte) []uint32 {
+	if len(data) == 0 {
+		return nil
+	}
+	return unsafe.Slice((*uint32)(unsafe.Pointer(&data[0])), len(data)/4)
+}
+
+func mappedUint64Slice(data []byte) []uint64 {
+	if len(data) == 0 {
+		return nil
+	}
+	return unsafe.Slice((*uint64)(unsafe.Pointer(&data[0])), len(data)/8)
+}
+
+func decodePostingSection(data []byte) mappedPostingSection {
+	if len(data) < 16 {
+		return mappedPostingSection{}
+	}
+	entryCount := int(binary.LittleEndian.Uint32(data[0:]))
+	keyBlobLen := int(binary.LittleEndian.Uint32(data[4:]))
+	blockCount := int(binary.LittleEndian.Uint32(data[8:]))
+	blockBlobLen := int(binary.LittleEndian.Uint32(data[12:]))
+	if entryCount < 0 || keyBlobLen < 0 || blockCount < 0 || blockBlobLen < 0 {
+		return mappedPostingSection{}
+	}
+	stringEntrySize := 20
+	gramEntrySize := 16
+	entrySize := stringEntrySize
+	if keyBlobLen == 0 {
+		entrySize = gramEntrySize
+	}
+	blockMetaSize := 28
+	off := 16
+	entriesBytes := entryCount * entrySize
+	if entriesBytes/entrySize != entryCount || off+entriesBytes < off || off+entriesBytes > len(data) {
+		return mappedPostingSection{}
+	}
+	off += entriesBytes
+	blockMetaBytes := blockCount * blockMetaSize
+	if blockMetaBytes/blockMetaSize != blockCount || off+blockMetaBytes < off || off+blockMetaBytes > len(data) {
+		return mappedPostingSection{}
+	}
+	off += blockMetaBytes
+	if off+keyBlobLen < off || off+keyBlobLen > len(data) {
+		return mappedPostingSection{}
+	}
+	off += keyBlobLen
+	if off+blockBlobLen < off || off+blockBlobLen > len(data) {
+		return mappedPostingSection{}
+	}
+	section := mappedPostingSection{EntryCount: entryCount, BlockCount: blockCount, Bytes: len(data), Data: data}
+	if keyBlobLen == 0 {
+		return section
+	}
+	for i := 0; i < entryCount; i++ {
+		entryOff := 16 + i*stringEntrySize
+		keyOff := int(binary.LittleEndian.Uint32(data[entryOff:]))
+		keyLen := int(binary.LittleEndian.Uint16(data[entryOff+4:]))
+		firstBlock := int(binary.LittleEndian.Uint32(data[entryOff+12:]))
+		entryBlockCount := int(binary.LittleEndian.Uint32(data[entryOff+16:]))
+		if keyOff < 0 || keyLen < 0 || keyOff+keyLen < keyOff || keyOff+keyLen > keyBlobLen {
+			return mappedPostingSection{}
+		}
+		if firstBlock < 0 || entryBlockCount < 0 || firstBlock+entryBlockCount < firstBlock || firstBlock+entryBlockCount > blockCount {
+			return mappedPostingSection{}
+		}
+	}
+	return section
+}
+
+func postingBlockCacheMaxBytes() int64 {
+	mb := int64(128)
+	if raw := strings.TrimSpace(os.Getenv("SEEKFS_POSTING_CACHE_MB")); raw != "" {
+		if parsed, err := strconv.ParseInt(raw, 10, 64); err == nil {
+			mb = parsed
+		}
+	}
+	if mb <= 0 {
+		return 0
+	}
+	const maxReasonableMB = 16 * 1024
+	if mb > maxReasonableMB {
+		mb = maxReasonableMB
+	}
+	return mb * 1024 * 1024
+}
+
+func (c *postingBlockLRU) get(key postingBlockCacheKey) ([]uint32, bool) {
+	maxBytes := postingBlockCacheMaxBytes()
+	if maxBytes <= 0 {
+		return nil, false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.items == nil {
+		return nil, false
+	}
+	elem := c.items[key]
+	if elem == nil {
+		return nil, false
+	}
+	c.ll.MoveToFront(elem)
+	entry := elem.Value.(*postingBlockCacheEntry)
+	return entry.ids, true
+}
+
+func (c *postingBlockLRU) add(key postingBlockCacheKey, ids []uint32) {
+	maxBytes := postingBlockCacheMaxBytes()
+	if maxBytes <= 0 || len(ids) == 0 {
+		return
+	}
+	entryBytes := int64(len(ids)) * int64(unsafe.Sizeof(uint32(0)))
+	if entryBytes > maxBytes {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.items == nil {
+		c.items = make(map[postingBlockCacheKey]*list.Element)
+	}
+	if elem := c.items[key]; elem != nil {
+		c.ll.MoveToFront(elem)
+		entry := elem.Value.(*postingBlockCacheEntry)
+		c.bytes += entryBytes - entry.bytes
+		entry.ids = ids
+		entry.bytes = entryBytes
+	} else {
+		elem := c.ll.PushFront(&postingBlockCacheEntry{key: key, ids: ids, bytes: entryBytes})
+		c.items[key] = elem
+		c.bytes += entryBytes
+	}
+	for c.bytes > maxBytes {
+		elem := c.ll.Back()
+		if elem == nil {
+			break
+		}
+		entry := elem.Value.(*postingBlockCacheEntry)
+		delete(c.items, entry.key)
+		c.bytes -= entry.bytes
+		c.ll.Remove(elem)
+	}
+}
+
+func (section mappedPostingSection) postingBlockCacheKey(blockIndex int) (postingBlockCacheKey, bool) {
+	if len(section.Data) == 0 || blockIndex < 0 {
+		return postingBlockCacheKey{}, false
+	}
+	return postingBlockCacheKey{
+		base:  uintptr(unsafe.Pointer(unsafe.SliceData(section.Data))),
+		bytes: len(section.Data),
+		block: blockIndex,
+	}, true
+}
+
+func (section mappedPostingSection) decodePostingBlock(blockIndex, blockMetaStart, blockBlobStart, blockBlobLen int) ([]uint32, bool) {
+	const blockMetaSize = 28
+	data := section.Data
+	metaOff := blockMetaStart + blockIndex*blockMetaSize
+	if metaOff < blockMetaStart || metaOff+blockMetaSize < metaOff || metaOff+blockMetaSize > len(data) {
+		return nil, false
+	}
+	blockOffset := int(binary.LittleEndian.Uint64(data[metaOff:]))
+	blockLength := int(binary.LittleEndian.Uint32(data[metaOff+8:]))
+	blockCountValue := int(binary.LittleEndian.Uint32(data[metaOff+12:]))
+	if blockOffset < 0 || blockLength < 0 || blockOffset+blockLength < blockOffset || blockOffset+blockLength > blockBlobLen {
+		return nil, false
+	}
+	if key, ok := section.postingBlockCacheKey(blockIndex); ok {
+		if cached, ok := servicePostingBlockCache.get(key); ok {
+			return cached, true
+		}
+		encoded := data[blockBlobStart+blockOffset : blockBlobStart+blockOffset+blockLength]
+		decoded := decodeDeltaUvarint32(encoded, blockCountValue)
+		servicePostingBlockCache.add(key, decoded)
+		return decoded, true
+	}
+	encoded := data[blockBlobStart+blockOffset : blockBlobStart+blockOffset+blockLength]
+	return decodeDeltaUvarint32(encoded, blockCountValue), true
+}
+
+type postingBlockIterator struct {
+	section        mappedPostingSection
+	next           int
+	end            int
+	blockMetaStart int
+	blockBlobStart int
+	blockBlobLen   int
+}
+
+type postingBlockRankRef struct {
+	index int
+	meta  postingBlockMeta
+}
+
+func (it *postingBlockIterator) nextBlock() ([]uint32, postingBlockMeta, bool) {
+	if it == nil || it.next >= it.end {
+		return nil, postingBlockMeta{}, false
+	}
+	blockIndex := it.next
+	it.next++
+	return it.blockAt(blockIndex)
+}
+
+func (it postingBlockIterator) blockAt(blockIndex int) ([]uint32, postingBlockMeta, bool) {
+	meta, ok := it.blockMetaAt(blockIndex)
+	if !ok {
+		return nil, postingBlockMeta{}, false
+	}
+	ids, ok := it.section.decodePostingBlock(blockIndex, it.blockMetaStart, it.blockBlobStart, it.blockBlobLen)
+	return ids, meta, ok
+}
+
+func (it postingBlockIterator) blockMetaAt(blockIndex int) (postingBlockMeta, bool) {
+	const blockMetaSize = 28
+	if blockIndex < 0 || blockIndex >= it.end {
+		return postingBlockMeta{}, false
+	}
+	metaOff := it.blockMetaStart + blockIndex*blockMetaSize
+	data := it.section.Data
+	if metaOff < it.blockMetaStart || metaOff+blockMetaSize < metaOff || metaOff+blockMetaSize > len(data) {
+		return postingBlockMeta{}, false
+	}
+	meta := postingBlockMeta{
+		offset:  binary.LittleEndian.Uint64(data[metaOff:]),
+		length:  binary.LittleEndian.Uint32(data[metaOff+8:]),
+		count:   binary.LittleEndian.Uint32(data[metaOff+12:]),
+		minID:   binary.LittleEndian.Uint32(data[metaOff+16:]),
+		maxID:   binary.LittleEndian.Uint32(data[metaOff+20:]),
+		minRank: binary.LittleEndian.Uint32(data[metaOff+24:]),
+	}
+	return meta, true
+}
+
+func (it postingBlockIterator) rankOrderedBlockRefs() []postingBlockRankRef {
+	if it.next >= it.end {
+		return nil
+	}
+	refs := make([]postingBlockRankRef, 0, it.end-it.next)
+	for blockIndex := it.next; blockIndex < it.end; blockIndex++ {
+		meta, ok := it.blockMetaAt(blockIndex)
+		if !ok {
+			return nil
+		}
+		refs = append(refs, postingBlockRankRef{index: blockIndex, meta: meta})
+	}
+	sort.Slice(refs, func(i, j int) bool {
+		if refs[i].meta.minRank == refs[j].meta.minRank {
+			return refs[i].meta.minID < refs[j].meta.minID
+		}
+		return refs[i].meta.minRank < refs[j].meta.minRank
+	})
+	return refs
+}
+
+func (section mappedPostingSection) stringPosting(key string) []uint32 {
+	it, count, ok := section.stringPostingIterator(key)
+	if !ok {
+		return nil
+	}
+	return materializePostingBlockIterator(it, count)
+}
+
+func (section mappedPostingSection) stringPostingIterator(key string) (postingBlockIterator, int, bool) {
+	data := section.Data
+	if key == "" || len(data) < 16 {
+		return postingBlockIterator{}, 0, false
+	}
+	entryCount := int(binary.LittleEndian.Uint32(data[0:]))
+	keyBlobLen := int(binary.LittleEndian.Uint32(data[4:]))
+	blockCount := int(binary.LittleEndian.Uint32(data[8:]))
+	blockBlobLen := int(binary.LittleEndian.Uint32(data[12:]))
+	if entryCount <= 0 || keyBlobLen <= 0 || blockCount < 0 || blockBlobLen < 0 {
+		return postingBlockIterator{}, 0, false
+	}
+	const stringEntrySize = 20
+	const blockMetaSize = 28
+	entriesStart := 16
+	entriesBytes := entryCount * stringEntrySize
+	if entriesBytes/stringEntrySize != entryCount || entriesStart+entriesBytes < entriesStart || entriesStart+entriesBytes > len(data) {
+		return postingBlockIterator{}, 0, false
+	}
+	blockMetaStart := entriesStart + entriesBytes
+	blockMetaBytes := blockCount * blockMetaSize
+	if blockMetaBytes/blockMetaSize != blockCount || blockMetaStart+blockMetaBytes < blockMetaStart || blockMetaStart+blockMetaBytes > len(data) {
+		return postingBlockIterator{}, 0, false
+	}
+	keyBlobStart := blockMetaStart + blockMetaBytes
+	blockBlobStart := keyBlobStart + keyBlobLen
+	if blockBlobStart < keyBlobStart || blockBlobStart > len(data) || blockBlobStart+blockBlobLen < blockBlobStart || blockBlobStart+blockBlobLen > len(data) {
+		return postingBlockIterator{}, 0, false
+	}
+	i := sort.Search(entryCount, func(i int) bool {
+		entryOff := entriesStart + i*stringEntrySize
+		keyOff := int(binary.LittleEndian.Uint32(data[entryOff:]))
+		keyLen := int(binary.LittleEndian.Uint16(data[entryOff+4:]))
+		if keyOff < 0 || keyLen < 0 || keyOff+keyLen < keyOff || keyOff+keyLen > keyBlobLen {
+			return true
+		}
+		entryKey := stringView(data[keyBlobStart+keyOff : keyBlobStart+keyOff+keyLen])
+		return entryKey >= key
+	})
+	if i >= entryCount {
+		return postingBlockIterator{}, 0, false
+	}
+	entryOff := entriesStart + i*stringEntrySize
+	keyOff := int(binary.LittleEndian.Uint32(data[entryOff:]))
+	keyLen := int(binary.LittleEndian.Uint16(data[entryOff+4:]))
+	if keyOff < 0 || keyLen < 0 || keyOff+keyLen < keyOff || keyOff+keyLen > keyBlobLen {
+		return postingBlockIterator{}, 0, false
+	}
+	if stringView(data[keyBlobStart+keyOff:keyBlobStart+keyOff+keyLen]) != key {
+		return postingBlockIterator{}, 0, false
+	}
+	count := int(binary.LittleEndian.Uint32(data[entryOff+8:]))
+	firstBlock := int(binary.LittleEndian.Uint32(data[entryOff+12:]))
+	entryBlockCount := int(binary.LittleEndian.Uint32(data[entryOff+16:]))
+	if count <= 0 || firstBlock < 0 || entryBlockCount <= 0 || firstBlock+entryBlockCount < firstBlock || firstBlock+entryBlockCount > blockCount {
+		return postingBlockIterator{}, 0, false
+	}
+	it := postingBlockIterator{
+		section:        section,
+		next:           firstBlock,
+		end:            firstBlock + entryBlockCount,
+		blockMetaStart: blockMetaStart,
+		blockBlobStart: blockBlobStart,
+		blockBlobLen:   blockBlobLen,
+	}
+	return it, count, true
+}
+
+func (section mappedPostingSection) gramPosting(gram uint32) []uint32 {
+	it, count, ok := section.gramPostingIterator(gram)
+	if !ok {
+		return nil
+	}
+	return materializePostingBlockIterator(it, count)
+}
+
+func (section mappedPostingSection) gramPostingIterator(gram uint32) (postingBlockIterator, int, bool) {
+	data := section.Data
+	if len(data) < 16 {
+		return postingBlockIterator{}, 0, false
+	}
+	entryCount := int(binary.LittleEndian.Uint32(data[0:]))
+	keyBlobLen := int(binary.LittleEndian.Uint32(data[4:]))
+	blockCount := int(binary.LittleEndian.Uint32(data[8:]))
+	blockBlobLen := int(binary.LittleEndian.Uint32(data[12:]))
+	if entryCount <= 0 || keyBlobLen != 0 || blockCount < 0 || blockBlobLen < 0 {
+		return postingBlockIterator{}, 0, false
+	}
+	const entrySize = 16
+	const blockMetaSize = 28
+	entriesStart := 16
+	entriesBytes := entryCount * entrySize
+	if entriesBytes/entrySize != entryCount || entriesStart+entriesBytes < entriesStart || entriesStart+entriesBytes > len(data) {
+		return postingBlockIterator{}, 0, false
+	}
+	blockMetaStart := entriesStart + entriesBytes
+	blockMetaBytes := blockCount * blockMetaSize
+	if blockMetaBytes/blockMetaSize != blockCount || blockMetaStart+blockMetaBytes < blockMetaStart || blockMetaStart+blockMetaBytes > len(data) {
+		return postingBlockIterator{}, 0, false
+	}
+	blockBlobStart := blockMetaStart + blockMetaBytes
+	if blockBlobStart < blockMetaStart || blockBlobStart > len(data) || blockBlobStart+blockBlobLen < blockBlobStart || blockBlobStart+blockBlobLen > len(data) {
+		return postingBlockIterator{}, 0, false
+	}
+	i := sort.Search(entryCount, func(i int) bool {
+		entryOff := entriesStart + i*entrySize
+		return binary.LittleEndian.Uint32(data[entryOff:]) >= gram
+	})
+	if i >= entryCount {
+		return postingBlockIterator{}, 0, false
+	}
+	entryOff := entriesStart + i*entrySize
+	if binary.LittleEndian.Uint32(data[entryOff:]) != gram {
+		return postingBlockIterator{}, 0, false
+	}
+	count := int(binary.LittleEndian.Uint32(data[entryOff+4:]))
+	firstBlock := int(binary.LittleEndian.Uint32(data[entryOff+8:]))
+	entryBlockCount := int(binary.LittleEndian.Uint32(data[entryOff+12:]))
+	if count <= 0 || firstBlock < 0 || entryBlockCount <= 0 || firstBlock+entryBlockCount < firstBlock || firstBlock+entryBlockCount > blockCount {
+		return postingBlockIterator{}, 0, false
+	}
+	it := postingBlockIterator{
+		section:        section,
+		next:           firstBlock,
+		end:            firstBlock + entryBlockCount,
+		blockMetaStart: blockMetaStart,
+		blockBlobStart: blockBlobStart,
+		blockBlobLen:   blockBlobLen,
+	}
+	return it, count, true
+}
+
+func decodeGramPostingIndex(data []byte, recordCount int) *compressedTrigramIndex {
+	if len(data) < 16 {
+		return nil
+	}
+	entryCount := int(binary.LittleEndian.Uint32(data[0:]))
+	keyBlobLen := int(binary.LittleEndian.Uint32(data[4:]))
+	blockCount := int(binary.LittleEndian.Uint32(data[8:]))
+	blockBlobLen := int(binary.LittleEndian.Uint32(data[12:]))
+	if entryCount <= 0 || keyBlobLen != 0 || blockCount < 0 || blockBlobLen < 0 {
+		return nil
+	}
+	const entrySize = 16
+	const blockMetaSize = 28
+	entriesStart := 16
+	entriesBytes := entryCount * entrySize
+	if entriesBytes/entrySize != entryCount || entriesStart+entriesBytes > len(data) {
+		return nil
+	}
+	blockMetaStart := entriesStart + entriesBytes
+	blockMetaBytes := blockCount * blockMetaSize
+	if blockMetaBytes/blockMetaSize != blockCount || blockMetaStart+blockMetaBytes < blockMetaStart || blockMetaStart+blockMetaBytes > len(data) {
+		return nil
+	}
+	blockBlobStart := blockMetaStart + blockMetaBytes
+	if blockBlobStart+blockBlobLen < blockBlobStart || blockBlobStart+blockBlobLen > len(data) {
+		return nil
+	}
+	ti := &compressedTrigramIndex{
+		counts:      make(map[uint32]int, entryCount),
+		gramSize:    3,
+		recordCount: recordCount,
+		mappedGrams: &mappedPostingSection{EntryCount: entryCount, BlockCount: blockCount, Bytes: len(data), Data: data},
+	}
+	for i := 0; i < entryCount; i++ {
+		entryOff := entriesStart + i*entrySize
+		gram := binary.LittleEndian.Uint32(data[entryOff:])
+		count := int(binary.LittleEndian.Uint32(data[entryOff+4:]))
+		firstBlock := int(binary.LittleEndian.Uint32(data[entryOff+8:]))
+		entryBlockCount := int(binary.LittleEndian.Uint32(data[entryOff+12:]))
+		if count <= 0 || firstBlock < 0 || entryBlockCount <= 0 || firstBlock+entryBlockCount < firstBlock || firstBlock+entryBlockCount > blockCount {
+			continue
+		}
+		for blockIndex := firstBlock; blockIndex < firstBlock+entryBlockCount; blockIndex++ {
+			metaOff := blockMetaStart + blockIndex*blockMetaSize
+			blockOffset := int(binary.LittleEndian.Uint64(data[metaOff:]))
+			blockLength := int(binary.LittleEndian.Uint32(data[metaOff+8:]))
+			if blockOffset < 0 || blockLength < 0 || blockOffset+blockLength < blockOffset || blockOffset+blockLength > blockBlobLen {
+				return nil
+			}
+		}
+		ti.counts[gram] = count
+	}
+	if len(ti.counts) == 0 {
+		return nil
+	}
+	return ti
 }
 
 func mappedReadString(data []byte, off int) (string, int, error) {

@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -23,8 +24,8 @@ import (
 	wruntime "github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
-const uiSearchDeadline = 1200 * time.Millisecond
-const uiServiceTimeout = 3 * time.Second
+const uiSearchDeadline = 15 * time.Second
+const uiServiceTimeout = 20 * time.Second
 
 //go:embed ui_frontend/*
 var seekfsUIAssets embed.FS
@@ -118,6 +119,12 @@ func cmdUI(args []string) error {
 	})
 }
 
+var cmdUIRun = cmdUI
+
+func cmdDefault(args []string) error {
+	return cmdUIRun(args)
+}
+
 func (a *UIApp) startup(ctx context.Context) {
 	a.ctx = ctx
 }
@@ -209,6 +216,22 @@ func (a *UIApp) search(req UISearchRequest, seq int64) UISearchResponse {
 
 func (a *UIApp) ensureServiceReady(dbs []string) {
 	resp, err := callServiceWithTimeout(a.pipeName, serviceRequest{Command: "info"}, 500*time.Millisecond)
+	if err == nil && !a.serviceResponseIsFresh(resp) {
+		if serviceResponseIsVerifiedStandalone(resp) {
+			if stopErr := a.stopStaleStandaloneService(resp.PID); stopErr == nil {
+				a.serviceStart.Store(false)
+				err = errors.New("stale service stopped")
+			} else {
+				a.ready = false
+				a.readyMessage = "Stale seekfs service is running. Restart seekfs or stop PID " + strconv.Itoa(resp.PID)
+				return
+			}
+		} else {
+			a.ready = false
+			a.readyMessage = "Stale seekfs service identity is ambiguous. Restart the verified seekfs service or change the UI pipe."
+			return
+		}
+	}
 	if err == nil && resp.OK && resp.Entries > 0 && !resp.Loading {
 		a.ready = true
 		a.readyMessage = ""
@@ -247,6 +270,120 @@ func (a *UIApp) ensureServiceReady(dbs []string) {
 	}
 	a.ready = false
 	a.readyMessage = "Service is not ready. Run elevated: seekfs launch " + uiDBArgs(dbs)
+}
+
+type serviceIdentityExpectation struct {
+	Executable     string
+	ExecutableHash string
+	Version        string
+	Commit         string
+	Date           string
+	BuildFlavor    string
+	PipeName       string
+}
+
+func currentUIServiceIdentity(pipeName string) (serviceIdentityExpectation, error) {
+	exe, err := os.Executable()
+	if err != nil {
+		return serviceIdentityExpectation{}, err
+	}
+	return serviceIdentityExpectation{
+		Executable:     exe,
+		ExecutableHash: executableContentHash(exe),
+		Version:        version,
+		Commit:         commit,
+		Date:           date,
+		BuildFlavor:    serviceBuildFlavorForMemoryMode("lowmem"),
+		PipeName:       pipeName,
+	}, nil
+}
+
+func (a *UIApp) serviceResponseIsFresh(resp serviceResponse) bool {
+	expected, err := currentUIServiceIdentity(a.pipeName)
+	if err != nil {
+		return false
+	}
+	return serviceIdentityMatchesExpected(resp, expected)
+}
+
+func serviceIdentityMatchesExpected(resp serviceResponse, expected serviceIdentityExpectation) bool {
+	if resp.PID <= 0 {
+		return false
+	}
+	if resp.Executable == "" || expected.Executable == "" {
+		return false
+	}
+	respExe, err := filepath.Abs(resp.Executable)
+	if err == nil {
+		resp.Executable = respExe
+	}
+	expectedExe, err := filepath.Abs(expected.Executable)
+	if err == nil {
+		expected.Executable = expectedExe
+	}
+	if !strings.EqualFold(filepath.Clean(resp.Executable), filepath.Clean(expected.Executable)) {
+		return false
+	}
+	if resp.ExecutableHash == "" || expected.ExecutableHash == "" || resp.ExecutableHash != expected.ExecutableHash {
+		return false
+	}
+	if resp.BuildFlavor == "" || expected.BuildFlavor == "" || resp.BuildFlavor != expected.BuildFlavor {
+		return false
+	}
+	if resp.PipeName == "" || expected.PipeName == "" || !strings.EqualFold(resp.PipeName, expected.PipeName) {
+		return false
+	}
+	return serviceBuildIdentityMatches(resp, expected)
+}
+
+func serviceBuildIdentityMatches(resp serviceResponse, expected serviceIdentityExpectation) bool {
+	if resp.Version == "" || resp.Commit == "" || resp.Date == "" {
+		return false
+	}
+	if expected.Version == "" || expected.Commit == "" || expected.Date == "" {
+		return false
+	}
+	if isUnknownBuildIdentity(resp.Version, resp.Commit, resp.Date) || isUnknownBuildIdentity(expected.Version, expected.Commit, expected.Date) {
+		return true
+	}
+	return resp.Version == expected.Version && resp.Commit == expected.Commit && resp.Date == expected.Date
+}
+
+func serviceResponseIsVerifiedStandalone(resp serviceResponse) bool {
+	return strings.EqualFold(resp.ProcessMode, "standalone")
+}
+
+func isUnknownBuildIdentity(v, c, d string) bool {
+	return v == "dev" || c == "unknown" || d == "unknown"
+}
+
+func (a *UIApp) stopStaleStandaloneService(pid int) error {
+	if pid <= 0 || pid == os.Getpid() {
+		return errors.New("invalid stale service pid")
+	}
+	proc, err := os.FindProcess(pid)
+	if err == nil {
+		_ = proc.Kill()
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := callServiceWithTimeout(a.pipeName, serviceRequest{Command: "ping"}, 100*time.Millisecond); err != nil {
+			return nil
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	cmd := exec.Command("taskkill.exe", "/PID", strconv.Itoa(pid), "/F")
+	if err := cmd.Run(); err != nil {
+		return err
+	}
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := callServiceWithTimeout(a.pipeName, serviceRequest{Command: "ping"}, 100*time.Millisecond); err != nil {
+			return nil
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return errors.New("stale service still responds")
 }
 
 func (a *UIApp) startStandaloneService(dbs []string) error {
@@ -294,7 +431,7 @@ func uiDBArgs(dbs []string) string {
 }
 
 func uiServiceArgs(pipeName string, dbs []string) []string {
-	args := []string{"service", "-lowmem", "-skip-startup-sync", "-pipe", pipeName, "-sddl", defaultServiceSDDL}
+	args := []string{"service", "-lowmem", "-pipe", pipeName, "-sddl", defaultServiceSDDL}
 	for _, db := range dbs {
 		args = append(args, "-db", db)
 	}
@@ -304,7 +441,6 @@ func uiServiceArgs(pipeName string, dbs []string) []string {
 func configureUIServiceEnvironment(cmd *exec.Cmd) {
 	env := os.Environ()
 	env = upsertEnv(env, "SEEKFS_MEMORY_MODE", "lowmem")
-	env = upsertEnv(env, "SEEKFS_LOW_MEMORY_SKIP_WAL", "1")
 	env = upsertEnv(env, "SEEKFS_STARTUP_WORKERS", "1")
 	cmd.Env = env
 }
@@ -405,6 +541,9 @@ func normalizeUIQueryForService(query string, matchPath bool) (string, bool) {
 	if len(fields) == 0 {
 		return query, matchPath
 	}
+	if !matchPath && shouldUIUseLoosePathMatching(fields) {
+		matchPath = true
+	}
 	out := make([]string, 0, len(fields))
 	for _, field := range fields {
 		converted, nextMatchPath := normalizeEverythingTokenForService(field, matchPath)
@@ -412,6 +551,34 @@ func normalizeUIQueryForService(query string, matchPath bool) (string, bool) {
 		out = append(out, converted...)
 	}
 	return strings.Join(out, " "), matchPath
+}
+
+func shouldUIUseLoosePathMatching(fields []string) bool {
+	plain := 0
+	for _, field := range fields {
+		raw := strings.TrimLeft(field, "!-")
+		if raw == "" {
+			continue
+		}
+		if isVolumeQueryTerm(raw) || strings.ContainsAny(raw, `\/`) {
+			return true
+		}
+		key, value, hasPrefix := strings.Cut(raw, ":")
+		if hasPrefix {
+			switch strings.ToLower(strings.TrimSpace(key)) {
+			case "path", "fullpath", "full-path", "full_path", "fullpathname", "full-path-name", "location":
+				return true
+			case "ext", "extension", "glob", "regex", "size", "sz", "dm", "date", "date-modified", "datemodified", "modified", "type", "case":
+				continue
+			}
+			if value != "" {
+				plain++
+			}
+			continue
+		}
+		plain++
+	}
+	return plain >= 2
 }
 
 func incompleteUIQuery(query string) bool {

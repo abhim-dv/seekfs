@@ -13,6 +13,7 @@ type mappedIndexFile struct {
 	mapping windows.Handle
 	addr    uintptr
 	data    []byte
+	derived indexDerivedSections
 }
 
 func mapIndexFile(path string) (*mappedIndexFile, error) {

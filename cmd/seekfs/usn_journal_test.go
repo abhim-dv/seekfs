@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/binary"
 	"testing"
+	"time"
 	"unicode/utf16"
 )
 
@@ -25,6 +26,20 @@ func TestParseUSNChangeBuffer(t *testing.T) {
 	got := changes[0]
 	if got.FRN != 44 || got.ParentFRN != 33 || got.USN != 1200 || got.Reason != 0x00000100 || got.Attr != fileAttributeDir || got.Name != "created-dir" {
 		t.Fatalf("change mismatch: %+v", got)
+	}
+}
+
+func TestMakeReadUSNJournalRequestWaitFields(t *testing.T) {
+	req := makeReadUSNJournalRequest(42, 100, 5*time.Second, 1)
+	if req.StartUsn != 100 || req.UsnJournalID != 42 {
+		t.Fatalf("request identity fields = %+v", req)
+	}
+	if req.Timeout != 5 || req.BytesToWaitFor != 1 {
+		t.Fatalf("wait fields = timeout %d bytes %d, want 5/1", req.Timeout, req.BytesToWaitFor)
+	}
+	req = makeReadUSNJournalRequest(42, 100, 0, 0)
+	if req.Timeout != 0 || req.BytesToWaitFor != 0 {
+		t.Fatalf("non-wait fields = timeout %d bytes %d, want 0/0", req.Timeout, req.BytesToWaitFor)
 	}
 }
 

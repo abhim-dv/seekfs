@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -19,16 +20,153 @@ type candidatePlan struct {
 }
 
 type candidatePlanSource struct {
-	name string
-	ids  []int
+	name       string
+	ids        []int
+	posting    postingCountCandidate
+	hasPosting bool
+	union      []candidatePlanSource
+	vol        *serviceVolumeIndex
+	roots      []int
+}
+
+func (source candidatePlanSource) len() int {
+	switch {
+	case source.hasPosting:
+		return source.posting.len()
+	case len(source.union) > 0:
+		total := 0
+		for _, part := range source.union {
+			total += part.len()
+		}
+		return total
+	case len(source.roots) > 0:
+		if source.vol != nil {
+			if estimate := source.vol.estimateUnderDescendantCount(source.roots); estimate >= 0 {
+				return estimate
+			}
+		}
+		return len(source.roots)
+	default:
+		return len(source.ids)
+	}
+}
+
+func (source candidatePlanSource) materialize() []int {
+	switch {
+	case source.hasPosting:
+		return uint32sToInts(source.posting.materialize())
+	case len(source.union) > 0:
+		total := 0
+		for _, part := range source.union {
+			total += part.len()
+		}
+		out := make([]int, 0, total)
+		for _, part := range source.union {
+			out = append(out, part.materialize()...)
+		}
+		sort.Ints(out)
+		return uniqueSortedInts(out)
+	case len(source.roots) > 0:
+		seen := make(map[int]struct{}, 256)
+		out := make([]int, 0, source.len())
+		if source.vol == nil {
+			return nil
+		}
+		for _, rootID := range source.roots {
+			for _, id := range source.vol.underDescendants(rootID) {
+				if _, ok := seen[id]; ok {
+					continue
+				}
+				seen[id] = struct{}{}
+				out = append(out, id)
+			}
+		}
+		sort.Ints(out)
+		return out
+	default:
+		return append([]int(nil), source.ids...)
+	}
+}
+
+func (source candidatePlanSource) intersect(out []int) []int {
+	if len(out) == 0 {
+		return out
+	}
+	if source.hasPosting {
+		if source.posting.mapped {
+			return intersectSortedIntsWithPostingIterator(out, source.posting.it)
+		}
+		return intersectSortedIntsWithUint32s(out, source.posting.ids)
+	}
+	return intersectSortedInts(out, source.materialize())
+}
+
+func intersectSortedIntsWithUint32s(a []int, b []uint32) []int {
+	out := a[:0]
+	i, j := 0, 0
+	for i < len(a) && j < len(b) {
+		av := a[i]
+		bv := int(b[j])
+		switch {
+		case av == bv:
+			out = append(out, av)
+			i++
+			j++
+		case av < bv:
+			i++
+		default:
+			j++
+		}
+	}
+	return out
+}
+
+func intersectSortedIntsWithPostingIterator(a []int, it postingBlockIterator) []int {
+	out := a[:0]
+	cursor := 0
+	for cursor < len(a) && it.next < it.end {
+		block, meta, ok := it.nextBlock()
+		if !ok {
+			return nil
+		}
+		if len(block) == 0 {
+			continue
+		}
+		for cursor < len(a) && a[cursor] < int(meta.minID) {
+			cursor++
+		}
+		if cursor >= len(a) {
+			break
+		}
+		if a[cursor] > int(meta.maxID) {
+			continue
+		}
+		j := 0
+		for cursor < len(a) && j < len(block) {
+			av := a[cursor]
+			if av > int(meta.maxID) {
+				break
+			}
+			bv := int(block[j])
+			switch {
+			case av == bv:
+				out = append(out, av)
+				cursor++
+				j++
+			case av < bv:
+				cursor++
+			default:
+				j++
+			}
+		}
+	}
+	return out
 }
 
 func (vol *serviceVolumeIndex) plannedCandidates(pq parsedQuery) ([]int, bool) {
-	if compactCandidateCanSkipEntryMatches(pq, true) && pq.Limit > 0 {
-		if out, ok := vol.exactTopPlannedCandidates(pq); ok {
-			pq.Trace.setSource("planned:ext-top", len(out))
-			return out, true
-		}
+	if out, ok := vol.exactTopPlannedCandidates(pq); ok {
+		pq.Trace.setSource("planned:ext-top", len(out))
+		return out, true
 	}
 	plan, ok := vol.buildCandidatePlan(pq)
 	if !ok {
@@ -54,7 +192,7 @@ func (vol *serviceVolumeIndex) exactTopPlannedCandidates(pq parsedQuery) ([]int,
 	}
 	terms := nonVolumeTerms(pq.Terms)
 	if len(terms) > 0 {
-		return vol.extTopPathTermCandidates(pq.Exts[0], terms, pq.Limit)
+		return nil, false
 	}
 	ids, ok := vol.extTopPosting(pq.Exts[0], pq.Limit)
 	if !ok {
@@ -75,6 +213,15 @@ func nonVolumeTerms(terms []string) []string {
 }
 
 func (vol *serviceVolumeIndex) plannedCount(pq parsedQuery) (int, bool) {
+	return vol.plannedCountHidden(pq, hiddenBaseIDs{})
+}
+
+// plannedCountHidden is plannedCount plus an id-level exclusion set (base
+// tombstoned/shadowed ids from the active v9 overlay snapshot). It never
+// materializes an Entry unless path reconstruction is unavoidable, and it
+// filters candidate ids against hidden before evaluating them so counts
+// stay exact while an overlay is active (review G7 / plan R2.6).
+func (vol *serviceVolumeIndex) plannedCountHidden(pq parsedQuery, hidden hiddenBaseIDs) (int, bool) {
 	pq.CountOnly = true
 	plan, ok := vol.buildCandidatePlan(pq)
 	if !ok {
@@ -96,6 +243,9 @@ func (vol *serviceVolumeIndex) plannedCount(pq parsedQuery) (int, bool) {
 			if id < 0 || id >= vol.index.compactRecordCount() {
 				continue
 			}
+			if !hidden.empty() && hidden.contains(id) {
+				continue
+			}
 			rec := vol.index.compactRecord(id)
 			if rec.Deleted {
 				continue
@@ -107,18 +257,19 @@ func (vol *serviceVolumeIndex) plannedCount(pq parsedQuery) (int, bool) {
 		return count, true
 	}
 
-	if vol.pathCache == nil {
-		vol.pathCache = make(map[int]string)
-	}
+	pathCache := make(map[int]string)
 	for _, id := range ids {
 		if id < 0 || id >= vol.index.compactRecordCount() {
+			continue
+		}
+		if !hidden.empty() && hidden.contains(id) {
 			continue
 		}
 		rec := vol.index.compactRecord(id)
 		if rec.Deleted || !compactRecordPrecheck(rec, pq, pq.MatchPath) {
 			continue
 		}
-		path := vol.index.reconstructCompactPathCached(id, vol.pathCache)
+		path := vol.index.reconstructCompactPathCached(id, pathCache)
 		entry := Entry{
 			Path:        path,
 			Name:        rec.Name,
@@ -242,6 +393,18 @@ func (vol *serviceVolumeIndex) buildCandidatePlan(pq parsedQuery) (candidatePlan
 		})
 		return true
 	}
+	addPostingRequired := func(name string, candidate postingCountCandidate) bool {
+		if candidate.len() == 0 {
+			plan.empty = true
+			return false
+		}
+		plan.sources = append(plan.sources, candidatePlanSource{
+			name:       name,
+			posting:    candidate,
+			hasPosting: true,
+		})
+		return true
+	}
 
 	if pq.Under != "" {
 		under := filepath.Clean(pq.Under)
@@ -259,6 +422,12 @@ func (vol *serviceVolumeIndex) buildCandidatePlan(pq parsedQuery) (candidatePlan
 	}
 
 	for _, ext := range pq.Exts {
+		if candidate, ok := vol.extPostingCountCandidate(ext); ok {
+			if !addPostingRequired("ext:"+ext, candidate) {
+				return plan, true
+			}
+			continue
+		}
 		if !addRequired("ext:"+ext, vol.extPosting(ext)) {
 			return plan, true
 		}
@@ -266,33 +435,50 @@ func (vol *serviceVolumeIndex) buildCandidatePlan(pq parsedQuery) (candidatePlan
 	globExts, globsOK := simpleGlobExts(pq.Globs)
 	if globsOK {
 		for _, ext := range globExts {
+			if candidate, ok := vol.extPostingCountCandidate(ext); ok {
+				if !addPostingRequired("glob-ext:"+ext, candidate) {
+					return plan, true
+				}
+				continue
+			}
 			if !addRequired("glob-ext:"+ext, vol.extPosting(ext)) {
 				return plan, true
 			}
 		}
 	} else {
 		for _, ext := range complexGlobExts(pq.Globs) {
+			if candidate, ok := vol.extPostingCountCandidate(ext); ok {
+				if !addPostingRequired("glob-ext:"+ext, candidate) {
+					return plan, true
+				}
+				continue
+			}
 			if !addRequired("glob-ext:"+ext, vol.extPosting(ext)) {
 				return plan, true
 			}
 		}
 	}
 	if pq.Type == "dir" {
-		dirs := []int(nil)
-		if vol.queryIndex != nil {
-			dirs = uint32sToInts(vol.queryIndex.dirs)
-			dirs = vol.withRecentCandidates(dirs, 0, func(rec CompactRecord) bool {
-				return rec.Mode&uint32(os.ModeDir) != 0
-			})
-		}
-		if !addRequired("type:dir", dirs) {
-			return plan, true
+		if vol.queryIndex != nil && vol.queryIndex.dirsReady {
+			if !addPostingRequired("type:dir", postingCountCandidate{ids: vol.queryIndex.dirs}) {
+				return plan, true
+			}
 		}
 	}
 	for _, dir := range pq.Dirs {
-		if !addRequired("dir:"+dir, vol.pathComponentPosting(dir)) {
+		if !vol.pathComponentPostingAvailable(dir) {
+			continue
+		}
+		roots := vol.pathComponentRootIDs(dir)
+		if len(roots) == 0 {
+			plan.empty = true
 			return plan, true
 		}
+		plan.sources = append(plan.sources, candidatePlanSource{
+			name:  "dir:" + dir,
+			vol:   vol,
+			roots: uniqueSortedInts(roots),
+		})
 	}
 	if len(plan.sources) == 0 && pq.MatchPath && hasNonVolumeTerm(pq.Terms) {
 		for _, term := range pathPlanProbeTerms(pq.Terms) {
@@ -305,19 +491,20 @@ func (vol *serviceVolumeIndex) buildCandidatePlan(pq parsedQuery) (candidatePlan
 			}
 		}
 	}
-
 	// OR groups: a record must match at least one alternative, so the candidate
 	// source is the union of each alternative's posting. We only build a posting
 	// source when every alternative is cheaply postable (ext/glob-ext/term);
 	// otherwise the group is verified later against the full candidate set.
 	for _, group := range pq.OrGroups {
-		ids, ok := vol.orGroupPosting(group, pq.MatchPath)
+		source, ok := vol.orGroupPlanSource(group, pq.MatchPath)
 		if !ok {
 			continue
 		}
-		if !addRequired("or-group", ids) {
+		if source.len() == 0 {
+			plan.empty = true
 			return plan, true
 		}
+		plan.sources = append(plan.sources, source)
 	}
 
 	// Cheap structural filters above are verified against the full query later.
@@ -331,15 +518,8 @@ func (vol *serviceVolumeIndex) buildCandidatePlan(pq parsedQuery) (candidatePlan
 			// term is selective enough AND there is no other source (under /
 			// regex literals) to bound the query, decline so the search uses the
 			// streaming name-order scan instead — how Everything scans columns.
-			term, ok := vol.mostSelectivePathTerm(pq)
-			if !ok {
-				if len(underRoots) == 0 {
-					return plan, false
-				}
-			} else if limited, ok := vol.pathPlanTermPostingLimited(term, pq); ok {
-				plan.sources = append(plan.sources, candidatePlanSource{name: "term-limited:" + term, ids: limited})
-			} else if !addRequired("term:"+term, vol.pathPlanTermPosting(term)) {
-				return plan, true
+			if len(underRoots) == 0 {
+				return plan, false
 			}
 		} else if !pq.MatchPath {
 			for _, term := range pq.Terms {
@@ -360,9 +540,11 @@ func (vol *serviceVolumeIndex) buildCandidatePlan(pq parsedQuery) (candidatePlan
 	}
 
 	if len(underRoots) > 0 && shouldUseUnderPlanSource(underEstimatedSize, plan.sources) {
-		if !addRequired("under", vol.unionUnderDescendants(underRoots)) {
-			return plan, true
-		}
+		plan.sources = append(plan.sources, candidatePlanSource{
+			name:  "under",
+			vol:   vol,
+			roots: uniqueSortedInts(underRoots),
+		})
 	}
 
 	if len(plan.sources) == 0 {
@@ -398,13 +580,14 @@ func (vol *serviceVolumeIndex) completeNameTrigramNameTermPostingLimited(term st
 	cacheKey := "\x00complete-ngram-name:" + term
 	vol.termMu.Lock()
 	if vol.termCache != nil {
-		if list, ok := vol.termCache[cacheKey]; ok {
-			seq := vol.termSeq[cacheKey]
-			vol.termMu.Unlock()
-			return vol.withRecentCandidates(list, seq, func(rec CompactRecord) bool {
-				id, ok := vol.idForFRN(rec.FRN)
-				return ok && vol.nameTrigramCandidateMatches(id, term)
-			}), true
+		if entry, ok := vol.termCache[cacheKey]; ok {
+			if vol.cacheStampValid(entry.gen) {
+				vol.termMu.Unlock()
+				return vol.withRecentCandidates(entry.ids, entry.gen, func(rec CompactRecord) bool {
+					id, ok := vol.idForFRN(rec.FRN)
+					return ok && vol.nameTrigramCandidateMatches(id, term)
+				}), true
+			}
 		}
 	}
 	vol.termMu.Unlock()
@@ -431,13 +614,14 @@ func (vol *serviceVolumeIndex) completeNameTrigramPathTermPosting(term string) (
 	cacheKey := "\x00complete-trigram-path:" + term
 	vol.termMu.Lock()
 	if vol.pathTermCache != nil {
-		if list, ok := vol.pathTermCache[cacheKey]; ok {
-			seq := vol.pathTermSeq[cacheKey]
-			vol.termMu.Unlock()
-			return vol.withRecentCandidates(list, seq, func(rec CompactRecord) bool {
-				id, ok := vol.idForFRN(rec.FRN)
-				return ok && vol.index.compactPathContainsTerm(id, term)
-			}), true
+		if entry, ok := vol.pathTermCache[cacheKey]; ok {
+			if vol.cacheStampValid(entry.gen) {
+				vol.termMu.Unlock()
+				return vol.withRecentCandidates(entry.ids, entry.gen, func(rec CompactRecord) bool {
+					id, ok := vol.idForFRN(rec.FRN)
+					return ok && vol.index.compactPathContainsTerm(id, term)
+				}), true
+			}
 		}
 	}
 	vol.termMu.Unlock()
@@ -456,13 +640,14 @@ func (vol *serviceVolumeIndex) scannedNamePathTermPosting(term string) ([]int, b
 	cacheKey := "\x00scan-name-path:" + term
 	vol.termMu.Lock()
 	if vol.pathTermCache != nil {
-		if list, ok := vol.pathTermCache[cacheKey]; ok {
-			seq := vol.pathTermSeq[cacheKey]
-			vol.termMu.Unlock()
-			return vol.withRecentCandidates(list, seq, func(rec CompactRecord) bool {
-				id, ok := vol.idForFRN(rec.FRN)
-				return ok && vol.index.compactPathContainsTerm(id, term)
-			}), true
+		if entry, ok := vol.pathTermCache[cacheKey]; ok {
+			if vol.cacheStampValid(entry.gen) {
+				vol.termMu.Unlock()
+				return vol.withRecentCandidates(entry.ids, entry.gen, func(rec CompactRecord) bool {
+					id, ok := vol.idForFRN(rec.FRN)
+					return ok && vol.index.compactPathContainsTerm(id, term)
+				}), true
+			}
 		}
 	}
 	vol.termMu.Unlock()
@@ -492,6 +677,9 @@ func (vol *serviceVolumeIndex) expandNameMatchesToPathTermPosting(cacheKey, term
 		if rec.Mode&uint32(os.ModeDir) == 0 {
 			estimated++
 		} else {
+			if !vol.hasDescendantIndex() {
+				return nil, false
+			}
 			estimated += vol.estimatedDescendantOrSelfCount(id)
 		}
 		if estimated > serviceComponentTrigramExpansionMaxIDs {
@@ -509,6 +697,9 @@ func (vol *serviceVolumeIndex) expandNameMatchesToPathTermPosting(cacheKey, term
 		rec := vol.index.compactRecord(id)
 		if rec.Deleted || rec.Mode&uint32(os.ModeDir) == 0 {
 			continue
+		}
+		if !vol.hasDescendantIndex() {
+			return nil, false
 		}
 		for _, childID := range vol.underDescendants(id) {
 			child := int(childID)
@@ -529,13 +720,9 @@ func (vol *serviceVolumeIndex) expandNameMatchesToPathTermPosting(cacheKey, term
 	return out, true
 }
 
-// broadPathScanCandidates handles broad path-substring queries (e.g.
-// `-path "src"` or `-path "src main"`) where no term is selective enough to
-// build a bounded posting. Instead of materializing a per-term path posting that
-// exceeds the cache cap and is rebuilt every call, it scans all records in
-// parallel and returns the ids whose full path contains every plain term. This
-// mirrors how Everything scans its packed columns. The final ranking, limit, and
-// full verification still happen in the shared search loop.
+// broadPathScanCandidates is retained for direct benchmark/test coverage of
+// the old broad path scanner. The live route now uses boundedScanCandidates for
+// this family.
 //
 // It only engages when the query is purely plain terms in path mode with no
 // other constraints that an earlier, cheaper strategy already covers.
@@ -562,6 +749,9 @@ func (vol *serviceVolumeIndex) broadPathScanCandidates(pq parsedQuery) ([]int, b
 	if workers <= 1 {
 		out := make([]int, 0, 256)
 		for i := 0; i < recordCount; i++ {
+			if i&1023 == 0 && queryCanceled(pq) {
+				return nil, false
+			}
 			rec := vol.index.compactRecord(i)
 			if rec.Deleted {
 				continue
@@ -579,6 +769,7 @@ func (vol *serviceVolumeIndex) broadPathScanCandidates(pq parsedQuery) ([]int, b
 	}
 
 	parts := make([][]int, workers)
+	var canceled atomic.Bool
 	var wg sync.WaitGroup
 	for w := 0; w < workers; w++ {
 		start := w * recordCount / workers
@@ -588,6 +779,10 @@ func (vol *serviceVolumeIndex) broadPathScanCandidates(pq parsedQuery) ([]int, b
 			defer wg.Done()
 			local := make([]int, 0, 256)
 			for i := start; i < end; i++ {
+				if i&1023 == 0 && queryCanceled(pq) {
+					canceled.Store(true)
+					return
+				}
 				rec := vol.index.compactRecord(i)
 				if rec.Deleted {
 					continue
@@ -600,6 +795,9 @@ func (vol *serviceVolumeIndex) broadPathScanCandidates(pq parsedQuery) ([]int, b
 		}(w, start, end)
 	}
 	wg.Wait()
+	if canceled.Load() {
+		return nil, false
+	}
 
 	total := 0
 	for _, p := range parts {
@@ -615,6 +813,110 @@ func (vol *serviceVolumeIndex) broadPathScanCandidates(pq parsedQuery) ([]int, b
 	})
 	sortCandidateIDs(out, pq, vol.index, vol.nameOrderRanks())
 	return capBroadCandidates(out, pq), true
+}
+
+// boundedScanCandidates is the universal candidate floor. It accepts any query
+// shape by scanning a bounded compact-record order and evaluating the same
+// predicate the shared verifier uses. Specialized postings can beat this, but
+// no query should need to fall through to older per-term reconstruction routes.
+func (vol *serviceVolumeIndex) boundedScanCandidates(pq parsedQuery) ([]int, bool) {
+	if vol == nil || vol.index == nil {
+		return nil, false
+	}
+	recordCount := vol.index.compactRecordCount()
+	if recordCount == 0 {
+		return []int{}, true
+	}
+	order := vol.mappedOrCompactNameOrder()
+	limit := pq.Limit
+	canStopAtLimit := !pq.CountOnly && limit > 0 && pq.RootBias == "" && pq.CWDBias == ""
+	if canStopAtLimit {
+		out := make([]int, 0, min(limit, 1024))
+		cache := make(map[int]string)
+		for pos := 0; pos < compactUint32OrderLen(order, recordCount); pos++ {
+			if pos&1023 == 0 && queryCanceled(pq) {
+				return nil, false
+			}
+			id := compactUint32OrderAt(order, pos)
+			if _, ok := compactCandidateEntryIfMatch(vol.index, pq, id, cache, true, false); !ok {
+				continue
+			}
+			out = append(out, id)
+			if len(out) >= limit {
+				return out, true
+			}
+		}
+		return out, true
+	}
+
+	workers := minInt(maxInt(1, recordCountWorkers(recordCount)), 16)
+	if workers <= 1 || recordCount < 8192 {
+		out := make([]int, 0, min(recordCount, 1024))
+		cache := make(map[int]string)
+		for pos := 0; pos < compactUint32OrderLen(order, recordCount); pos++ {
+			if pos&1023 == 0 && queryCanceled(pq) {
+				return nil, false
+			}
+			id := compactUint32OrderAt(order, pos)
+			if _, ok := compactCandidateEntryIfMatch(vol.index, pq, id, cache, true, false); ok {
+				out = append(out, id)
+			}
+		}
+		return out, true
+	}
+
+	orderLen := compactUint32OrderLen(order, recordCount)
+	parts := make([][]int, workers)
+	var canceled atomic.Bool
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		start := w * orderLen / workers
+		end := (w + 1) * orderLen / workers
+		wg.Add(1)
+		go func(w, start, end int) {
+			defer wg.Done()
+			local := make([]int, 0, 256)
+			cache := make(map[int]string)
+			for pos := start; pos < end; pos++ {
+				if pos&1023 == 0 && queryCanceled(pq) {
+					canceled.Store(true)
+					return
+				}
+				id := compactUint32OrderAt(order, pos)
+				if _, ok := compactCandidateEntryIfMatch(vol.index, pq, id, cache, true, false); ok {
+					local = append(local, id)
+				}
+			}
+			parts[w] = local
+		}(w, start, end)
+	}
+	wg.Wait()
+	if canceled.Load() {
+		return nil, false
+	}
+	total := 0
+	for _, part := range parts {
+		total += len(part)
+	}
+	out := make([]int, 0, total)
+	for _, part := range parts {
+		out = append(out, part...)
+	}
+	return out, true
+}
+
+func compactUint32OrderLen(order []uint32, recordCount int) int {
+	if len(order) == 0 {
+		return recordCount
+	}
+	return len(order)
+}
+
+func compactUint32OrderAt(order []uint32, pos int) int {
+	if len(order) == 0 {
+		return pos
+	}
+	return int(order[pos])
 }
 
 // capBroadCandidates trims a fully-path-verified, name-order-sorted candidate
@@ -672,27 +974,6 @@ func hasNonVolumeTerm(terms []string) bool {
 		}
 	}
 	return false
-}
-
-func (vol *serviceVolumeIndex) mostSelectivePathTerm(pq parsedQuery) (string, bool) {
-	best := ""
-	bestSize := -1
-	for _, term := range pathPlanProbeTerms(pq.Terms) {
-		size := len(vol.pathPlanTermPosting(term))
-		if bestSize < 0 || size < bestSize {
-			best, bestSize = term, size
-		}
-		if bestSize <= serviceCachedPostingMaxIDs {
-			break
-		}
-	}
-	if bestSize < 0 {
-		return "", false
-	}
-	if bestSize > serviceCachedPostingMaxIDs {
-		return "", false
-	}
-	return best, true
 }
 
 func pathPlanProbeTerms(terms []string) []string {
@@ -781,6 +1062,160 @@ func (vol *serviceVolumeIndex) limitedDottedPathScanCandidates(pq parsedQuery) (
 		return nil, false
 	}
 	return nil, false
+}
+
+func (vol *serviceVolumeIndex) pathDirectoryTermTopCandidates(pq parsedQuery) ([]int, bool) {
+	if vol == nil || vol.index == nil || !vol.hasDescendantIndex() ||
+		!pq.MatchPath || pq.CountOnly || pq.Limit <= 0 ||
+		pq.CaseSensitive || pq.Under != "" || pq.Type != "" || pq.HasModAfter || pq.Exists ||
+		pq.CWDBias != "" || pq.RootBias != "" ||
+		len(pq.Exts) != 1 || len(pq.Dirs) > 0 || len(pq.Globs) > 0 || len(pq.Regexps) > 0 ||
+		len(pq.SizeFilters) > 0 || len(pq.DateFilters) > 0 ||
+		len(pq.OrGroups) > 0 || len(pq.NotGroups) > 0 ||
+		countNonVolumeTerms(pq.Terms) != 1 {
+		return nil, false
+	}
+	term := ""
+	for _, candidate := range pq.Terms {
+		if !isVolumeQueryTerm(candidate) {
+			term = candidate
+			break
+		}
+	}
+	if len(term) < 3 || strings.ContainsAny(term, `\/*?[]:`) {
+		return nil, false
+	}
+	if vol.pathTermIsUsableExtensionCandidate(term) {
+		return nil, false
+	}
+	nameMatches, roots, complete := vol.pathDirectoryTermSource(term)
+	if complete && len(nameMatches) == 0 {
+		return []int{}, true
+	}
+	if len(roots) == 0 {
+		return nil, false
+	}
+	recordCount := vol.index.compactRecordCount()
+	rankOf := candidateRanker(vol.index, vol.nameOrderRanks())
+	seen := make(map[int]struct{}, pq.Limit*4)
+	h := make(candidateRankMaxHeap, 0, pq.Limit)
+	add := func(id int) {
+		if id < 0 || id >= recordCount {
+			return
+		}
+		if _, ok := seen[id]; ok {
+			return
+		}
+		rec := vol.index.compactRecord(id)
+		if rec.Deleted || !compactRecordPrecheck(rec, pq, true) || !vol.index.compactPathContainsTerm(id, term) {
+			return
+		}
+		seen[id] = struct{}{}
+		item := candidateRankItem{id: id, rank: rankOf(id)}
+		if len(h) < pq.Limit {
+			heap.Push(&h, item)
+			return
+		}
+		if item.rank < h[0].rank {
+			h[0] = item
+			heap.Fix(&h, 0)
+		}
+	}
+	for _, id := range nameMatches {
+		add(id)
+	}
+	if ext := pq.Exts[0]; ext != "" {
+		if ids, ok := vol.extTopPosting(ext, maxInt(pq.Limit*8, pq.Limit)); ok {
+			for _, id := range ids {
+				add(id)
+			}
+		}
+	}
+	scanned := 0
+	for rootIndex, rootID := range roots {
+		if rootIndex&127 == 0 && queryCanceled(pq) {
+			return nil, false
+		}
+		if len(vol.subtreeOrder) > 0 && rootID >= 0 && rootID < len(vol.subtreeStart) && rootID < len(vol.subtreeEnd) {
+			start, end := vol.subtreeStart[rootID], vol.subtreeEnd[rootID]
+			if start != ^uint32(0) && start <= end && int(end) <= len(vol.subtreeOrder) {
+				for pos := start; pos < end; pos++ {
+					if scanned >= serviceComponentMultiTermScanMaxIDs {
+						return heapIDsByRank(h, rankOf), len(h) > 0
+					}
+					scanned++
+					if pos&4095 == 0 && queryCanceled(pq) {
+						return nil, false
+					}
+					add(int(vol.subtreeOrder[pos]))
+				}
+				continue
+			}
+		}
+		for _, childID := range vol.underDescendantsLimited(rootID, serviceComponentMultiTermScanMaxIDs-scanned+1) {
+			if scanned >= serviceComponentMultiTermScanMaxIDs {
+				return heapIDsByRank(h, rankOf), len(h) > 0
+			}
+			scanned++
+			add(int(childID))
+		}
+	}
+	out := heapIDsByRank(h, rankOf)
+	return out, len(out) > 0
+}
+
+func (vol *serviceVolumeIndex) pathDirectoryTermRoots(term string) ([]int, bool) {
+	_, roots, complete := vol.pathDirectoryTermSource(term)
+	return roots, complete
+}
+
+func (vol *serviceVolumeIndex) pathDirectoryTermSource(term string) (nameMatches []int, roots []int, complete bool) {
+	if vol == nil || vol.index == nil || len(term) < 3 || isVolumeQueryTerm(term) ||
+		strings.ContainsAny(term, `\/*?[]:`) {
+		return nil, nil, false
+	}
+	nameMatches, ok := vol.completeNameTrigramNameTermPostingLimited(term, servicePathNameTrigramCandidateMaxIDs)
+	if !ok {
+		roots = vol.pathComponentRootIDs(term)
+		return nil, roots, false
+	}
+	seen := make(map[int]struct{}, len(nameMatches))
+	for _, id := range nameMatches {
+		if id < 0 || id >= vol.index.compactRecordCount() {
+			continue
+		}
+		rec := vol.index.compactRecord(id)
+		if rec.Deleted || rec.Mode&uint32(os.ModeDir) == 0 {
+			continue
+		}
+		if !strings.Contains(vol.index.compactLowerNameAt(id), term) {
+			continue
+		}
+		if _, exists := seen[id]; exists {
+			continue
+		}
+		seen[id] = struct{}{}
+		roots = append(roots, id)
+	}
+	if len(roots) == 0 {
+		roots = vol.pathComponentRootIDs(term)
+	}
+	sortCandidateIDs(roots, parsedQuery{}, vol.index, vol.nameOrderRanks())
+	return nameMatches, roots, true
+}
+
+func heapIDsByRank(h candidateRankMaxHeap, rankOf func(int) int) []int {
+	if len(h) == 0 {
+		return nil
+	}
+	out := make([]int, len(h))
+	for i := range h {
+		out[i] = h[i].id
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return rankOf(out[i]) < rankOf(out[j])
+	})
+	return out
 }
 
 func (vol *serviceVolumeIndex) extensionShapedPathTermCandidates(pq parsedQuery) ([]int, bool) {
@@ -950,6 +1385,72 @@ func (vol *serviceVolumeIndex) extensionShapedPathTopCandidates(pq parsedQuery) 
 	return topCandidateIDsByRank(out, pq.Limit, vol.index, vol.nameOrderRanks()), true
 }
 
+func (vol *serviceVolumeIndex) bareExtensionMultiPathTopCandidates(pq parsedQuery) ([]int, bool) {
+	if vol == nil || vol.index == nil || !pq.MatchPath || pq.CountOnly || pq.Limit <= 0 ||
+		pq.CaseSensitive || pq.Under != "" || len(pq.Dirs) > 0 || len(pq.Regexps) > 0 ||
+		len(pq.OrGroups) > 0 || len(pq.NotGroups) > 0 ||
+		pq.Type != "" || pq.HasModAfter || pq.Exists ||
+		len(pq.Exts) > 0 || len(pq.Globs) > 0 ||
+		len(pq.SizeFilters) > 0 || len(pq.DateFilters) > 0 ||
+		pq.CWDBias != "" || pq.RootBias != "" ||
+		countNonVolumeTerms(pq.Terms) < 2 {
+		return nil, false
+	}
+	hasAnchor := false
+	for _, term := range pq.Terms {
+		if isVolumeQueryTerm(term) || strings.ContainsAny(term, `\/*?[]:`) {
+			continue
+		}
+		if vol.pathTermIsUsableExtensionCandidate(term) {
+			continue
+		}
+		if len(term) >= 4 {
+			hasAnchor = true
+			break
+		}
+	}
+	if !hasAnchor {
+		return nil, false
+	}
+	for _, term := range pq.Terms {
+		if isVolumeQueryTerm(term) {
+			continue
+		}
+		ext, ok := pathExtensionCandidateTerm(term)
+		if !ok {
+			continue
+		}
+		if !strings.HasPrefix(term, ".") {
+			candidate, ok := vol.extPostingCountCandidate(ext)
+			if !ok || candidate.len() == 0 {
+				continue
+			}
+		}
+		if candidates, ok := vol.extTopPathTermCandidates(ext, pq.Terms, pq.Limit); ok {
+			return candidates, true
+		}
+		if candidates, ok := vol.extPathTermPostingCandidates(ext, pq.Terms, pq.Limit); ok {
+			return candidates, true
+		}
+		if candidates, ok := vol.extPostingPathTermCandidates(ext, pq.Terms, pq.Limit); ok {
+			return candidates, true
+		}
+	}
+	return nil, false
+}
+
+func (vol *serviceVolumeIndex) pathTermIsUsableExtensionCandidate(term string) bool {
+	ext, ok := pathExtensionCandidateTerm(term)
+	if !ok {
+		return false
+	}
+	if strings.HasPrefix(term, ".") {
+		return true
+	}
+	candidate, ok := vol.extPostingCountCandidate(ext)
+	return ok && candidate.len() > 0
+}
+
 func (vol *serviceVolumeIndex) hasDirectoryCandidate(ids []int) bool {
 	if vol == nil || vol.index == nil {
 		return true
@@ -976,6 +1477,201 @@ func extensionShapedPathTerm(term string) (string, bool) {
 		return "", false
 	}
 	return ext, true
+}
+
+func bareExtensionCandidateTerm(term string) bool {
+	if len(term) < 2 || len(term) > 8 || strings.ContainsAny(term, `.\/*?[]:`) {
+		return false
+	}
+	for _, r := range term {
+		if r >= 'a' && r <= 'z' || r >= '0' && r <= '9' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func pathExtensionCandidateTerm(term string) (string, bool) {
+	if ext, ok := extensionShapedPathTerm(term); ok {
+		return ext, true
+	}
+	if bareExtensionCandidateTerm(term) {
+		return term, true
+	}
+	return "", false
+}
+
+func (vol *serviceVolumeIndex) extPathTermPostingCandidates(ext string, terms []string, limit int) ([]int, bool) {
+	if vol == nil || vol.index == nil || ext == "" || limit <= 0 || len(terms) == 0 {
+		return nil, false
+	}
+	best := []int(nil)
+	bestSet := false
+	checkedAnchor := false
+	for _, term := range terms {
+		if isVolumeQueryTerm(term) {
+			continue
+		}
+		if vol.pathTermIsUsableExtensionCandidate(term) {
+			continue
+		}
+		if strings.ContainsAny(term, `\/*?[]:`) {
+			continue
+		}
+		checkedAnchor = true
+		ids, ok := vol.boundedPathTermPlanSource(term)
+		if !ok {
+			if expanded, expandedOK := vol.pathTermPostingForExtFilter(term, serviceComponentMultiTermScanMaxIDs); expandedOK {
+				ids = expanded
+				ok = true
+			}
+		}
+		if !ok {
+			if vol.pathTermDefinitelyEmpty(term) {
+				return []int{}, true
+			}
+			continue
+		}
+		if !bestSet || len(ids) < len(best) {
+			best = ids
+			bestSet = true
+		}
+	}
+	if checkedAnchor && !bestSet {
+		return nil, false
+	}
+	if !bestSet {
+		return nil, false
+	}
+	out := make([]int, 0, min(limit, len(best)))
+	for _, id := range best {
+		if id < 0 || id >= vol.index.compactRecordCount() {
+			continue
+		}
+		rec := vol.index.compactRecord(id)
+		if rec.Deleted {
+			continue
+		}
+		actual := strings.TrimPrefix(filepath.Ext(rec.Name), ".")
+		if !strings.EqualFold(actual, ext) || !vol.index.compactPathContainsAll(id, terms) {
+			continue
+		}
+		out = append(out, id)
+	}
+	return topCandidateIDsByRank(out, limit, vol.index, vol.nameOrderRanks()), true
+}
+
+func (vol *serviceVolumeIndex) pathTermDefinitelyEmpty(term string) bool {
+	if vol == nil || vol.index == nil || term == "" || isVolumeQueryTerm(term) {
+		return false
+	}
+	if len(vol.pathComponentRootIDs(term)) > 0 {
+		return false
+	}
+	if ids, ok := vol.nameTrigramNameTermPosting(term); ok {
+		return len(ids) == 0
+	}
+	return len(vol.nameTermPosting(term)) == 0
+}
+
+func (vol *serviceVolumeIndex) pathTermPostingForExtFilter(term string, maxIDs int) ([]int, bool) {
+	if vol == nil || vol.index == nil || term == "" || maxIDs <= 0 {
+		return nil, false
+	}
+	seen := make(map[int]struct{})
+	out := make([]int, 0, 256)
+	add := func(id int) bool {
+		if id < 0 || id >= vol.index.compactRecordCount() {
+			return true
+		}
+		if _, exists := seen[id]; exists {
+			return true
+		}
+		rec := vol.index.compactRecord(id)
+		if rec.Deleted {
+			return true
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+		return len(out) <= maxIDs
+	}
+	for _, root := range vol.pathComponentRootIDs(term) {
+		if root < 0 || root >= vol.index.compactRecordCount() {
+			continue
+		}
+		rec := vol.index.compactRecord(root)
+		if rec.Deleted {
+			continue
+		}
+		if rec.Mode&uint32(os.ModeDir) == 0 {
+			if !add(root) {
+				return nil, false
+			}
+			continue
+		}
+		if !vol.hasDescendantIndex() || vol.estimatedDescendantOrSelfCount(root) > maxIDs {
+			return nil, false
+		}
+		for _, childID := range vol.underDescendantsLimited(root, maxIDs+1) {
+			if !add(int(childID)) {
+				return nil, false
+			}
+		}
+	}
+	nameMatches, ok := vol.completeNameTrigramNameTermPostingLimited(term, servicePathNameTrigramCandidateMaxIDs)
+	if !ok {
+		nameMatches = vol.nameTermPosting(term)
+		if len(nameMatches) > servicePathNameTrigramCandidateMaxIDs {
+			return nil, false
+		}
+	}
+	if len(nameMatches) == 0 && len(out) == 0 {
+		return []int{}, true
+	}
+	estimated := 0
+	for _, id := range nameMatches {
+		if id < 0 || id >= vol.index.compactRecordCount() {
+			continue
+		}
+		rec := vol.index.compactRecord(id)
+		if rec.Deleted {
+			continue
+		}
+		if rec.Mode&uint32(os.ModeDir) == 0 {
+			estimated++
+		} else {
+			if !vol.hasDescendantIndex() {
+				return nil, false
+			}
+			estimated += vol.estimatedDescendantOrSelfCount(id)
+		}
+		if estimated > maxIDs {
+			return nil, false
+		}
+	}
+	for _, id := range nameMatches {
+		if !add(id) {
+			return nil, false
+		}
+		if id < 0 || id >= vol.index.compactRecordCount() {
+			continue
+		}
+		rec := vol.index.compactRecord(id)
+		if rec.Deleted || rec.Mode&uint32(os.ModeDir) == 0 {
+			continue
+		}
+		if !vol.hasDescendantIndex() {
+			return nil, false
+		}
+		for _, childID := range vol.underDescendantsLimited(id, maxIDs+1) {
+			if !add(int(childID)) {
+				return nil, false
+			}
+		}
+	}
+	sort.Ints(out)
+	return out, true
 }
 
 func (vol *serviceVolumeIndex) pathPlanTermPostingLimited(term string, pq parsedQuery) ([]int, bool) {
@@ -1169,14 +1865,14 @@ func (plan candidatePlan) execute() []int {
 		return []int{}
 	}
 	sort.Slice(plan.sources, func(i, j int) bool {
-		if len(plan.sources[i].ids) == len(plan.sources[j].ids) {
+		if plan.sources[i].len() == plan.sources[j].len() {
 			return plan.sources[i].name < plan.sources[j].name
 		}
-		return len(plan.sources[i].ids) < len(plan.sources[j].ids)
+		return plan.sources[i].len() < plan.sources[j].len()
 	})
-	out := append([]int(nil), plan.sources[0].ids...)
+	out := plan.sources[0].materialize()
 	for _, source := range plan.sources[1:] {
-		out = intersectSortedInts(out, source.ids)
+		out = source.intersect(out)
 		if len(out) == 0 {
 			break
 		}
@@ -1211,15 +1907,13 @@ func (plan candidatePlan) filterUnderPath(ids []int) []int {
 	if plan.vol == nil || plan.vol.index == nil || plan.underPathFallback == "" || len(ids) == 0 {
 		return ids
 	}
-	if plan.vol.pathCache == nil {
-		plan.vol.pathCache = make(map[int]string)
-	}
+	pathCache := make(map[int]string)
 	out := make([]int, 0, len(ids))
 	for _, id := range ids {
 		if id < 0 || id >= plan.vol.index.compactRecordCount() {
 			continue
 		}
-		path := plan.vol.index.reconstructCompactPathCached(id, plan.vol.pathCache)
+		path := plan.vol.index.reconstructCompactPathCached(id, pathCache)
 		if pathUnder(path, plan.underPathFallback) {
 			out = append(out, id)
 		}
@@ -1232,36 +1926,74 @@ func (plan candidatePlan) filterUnderPath(ids []int) []int {
 // alternative cannot be turned into a posting, in which case the caller should
 // let the group be verified against the broader candidate set instead.
 func (vol *serviceVolumeIndex) orGroupPosting(group []parsedQuery, matchPath bool) ([]int, bool) {
+	source, ok := vol.orGroupPlanSource(group, matchPath)
+	if !ok {
+		return nil, false
+	}
+	return source.materialize(), true
+}
+
+func (vol *serviceVolumeIndex) orGroupPlanSource(group []parsedQuery, matchPath bool) (candidatePlanSource, bool) {
 	union := make([]int, 0, 64)
+	parts := make([]candidatePlanSource, 0, len(group))
 	for _, alt := range group {
-		ids, ok := vol.altPosting(alt, matchPath)
+		source, ok := vol.altPlanSource(alt, matchPath)
 		if !ok {
-			return nil, false
+			return candidatePlanSource{}, false
 		}
-		union = append(union, ids...)
+		if source.hasPosting || len(source.union) > 0 {
+			parts = append(parts, source)
+			continue
+		}
+		union = append(union, source.ids...)
+	}
+	if len(parts) > 0 {
+		if len(union) > 0 {
+			sort.Ints(union)
+			parts = append(parts, candidatePlanSource{name: "or-group-ids", ids: uniqueSortedInts(union)})
+		}
+		return candidatePlanSource{name: "or-group", union: parts}, true
 	}
 	sort.Ints(union)
-	return uniqueSortedInts(union), true
+	return candidatePlanSource{name: "or-group", ids: uniqueSortedInts(union)}, true
 }
 
 // altPosting returns a posting for a single OR alternative if it is a lone
 // ext:, simple glob extension, or plain term. Returns ok=false otherwise.
 func (vol *serviceVolumeIndex) altPosting(alt parsedQuery, matchPath bool) ([]int, bool) {
+	source, ok := vol.altPlanSource(alt, matchPath)
+	if !ok {
+		return nil, false
+	}
+	return source.materialize(), true
+}
+
+func (vol *serviceVolumeIndex) altPlanSource(alt parsedQuery, matchPath bool) (candidatePlanSource, bool) {
 	switch {
 	case len(alt.Exts) == 1 && alt.isOnly("ext"):
-		return vol.extPosting(alt.Exts[0]), true
+		ext := alt.Exts[0]
+		if candidate, ok := vol.extPostingCountCandidate(ext); ok {
+			return candidatePlanSource{name: "ext:" + ext, posting: candidate, hasPosting: true}, true
+		}
+		return candidatePlanSource{name: "ext:" + ext, ids: uniqueSortedInts(vol.extPosting(ext))}, true
 	case len(alt.Globs) == 1 && alt.isOnly("glob"):
 		if exts, ok := simpleGlobExts(alt.Globs); ok && len(exts) == 1 {
-			return vol.extPosting(exts[0]), true
+			ext := exts[0]
+			if candidate, ok := vol.extPostingCountCandidate(ext); ok {
+				return candidatePlanSource{name: "glob-ext:" + ext, posting: candidate, hasPosting: true}, true
+			}
+			return candidatePlanSource{name: "glob-ext:" + ext, ids: uniqueSortedInts(vol.extPosting(ext))}, true
 		}
-		return nil, false
+		return candidatePlanSource{}, false
 	case len(alt.Terms) == 1 && alt.isOnly("term"):
 		if matchPath {
-			return vol.pathTermPosting(alt.Terms[0]), true
+			term := alt.Terms[0]
+			return candidatePlanSource{name: "path-term:" + term, ids: uniqueSortedInts(vol.pathTermPosting(term))}, true
 		}
-		return vol.nameTermPosting(alt.Terms[0]), true
+		term := alt.Terms[0]
+		return candidatePlanSource{name: "term:" + term, ids: uniqueSortedInts(vol.nameTermPosting(term))}, true
 	default:
-		return nil, false
+		return candidatePlanSource{}, false
 	}
 }
 
@@ -1318,10 +2050,10 @@ func shouldUseUnderPlanSource(underEstimatedSize int, sources []candidatePlanSou
 	if underEstimatedSize < 0 {
 		return false
 	}
-	smallest := len(sources[0].ids)
+	smallest := sources[0].len()
 	for _, source := range sources[1:] {
-		if len(source.ids) < smallest {
-			smallest = len(source.ids)
+		if source.len() < smallest {
+			smallest = source.len()
 		}
 	}
 	return underEstimatedSize <= smallest
