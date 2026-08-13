@@ -556,11 +556,17 @@ func normalizeUIQueryForService(query string, matchPath bool) (string, bool) {
 func shouldUIUseLoosePathMatching(fields []string) bool {
 	plain := 0
 	for _, field := range fields {
+		if strings.HasPrefix(field, "!") || strings.HasPrefix(field, "-") {
+			continue
+		}
 		raw := strings.TrimLeft(field, "!-")
 		if raw == "" {
 			continue
 		}
-		if isVolumeQueryTerm(raw) || strings.ContainsAny(raw, `\/`) {
+		if isVolumeQueryTerm(raw) {
+			continue
+		}
+		if strings.ContainsAny(raw, `\/`) {
 			return true
 		}
 		key, value, hasPrefix := strings.Cut(raw, ":")
@@ -568,7 +574,7 @@ func shouldUIUseLoosePathMatching(fields []string) bool {
 			switch strings.ToLower(strings.TrimSpace(key)) {
 			case "path", "fullpath", "full-path", "full_path", "fullpathname", "full-path-name", "location":
 				return true
-			case "ext", "extension", "glob", "regex", "size", "sz", "dm", "date", "date-modified", "datemodified", "modified", "type", "case":
+			case "ext", "extension", "glob", "regex", "size", "sz", "dm", "date", "date-modified", "datemodified", "modified", "type", "case", "attrib", "sort":
 				continue
 			}
 			if value != "" {

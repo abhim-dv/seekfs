@@ -192,14 +192,24 @@ func fileAttributeFromDir(isDir bool) uint32 {
 // parseStandardInformation reads the modification time from a resident
 // $STANDARD_INFORMATION attribute.
 func parseStandardInformation(attr []byte, entry *mftEntry) {
+	if len(attr) < 22 {
+		return
+	}
 	contentOff := int(binary.LittleEndian.Uint16(attr[20:22]))
-	// $STANDARD_INFORMATION layout: 0 created, 8 modified (last data change).
+	// $STANDARD_INFORMATION layout: 0 created, 8 modified, 32 file attributes.
 	if contentOff+16 > len(attr) {
 		return
 	}
 	modified := binary.LittleEndian.Uint64(attr[contentOff+8 : contentOff+16])
 	if t := filetimeToUnixNano(modified); t != 0 {
 		entry.modUnix = t
+	}
+	if contentOff+36 <= len(attr) {
+		attrs := binary.LittleEndian.Uint32(attr[contentOff+32 : contentOff+36])
+		if attrs != 0 {
+			entry.attr = attrs
+			entry.isDir = attrs&fileAttributeDir != 0
+		}
 	}
 }
 

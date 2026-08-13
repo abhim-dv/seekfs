@@ -12,7 +12,8 @@ import (
 const trigramSegmentTargetRecords = 500_000
 const trigramBuildMaxWorkers = 4
 const trigramStoredPostingMaxCount = 25_000
-const trigramLowMemoryStoredPostingMaxCount = 25_000
+const trigramLowMemoryStoredPostingMaxCount = 250_000
+const gramPostingMetadataMagic = uint32(0x47524d31) // "GRM1"
 
 type trigramSegment struct {
 	start        int
@@ -38,14 +39,17 @@ type flatPosting struct {
 }
 
 type compressedTrigramIndex struct {
-	segments     []trigramSegment
-	counts       map[uint32]int
-	countKeys    []uint32
-	countValues  []int
-	mappedGrams  *mappedPostingSection
-	gramSize     int
-	recordCount  int
-	postingBytes int
+	segments           []trigramSegment
+	counts             map[uint32]int
+	countKeys          []uint32
+	countValues        []int
+	omitted            map[uint32]struct{}
+	gramCountsComplete bool
+	mappedGrams        *mappedPostingSection
+	gramSize           int
+	recordCount        int
+	postingBytes       int
+	gramUnionComplete  bool
 }
 
 func buildNameTrigramIndex(idx *Index) *compressedTrigramIndex {
@@ -74,9 +78,10 @@ func buildCompactTrigramIndex(idx *Index, text func(id int, cache map[int]string
 		recordCount = idx.compactRecordCount()
 	}
 	ti := &compressedTrigramIndex{
-		counts:      make(map[uint32]int),
-		gramSize:    3,
-		recordCount: recordCount,
+		counts:             make(map[uint32]int),
+		gramCountsComplete: true,
+		gramSize:           3,
+		recordCount:        recordCount,
 	}
 	if idx == nil || recordCount == 0 {
 		return ti
@@ -123,9 +128,10 @@ func buildSelectiveCompactTrigramIndex(idx *Index, maxPostingCount int, text fun
 		recordCount = idx.compactRecordCount()
 	}
 	ti := &compressedTrigramIndex{
-		counts:      make(map[uint32]int),
-		gramSize:    3,
-		recordCount: recordCount,
+		counts:             make(map[uint32]int),
+		gramCountsComplete: true,
+		gramSize:           3,
+		recordCount:        recordCount,
 	}
 	if idx == nil || recordCount == 0 || maxPostingCount <= 0 {
 		return ti
@@ -181,6 +187,7 @@ func buildSelectiveCompactTrigramIndex(idx *Index, maxPostingCount int, text fun
 		ti.segments = append(ti.segments, segment)
 		ti.postingBytes += segment.postingBytes
 	}
+	ti.markOmittedPostings(maxPostingCount)
 	return ti
 }
 
@@ -194,9 +201,10 @@ func buildSelectiveCompactNameGramIndex(idx *Index, gramSize int, maxPostingCoun
 		recordCount = idx.compactRecordCount()
 	}
 	ti := &compressedTrigramIndex{
-		counts:      make(map[uint32]int),
-		gramSize:    gramSize,
-		recordCount: recordCount,
+		counts:             make(map[uint32]int),
+		gramCountsComplete: true,
+		gramSize:           gramSize,
+		recordCount:        recordCount,
 	}
 	if idx == nil || recordCount == 0 || maxPostingCount <= 0 {
 		return ti
@@ -219,6 +227,7 @@ func buildSelectiveCompactNameGramIndex(idx *Index, gramSize int, maxPostingCoun
 			ti.segments = append(ti.segments, segment)
 			ti.postingBytes += segment.postingBytes
 		}
+		ti.markOmittedPostings(maxPostingCount)
 		ti.compactForLowMemory()
 		return ti
 	}
@@ -272,6 +281,7 @@ func buildSelectiveCompactNameGramIndex(idx *Index, gramSize int, maxPostingCoun
 		ti.segments = append(ti.segments, segment)
 		ti.postingBytes += segment.postingBytes
 	}
+	ti.markOmittedPostings(maxPostingCount)
 	return ti
 }
 
@@ -446,8 +456,15 @@ func (ti *compressedTrigramIndex) selectiveCandidateIDs(term string, maxIDs int)
 	for _, gram := range grams {
 		count := ti.countForGram(gram)
 		if count == 0 {
-			missing = true
+			if ti.gramCountsComplete {
+				missing = true
+			} else {
+				return nil, false, false
+			}
 			continue
+		}
+		if ti.isOmittedGram(gram) {
+			return nil, false, false
 		}
 		if maxIDs <= 0 || count <= maxIDs {
 			filtered = append(filtered, gram)
@@ -473,8 +490,15 @@ func (ti *compressedTrigramIndex) selectiveIntersectCandidateIDs(term string, ma
 		return nil, false, false
 	}
 	for _, gram := range grams {
-		if ti.countForGram(gram) == 0 {
-			return nil, true, true
+		count := ti.countForGram(gram)
+		if count == 0 {
+			if ti.gramCountsComplete {
+				return nil, true, true
+			}
+			return nil, false, false
+		}
+		if ti.isOmittedGram(gram) {
+			return nil, false, false
 		}
 	}
 	stored := grams[:0]
@@ -535,7 +559,8 @@ func (ti *compressedTrigramIndex) hasStoredPosting(gram uint32) bool {
 		return false
 	}
 	if ti.mappedGrams != nil {
-		return ti.countForGram(gram) > 0
+		_, _, ok := ti.mappedGrams.gramPostingIterator(gram)
+		return ok && !ti.isOmittedGram(gram)
 	}
 	for _, segment := range ti.segments {
 		if segment.postingForGram(gram).count > 0 {
@@ -554,6 +579,9 @@ func (ti *compressedTrigramIndex) postingCount(term string) (int, bool) {
 	for _, gram := range grams {
 		count := ti.countForGram(gram)
 		if count == 0 {
+			if !ti.gramCountsComplete {
+				return 0, false
+			}
 			return 0, true
 		}
 		if minCount < 0 || count < minCount {
@@ -561,6 +589,46 @@ func (ti *compressedTrigramIndex) postingCount(term string) (int, bool) {
 		}
 	}
 	return minCount, true
+}
+
+func (ti *compressedTrigramIndex) isOmittedGram(gram uint32) bool {
+	if ti == nil || len(ti.omitted) == 0 {
+		return false
+	}
+	_, ok := ti.omitted[gram]
+	return ok
+}
+
+func (ti *compressedTrigramIndex) lookupState(term string) string {
+	if ti == nil {
+		return "missing-section"
+	}
+	for _, gram := range ti.termGramKeys(strings.ToLower(term)) {
+		if ti.isOmittedGram(gram) {
+			return "omitted-common"
+		}
+		if ti.countForGram(gram) == 0 {
+			if ti.gramCountsComplete {
+				return "exact-empty"
+			}
+			return "missing-section"
+		}
+	}
+	return "present"
+}
+
+func (ti *compressedTrigramIndex) markOmittedPostings(maxPostingCount int) {
+	if ti == nil || maxPostingCount <= 0 {
+		return
+	}
+	if ti.omitted == nil {
+		ti.omitted = make(map[uint32]struct{})
+	}
+	ti.forEachCount(func(gram uint32, count int) {
+		if count > maxPostingCount && !ti.hasStoredPosting(gram) {
+			ti.omitted[gram] = struct{}{}
+		}
+	})
 }
 
 func (ti *compressedTrigramIndex) keyCount() int {
