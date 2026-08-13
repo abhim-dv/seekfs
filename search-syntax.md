@@ -45,20 +45,26 @@
 - Bare wildcard filename tokens such as `*_test.go` are treated as filename
   globs too; use `glob:` when you want that behavior to be explicit.
 - `dir:` is a path substring filter.
+- `parent:` matches entries whose immediate parent directory name equals the
+  supplied value; it accepts one directory name, not a path or glob.
+- `attrib:` matches file attributes. Supported flags are `R`, `H`, `S`, `D`,
+  and `A`; combined flags such as `attrib:HS` require all listed bits.
 - `regex:` evaluates against the normalized full path.
 - Omitting the `search` subcommand is accepted for search-like invocations, for
   example `seekfs --under F:\git\seekfs "main.go"`.
 - `--exists` calls `os.Stat` and is slower, but filters stale index entries.
+  Rootless service `--exists` uses a complete global verification fallback and
+  is intentionally outside the bounded R5 planner performance claim.
 - `size:` units are 1024-based (`kb`, `mb`, `gb`, `tb`; the trailing `b` is
-  optional). `size:` and `dm:` require an index built with file metadata; NTFS
-  service indexes capture this from the MFT. Querying them against an index that
-  lacks size or modification times returns a clear error rather than no results.
-- Unsupported `name:` style filters (for example `attrib:`, `parent:`) are
-  rejected with an error instead of being treated as literal text.
+  optional). `size:`, `dm:`, and `attrib:` require an index built with file
+  metadata; NTFS service indexes capture this from the MFT. Querying them
+  against an index that lacks required metadata returns a clear error rather
+  than no results.
+- Unsupported `name:` style filters are rejected with an error instead of being
+  treated as literal text.
 
 ## Not Implemented Yet
 
-- Everything filters such as `attrib:` and `parent:`.
 - Directory sizes (Everything reports folders at the recursive size of their
   contents; seekfs reports directory size as 0).
 - Everything-compatible ranking.
