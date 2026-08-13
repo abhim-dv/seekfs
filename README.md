@@ -93,6 +93,7 @@ Agent-friendly filters:
 .\seekfs.exe search "size:>100mb"
 .\seekfs.exe count  "ext:log dm:today"
 .\seekfs.exe bench -service --json -iterations 100
+.\seekfs.exe bench -service -count --json -iterations 100
 ```
 
 Performance note for agents: prefer filename-only search when looking for a
@@ -139,11 +140,9 @@ Representative warm service CLI timings:
 - Result ranking is simple and not Everything-compatible.
 - Directory sizes are reported as 0 (Everything reports folders at the recursive
   size of their contents).
-- Some Everything-style filters are not implemented, including `attrib:` and
-  `parent:`.
-- `size:` and `dm:` require an index built with file metadata. NTFS service
-  indexes capture size and modified time from the MFT; older indexes without
-  this metadata return a clear error for these filters.
+- `size:`, `dm:`, and `attrib:` require an index built with file metadata. NTFS
+  service indexes capture this from the MFT; older indexes without this metadata
+  return a clear error for these filters.
 - Index files contain local path names and should be treated as sensitive local
   metadata.
 
