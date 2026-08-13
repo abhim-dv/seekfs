@@ -1748,17 +1748,28 @@ func directV9ReadRankItem(r *bufio.Reader) (directV9RankItem, error) {
 	return directV9RankItem{ID: binary.LittleEndian.Uint32(idBytes[:]), Key: string(key)}, nil
 }
 
-func directV9WriteRankSection(ctx context.Context, cw *countingWriter, tag uint32, runs []directV9RunFile, recordCount, liveCount int, rankPath string, owned *[]string) (indexSectionTableEntry, error) {
-	if err := writeAlignment(cw, 8); err != nil {
-		return indexSectionTableEntry{}, err
+// directV9ComputeRankFamily merges one rank family's external-sort runs into
+// its section bytes plus a rank-by-id array, writing both to private temp
+// files.  It is safe to run for multiple families concurrently: each family
+// touches only its own runs and its own temp paths, and the output file order
+// is preserved by the caller's serial emission phase.
+func directV9ComputeRankFamily(ctx context.Context, tag uint32, runs []directV9RunFile, recordCount, liveCount int, sectionPath, rankPath string, owned *[]string) (int64, error) {
+	section, err := os.Create(sectionPath)
+	if err != nil {
+		return 0, err
 	}
-	offset := uint64(cw.n)
-	if err := binary.Write(cw, binary.LittleEndian, uint32(liveCount)); err != nil {
-		return indexSectionTableEntry{}, err
+	*owned = append(*owned, sectionPath)
+	sw := bufio.NewWriterSize(section, 256*1024)
+	written := int64(0)
+	if err := binary.Write(sw, binary.LittleEndian, uint32(liveCount)); err != nil {
+		_ = section.Close()
+		return 0, err
 	}
+	written += 4
 	// The rank-by-id array is filled in memory during the merge and written
-	// once, avoiding a random WriteAt syscall per record.  It is transient
-	// (recordCount*4 bytes) and released when the section returns.
+	// once per family; the array is bounded by recordCount*4 and released when
+	// the family completes.  Multiple families may be in flight, so the caller
+	// bounds the worker pool.
 	ranks := make([]byte, recordCount*4)
 	readers := make([]*bufio.Reader, len(runs))
 	files := make([]*os.File, len(runs))
@@ -1767,7 +1778,8 @@ func directV9WriteRankSection(ctx context.Context, cw *countingWriter, tag uint3
 	for i, run := range runs {
 		f, openErr := os.Open(run.path)
 		if openErr != nil {
-			return indexSectionTableEntry{}, openErr
+			_ = section.Close()
+			return 0, openErr
 		}
 		files[i] = f
 		readers[i] = bufio.NewReaderSize(f, 256*1024)
@@ -1775,7 +1787,8 @@ func directV9WriteRankSection(ctx context.Context, cw *countingWriter, tag uint3
 		if readErr == nil {
 			heap.Push(h, itemWithRun{item: item, run: i})
 		} else if !errors.Is(readErr, io.EOF) {
-			return indexSectionTableEntry{}, readErr
+			_ = section.Close()
+			return 0, readErr
 		}
 	}
 	defer func() {
@@ -1786,42 +1799,70 @@ func directV9WriteRankSection(ctx context.Context, cw *countingWriter, tag uint3
 	for rank := 0; h.Len() > 0; rank++ {
 		select {
 		case <-ctx.Done():
-			return indexSectionTableEntry{}, ctx.Err()
+			_ = section.Close()
+			return 0, ctx.Err()
 		default:
 		}
 		head := heap.Pop(h).(itemWithRun)
-		if err := binary.Write(cw, binary.LittleEndian, head.item.ID); err != nil {
-			return indexSectionTableEntry{}, err
+		if err := binary.Write(sw, binary.LittleEndian, head.item.ID); err != nil {
+			_ = section.Close()
+			return 0, err
 		}
+		written += 4
 		binary.LittleEndian.PutUint32(ranks[head.item.ID*4:head.item.ID*4+4], uint32(rank))
 		next, readErr := directV9ReadRankItem(readers[head.run])
 		if readErr == nil {
 			heap.Push(h, itemWithRun{item: next, run: head.run})
 		} else if !errors.Is(readErr, io.EOF) {
-			return indexSectionTableEntry{}, readErr
+			_ = section.Close()
+			return 0, readErr
 		}
 	}
-	if err := binary.Write(cw, binary.LittleEndian, uint32(recordCount)); err != nil {
-		return indexSectionTableEntry{}, err
+	if err := binary.Write(sw, binary.LittleEndian, uint32(recordCount)); err != nil {
+		_ = section.Close()
+		return 0, err
 	}
-	if _, err := cw.Write(ranks); err != nil {
-		return indexSectionTableEntry{}, err
+	written += 4
+	if _, err := sw.Write(ranks); err != nil {
+		_ = section.Close()
+		return 0, err
+	}
+	written += int64(len(ranks))
+	if err := sw.Flush(); err != nil {
+		_ = section.Close()
+		return 0, err
+	}
+	if err := section.Close(); err != nil {
+		return 0, err
 	}
 	// Persist the rank-by-id array for the retained copy the caller needs for
 	// subtree/bounds.  One sequential write replaces N random WriteAt calls.
 	rankFile, err := os.Create(rankPath)
 	if err != nil {
-		return indexSectionTableEntry{}, err
+		return 0, err
 	}
 	*owned = append(*owned, rankPath)
 	if _, err := rankFile.Write(ranks); err != nil {
 		_ = rankFile.Close()
-		return indexSectionTableEntry{}, err
+		return 0, err
 	}
 	if err := rankFile.Close(); err != nil {
-		return indexSectionTableEntry{}, err
+		return 0, err
 	}
 	ranks = nil
+	return written, nil
+}
+
+// directV9EmitRankSection streams a computed rank-family section into the
+// output writer with alignment, preserving the section byte layout exactly.
+func directV9EmitRankSection(cw *countingWriter, tag uint32, sectionPath string) (indexSectionTableEntry, error) {
+	if err := writeAlignment(cw, 8); err != nil {
+		return indexSectionTableEntry{}, err
+	}
+	offset := uint64(cw.n)
+	if err := copyFileToWriter(cw, sectionPath); err != nil {
+		return indexSectionTableEntry{}, err
+	}
 	return indexSectionTableEntry{tag: tag, offset: offset, length: uint64(cw.n) - offset}, nil
 }
 
@@ -1987,66 +2028,118 @@ func directV9WriteAtomic(ctx context.Context, opts directV9BuildOptions, finalPa
 	}
 	entries := make([]indexSectionTableEntry, 0, len(rankSpecs))
 	rankScratchPaths := make([]string, 0, len(rankSpecs))
-	rankPath := filepath.Join(filepath.Dir(finalPath), "direct-v9-rank-by-id.tmp")
 	sharedRankRuns, sharedRankErr := directV9BuildRankRunsShared(ctx, finalPath, filepath.Dir(finalPath), opts.RunRecords, opts.RankWorkers, rankSpecs, owned)
 	if sharedRankErr != nil {
 		cleanup()
 		return 0, sharedRankErr
 	}
-	for _, spec := range rankSpecs {
-		rankRuns := sharedRankRuns.Runs[spec.Name]
-		liveCount := sharedRankRuns.LiveCounts[spec.Name]
-		maxRunBytes := sharedRankRuns.MaxBytes[spec.Name]
-		var runBytes int64
-		for _, run := range rankRuns {
-			runBytes += run.bytes
+	// Compute every rank family concurrently with a bounded worker pool, then
+	// emit the finished sections serially in tag order.  The section bytes are
+	// written to private temp files during the merge so the parallel phase is
+	// memory-bounded and the serial phase stays byte-deterministic.
+	rankWorkers := opts.RankWorkers
+	if rankWorkers < 1 {
+		rankWorkers = 1
+	}
+	if rankWorkers > 16 {
+		rankWorkers = 16
+	}
+	type rankFamilyResult struct {
+		spec     directV9RankSpec
+		entry    indexSectionTableEntry
+		runBytes int64
+		report   directV9RankReport
+		section  directV9SectionReport
+		rankPath string
+	}
+	results := make([]*rankFamilyResult, len(rankSpecs))
+	ctxRanks, cancelRanks := context.WithCancel(ctx)
+	defer cancelRanks()
+	jobs := make(chan int, len(rankSpecs))
+	var workerWG sync.WaitGroup
+	var firstRankErr error
+	var rankErrMu sync.Mutex
+	for worker := 0; worker < rankWorkers; worker++ {
+		workerWG.Add(1)
+		go func() {
+			defer workerWG.Done()
+			for index := range jobs {
+				spec := rankSpecs[index]
+				runs := sharedRankRuns.Runs[spec.Name]
+				liveCount := sharedRankRuns.LiveCounts[spec.Name]
+				maxRunBytes := sharedRankRuns.MaxBytes[spec.Name]
+				var runBytes int64
+				for _, run := range runs {
+					runBytes += run.bytes
+				}
+				sectionPath := filepath.Join(filepath.Dir(finalPath), fmt.Sprintf("direct-v9-rank-section-%s.tmp", spec.Name))
+				rankPath := filepath.Join(filepath.Dir(finalPath), fmt.Sprintf("direct-v9-rank-by-id-%s.tmp", spec.Name))
+				if _, err := directV9ComputeRankFamily(ctxRanks, spec.Tag, runs, recordCount, liveCount, sectionPath, rankPath, owned); err != nil {
+					rankErrMu.Lock()
+					if firstRankErr == nil {
+						firstRankErr = err
+						cancelRanks()
+					}
+					rankErrMu.Unlock()
+					continue
+				}
+				results[index] = &rankFamilyResult{
+					spec:     spec,
+					runBytes: runBytes,
+					report:   directV9RankReport{Name: spec.Name, Tag: spec.Tag, Runs: len(runs), RunBytes: runBytes, MaxRunBytes: maxRunBytes},
+					rankPath: rankPath,
+				}
+			}
+		}()
+	}
+	for index := range rankSpecs {
+		select {
+		case jobs <- index:
+		case <-ctxRanks.Done():
+			break
 		}
-		if high := baseScratch + runBytes + int64(recordCount)*4; high > *scratchHigh {
+	}
+	close(jobs)
+	workerWG.Wait()
+	if firstRankErr != nil {
+		cleanup()
+		return 0, firstRankErr
+	}
+	for _, result := range results {
+		if result == nil {
+			cleanup()
+			return 0, errors.New("direct v9 rank family was not computed")
+		}
+		spec := result.spec
+		rankRuns := sharedRankRuns.Runs[spec.Name]
+		sectionPath := filepath.Join(filepath.Dir(finalPath), fmt.Sprintf("direct-v9-rank-section-%s.tmp", spec.Name))
+		entry, emitErr := directV9EmitRankSection(cw, spec.Tag, sectionPath)
+		if emitErr != nil {
+			cleanup()
+			return 0, emitErr
+		}
+		result.entry = entry
+		if high := baseScratch + result.runBytes + int64(recordCount)*4; high > *scratchHigh {
 			*scratchHigh = high
 		}
-		entry, writeErr := directV9WriteRankSection(ctx, cw, spec.Tag, rankRuns, recordCount, liveCount, rankPath, owned)
-		if writeErr != nil {
-			cleanup()
-			return 0, writeErr
-		}
 		entries = append(entries, entry)
-		retainedPath := filepath.Join(filepath.Dir(finalPath), fmt.Sprintf("direct-v9-rank-by-id-%s.tmp", spec.Name))
-		srcRank, srcErr := os.Open(rankPath)
-		if srcErr != nil {
-			cleanup()
-			return 0, srcErr
-		}
-		dstRank, dstErr := os.Create(retainedPath)
-		if dstErr == nil {
-			_, dstErr = io.Copy(dstRank, srcRank)
-		}
-		if closeErr := srcRank.Close(); dstErr == nil {
-			dstErr = closeErr
-		}
-		if dstRank != nil {
-			if closeErr := dstRank.Close(); dstErr == nil {
-				dstErr = closeErr
-			}
-		}
-		if dstErr != nil {
-			cleanup()
-			return 0, dstErr
-		}
+		retainedPath := result.rankPath
 		*owned = append(*owned, retainedPath)
 		rankScratchPaths = append(rankScratchPaths, retainedPath)
-		if high := baseScratch + runBytes + int64(recordCount)*4*int64(len(rankScratchPaths)+1); high > *scratchHigh {
+		if high := baseScratch + result.runBytes + int64(recordCount)*4*int64(len(rankScratchPaths)+1); high > *scratchHigh {
 			*scratchHigh = high
 		}
 		if reports != nil {
-			*reports = append(*reports, directV9RankReport{Name: spec.Name, Tag: spec.Tag, Runs: len(rankRuns), Bytes: int64(entry.length), RunBytes: runBytes, MaxRunBytes: maxRunBytes})
+			result.report.Bytes = int64(entry.length)
+			*reports = append(*reports, result.report)
 		}
 		if sectionReports != nil {
-			*sectionReports = append(*sectionReports, directV9SectionReport{Name: spec.Name, Tag: spec.Tag, Runs: len(rankRuns), Bytes: int64(entry.length), ScratchBytes: baseScratch + runBytes + int64(recordCount)*4})
+			*sectionReports = append(*sectionReports, directV9SectionReport{Name: spec.Name, Tag: spec.Tag, Runs: len(rankRuns), Bytes: int64(entry.length), ScratchBytes: baseScratch + result.runBytes + int64(recordCount)*4})
 		}
 		for _, run := range rankRuns {
 			_ = os.Remove(run.path)
 		}
-		_ = os.Remove(rankPath)
+		_ = os.Remove(sectionPath)
 	}
 	topologyEntries, topologyReports, topologyErr := directV9WriteTopologySections(ctx, cw, finalPath, frnPath, filepath.Dir(finalPath), recordCount, opts.RunRecords, owned, scratchHigh)
 	if topologyErr != nil {
