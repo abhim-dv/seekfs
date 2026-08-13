@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -282,18 +283,22 @@ func deterministicFullScanAcrossVolumes(t *testing.T, volumes []*serviceVolumeIn
 	out := make([]Entry, 0, limit)
 	for _, vol := range selected {
 		childOpts := opts
-		childOpts.Limit = limit - len(out)
-		if childOpts.Limit <= 0 {
-			break
-		}
+		childOpts.Limit = max(limit, vol.index.compactRecordCount())
 		got, err := searchCompactWithCache(vol.index, childOpts, false, make(map[int]string), nil)
 		if err != nil {
 			t.Fatal(err)
 		}
 		out = append(out, got...)
-		if len(out) >= limit {
-			break
+	}
+	if entriesSpanMultipleVolumes(out) {
+		pq, err := parseQuery(opts)
+		if err != nil {
+			t.Fatal(err)
 		}
+		sortSearchAllEntries(out, pq)
+	}
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
 	}
 	return out
 }
@@ -352,6 +357,9 @@ func assertPlannerBudget(t *testing.T, tc deterministicQueryCase, trace searchTr
 		t.Fatalf("query %q used filesystem fallback", tc.Query)
 	}
 	budget := deterministicCandidateBudget(tc, tc.Limit, trace.Candidates, recordCount)
+	if trace.Source == "global:bounded-scan" {
+		budget = recordCount
+	}
 	if trace.Candidates > budget {
 		t.Fatalf("query %q source=%s candidates=%d budget=%d", tc.Query, trace.Source, trace.Candidates, budget)
 	}
@@ -363,7 +371,7 @@ func assertPlannerBudget(t *testing.T, tc deterministicQueryCase, trace searchTr
 func deterministicCandidateBudget(tc deterministicQueryCase, limit, resultCount, recordCount int) int {
 	budget := maxInt(4*limit, 512)
 	switch tc.Family {
-	case "broad-common", "cold-trigram", "mixed-filter", "negation", "under":
+	case "broad-common", "cold-trigram", "dotted-extension", "mixed-filter", "negation", "under":
 		return min(recordCount, maxInt(budget, 50_000))
 	default:
 		return min(recordCount, budget)
@@ -387,4 +395,376 @@ func assertAllPathsOnVolume(t *testing.T, entries []Entry, volume string) {
 			t.Fatalf("path %q is not on volume %s", entry.Path, volume)
 		}
 	}
+}
+
+type coverageGapCase struct {
+	Name         string
+	Query        string
+	MatchPath    bool
+	Limit        int
+	Exists       bool
+	WantNonEmpty bool
+	Corpus       func(t *testing.T) []*serviceVolumeIndex
+}
+
+// TestDeterministicCoverageGapFamilies is the R5 audit regression: every
+// planner family that declines to a full-scan fallback must still be exact,
+// complete, and count/search-parity across a multi-volume synthetic corpus.
+func TestDeterministicCoverageGapFamilies(t *testing.T) {
+	cases := []coverageGapCase{
+		{Name: "short-term-x", Query: "x", Limit: 5000, WantNonEmpty: true},
+		{Name: "complex-glob", Query: "glob:*volume*", Limit: 5000, WantNonEmpty: true},
+		{Name: "non-literal-regex", Query: `regex:.*\.(md|txt)$`, Limit: 5000, WantNonEmpty: true},
+		{Name: "rootless-exists", Query: "needle", Limit: 20, Exists: true, WantNonEmpty: true, Corpus: deterministicRealPathCorpus},
+		{Name: "type-dir-term", Query: "type:dir node_modules", Limit: 5000, WantNonEmpty: true},
+		{Name: "parent-no-subt-large", Query: "parent:workspace-alpha", Limit: 5000, WantNonEmpty: true, Corpus: deterministicParentLargeCorpus},
+		{Name: "broad-common-term", Query: "commonish", Limit: 5000, WantNonEmpty: true, Corpus: deterministicBroadTermCorpus},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.Name, func(t *testing.T) {
+			volumes := deterministicMultiVolumeCorpus(t, 42)
+			if tc.Corpus != nil {
+				volumes = tc.Corpus(t)
+			}
+			assertCoverageGapFamily(t, volumes, tc)
+		})
+	}
+}
+
+func assertCoverageGapFamily(t *testing.T, volumes []*serviceVolumeIndex, tc coverageGapCase) {
+	t.Helper()
+	opts := queryOptions{Query: tc.Query, MatchPath: tc.MatchPath, Limit: tc.Limit, Exists: tc.Exists}
+	want := deterministicFullScanAcrossVolumesOptions(t, volumes, opts)
+	if tc.WantNonEmpty && len(want) == 0 {
+		t.Fatalf("oracle returned no results for %q", tc.Query)
+	}
+	wantCount := deterministicFullScanCountAcrossVolumesOptions(t, volumes, opts)
+
+	trace := &searchTrace{}
+	searchOpts := opts
+	searchOpts.Trace = trace
+	got, err := searchServiceVolumes(volumes, searchOpts, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertSameOrderedPaths(t, got, want)
+	if !completeTrace(trace) {
+		t.Fatalf("query %q search trace is not complete: source=%s mode=%s", tc.Query, trace.Source, trace.PlannerMode)
+	}
+	if len(got) != minInt(tc.Limit, wantCount) {
+		t.Fatalf("query %q search results = %d, want min(limit=%d, count=%d)", tc.Query, len(got), tc.Limit, wantCount)
+	}
+
+	countTrace := &searchTrace{}
+	countOpts := opts
+	countOpts.Trace = countTrace
+	count, handled, err := countServiceVolumes(volumes, countOpts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !handled {
+		t.Fatalf("query %q count not handled", tc.Query)
+	}
+	if count != wantCount {
+		t.Fatalf("query %q count = %d, want oracle count %d", tc.Query, count, wantCount)
+	}
+	if !completeTrace(countTrace) {
+		t.Fatalf("query %q count trace is not complete: source=%s mode=%s", tc.Query, countTrace.Source, countTrace.PlannerMode)
+	}
+	if count != wantCount {
+		t.Fatalf("query %q count/search parity: count %d, search exhaustive %d", tc.Query, count, wantCount)
+	}
+}
+
+func completeTrace(trace *searchTrace) bool {
+	return trace != nil && trace.Complete != nil && *trace.Complete
+}
+
+func deterministicFullScanAcrossVolumesOptions(t *testing.T, volumes []*serviceVolumeIndex, opts queryOptions) []Entry {
+	t.Helper()
+	selected, err := serviceVolumesForQuery(volumes, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	selected = prioritizeServiceVolumesForPathTerms(selected, opts)
+	limit := normalizedLimit(opts.Limit, false)
+	out := make([]Entry, 0, limit)
+	for _, vol := range selected {
+		childOpts := opts
+		childOpts.Limit = max(limit, vol.index.compactRecordCount())
+		got, err := searchCompactWithCache(vol.index, childOpts, false, make(map[int]string), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, got...)
+	}
+	if entriesSpanMultipleVolumes(out) {
+		pq, err := parseQuery(opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sortSearchAllEntries(out, pq)
+	}
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out
+}
+
+func deterministicFullScanCountAcrossVolumesOptions(t *testing.T, volumes []*serviceVolumeIndex, opts queryOptions) int {
+	t.Helper()
+	selected, err := serviceVolumesForQuery(volumes, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	total := 0
+	for _, vol := range selected {
+		got, err := searchCompactWithCache(vol.index, opts, true, make(map[int]string), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		total += len(got)
+	}
+	return total
+}
+
+// deterministicParentLargeCorpus builds large volumes with no SUBT metadata
+// (nothing populates idx.Derived), so parent: must resolve through the child
+// map without ever touching a subtree interval.
+func deterministicParentLargeCorpus(t *testing.T) []*serviceVolumeIndex {
+	t.Helper()
+	build := func(volume string, seed int) *serviceVolumeIndex {
+		idx := &Index{
+			Source:  "usn",
+			Volume:  volume,
+			Compact: true,
+			Records: make([]CompactRecord, 0, 5000),
+		}
+		nextFRN := uint64(seed * 100_000)
+		add := func(parent int32, parentFRN uint64, name string, mode uint32) int32 {
+			nextFRN++
+			idx.Records = append(idx.Records, CompactRecord{
+				FRN: nextFRN, ParentFRN: parentFRN, Parent: parent, Name: name, Mode: mode,
+				Size: 100, ModUnix: time.Date(2026, 7, 7, 12, 0, 0, 0, time.UTC).UnixNano(),
+			})
+			return int32(len(idx.Records) - 1)
+		}
+		rootFRN := nextFRN + 1
+		idx.Records = append(idx.Records, CompactRecord{FRN: rootFRN, ParentFRN: rootFRN, Parent: -1, Name: ".", Mode: uint32(os.ModeDir)})
+		nextFRN = rootFRN
+		root := int32(0)
+		workspace := add(root, rootFRN, "workspace-alpha", uint32(os.ModeDir))
+		workspaceFRN := idx.Records[workspace].FRN
+		for i := 0; i < 2000; i++ {
+			add(workspace, workspaceFRN, fmt.Sprintf("child-%04d.bin", i), 0)
+		}
+		for i := 0; i < 2000; i++ {
+			add(root, rootFRN, fmt.Sprintf("noise-%04d.bin", i), 0)
+		}
+		buildOrders(idx)
+		return newServiceVolumeIndex(strings.ToLower(strings.TrimSuffix(volume, ":"))+"-parent-large.gsi", idx)
+	}
+	return []*serviceVolumeIndex{build("C:", 1), build("F:", 2)}
+}
+
+// deterministicBroadTermCorpus builds volumes where a single gram posting is
+// above the selective trigram candidate cap, so every candidate source must
+// decline to the exhaustive scan.
+func deterministicBroadTermCorpus(t *testing.T) []*serviceVolumeIndex {
+	t.Helper()
+	build := func(volume string, seed int) *serviceVolumeIndex {
+		idx := &Index{
+			Source:  "usn",
+			Volume:  volume,
+			Compact: true,
+			Records: make([]CompactRecord, 0, 30_500),
+		}
+		nextFRN := uint64(seed * 100_000)
+		add := func(parent int32, parentFRN uint64, name string, mode uint32) int32 {
+			nextFRN++
+			idx.Records = append(idx.Records, CompactRecord{
+				FRN: nextFRN, ParentFRN: parentFRN, Parent: parent, Name: name, Mode: mode,
+				Size: 100, ModUnix: time.Date(2026, 7, 7, 12, 0, 0, 0, time.UTC).UnixNano(),
+			})
+			return int32(len(idx.Records) - 1)
+		}
+		rootFRN := nextFRN + 1
+		idx.Records = append(idx.Records, CompactRecord{FRN: rootFRN, ParentFRN: rootFRN, Parent: -1, Name: ".", Mode: uint32(os.ModeDir)})
+		nextFRN = rootFRN
+		root := int32(0)
+		broad := add(root, rootFRN, "broad", uint32(os.ModeDir))
+		broadFRN := idx.Records[broad].FRN
+		for i := 0; i < 30_000; i++ {
+			add(broad, broadFRN, fmt.Sprintf("commonish-token-%05d.bin", i), 0)
+		}
+		buildOrders(idx)
+		vol := newServiceVolumeIndex(strings.ToLower(strings.TrimSuffix(volume, ":"))+"-broad.gsi", idx)
+		vol.rebuildNameTrigramsLocked()
+		return vol
+	}
+	return []*serviceVolumeIndex{build("C:", 1), build("F:", 2)}
+}
+
+// deterministicRealPathCorpus builds volumes whose reconstructed paths exist on
+// disk, so `exists` filtering resolves through os.Stat exactly like production.
+func deterministicRealPathCorpus(t *testing.T) []*serviceVolumeIndex {
+	t.Helper()
+	build := func(volume string, names ...string) *serviceVolumeIndex {
+		root := filepath.Join(t.TempDir(), "exists-"+strings.ToLower(strings.TrimSuffix(volume, ":")))
+		if err := os.MkdirAll(root, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		sub := filepath.Join(root, "sub")
+		if err := os.MkdirAll(sub, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		idx := &Index{
+			Source:  "usn",
+			Volume:  root,
+			Compact: true,
+			Records: make([]CompactRecord, 0, len(names)+2),
+		}
+		add := func(frn, parentFRN uint64, parent int32, name string, mode uint32) int32 {
+			idx.Records = append(idx.Records, CompactRecord{
+				FRN: frn, ParentFRN: parentFRN, Parent: parent, Name: name, Mode: mode,
+				Size: 1024, ModUnix: time.Date(2026, 7, 7, 12, 0, 0, 0, time.UTC).UnixNano(),
+			})
+			return int32(len(idx.Records) - 1)
+		}
+		rootRec := add(1, 1, -1, ".", uint32(os.ModeDir))
+		subRec := add(2, 1, rootRec, "sub", uint32(os.ModeDir))
+		frn := uint64(10)
+		for _, name := range names {
+			if err := os.WriteFile(filepath.Join(sub, name), []byte("payload"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			add(frn, 2, subRec, name, 0)
+			frn++
+		}
+		buildOrders(idx)
+		return newServiceVolumeIndex(strings.ToLower(strings.TrimSuffix(volume, ":"))+"-exists.gsi", idx)
+	}
+	return []*serviceVolumeIndex{build("C:", "alpha-needle.txt", "gamma-other.md"), build("F:", "beta-needle.log")}
+}
+
+// TestExtCountRecentLegacyParity is the BUG-1 regression: on a legacy engine
+// (no overlay snapshot published), a live USN change is tracked only in
+// vol.recentIDs.  The ext count planner must reconcile those records the same
+// way extTopPosting does, so count stays in parity with an oracle volume that
+// has the change folded into its base index.
+func TestExtCountRecentLegacyParity(t *testing.T) {
+	liveIdx, recentID := extCountRecentFixture(t, "F:", "recent-tool.bin")
+	liveVol := newServiceVolumeIndex("live-ext-recent.gsi", liveIdx)
+	if liveVol.recentIDs == nil {
+		liveVol.recentIDs = make(map[int]struct{})
+	}
+	liveVol.recentIDs[recentID] = struct{}{}
+	liveVol.recentSeq++
+
+	oracleIdx, _ := extCountRecentFixture(t, "F:", "recent-tool.bin")
+	oracleVol := newServiceVolumeIndex("oracle-ext-recent.gsi", oracleIdx)
+
+	setExtTopForRecentTest(t, liveVol)
+	setExtTopForRecentTest(t, oracleVol)
+
+	other := workspaceAlphaModelVolume("C:", false)
+	live := []*serviceVolumeIndex{liveVol, other}
+	oracle := []*serviceVolumeIndex{oracleVol, other}
+
+	countOpts := queryOptions{Query: "ext:bin", Limit: 100}
+	liveCount, ok, err := countServiceVolumesGlobalOnly(live, countOpts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("global ext count declined")
+	}
+	oracleCount, ok2, err2 := countServiceVolumesGlobalOnly(oracle, countOpts)
+	if err2 != nil {
+		t.Fatal(err2)
+	}
+	if !ok2 {
+		t.Fatal("oracle global ext count declined")
+	}
+	if want := 9; liveCount != want {
+		t.Fatalf("live ext count = %d, want %d (recent record must be counted)", liveCount, want)
+	}
+	if liveCount != oracleCount {
+		t.Fatalf("live count %d != oracle count %d", liveCount, oracleCount)
+	}
+
+	searchOpts := queryOptions{Query: "ext:bin", Limit: 5}
+	liveGot, handled, err := searchServiceVolumesGlobalExtOnly(live, searchOpts, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !handled {
+		t.Fatal("global ext search declined")
+	}
+	oracleGot, handled, err := searchServiceVolumesGlobalExtOnly(oracle, searchOpts, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !handled {
+		t.Fatal("oracle global ext search declined")
+	}
+	if !sameOrderedStrings(pathsOf(liveGot), pathsOf(oracleGot)) {
+		t.Fatalf("live search paths = %v, oracle = %v", pathsOf(liveGot), pathsOf(oracleGot))
+	}
+	if !containsString(pathsOf(liveGot), `F:\workspace\recent-tool.bin`) {
+		t.Fatalf("recent record missing from live search results: %v", pathsOf(liveGot))
+	}
+}
+
+func extCountRecentFixture(t *testing.T, volume, recentName string) (*Index, int) {
+	t.Helper()
+	idx := &Index{
+		Source:  "usn",
+		Volume:  volume,
+		Compact: true,
+		Records: make([]CompactRecord, 0, 12),
+	}
+	add := func(frn, parentFRN uint64, parent int32, name string, mode uint32) int32 {
+		idx.Records = append(idx.Records, CompactRecord{
+			FRN: frn, ParentFRN: parentFRN, Parent: parent, Name: name, Mode: mode,
+			Size: 1024, ModUnix: time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC).UnixNano(),
+		})
+		return int32(len(idx.Records) - 1)
+	}
+	root := add(1, 1, -1, ".", uint32(os.ModeDir))
+	workspace := add(2, 1, root, "workspace", uint32(os.ModeDir))
+	nextFRN := uint64(10)
+	for i := 0; i < 8; i++ {
+		add(nextFRN, 2, workspace, fmt.Sprintf("target-%02d.bin", i), 0)
+		nextFRN++
+	}
+	buildOrders(idx)
+	if recentName == "" {
+		return idx, -1
+	}
+	id := idx.appendCompactRecord(CompactRecord{
+		FRN: nextFRN, ParentFRN: 2, Parent: workspace, Name: recentName, Size: 1,
+		ModUnix: time.Now().UnixNano(),
+	})
+	return idx, int(id)
+}
+
+// setExtTopForRecentTest installs a rank-aware resident extTop plus a full
+// name-rank slice so both the live and oracle volumes take the persisted
+// extTop branch of extTopPosting.  The appended recent record gets the best
+// rank so it must surface in the top-N page.
+func setExtTopForRecentTest(t *testing.T, vol *serviceVolumeIndex) {
+	t.Helper()
+	if vol.queryIndex == nil {
+		vol.queryIndex = &residentQueryIndex{}
+	}
+	recordCount := vol.index.compactRecordCount()
+	ranks := make([]uint32, recordCount)
+	for i := 0; i < recordCount; i++ {
+		ranks[i] = uint32(i + 1)
+	}
+	ranks[recordCount-1] = 0
+	vol.queryIndex.nameRank = ranks
+	vol.queryIndex.extTop = buildExtTopPostingsMin(vol.queryIndex.ext, ranks, serviceExtTopPostingLimit, 1)
 }

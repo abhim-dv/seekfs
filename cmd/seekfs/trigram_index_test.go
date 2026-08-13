@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/binary"
 	"fmt"
 	"os"
 	"runtime"
@@ -46,6 +47,61 @@ func TestSelectiveIntersectCandidateIDsCollapsesFusedNoHit(t *testing.T) {
 	}
 	if len(ids) != 0 {
 		t.Fatalf("fused no-hit candidate count = %d missing=%v, want 0", len(ids), missing)
+	}
+}
+
+func TestGramPostingMetadataPreservesPNGRTriState(t *testing.T) {
+	abc := fixedGramKey("abc", 0, 3)
+	bcd := fixedGramKey("bcd", 0, 3)
+	ti := &compressedTrigramIndex{
+		counts:             map[uint32]int{abc: 100, bcd: 2},
+		omitted:            map[uint32]struct{}{abc: {}},
+		gramCountsComplete: true,
+		gramSize:           3,
+		segments: []trigramSegment{{
+			start: 0,
+			end:   3,
+			postings: map[uint32]compressedPosting{
+				bcd: {count: 2, data: encodeDeltaUvarint32([]uint32{1, 2})},
+			},
+		}},
+	}
+	section := encodeGramPostingSection(ti, nil)
+	legacyView := decodePostingSection(section)
+	if legacyView.EntryCount != 1 || legacyView.BlockCount != 1 {
+		t.Fatalf("legacy section view rejected optional trailer: entries=%d blocks=%d", legacyView.EntryCount, legacyView.BlockCount)
+	}
+	decoded := decodeGramPostingIndex(section, 3)
+	if decoded == nil || !decoded.gramCountsComplete || !decoded.isOmittedGram(abc) {
+		t.Fatalf("decoded PNGR metadata lost: %#v", decoded)
+	}
+	if _, ok, missing := decoded.selectiveIntersectCandidateIDs("abcd", 25_000); ok || missing {
+		t.Fatalf("omitted common gram became a result: ok=%v missing=%v", ok, missing)
+	}
+	if _, ok, missing := decoded.selectiveIntersectCandidateIDs("zzz", 25_000); !ok || !missing {
+		t.Fatalf("new complete PNGR did not preserve exact empty semantics: ok=%v missing=%v", ok, missing)
+	}
+
+	legacy := *ti
+	legacy.gramCountsComplete = false
+	legacy.omitted = nil
+	legacySection := encodeGramPostingSection(&legacy, nil)
+	legacyDecoded := decodeGramPostingIndex(legacySection, 3)
+	if legacyDecoded == nil || legacyDecoded.gramCountsComplete {
+		t.Fatalf("legacy PNGR did not decode as incomplete: %#v", legacyDecoded)
+	}
+	if _, ok := legacyDecoded.postingCount("zzz"); ok {
+		t.Fatal("legacy PNGR missing gram was treated as exact no-match")
+	}
+	malformed := append([]byte(nil), section...)
+	binary.LittleEndian.PutUint32(malformed[len(malformed)-12:], 2)
+	if decodeGramPostingIndex(malformed, 3) != nil {
+		t.Fatal("PNGR accepted an optional trailer count beyond the payload")
+	}
+	badHeader := append([]byte(nil), section...)
+	binary.LittleEndian.PutUint32(badHeader[4:], 1)
+	if decodeGramPostingIndex(badHeader, 3) != nil {
+		t.Fatal("PNGR accepted a nonzero key blob flag")
 	}
 }
 
