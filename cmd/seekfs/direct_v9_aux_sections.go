@@ -61,59 +61,62 @@ func directV9WriteAuxiliarySections(ctx context.Context, cw *countingWriter, fin
 	}
 	entries = append(entries, lowr)
 	reports = append(reports, directV9SectionReport{Name: "LOWR", Tag: indexSectionLOWR, Bytes: int64(lowr.length)})
-	ext, err := directV9CollectStringPostings(ctx, finalPath, false)
+
+	// Collect every posting family in a single spool pass; the individual
+	// sections below then emit from the shared maps without re-reading the
+	// record spool.
+	maps, err := directV9CollectAuxMaps(ctx, finalPath)
 	if err != nil {
 		return nil, nil, err
 	}
-	pext := encodeStringPostingSection(ext, nil)
+	pext := encodeStringPostingSection(maps.ext, nil)
 	if err := emit(indexSectionPEXT, "PEXT", pext); err != nil {
 		return nil, nil, err
 	}
 	if err := emit(indexSectionPXRB, "PXRB", directV9ZeroPostingBounds(pext)); err != nil {
 		return nil, nil, err
 	}
-	ext = nil
+	maps.ext = nil
 	pext = nil
 	runtime.GC()
 	directV9AuxMemoryTrace(scratchDir, "PEXT-released")
 
-	cmp, err := directV9CollectStringPostings(ctx, finalPath, true)
-	if err != nil {
-		return nil, nil, err
-	}
-	pcmp := encodeStringPostingSection(cmp, nameRanks)
+	pcmp := encodeStringPostingSection(maps.comp, nameRanks)
 	if err := emit(indexSectionPCMP, "PCMP", pcmp); err != nil {
 		return nil, nil, err
 	}
-	cmpBounds, err := directV9BuildComponentPostingRankBounds(cmp, subtreeRankPaths, recordCount)
+	cmpBounds, err := directV9BuildComponentPostingRankBounds(maps.comp, subtreeRankPaths, recordCount)
 	if err != nil {
 		return nil, nil, err
 	}
 	if err := emit(indexSectionPXRC, "PXRC", encodePostingRankBounds(cmpBounds)); err != nil {
 		return nil, nil, err
 	}
-	cmp = nil
+	maps.comp = nil
 	pcmp = nil
 	runtime.GC()
 	directV9AuxMemoryTrace(scratchDir, "PCMP-released")
 
-	attrs, err := directV9CollectAttrs(ctx, finalPath)
-	if err != nil {
+	if err := emit(indexSectionPATR, "PATR", encodeAttrPostingSection(maps.attrs)); err != nil {
 		return nil, nil, err
 	}
-	if err := emit(indexSectionPATR, "PATR", encodeAttrPostingSection(attrs)); err != nil {
-		return nil, nil, err
-	}
-	attrs = nil
+	maps.attrs = nil
 	runtime.GC()
 	directV9AuxMemoryTrace(scratchDir, "PATR-released")
 
-	gramCounts, err := directV9CountNameGrams(ctx, finalPath)
+	stored, omitted := directV9PartitionNameGrams(maps.gramCnt, serviceLowMemoryTrigramStoredPostingMax())
+	maps.gramCnt = nil
+	// Build both gram run sets in one spool pass, then emit each section
+	// serially to the shared output writer.
+	runLimit := directV9GramRunLimit(runRecords)
+	pngrRuns, pngcRuns, err := directV9BuildGramRunSets(ctx, finalPath, scratchDir, runLimit, stored, directV9GramKeys(omitted), owned)
 	if err != nil {
 		return nil, nil, err
 	}
-	stored, omitted := directV9PartitionNameGrams(gramCounts, serviceLowMemoryTrigramStoredPostingMax())
-	gramEntry, gramReport, err := directV9WriteGramSectionFromSpool(ctx, cw, finalPath, runRecords, stored, omitted, nameRanks, gramPostingMetadataMagic, "PNGR", scratchDir, owned, scratchHigh)
+	gramEntry, gramReport, err := directV9WriteGramSectionFromRuns(ctx, cw, pngrRuns, omitted, nameRanks, gramPostingMetadataMagic, "PNGR", scratchDir, owned, scratchHigh)
+	for _, run := range pngrRuns {
+		_ = os.Remove(run.path)
+	}
 	if err != nil {
 		return nil, nil, err
 	}
@@ -122,8 +125,11 @@ func directV9WriteAuxiliarySections(ctx context.Context, cw *countingWriter, fin
 	runtime.GC()
 	directV9AuxMemoryTrace(scratchDir, "PNGR-released")
 
-	if len(omitted) > 0 {
-		gramEntry, gramReport, err = directV9WriteGramSectionFromSpool(ctx, cw, finalPath, runRecords, directV9GramKeys(omitted), nil, nameRanks, gramPostingUnionMetadataMagic, "PNGC", scratchDir, owned, scratchHigh)
+	if len(pngcRuns) > 0 {
+		gramEntry, gramReport, err = directV9WriteGramSectionFromRuns(ctx, cw, pngcRuns, nil, nameRanks, gramPostingUnionMetadataMagic, "PNGC", scratchDir, owned, scratchHigh)
+		for _, run := range pngcRuns {
+			_ = os.Remove(run.path)
+		}
 		if err != nil {
 			return nil, nil, err
 		}
@@ -192,60 +198,80 @@ func directV9WriteGramRun(path string, pairs []directV9GramPair) (int64, error) 
 	return written, f.Close()
 }
 
-func directV9BuildGramRuns(ctx context.Context, finalPath, spoolDir string, maxPairs int, include map[uint32]struct{}, name string, owned *[]string) ([]directV9RunFile, error) {
+// directV9BuildGramRunSets builds the PNGR and PNGC run files in a single pass
+// over the record spool.  Each record's grams are emitted to the stored (PNGR)
+// and omitted (PNGC) run sets according to the partition, halving the number of
+// full-spool traversals versus building the sections independently.
+func directV9BuildGramRunSets(ctx context.Context, finalPath, spoolDir string, maxPairs int, stored map[uint32]struct{}, omitted map[uint32]struct{}, owned *[]string) ([]directV9RunFile, []directV9RunFile, error) {
 	if maxPairs <= 0 {
 		maxPairs = directV9DefaultRunRecords
 	}
 	f, err := os.Open(finalPath)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer f.Close()
 	r := bufio.NewReaderSize(f, 256*1024)
-	pairs := make([]directV9GramPair, 0, min(maxPairs, 4096))
-	runs := make([]directV9RunFile, 0)
-	flush := func() error {
+	storedPairs := make([]directV9GramPair, 0, min(maxPairs, 4096))
+	omittedPairs := make([]directV9GramPair, 0, min(maxPairs, 4096))
+	var storedRuns, omittedRuns []directV9RunFile
+	flush := func(pairs []directV9GramPair, name string, runs []directV9RunFile) ([]directV9RunFile, error) {
 		if len(pairs) == 0 {
-			return nil
+			return runs, nil
 		}
 		path := filepath.Join(spoolDir, fmt.Sprintf("direct-v9-%s-gram-run-%06d.tmp", strings.ToLower(name), len(runs)))
 		bytes, err := directV9WriteGramRun(path, pairs)
 		if err != nil {
-			return err
+			return runs, err
 		}
 		*owned = append(*owned, path)
-		runs = append(runs, directV9RunFile{path: path, bytes: bytes})
-		pairs = make([]directV9GramPair, 0, min(maxPairs, 4096))
-		return nil
+		return append(runs, directV9RunFile{path: path, bytes: bytes}), nil
 	}
 	for id := 0; ; id++ {
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return nil, nil, ctx.Err()
 		default:
 		}
 		rec, readErr := readDirectV9SpoolRecord(r)
 		if errors.Is(readErr, io.EOF) {
-			if err := flush(); err != nil {
-				return nil, err
-			}
-			return runs, nil
+			break
 		}
 		if readErr != nil {
-			return nil, readErr
+			return nil, nil, readErr
 		}
 		for _, gram := range uniqueTrigramKeys(strings.ToLower(rec.Name)) {
-			if _, ok := include[gram]; !ok {
-				continue
+			if _, ok := stored[gram]; ok {
+				storedPairs = append(storedPairs, directV9GramPair{Gram: gram, ID: uint32(id)})
+				if len(storedPairs) >= maxPairs {
+					storedRuns, err = flush(storedPairs, "PNGR", storedRuns)
+					if err != nil {
+						return nil, nil, err
+					}
+					storedPairs = make([]directV9GramPair, 0, min(maxPairs, 4096))
+				}
 			}
-			pairs = append(pairs, directV9GramPair{Gram: gram, ID: uint32(id)})
-			if len(pairs) >= maxPairs {
-				if err := flush(); err != nil {
-					return nil, err
+			if _, ok := omitted[gram]; ok {
+				omittedPairs = append(omittedPairs, directV9GramPair{Gram: gram, ID: uint32(id)})
+				if len(omittedPairs) >= maxPairs {
+					omittedRuns, err = flush(omittedPairs, "PNGC", omittedRuns)
+					if err != nil {
+						return nil, nil, err
+					}
+					omittedPairs = make([]directV9GramPair, 0, min(maxPairs, 4096))
 				}
 			}
 		}
 	}
+	storedRuns, err = flush(storedPairs, "PNGR", storedRuns)
+	if err != nil {
+		return nil, nil, err
+	}
+	omittedRuns, err = flush(omittedPairs, "PNGC", omittedRuns)
+	if err != nil {
+		return nil, nil, err
+	}
+	return storedRuns, omittedRuns, nil
 }
 
 type directV9GramHead struct {
@@ -271,11 +297,7 @@ func (h *directV9GramHeap) Pop() any {
 	return x
 }
 
-func directV9WriteGramSectionFromSpool(ctx context.Context, cw *countingWriter, finalPath string, runRecords int, include map[uint32]struct{}, omitted map[uint32]int, ranks []uint32, metadataMagic uint32, name, scratchDir string, owned *[]string, scratchHigh *int64) (indexSectionTableEntry, directV9SectionReport, error) {
-	runs, err := directV9BuildGramRuns(ctx, finalPath, scratchDir, directV9GramRunLimit(runRecords), include, name, owned)
-	if err != nil {
-		return indexSectionTableEntry{}, directV9SectionReport{}, err
-	}
+func directV9WriteGramSectionFromRuns(ctx context.Context, cw *countingWriter, runs []directV9RunFile, omitted map[uint32]int, ranks []uint32, metadataMagic uint32, name, scratchDir string, owned *[]string, scratchHigh *int64) (indexSectionTableEntry, directV9SectionReport, error) {
 	entryPath := filepath.Join(scratchDir, "direct-v9-"+strings.ToLower(name)+"-entries.tmp")
 	metaPath := filepath.Join(scratchDir, "direct-v9-"+strings.ToLower(name)+"-meta.tmp")
 	blobPath := filepath.Join(scratchDir, "direct-v9-"+strings.ToLower(name)+"-blob.tmp")
@@ -720,13 +742,31 @@ func directV9EncodeLOWR(ctx context.Context, finalPath string) ([]byte, error) {
 	return out.Bytes(), nil
 }
 
-func directV9CollectStringPostings(ctx context.Context, finalPath string, components bool) (map[string][]uint32, error) {
+// directV9AuxMaps carries every posting family collected in one spool pass so
+// the PEXT/PCMP/PATR/PNGR sections no longer each re-read the record spool.
+type directV9AuxMaps struct {
+	ext     map[string][]uint32
+	comp    map[string][]uint32
+	attrs   map[uint32][]uint32
+	gramCnt map[uint32]int
+}
+
+// directV9CollectAuxMaps reads the final spool once and produces the extension,
+// component, attribute, and filename-gram count maps together.  The per-key
+// posting lists are sorted and deduplicated, matching the individual
+// collectors' output exactly.
+func directV9CollectAuxMaps(ctx context.Context, finalPath string) (*directV9AuxMaps, error) {
 	f, err := os.Open(finalPath)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
-	postings := make(map[string][]uint32)
+	out := &directV9AuxMaps{
+		ext:     make(map[string][]uint32),
+		comp:    make(map[string][]uint32),
+		attrs:   make(map[uint32][]uint32),
+		gramCnt: make(map[uint32]int),
+	}
 	r := bufio.NewReaderSize(f, 256*1024)
 	for id := 0; ; id++ {
 		select {
@@ -741,26 +781,27 @@ func directV9CollectStringPostings(ctx context.Context, finalPath string, compon
 		if readErr != nil {
 			return nil, readErr
 		}
-		if !components {
-			ext := strings.ToLower(strings.TrimPrefix(filepath.Ext(rec.Name), "."))
-			if ext != "" {
-				postings[ext] = append(postings[ext], uint32(id))
+		if ext := strings.ToLower(strings.TrimPrefix(filepath.Ext(rec.Name), ".")); ext != "" {
+			out.ext[ext] = append(out.ext[ext], uint32(id))
+		}
+		if rec.Mode&uint32(os.ModeDir) != 0 {
+			out.attrs[0x10] = append(out.attrs[0x10], uint32(id))
+			name := strings.ToLower(rec.Name)
+			if name != "" && name != "." {
+				out.comp[name] = append(out.comp[name], uint32(id))
 			}
-			continue
 		}
-		if rec.Mode&uint32(os.ModeDir) == 0 {
-			continue
-		}
-		name := strings.ToLower(rec.Name)
-		if name != "" && name != "." {
-			postings[name] = append(postings[name], uint32(id))
+		for _, gram := range uniqueTrigramKeys(strings.ToLower(rec.Name)) {
+			out.gramCnt[gram]++
 		}
 	}
-	for key, ids := range postings {
-		sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
-		postings[key] = uniqueSortedUint32s(ids)
+	for key, ids := range out.ext {
+		out.ext[key] = uniqueSortedUint32s(ids)
 	}
-	return postings, nil
+	for key, ids := range out.comp {
+		out.comp[key] = uniqueSortedUint32s(ids)
+	}
+	return out, nil
 }
 
 func directV9ReadUint32Vector(path string, expected int) ([]uint32, error) {
@@ -802,93 +843,6 @@ func directV9BuildComponentPostingRankBounds(postings map[string][]uint32, rankP
 		return postingRankBounds{}, nil
 	}
 	return postingRankBounds{BlockCount: len(parts[0]), Name: parts[0], Size: parts[1], Modified: parts[2], Extension: parts[3], Type: parts[4], Path: parts[5]}, nil
-}
-
-func directV9CollectAttrs(ctx context.Context, finalPath string) (map[uint32][]uint32, error) {
-	f, err := os.Open(finalPath)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	attrs := make(map[uint32][]uint32)
-	r := bufio.NewReaderSize(f, 256*1024)
-	for id := 0; ; id++ {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		default:
-		}
-		rec, readErr := readDirectV9SpoolRecord(r)
-		if readErr != nil {
-			if errors.Is(readErr, io.EOF) {
-				break
-			}
-			return nil, readErr
-		}
-		if rec.Mode&uint32(os.ModeDir) != 0 {
-			attrs[0x10] = append(attrs[0x10], uint32(id))
-		}
-	}
-	return attrs, nil
-}
-
-func directV9CollectGramPostings(ctx context.Context, finalPath string, selfOnly bool) (map[uint32][]uint32, error) {
-	f, err := os.Open(finalPath)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	postings := make(map[uint32][]uint32)
-	r := bufio.NewReaderSize(f, 256*1024)
-	for id := 0; ; id++ {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		default:
-		}
-		rec, readErr := readDirectV9SpoolRecord(r)
-		if readErr != nil {
-			if errors.Is(readErr, io.EOF) {
-				break
-			}
-			return nil, readErr
-		}
-		text := rec.Path
-		if selfOnly || text == "" {
-			text = rec.Name
-		}
-		for _, gram := range uniqueTrigramKeys(strings.ToLower(text)) {
-			postings[gram] = append(postings[gram], uint32(id))
-		}
-	}
-	return postings, nil
-}
-
-func directV9CountNameGrams(ctx context.Context, finalPath string) (map[uint32]int, error) {
-	f, err := os.Open(finalPath)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	counts := make(map[uint32]int)
-	r := bufio.NewReaderSize(f, 256*1024)
-	for {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		default:
-		}
-		rec, readErr := readDirectV9SpoolRecord(r)
-		if errors.Is(readErr, io.EOF) {
-			return counts, nil
-		}
-		if readErr != nil {
-			return nil, readErr
-		}
-		for _, gram := range uniqueTrigramKeys(strings.ToLower(rec.Name)) {
-			counts[gram]++
-		}
-	}
 }
 
 func directV9PartitionNameGrams(counts map[uint32]int, maxPostingCount int) (map[uint32]struct{}, map[uint32]int) {
