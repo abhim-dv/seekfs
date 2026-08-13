@@ -397,7 +397,11 @@ func TestUIStrictSpaceSplitDoesNotInferFusedPathExtensions(t *testing.T) {
 		{"path:C:.NRRD", "C:.NRRD", true},
 		{"path:.nrrd", "path:.nrrd", true},
 		{"path:Downloads.nrrd", "Downloads.nrrd", true},
-		{"F: nrrd", "F: nrrd", true},
+		{"F: nrrd", "F: nrrd", false},
+		{"F: nrrd|raw", "F: nrrd|raw", false},
+		{"F: nrrd !raw", "F: nrrd !raw", false},
+		{"F: nrrd sort:size", "F: nrrd sort:size", false},
+		{"path:F: nrrd", "F: nrrd", true},
 		{"pretraining DVT nrrd", "pretraining DVT nrrd", true},
 		{"nrrd", "nrrd", false},
 		{"ext:nrrd", "ext:nrrd", false},
@@ -409,6 +413,9 @@ func TestUIStrictSpaceSplitDoesNotInferFusedPathExtensions(t *testing.T) {
 				t.Fatalf("normalizeUIQueryForService(%q) = (%q, %v), want (%q, %v)", tc.raw, gotQuery, gotPath, tc.wantQuery, tc.wantPath)
 			}
 		})
+	}
+	if gotQuery, gotPath := normalizeUIQueryForService("F: nrrd", true); gotQuery != "F: nrrd" || !gotPath {
+		t.Fatalf("explicit UI path mode = (%q, %v), want (F: nrrd, true)", gotQuery, gotPath)
 	}
 }
 

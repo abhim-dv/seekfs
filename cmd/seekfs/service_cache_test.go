@@ -8,10 +8,22 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 	"unsafe"
 )
+
+const standaloneTestPipeSDDL = `D:(A;;GA;;;WD)`
+
+func TestStandaloneServicePipeACLIsTestOnly(t *testing.T) {
+	if standaloneTestPipeSDDL == defaultServiceSDDL {
+		t.Fatal("test-only pipe ACL must not replace the production service ACL")
+	}
+	if defaultServiceSDDL != `D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)` {
+		t.Fatalf("production service ACL changed: %q", defaultServiceSDDL)
+	}
+}
 
 func TestServiceVolumeIndexAfterPersistClearsRecentAndSearchCaches(t *testing.T) {
 	vol := syntheticServiceVolumeIndexForCacheTests()
@@ -847,16 +859,21 @@ func TestServiceSearchFallsBackToFilesystemForScopedIndexMiss(t *testing.T) {
 	buildOrders(idx)
 	vol := newServiceVolumeIndex("fixture.gsi", idx)
 
+	trace := &searchTrace{}
 	got, err := searchServiceVolumes([]*serviceVolumeIndex{vol}, queryOptions{
 		Query: "specific_fixture_tool.py",
 		Under: root,
 		Limit: 20,
+		Trace: trace,
 	}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(got) != 1 || got[0].Name != "specific_fixture_tool.py" {
 		t.Fatalf("matches = %+v, want filesystem fallback result", got)
+	}
+	if trace.Fallback != "filesystem-under-fallback" || trace.Complete == nil || !*trace.Complete {
+		t.Fatalf("trace fallback=%q complete=%v, want filesystem-under-fallback complete=true", trace.Fallback, trace.Complete)
 	}
 }
 
@@ -867,13 +884,34 @@ func TestFilesystemUnderFallbackIsBounded(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	got, ok := filesystemUnderFallbackSearchLimited(queryOptions{
+	got, ok, complete := filesystemUnderFallbackSearchLimited(queryOptions{
 		Query: "item-11.txt",
 		Under: root,
 		Limit: 20,
 	}, false, 3, time.Minute)
 	if ok {
 		t.Fatalf("fallback returned %v after maxVisited cap; want no result", got)
+	}
+	if complete {
+		t.Fatal("fallback complete = true after maxVisited cap, want false")
+	}
+}
+
+func TestFilesystemUnderFallbackReportsCompleteWhenExhausted(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "specific_fixture_tool.py"), []byte("pass"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, ok, complete := filesystemUnderFallbackSearchLimited(queryOptions{
+		Query: "specific_fixture_tool.py",
+		Under: root,
+		Limit: 20,
+	}, false, 100, time.Minute)
+	if !ok || len(got) != 1 {
+		t.Fatalf("fallback returned %v ok=%v, want one result", got, ok)
+	}
+	if !complete {
+		t.Fatal("fallback complete = false after exhausting tree, want true")
 	}
 }
 
@@ -908,18 +946,23 @@ func TestStandaloneServicePipeSearchEndToEnd(t *testing.T) {
 	pipeName := fmt.Sprintf(`\\.\pipe\seekfs-test-%d-%d`, os.Getpid(), time.Now().UnixNano())
 	svc := &goSearchService{
 		pipeName: pipeName,
-		sddl:     defaultServiceSDDL,
-		stop:     make(chan struct{}),
-		indexes:  []*Index{idx},
-		volumes:  []*serviceVolumeIndex{vol},
+		// The production SDDL intentionally limits access to interactive users.
+		// The test process is not guaranteed to carry an interactive-token SID,
+		// so use an owned, unique pipe that is explicitly accessible to the
+		// authenticated test user instead of weakening the production ACL.
+		sddl:    standaloneTestPipeSDDL,
+		stop:    make(chan struct{}),
+		indexes: []*Index{idx},
+		volumes: []*serviceVolumeIndex{vol},
 	}
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		svc.servePipeListener()
 	}()
-	defer func() {
-		close(svc.stop)
+	var stopOnce sync.Once
+	stop := func() {
+		stopOnce.Do(func() { close(svc.stop) })
 		if handle, err := openPipeClientWithTimeout(pipeName, 100*time.Millisecond); err == nil {
 			_ = os.NewFile(uintptr(handle), pipeName).Close()
 		}
@@ -928,7 +971,8 @@ func TestStandaloneServicePipeSearchEndToEnd(t *testing.T) {
 		case <-time.After(5 * time.Second):
 			t.Fatal("standalone service listener did not stop")
 		}
-	}()
+	}
+	t.Cleanup(stop)
 
 	info, err := callService(pipeName, serviceRequest{Command: "info"})
 	if err != nil {
@@ -956,6 +1000,23 @@ func TestStandaloneServicePipeSearchEndToEnd(t *testing.T) {
 	}
 	if search.Source == "" || search.Candidates == 0 {
 		t.Fatalf("search trace source=%q candidates=%d, want populated service metadata", search.Source, search.Candidates)
+	}
+
+	count, err := callService(pipeName, serviceRequestFromOptions(queryOptions{
+		Query: "ext:go",
+		Limit: 20,
+	}, true))
+	if err != nil {
+		t.Fatalf("count request failed: %v", err)
+	}
+	if !count.OK {
+		t.Fatalf("count response = %+v, want ok", count)
+	}
+	if count.Count != 1 || len(count.Rows) != 0 || len(count.Results) != 0 {
+		t.Fatalf("count response rows=%+v results=%+v count=%d, want count-only metadata", count.Rows, count.Results, count.Count)
+	}
+	if count.PlannerMode == "" || count.Source == "" || len(count.EligibleVolumes) == 0 || count.Complete == nil || !*count.Complete {
+		t.Fatalf("count trace planner=%q source=%q eligible=%v complete=%v, want populated metadata", count.PlannerMode, count.Source, count.EligibleVolumes, count.Complete)
 	}
 }
 

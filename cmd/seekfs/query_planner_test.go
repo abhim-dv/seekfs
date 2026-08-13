@@ -1,15 +1,1333 @@
 package main
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
 	"math/rand"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestGlobalRecordIDOrdering(t *testing.T) {
+	cases := []struct {
+		a, b globalRecordID
+		want int
+	}{
+		{globalRecordID{volume: 0, local: 1}, globalRecordID{volume: 0, local: 1}, 0},
+		{globalRecordID{volume: 0, local: 2}, globalRecordID{volume: 0, local: 3}, -1},
+		{globalRecordID{volume: 0, local: 4}, globalRecordID{volume: 0, local: 3}, 1},
+		{globalRecordID{volume: 0, local: 99}, globalRecordID{volume: 1, local: 0}, -1},
+		{globalRecordID{volume: 2, local: 0}, globalRecordID{volume: 1, local: 99}, 1},
+	}
+	for _, tc := range cases {
+		if got := compareGlobalRecordID(tc.a, tc.b); got != tc.want {
+			t.Fatalf("compareGlobalRecordID(%+v, %+v) = %d, want %d", tc.a, tc.b, got, tc.want)
+		}
+	}
+}
+
+func TestGlobalPostingIteratorDecodesMappedBlocksLazily(t *testing.T) {
+	t.Setenv("SEEKFS_POSTING_CACHE_MB", "1")
+	servicePostingBlockCache = postingBlockLRU{}
+	t.Cleanup(func() { servicePostingBlockCache = postingBlockLRU{} })
+
+	ids := make([]uint32, 2050)
+	for i := range ids {
+		ids[i] = uint32(i)
+	}
+	section := decodePostingSection(encodeStringPostingSection(map[string][]uint32{"txt": ids}, nil))
+	posting, count, ok := section.stringPostingIterator("txt")
+	if !ok || count != len(ids) {
+		t.Fatalf("posting iterator = (%v, %d), want (true, %d)", ok, count, len(ids))
+	}
+	it := newGlobalPostingIterator(1, postingCountCandidate{it: posting, count: count, mapped: true})
+	if got := len(servicePostingBlockCache.items); got != 0 {
+		t.Fatalf("constructor decoded %d blocks, want 0", got)
+	}
+	if got, ok := it.Next(); !ok || got != (globalRecordID{volume: 1, local: 0}) {
+		t.Fatalf("first id = (%+v, %v), want volume 1 local 0", got, ok)
+	}
+	if got := len(servicePostingBlockCache.items); got != 1 {
+		t.Fatalf("first Next decoded %d blocks, want 1", got)
+	}
+
+	servicePostingBlockCache = postingBlockLRU{}
+	posting, count, _ = section.stringPostingIterator("txt")
+	it = newGlobalPostingIterator(1, postingCountCandidate{it: posting, count: count, mapped: true})
+	got, ok := it.SeekGE(globalRecordID{volume: 1, local: 2048})
+	if !ok || got != (globalRecordID{volume: 1, local: 2048}) {
+		t.Fatalf("SeekGE = (%+v, %v), want volume 1 local 2048", got, ok)
+	}
+	if got := len(servicePostingBlockCache.items); got != 1 {
+		t.Fatalf("SeekGE decoded %d blocks, want only the target block", got)
+	}
+	if got := it.CountHint(); got != 1 {
+		t.Fatalf("CountHint after SeekGE = %d, want 1", got)
+	}
+}
+
+func TestGlobalSubtreeIteratorNestedRootsDedupesAndOrders(t *testing.T) {
+	idx := &Index{Source: "usn", Volume: "C:", Compact: true, Records: []CompactRecord{
+		{FRN: 1, ParentFRN: 1, Parent: -1, Name: ".", Mode: uint32(os.ModeDir)},
+		{FRN: 2, ParentFRN: 1, Parent: 0, Name: "workspace", Mode: uint32(os.ModeDir)},
+		{FRN: 3, ParentFRN: 2, Parent: 1, Name: "nested", Mode: uint32(os.ModeDir)},
+		{FRN: 4, ParentFRN: 3, Parent: 2, Name: "model_v2.txt"},
+		{FRN: 5, ParentFRN: 1, Parent: 0, Name: "sibling.txt"},
+	}}
+	buildOrders(idx)
+	vol := newServiceVolumeIndex("nested-subtree.gsi", idx)
+	it := newGlobalSubtreeScanIterator(0, vol, []int{1, 2})
+	got := collectGlobalIterator(it, 0)
+	want := []globalRecordID{{volume: 0, local: 1}, {volume: 0, local: 2}, {volume: 0, local: 3}}
+	if !slices.Equal(got, want) {
+		t.Fatalf("nested subtree IDs = %v, want %v", got, want)
+	}
+	it = newGlobalSubtreeScanIterator(0, vol, []int{1})
+	if got, ok := it.SeekGE(globalRecordID{volume: 0, local: 3}); !ok || got.local != 3 {
+		t.Fatalf("subtree SeekGE = (%+v, %v), want local 3", got, ok)
+	}
+}
+
+func TestGlobalSubtreeIntervalIteratorUsesSubtreeMetadata(t *testing.T) {
+	idx := &Index{Source: "usn", Volume: "C:", Compact: true, Records: []CompactRecord{
+		{FRN: 1, ParentFRN: 1, Parent: -1, Name: ".", Mode: uint32(os.ModeDir)},
+		{FRN: 2, ParentFRN: 1, Parent: 0, Name: "workspace", Mode: uint32(os.ModeDir)},
+		{FRN: 3, ParentFRN: 2, Parent: 1, Name: "nested", Mode: uint32(os.ModeDir)},
+		{FRN: 4, ParentFRN: 3, Parent: 2, Name: "model_v2.txt"},
+		{FRN: 5, ParentFRN: 1, Parent: 0, Name: "sibling.txt"},
+	}}
+	buildOrders(idx)
+	vol := newServiceVolumeIndex("interval-subtree.gsi", idx)
+	vol.buildCompactChildren()
+	vol.buildSubtreeRanges()
+	it := newGlobalSubtreeIterator(0, vol, []int{1, 2})
+	got := collectGlobalIterator(it, 0)
+	want := []globalRecordID{{volume: 0, local: 1}, {volume: 0, local: 2}, {volume: 0, local: 3}}
+	if !slices.Equal(got, want) {
+		t.Fatalf("interval subtree IDs = %v, want %v", got, want)
+	}
+	if _, ok := it.SeekGE(globalRecordID{volume: 0, local: 2}); ok {
+		t.Fatal("exhausted interval iterator unexpectedly returned an ID")
+	}
+}
+
+func TestMappedComponentCoverageMergesNestedRootsAndHiddenSelfHits(t *testing.T) {
+	idx := &Index{
+		Version: indexVersionV9, Source: "usn", Volume: "C:", Compact: true,
+		Records: []CompactRecord{
+			{FRN: 1, ParentFRN: 1, Parent: -1, Name: ".", Mode: uint32(os.ModeDir)},
+			{FRN: 2, ParentFRN: 1, Parent: 0, Name: "needle", Mode: uint32(os.ModeDir)},
+			{FRN: 3, ParentFRN: 2, Parent: 1, Name: "needle", Mode: uint32(os.ModeDir)},
+			{FRN: 4, ParentFRN: 3, Parent: 2, Name: "inside.txt"},
+			{FRN: 5, ParentFRN: 2, Parent: 1, Name: "other.txt"},
+			{FRN: 6, ParentFRN: 1, Parent: 0, Name: "needle-report.txt"},
+		},
+	}
+	buildOrders(idx)
+	vol := newServiceVolumeIndex("component-coverage.gsi", idx)
+	vol.buildCompactChildren()
+	vol.buildSubtreeRanges()
+	vol.queryIndex = &residentQueryIndex{components: map[string][]uint32{"needle": {1, 2}}}
+
+	coverage, ok := vol.buildMappedComponentCoverage("needle", []int{3, 5})
+	if !ok {
+		t.Fatal("mapped component coverage declined")
+	}
+	if coverage.rootCount != 2 || len(coverage.intervals) != 1 {
+		t.Fatalf("coverage roots/intervals = %d/%d, want 2/1", coverage.rootCount, len(coverage.intervals))
+	}
+	if coverage.cardinality != 5 {
+		t.Fatalf("coverage cardinality = %d, want 5 (nested roots deduped and one file self-hit)", coverage.cardinality)
+	}
+	count, verified := coverage.countLive(vol, func(id int) bool { return id == 3 })
+	if count != 4 || verified != 5 {
+		t.Fatalf("hidden count/verified = %d/%d, want 4/5", count, verified)
+	}
+}
+
+func TestMappedComponentSubstringCoverageUsesCompletePCMPDictionary(t *testing.T) {
+	idx := &Index{
+		Version: indexVersionV9, Source: "usn", Volume: "C:", Compact: true,
+		Records: []CompactRecord{
+			{FRN: 1, ParentFRN: 1, Parent: -1, Name: ".", Mode: uint32(os.ModeDir)},
+			{FRN: 2, ParentFRN: 1, Parent: 0, Name: "Windows", Mode: uint32(os.ModeDir)},
+			{FRN: 3, ParentFRN: 1, Parent: 0, Name: "Windows.old", Mode: uint32(os.ModeDir)},
+			{FRN: 4, ParentFRN: 2, Parent: 1, Name: "inside.txt"},
+			{FRN: 5, ParentFRN: 3, Parent: 2, Name: "old.txt"},
+			{FRN: 6, ParentFRN: 1, Parent: 0, Name: "WindowsReport.txt"},
+			{FRN: 7, ParentFRN: 1, Parent: 0, Name: "UsersBackup", Mode: uint32(os.ModeDir)},
+		},
+	}
+	buildOrders(idx)
+	vol := newServiceVolumeIndex("component-substring.gsi", idx)
+	vol.buildCompactChildren()
+	vol.buildSubtreeRanges()
+	vol.index.Derived.Postings = map[uint32]mappedPostingSection{
+		indexSectionPCMP: {Data: encodeStringPostingSection(map[string][]uint32{
+			"windows":     {1},
+			"windows.old": {2},
+			"usersbackup": {6},
+		}, nil)},
+	}
+	coverage, ok := vol.mappedComponentSubstringCoverage("windows")
+	if !ok {
+		t.Fatal("substring PCMP coverage declined")
+	}
+	if coverage.rootCount != 2 || coverage.cardinality != 5 {
+		t.Fatalf("substring coverage roots/cardinality = %d/%d, want 2/5", coverage.rootCount, coverage.cardinality)
+	}
+	if len(coverage.selfIDs) != 1 || coverage.selfIDs[0] != 5 {
+		t.Fatalf("substring self hits = %v, want [5]", coverage.selfIDs)
+	}
+}
+
+func TestCompleteLowerNameTermScanMatchesPackedOracle(t *testing.T) {
+	idx := &Index{Source: "usn", Volume: "C:", Compact: true, Records: []CompactRecord{
+		{FRN: 1, ParentFRN: 1, Parent: -1, Name: ".", Mode: uint32(os.ModeDir)},
+		{FRN: 2, ParentFRN: 1, Parent: 0, Name: "Users", Mode: uint32(os.ModeDir)},
+		{FRN: 3, ParentFRN: 1, Parent: 0, Name: "UsersBackup.txt"},
+		{FRN: 4, ParentFRN: 1, Parent: 0, Name: "unrelated.txt"},
+	}}
+	buildOrders(idx)
+	idx.packCompactRecords(true)
+	got, ok := idx.scanCompactLowerNameTerm("users")
+	if !ok {
+		t.Fatal("packed lower-name scan declined")
+	}
+	want := make([]int, 0, len(got))
+	for id := 0; id < idx.compactRecordCount(); id++ {
+		if strings.Contains(idx.compactLowerNameAt(id), "users") && !idx.compactRecord(id).Deleted {
+			want = append(want, id)
+		}
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("packed lower-name scan = %v, want %v", got, want)
+	}
+}
+
+// TestR5HolisticPlannerGeneratedCoverageMatrix keeps the component and boolean
+// planner work honest across the dimensions called out by the R5 exit gate.
+// This is deliberately a selected cross-product: it exercises every family
+// and limit/sort pair while keeping the exhaustive oracle bounded and the
+// seed stable for reproducible failures.
+func TestR5HolisticPlannerGeneratedCoverageMatrix(t *testing.T) {
+	const seed int64 = 0x5eedf5
+	rng := rand.New(rand.NewSource(seed))
+	terms := []string{"workspace", "Users", "src", "nrrd", "pdf", "raw", "x", "zzzz-nohit"}
+	altTerms := []string{"needle", "backup", "dataset", "report"}
+	families := []string{"bare", "implicit-path", "explicit-path", "dir", "ext", "scalar", "date", "parent", "attrib", "glob", "regex", "or", "not", "under"}
+	sorts := []string{"", "sort:path", "sort:size", "sort:modified", "sort:extension", "sort:type"}
+	limits := []int{1, 20, 100}
+	volumeStates := []string{"single", "both", "absent", "early-miss-later-hit", "mixed-v8", "missing-derived"}
+	resultStates := []string{"self-hit", "directory-root", "nested-root", "tie"}
+	overlayStates := []string{"none", "create", "hide", "delete", "rename"}
+	pairCounts := make(map[string]int)
+	cases := make([]struct {
+		family, volume, result, overlay, sort string
+		query, under                          string
+		matchPath                             bool
+		limit                                 int
+	}, 0, 48)
+	for i := 0; i < 48; i++ {
+		family := families[i%len(families)]
+		term := terms[rng.Intn(len(terms))]
+		alt := altTerms[rng.Intn(len(altTerms))]
+		query := term
+		matchPath := false
+		under := ""
+		switch family {
+		case "implicit-path":
+			matchPath = true
+		case "explicit-path":
+			query, matchPath = "path:"+term, true
+		case "dir":
+			query, matchPath = "dir:"+term, true
+		case "ext":
+			query = "ext:" + map[string]string{"nrrd": "nrrd", "pdf": "pdf", "raw": "raw"}[term]
+			if strings.HasSuffix(query, ":") {
+				query = "ext:nrrd"
+			}
+		case "scalar":
+			query = "size:>=0 " + term
+		case "date":
+			query = "dm:2026-01-10 " + term
+		case "parent":
+			query = "parent:workspace"
+		case "attrib":
+			query = "type:file " + term
+		case "glob":
+			query = "glob:*" + term + "*"
+		case "regex":
+			query = "regex:.*" + regexpSafeLiteral(term) + ".*"
+		case "or":
+			query, matchPath = term+"|"+alt, true
+		case "not":
+			query, matchPath = term+" !backup", true
+		case "under":
+			query, matchPath, under = term, true, `C:\workspace`
+		}
+		sortToken := sorts[rng.Intn(len(sorts))]
+		if sortToken != "" {
+			query += " " + sortToken
+		}
+		volumeState := volumeStates[rng.Intn(len(volumeStates))]
+		resultState := resultStates[rng.Intn(len(resultStates))]
+		overlayState := overlayStates[rng.Intn(len(overlayStates))]
+		limit := limits[rng.Intn(len(limits))]
+		cases = append(cases, struct {
+			family, volume, result, overlay, sort string
+			query, under                          string
+			matchPath                             bool
+			limit                                 int
+		}{family, volumeState, resultState, overlayState, sortToken, query, under, matchPath, limit})
+		pairCounts[family+"/"+sortToken]++
+	}
+
+	for i, tc := range cases {
+		tc := tc
+		t.Run(fmt.Sprintf("%02d-%s-%s-%s", i, tc.family, tc.volume, tc.overlay), func(t *testing.T) {
+			baseC := randomCorpusIndex(seed+int64(i), randomCorpusParams{Records: 96})
+			baseC.Source, baseC.Volume, baseC.Roots = "usn", "C:", []string{`C:\`}
+			baseF := cloneCompactIndex(baseC)
+			baseF.Volume, baseF.Roots = "F:", []string{`F:\`}
+			if tc.volume == "mixed-v8" {
+				baseF.Version = indexVersion
+				baseF.Derived = indexDerivedSections{}
+			}
+			if tc.volume == "missing-derived" {
+				baseF.Version = indexVersionV9
+				baseF.Derived = indexDerivedSections{}
+			}
+			volC := newServiceVolumeIndex(fmt.Sprintf("r5-matrix-c-%d.gsi", i), baseC)
+			volF := newServiceVolumeIndex(fmt.Sprintf("r5-matrix-f-%d.gsi", i), baseF)
+			volumes := []*serviceVolumeIndex{volC, volF}
+			switch tc.volume {
+			case "single", "absent":
+				volumes = []*serviceVolumeIndex{volC}
+			case "early-miss-later-hit":
+				volumes = []*serviceVolumeIndex{volF, volC}
+			}
+			query := tc.query
+			under := tc.under
+			if tc.volume == "absent" {
+				query = "path:F: " + query
+				// Keep the absent-volume case orthogonal to an explicit C:-root
+				// under constraint; that combination is intentionally covered by
+				// the separate under/volume adversarial tests.
+				under = ""
+			}
+			opts := queryOptions{Query: query, MatchPath: tc.matchPath, Under: under, Limit: tc.limit}
+			want, err := r5ExhaustivePlannerOracle(volumes, opts, false)
+			if err != nil {
+				t.Fatalf("exhaustive search oracle: %v", err)
+			}
+			trace := &searchTrace{}
+			fast, err := searchServiceVolumes(volumes, queryOptions{Query: query, MatchPath: tc.matchPath, Under: under, Limit: tc.limit, Trace: trace}, false)
+			if err != nil {
+				t.Fatalf("planned search: %v trace=%+v", err, *trace)
+			}
+			if got, expected := pathsOf(fast), pathsOf(want); !sameOrderedStrings(got, expected) {
+				t.Fatalf("search parity query=%q family=%s result=%s sort=%s got=%v want=%v trace=%+v", query, tc.family, tc.result, tc.sort, got, expected, *trace)
+			}
+			wantCount, err := r5ExhaustivePlannerOracle(volumes, opts, true)
+			if err != nil {
+				t.Fatalf("exhaustive count oracle: %v", err)
+			}
+			gotCount, err := searchServiceVolumes(volumes, queryOptions{Query: query, MatchPath: tc.matchPath, Under: under, Limit: tc.limit, Trace: &searchTrace{}}, true)
+			if err != nil {
+				t.Fatalf("planned count: %v", err)
+			}
+			if len(gotCount) != len(wantCount) {
+				t.Fatalf("count parity query=%q family=%s got=%d want=%d", query, tc.family, len(gotCount), len(wantCount))
+			}
+			if tc.volume == "absent" && (trace.Candidates != 0 || trace.BlocksDecoded != 0) {
+				t.Fatalf("absent volume did work: candidates=%d decoded=%d skipped=%d trace=%+v", trace.Candidates, trace.BlocksDecoded, trace.BlocksSkipped, *trace)
+			}
+		})
+	}
+	pairs := make([]string, 0, len(pairCounts))
+	for pair, count := range pairCounts {
+		pairs = append(pairs, fmt.Sprintf("%s=%d", pair, count))
+	}
+	sort.Strings(pairs)
+	t.Logf("R5 matrix seed=%d cases=%d dimension-pairs=%s; oracle=exhaustive search/count, absent-volume zero-work asserted", seed, len(cases), strings.Join(pairs, ","))
+}
+
+func r5ExhaustivePlannerOracle(volumes []*serviceVolumeIndex, opts queryOptions, countOnly bool) ([]Entry, error) {
+	selected, err := serviceVolumesForQuery(volumes, opts)
+	if err != nil {
+		return nil, err
+	}
+	selected = prioritizeServiceVolumesForPathTerms(selected, opts)
+	out := make([]Entry, 0)
+	for _, vol := range selected {
+		child := opts
+		if !countOnly {
+			child.Limit = max(normalizedLimit(opts.Limit, false), vol.index.compactRecordCount())
+		}
+		got, err := searchCompactWithCache(vol.index, child, countOnly, make(map[int]string), nil)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, got...)
+	}
+	if !countOnly && len(selected) > 1 {
+		pq, err := parseQuery(opts)
+		if err != nil {
+			return nil, err
+		}
+		sortSearchAllEntries(out, pq)
+	}
+	if !countOnly {
+		limit := normalizedLimit(opts.Limit, false)
+		if limit > 0 && len(out) > limit {
+			out = out[:limit]
+		}
+	}
+	return out, nil
+}
+
+func TestR5GeneratedOverlayCoverageMatrix(t *testing.T) {
+	t.Setenv("SEEKFS_ENGINE_V9", "1")
+	const seed int64 = 0x0a11ce
+	states := []struct {
+		name    string
+		changes []usnChange
+	}{
+		{name: "none"},
+		{name: "create", changes: []usnChange{{FRN: 301, ParentFRN: 100, USN: 10, Reason: usnReasonFileCreate, Name: "matrix-needle.txt"}}},
+		{name: "hide", changes: []usnChange{{FRN: 302, ParentFRN: 100, USN: 11, Reason: usnReasonFileCreate, Name: "matrix-hidden.txt", Attr: fileAttributeHidden}}},
+		{name: "delete", changes: []usnChange{{FRN: 101, USN: 12, Reason: usnReasonFileDelete}}},
+		{name: "rename", changes: []usnChange{{FRN: 101, ParentFRN: 100, USN: 13, Reason: usnReasonRenameOld, Name: "needle-base.txt"}, {FRN: 101, ParentFRN: 100, USN: 14, Reason: usnReasonRenameNew, Name: "renamed-away.txt"}}},
+	}
+	queries := []queryOptions{
+		{Query: "needle", MatchPath: true, Limit: 1},
+		{Query: "path:base-parent needle", Limit: 20},
+		{Query: "needle|base", MatchPath: true, Limit: 100},
+		{Query: "ext:txt sort:path", Limit: 20},
+		{Query: "type:file needle", MatchPath: true, Limit: 20},
+		{Query: "path:F: needle|base", MatchPath: true, Limit: 20},
+		{Query: "path:F: needle !base", MatchPath: true, Limit: 20},
+	}
+	caseCount := 0
+	for _, state := range states {
+		state := state
+		t.Run(state.name, func(t *testing.T) {
+			vol := engineV9OverlaySearchTestVolume(t)
+			logical := make(map[uint64]CompactRecord, vol.index.compactRecordCount())
+			for i := 0; i < vol.index.compactRecordCount(); i++ {
+				rec := vol.index.compactRecord(i)
+				logical[rec.FRN] = rec
+			}
+			if len(state.changes) > 0 {
+				vol.applyUSNChanges(state.changes)
+				applyLogicalUSNChanges(logical, state.changes)
+			}
+			fresh := freshIndexFromLogicalRecords("F:", logical)
+			fresh.Roots = []string{`F:\`}
+			freshVol := newServiceVolumeIndex(fmt.Sprintf("r5-overlay-oracle-%d.gsi", seed+int64(len(state.name))), fresh)
+			for _, baseOpts := range queries {
+				caseCount++
+				opts := baseOpts
+				want, err := r5ExhaustivePlannerOracle([]*serviceVolumeIndex{freshVol}, opts, false)
+				if err != nil {
+					t.Fatalf("state=%s query=%q oracle search: %v", state.name, opts.Query, err)
+				}
+				got, err := searchServiceVolumes([]*serviceVolumeIndex{vol}, opts, false)
+				if err != nil {
+					t.Fatalf("state=%s query=%q overlay search: %v", state.name, opts.Query, err)
+				}
+				if gotPaths, wantPaths := pathsOf(got), pathsOf(want); !sameOrderedStrings(gotPaths, wantPaths) {
+					t.Fatalf("state=%s query=%q paths=%v want=%v fresh-volume=%q fresh-records=%d fresh-state=%q", state.name, opts.Query, gotPaths, wantPaths, fresh.Volume, len(fresh.Records), freshVol.state)
+				}
+				wantCount, err := r5ExhaustivePlannerOracle([]*serviceVolumeIndex{freshVol}, opts, true)
+				if err != nil {
+					t.Fatalf("state=%s query=%q oracle count: %v", state.name, opts.Query, err)
+				}
+				gotCount, err := searchServiceVolumes([]*serviceVolumeIndex{vol}, opts, true)
+				if err != nil {
+					t.Fatalf("state=%s query=%q overlay count: %v", state.name, opts.Query, err)
+				}
+				if len(gotCount) != len(wantCount) {
+					t.Fatalf("state=%s query=%q count=%d want=%d", state.name, opts.Query, len(gotCount), len(wantCount))
+				}
+			}
+		})
+	}
+	t.Logf("R5 overlay matrix seed=%d cases=%d states=none/create/hide/delete/rename; volume+overlay+boolean triples included; oracle=clean rebuilt index search/count", seed, caseCount)
+}
+
+// TestR5RequiredAdversarialCoverageMatrix makes the exit-gate dimensions that
+// are easy to miss explicit.  It uses one stable fixture and checks both
+// search ordering and exact count against the exhaustive oracle for every
+// case, including the v8 fallback volume.
+func TestR5RequiredAdversarialCoverageMatrix(t *testing.T) {
+	const seed int64 = 0x71e5eed
+	baseC := randomCorpusIndex(seed, randomCorpusParams{Records: 144})
+	baseC.Source, baseC.Volume, baseC.Roots, baseC.CompactAttrs = "usn", "C:", []string{`C:\`}, true
+	for i := range baseC.Records {
+		if baseC.Records[i].Mode&uint32(os.ModeDir) == 0 && i%9 == 0 {
+			baseC.Records[i].Mode = modeFromAttrs(fileAttributeHidden | fileAttributeArchive)
+		}
+		if i >= 8 && i <= 11 {
+			baseC.Records[i].Size = 4096
+			baseC.Records[i].ModUnix = time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC).UnixNano()
+		}
+	}
+	buildOrders(baseC)
+	baseF := cloneCompactIndex(baseC)
+	baseF.Volume, baseF.Roots = "F:", []string{`F:\`}
+	baseF.Version, baseF.Derived = indexVersion, indexDerivedSections{}
+	volC := newServiceVolumeIndex("r5-adversarial-c.gsi", baseC)
+	volF := newServiceVolumeIndex("r5-adversarial-f-v8.gsi", baseF)
+
+	cases := []struct {
+		name, query, volume, under string
+		matchPath                  bool
+		limit                      int
+	}{
+		{"attrib-hidden", "attrib:H", "C", "", false, 20},
+		{"exact-name", "workspace", "C", "", true, 1},
+		{"substring-superset", "work", "C", "", true, 20},
+		{"common-term", "a", "C", "", true, 100},
+		{"rare-term", "Ã¼ber", "C", "", true, 20},
+		{"short-term", "x", "C", "", true, 1},
+		{"dotted-term", ".leading-dot", "C", "", true, 20},
+		{"case-varied", "WORKSPACE", "C", "", true, 20},
+		{"no-hit", "zzzz-nohit", "C", "", true, 20},
+		{"separator-derived", `path:workspace\src`, "C", "", true, 20},
+		{"file-self-hit", "path:README.md", "C", "", true, 20},
+		{"directory-self-hit", "path:workspace", "C", "", true, 20},
+		{"nested-overlap", "path:workspace|path:src", "C", "", true, 100},
+		{"under-root", "workspace", "C", `C:\workspace`, true, 20},
+		{"size-ascending-ties", "type:file sort:size", "C", "", true, 20},
+		{"modified-descending-ties", "type:file sort:modified", "C", "", true, 20},
+		{"path-order", "path:workspace sort:path", "both", "", true, 20},
+		{"type-order", "path:workspace sort:type", "both", "", true, 20},
+		{"extension-order", "ext:nrrd sort:extension", "both", "", true, 20},
+		{"v8-fallback", "nrrd sort:size", "F", "", true, 20},
+		{"mixed-metadata-ties", "nrrd sort:modified", "both", "", true, 100},
+		{"absent-volume", "path:F: .pdf", "C", "", true, 20},
+		{"volume-boolean", "path:F: nrrd|raw", "F", "", true, 20},
+		{"volume-not", "path:F: nrrd !backup", "F", "", true, 20},
+	}
+	pairs := make(map[string]struct{})
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			volumes := []*serviceVolumeIndex{volC}
+			switch tc.volume {
+			case "F":
+				volumes = []*serviceVolumeIndex{volF}
+			case "both":
+				volumes = []*serviceVolumeIndex{volC, volF}
+			}
+			opts := queryOptions{Query: tc.query, MatchPath: tc.matchPath, Under: tc.under, Limit: tc.limit}
+			want, err := r5ExhaustivePlannerOracle(volumes, opts, false)
+			if err != nil {
+				t.Fatalf("oracle search: %v", err)
+			}
+			trace := &searchTrace{}
+			got, err := searchServiceVolumes(volumes, queryOptions{Query: tc.query, MatchPath: tc.matchPath, Under: tc.under, Limit: tc.limit, Trace: trace}, false)
+			if err != nil {
+				t.Fatalf("planned search: %v trace=%+v", err, *trace)
+			}
+			if !sameOrderedStrings(pathsOf(got), pathsOf(want)) {
+				t.Fatalf("search parity got=%v want=%v trace=%+v", pathsOf(got), pathsOf(want), *trace)
+			}
+			wantCount, err := r5ExhaustivePlannerOracle(volumes, opts, true)
+			if err != nil {
+				t.Fatalf("oracle count: %v", err)
+			}
+			gotCount, err := searchServiceVolumes(volumes, queryOptions{Query: tc.query, MatchPath: tc.matchPath, Under: tc.under, Limit: tc.limit, Trace: &searchTrace{}}, true)
+			if err != nil {
+				t.Fatalf("planned count: %v", err)
+			}
+			if len(gotCount) != len(wantCount) {
+				t.Fatalf("count parity got=%d want=%d", len(gotCount), len(wantCount))
+			}
+			if tc.name == "absent-volume" && (trace.Candidates != 0 || trace.BlocksDecoded != 0) {
+				t.Fatalf("absent volume did work: trace=%+v", *trace)
+			}
+			pairs[tc.name+"/"+tc.volume] = struct{}{}
+		})
+	}
+	keys := make([]string, 0, len(pairs))
+	for pair := range pairs {
+		keys = append(keys, pair)
+	}
+	sort.Strings(keys)
+	t.Logf("R5 required adversarial matrix seed=%d cases=%d dimension-pairs=%s; search/count exhaustive parity, zero-work absent volume, global tie order asserted", seed, len(cases), strings.Join(keys, ","))
+}
+
+func TestMappedComponentTopUsesDescendantRankBounds(t *testing.T) {
+	t.Setenv("SEEKFS_ENGINE_V9", "1")
+	const roots = 2048
+	idx := &Index{
+		Version: indexVersion, Source: "usn", Volume: "C:", Compact: true,
+		Roots: []string{`C:\`}, Records: make([]CompactRecord, 0, 1+roots*3),
+	}
+	idx.Records = append(idx.Records, CompactRecord{FRN: 1, ParentFRN: 1, Parent: -1, Name: ".", Mode: uint32(os.ModeDir)})
+	for i := 0; i < roots; i++ {
+		bucketID := len(idx.Records)
+		bucketFRN := uint64(bucketID + 1)
+		idx.Records = append(idx.Records, CompactRecord{
+			FRN: bucketFRN, ParentFRN: 1, Parent: 0,
+			Name: fmt.Sprintf("bucket-%04d", i), Mode: uint32(os.ModeDir),
+		})
+		workspaceID := len(idx.Records)
+		workspaceFRN := uint64(workspaceID + 1)
+		idx.Records = append(idx.Records, CompactRecord{
+			FRN: workspaceFRN, ParentFRN: bucketFRN, Parent: int32(bucketID),
+			Name: "workspace", Mode: uint32(os.ModeDir),
+		})
+		childName := fmt.Sprintf("z-%04d.txt", i)
+		if i < roots/2 {
+			childName = fmt.Sprintf("a-%04d.txt", i)
+		}
+		idx.Records = append(idx.Records, CompactRecord{
+			FRN: uint64(len(idx.Records) + 1), ParentFRN: workspaceFRN, Parent: int32(workspaceID),
+			Name: childName, Size: int64(i + 1), ModUnix: int64(i + 1),
+		})
+	}
+	buildOrders(idx)
+	db := filepath.Join(t.TempDir(), "component-top.gsi")
+	if err := saveIndex(db, idx); err != nil {
+		t.Fatalf("save index: %v", err)
+	}
+	loaded, err := loadIndexMMap(db)
+	if err != nil {
+		t.Fatalf("load mapped index: %v", err)
+	}
+	if loaded.MMapRecords == nil {
+		t.Fatal("expected mapped records")
+	}
+	t.Cleanup(func() { _ = loaded.MMapRecords.file.close() })
+	vol := newServiceVolumeIndex(db, loaded)
+	for _, sortColumn := range []string{"", "path", "size", "modified", "extension", "type"} {
+		query := "path:workspace"
+		if sortColumn != "" {
+			query += " sort:" + sortColumn
+		}
+		opts := queryOptions{Query: query, Limit: 1}
+		var want []Entry
+		if sortColumn == "" {
+			want, err = searchCompactWithCache(loaded, opts, false, make(map[int]string), nil)
+		} else {
+			want, err = searchAll([]*Index{loaded}, opts, false)
+		}
+		if err != nil {
+			t.Fatalf("%s oracle search: %v", sortColumn, err)
+		}
+		trace := &searchTrace{}
+		opts.Trace = trace
+		got, err := searchServiceVolumes([]*serviceVolumeIndex{vol}, opts, false)
+		if err != nil {
+			t.Fatalf("%s mapped component search: %v", sortColumn, err)
+		}
+		if !slices.Equal(pathsOf(got), pathsOf(want)) {
+			t.Fatalf("%s paths = %v, want %v", sortColumn, pathsOf(got), pathsOf(want))
+		}
+		if trace.Source != "global:component-top" {
+			t.Fatalf("%s trace = %+v, want component-top", sortColumn, trace)
+		}
+		if trace.ComponentDriver == "persisted-order-pngc-self" {
+			if trace.ComponentRecordsVerified == 0 {
+				t.Fatalf("%s complete self-name route did no bounded verification: %+v", sortColumn, trace)
+			}
+		} else if trace.BlocksSkipped == 0 {
+			t.Fatalf("%s trace = %+v, want component-top with skipped blocks or complete self-name route", sortColumn, trace)
+		}
+	}
+}
+
+func TestGlobalBooleanIteratorsDeduplicateAndExcludeLazily(t *testing.T) {
+	a := newGlobalIDSliceIterator([]globalRecordID{{volume: 0, local: 1}, {volume: 0, local: 3}, {volume: 1, local: 1}})
+	b := newGlobalIDSliceIterator([]globalRecordID{{volume: 0, local: 3}, {volume: 1, local: 0}, {volume: 1, local: 1}})
+	union := newGlobalMergeIterator(&a, &b)
+	if got := collectGlobalIterator(union, 0); !slices.Equal(got, []globalRecordID{{volume: 0, local: 1}, {volume: 0, local: 3}, {volume: 1, local: 0}, {volume: 1, local: 1}}) {
+		t.Fatalf("union = %v", got)
+	}
+	include := newGlobalIDSliceIterator([]globalRecordID{{volume: 0, local: 1}, {volume: 0, local: 3}, {volume: 1, local: 1}})
+	exclude := newGlobalIDSliceIterator([]globalRecordID{{volume: 0, local: 1}, {volume: 1, local: 1}})
+	countingExclude := &countingSeekGlobalIterator{globalIDIterator: &exclude}
+	without := newGlobalExclusionIterator(&include, countingExclude)
+	if got := collectGlobalIterator(without, 0); !slices.Equal(got, []globalRecordID{{volume: 0, local: 3}}) {
+		t.Fatalf("exclusion = %v", got)
+	}
+	if countingExclude.seeks == 0 {
+		t.Fatal("exclusion did not use SeekGE on the broad negative iterator")
+	}
+}
+
+type countingSeekGlobalIterator struct {
+	globalIDIterator
+	seeks int
+}
+
+func (it *countingSeekGlobalIterator) SeekGE(target globalRecordID) (globalRecordID, bool) {
+	it.seeks++
+	return it.globalIDIterator.SeekGE(target)
+}
+
+func TestBooleanLocalPlanUsesBoundedTopN(t *testing.T) {
+	idx := &Index{Source: "usn", Volume: "C:", Compact: true, Records: []CompactRecord{
+		{FRN: 1, ParentFRN: 1, Parent: -1, Name: ".", Mode: uint32(os.ModeDir)},
+		{FRN: 2, ParentFRN: 1, Parent: 0, Name: "nrrd-z.txt"},
+		{FRN: 3, ParentFRN: 1, Parent: 0, Name: "raw-a.txt"},
+		{FRN: 4, ParentFRN: 1, Parent: 0, Name: "nrrd-a.txt"},
+		{FRN: 5, ParentFRN: 1, Parent: 0, Name: "other.txt"},
+	}}
+	buildOrders(idx)
+	idx.packCompactRecords(true)
+	vol := newServiceVolumeIndex("boolean-local.gsi", idx)
+	pq, err := parseQuery(queryOptions{Query: "nrrd|raw", Limit: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pq.Limit = 1
+	plan, ok := vol.buildCandidatePlan(pq)
+	if !ok || len(plan.sources) != 1 || len(plan.sources[0].union) != 2 {
+		t.Fatalf("plan = %+v, want one two-way union", plan)
+	}
+	got, scanned, ok := plan.executeTop(pq)
+	if !ok || scanned == 0 || scanned > 2 || len(got) != 1 {
+		t.Fatalf("bounded top = ids=%v scanned=%d ok=%v, want bounded two-branch top", got, scanned, ok)
+	}
+}
+
+func TestGlobalBooleanPersistedTopAndCountMatchOracle(t *testing.T) {
+	t.Setenv("SEEKFS_GLOBAL_PLANNER", "1")
+	volumes := deterministicMultiVolumeCorpus(t, 0x0b001)
+	queries := []string{
+		"path:C: nrrd|raw",
+		"path:C: raw|nrrd",
+		"path:C: nrrd|nrrd",
+		"path:C: zzzz-no-hit|no-such-term",
+		"path:C: a|raw",
+		"path:C: zzzz-no-hit|raw sort:path",
+		"path:C: nrrd|raw sort:modified",
+		"path:C: nrrd|raw sort:extension",
+		"path:C: nrrd|raw sort:type",
+		"path:F: nrrd|raw",
+		"path:C: nrrd !raw sort:size",
+	}
+	for _, query := range queries {
+		for _, limit := range []int{1, 20, 100} {
+			t.Run(fmt.Sprintf("%s-limit-%d", query, limit), func(t *testing.T) {
+				opts := queryOptions{Query: query, Limit: limit}
+				want, err := r5ExhaustivePlannerOracle(volumes, opts, false)
+				if err != nil {
+					t.Fatal(err)
+				}
+				trace := &searchTrace{}
+				got, err := searchServiceVolumes(volumes, queryOptions{Query: query, Limit: limit, Trace: trace}, false)
+				if err != nil {
+					t.Fatalf("search: %v trace=%+v", err, *trace)
+				}
+				if !slices.Equal(pathsOf(got), pathsOf(want)) {
+					t.Fatalf("search paths=%v want=%v trace=%+v", pathsOf(got), pathsOf(want), *trace)
+				}
+				wantCount, err := r5ExhaustivePlannerOracle(volumes, opts, true)
+				if err != nil {
+					t.Fatal(err)
+				}
+				countTrace := &searchTrace{}
+				gotCount, _, err := countServiceVolumes(volumes, queryOptions{Query: query, Limit: limit, Trace: countTrace})
+				if err != nil {
+					t.Fatalf("count: %v trace=%+v", err, *countTrace)
+				}
+				if gotCount != len(wantCount) {
+					t.Fatalf("count=%d want=%d trace=%+v", gotCount, len(wantCount), *countTrace)
+				}
+				if strings.Contains(query, "!") {
+					if trace.Source != "global:boolean-iterator" || countTrace.Source != "global:boolean-iterator" {
+						t.Fatalf("NOT did not use lazy iterator: search=%+v count=%+v", *trace, *countTrace)
+					}
+				} else if trace.Source != "global:boolean-persisted-top" || countTrace.Source != "global:boolean-persisted-count" {
+					t.Fatalf("OR did not use persisted top/count: search=%+v count=%+v", *trace, *countTrace)
+				}
+			})
+		}
+	}
+}
+
+func TestGlobalBooleanCancellationUsesSafeFallback(t *testing.T) {
+	volumes := deterministicMultiVolumeCorpus(t, 0x0b002)
+	canceled := func() bool { return true }
+	for _, countOnly := range []bool{false, true} {
+		trace := &searchTrace{}
+		opts := queryOptions{Query: "path:C: nrrd|raw", Limit: 20, Cancel: canceled, Trace: trace}
+		if countOnly {
+			_, _, err := countServiceVolumes(volumes, opts)
+			if !errors.Is(err, errQueryCanceled) {
+				t.Fatalf("count cancellation error=%v trace=%+v, want %v", err, *trace, errQueryCanceled)
+			}
+			continue
+		}
+		_, err := searchServiceVolumes(volumes, opts, false)
+		if !errors.Is(err, errQueryCanceled) {
+			t.Fatalf("search cancellation error=%v trace=%+v, want %v", err, *trace, errQueryCanceled)
+		}
+	}
+}
+
+func TestSearchAllMultiIndexLimitDoesNotHideLaterBetterMatch(t *testing.T) {
+	cIdx := singleFileCompactIndex("C:", "z-match.txt")
+	fIdx := singleFileCompactIndex("F:", "a-match.txt")
+
+	got, err := searchAll([]*Index{cIdx, fIdx}, queryOptions{Query: "match", Limit: 1}, false)
+	if err != nil {
+		t.Fatalf("searchAll: %v", err)
+	}
+	if gotPaths := pathsOf(got); !sameOrderedStrings(gotPaths, []string{`F:\workspace\a-match.txt`}) {
+		t.Fatalf("paths = %v, want F volume global best match", gotPaths)
+	}
+}
+
+func TestSearchAllPromotedShortExtensionDoesNotWaterfall(t *testing.T) {
+	cIdx := singleDownloadFileCompactIndex("C:", "z-notes.md")
+	fIdx := singleDownloadFileCompactIndex("F:", "a-notes.md")
+
+	got, err := searchAll([]*Index{cIdx, fIdx}, queryOptions{Query: "path:Downloads md", Limit: 1}, false)
+	if err != nil {
+		t.Fatalf("searchAll: %v", err)
+	}
+	if gotPaths := pathsOf(got); !sameOrderedStrings(gotPaths, []string{`F:\Downloads\a-notes.md`}) {
+		t.Fatalf("paths = %v, want F volume global best promoted extension match", gotPaths)
+	}
+}
+
+func TestServiceVolumesPromotedShortExtensionDoesNotWaterfall(t *testing.T) {
+	for _, lowmem := range []bool{false, true} {
+		t.Run(fmt.Sprintf("lowmem=%v", lowmem), func(t *testing.T) {
+			if lowmem {
+				t.Setenv("SEEKFS_MEMORY_MODE", "lowmem")
+			}
+			volumes := []*serviceVolumeIndex{
+				newServiceVolumeIndex("c-short-ext.gsi", singleDownloadFileCompactIndex("C:", "z-notes.md")),
+				newServiceVolumeIndex("f-short-ext.gsi", singleDownloadFileCompactIndex("F:", "a-notes.md")),
+			}
+			got, err := searchServiceVolumes(volumes, queryOptions{Query: "path:Downloads md", Limit: 1}, false)
+			if err != nil {
+				t.Fatalf("searchServiceVolumes: %v", err)
+			}
+			if gotPaths := pathsOf(got); !sameOrderedStrings(gotPaths, []string{`F:\Downloads\a-notes.md`}) {
+				t.Fatalf("paths = %v, want F volume global best promoted extension match", gotPaths)
+			}
+		})
+	}
+}
+
+func TestMultiVolumePlannerDeclineDoesNotUsePerVolumeTerminal(t *testing.T) {
+	t.Setenv("SEEKFS_ENGINE_V9", "1")
+	volumes := []*serviceVolumeIndex{
+		newServiceVolumeIndex("c-declined.gsi", singleFileCompactIndex("C:", "needle.txt")),
+		newServiceVolumeIndex("f-declined.gsi", singleFileCompactIndex("F:", "needle.txt")),
+	}
+	// Model the only unsafe global-planner decline that must not fall through:
+	// an active overlay whose snapshot has not been published yet.
+	volumes[0].overlay.watermark.Store(1)
+	volumes[0].snap.Store(nil)
+
+	trace := &searchTrace{}
+	_, err := searchServiceVolumes(volumes, queryOptions{Query: "needle", Trace: trace}, false)
+	if !errors.Is(err, errGlobalMultiVolumePlannerDeclined) {
+		t.Fatalf("search error = %v, want global multi-volume planner decline", err)
+	}
+	if trace.PlannerMode == "service-per-volume" || trace.Fallback == "service-per-volume" {
+		t.Fatalf("search trace used removed per-volume terminal: %+v", trace)
+	}
+
+	countTrace := &searchTrace{}
+	_, handled, err := countServiceVolumes(volumes, queryOptions{Query: "needle", Trace: countTrace})
+	if !handled || !errors.Is(err, errGlobalMultiVolumePlannerDeclined) {
+		t.Fatalf("count = (handled=%v, err=%v), want handled decline error", handled, err)
+	}
+	if countTrace.PlannerMode == "service-count-per-volume" || countTrace.Fallback == "service-count-per-volume" {
+		t.Fatalf("count trace used removed per-volume terminal: %+v", countTrace)
+	}
+}
+
+func TestBareShortNameSubstringKeepsSubstringSemantics(t *testing.T) {
+	idx := shortSubstringCompactIndex()
+	got, err := searchCompactWithCache(idx, queryOptions{Query: "md", Limit: 10}, false, make(map[int]string), nil)
+	if err != nil {
+		t.Fatalf("search md: %v", err)
+	}
+	if names := namesOf(got); !sameStringSet(names, []string{"cmd.exe", "readme.md"}) {
+		t.Fatalf("names = %v, want substring match not extension rewrite", names)
+	}
+}
+
+func TestExplicitTwoCharExtUsesGlobalMerge(t *testing.T) {
+	for _, query := range []string{"ext:md", "glob:*.md"} {
+		t.Run(query, func(t *testing.T) {
+			volumes := []*serviceVolumeIndex{
+				newServiceVolumeIndex("c-explicit-md.gsi", singleDownloadFileCompactIndex("C:", "z-notes.md")),
+				newServiceVolumeIndex("f-explicit-md.gsi", singleDownloadFileCompactIndex("F:", "a-notes.md")),
+			}
+			got, err := searchServiceVolumes(volumes, queryOptions{Query: query, Limit: 1}, false)
+			if err != nil {
+				t.Fatalf("searchServiceVolumes: %v", err)
+			}
+			if gotPaths := pathsOf(got); !sameOrderedStrings(gotPaths, []string{`F:\Downloads\a-notes.md`}) {
+				t.Fatalf("paths = %v, want F volume global best explicit extension match", gotPaths)
+			}
+		})
+	}
+}
+
+func singleFileCompactIndex(volume, name string) *Index {
+	idx := &Index{
+		Source:  "usn",
+		Volume:  volume,
+		Compact: true,
+	}
+	add := func(frn, parentFRN uint64, parent int32, name string, mode uint32) int32 {
+		idx.Records = append(idx.Records, CompactRecord{
+			FRN:       frn,
+			ParentFRN: parentFRN,
+			Parent:    parent,
+			Name:      name,
+			Mode:      mode,
+			Size:      1024,
+			ModUnix:   time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC).UnixNano(),
+		})
+		return int32(len(idx.Records) - 1)
+	}
+	root := add(1, 1, -1, ".", uint32(os.ModeDir))
+	workspace := add(2, 1, root, "workspace", uint32(os.ModeDir))
+	add(3, 2, workspace, name, 0)
+	buildOrders(idx)
+	return idx
+}
+
+func singleDownloadFileCompactIndex(volume, name string) *Index {
+	idx := &Index{
+		Source:  "usn",
+		Volume:  volume,
+		Compact: true,
+	}
+	add := func(frn, parentFRN uint64, parent int32, name string, mode uint32) int32 {
+		idx.Records = append(idx.Records, CompactRecord{
+			FRN:       frn,
+			ParentFRN: parentFRN,
+			Parent:    parent,
+			Name:      name,
+			Mode:      mode,
+			Size:      1024,
+			ModUnix:   time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC).UnixNano(),
+		})
+		return int32(len(idx.Records) - 1)
+	}
+	root := add(1, 1, -1, ".", uint32(os.ModeDir))
+	downloads := add(2, 1, root, "Downloads", uint32(os.ModeDir))
+	add(3, 2, downloads, name, 0)
+	buildOrders(idx)
+	return idx
+}
+
+func shortSubstringCompactIndex() *Index {
+	idx := singleDownloadFileCompactIndex("C:", "readme.md")
+	idx.Records = append(idx.Records, CompactRecord{
+		FRN:       4,
+		ParentFRN: 2,
+		Parent:    1,
+		Name:      "cmd.exe",
+		Mode:      0,
+		Size:      1024,
+		ModUnix:   time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC).UnixNano(),
+	})
+	buildOrders(idx)
+	return idx
+}
+
+func TestGlobalRecordIteratorNextSeekGE(t *testing.T) {
+	it := newGlobalRecordIterator(2, []int{1, 4, 9, 15})
+	var _ globalIDIterator = &it
+	if got := it.CountHint(); got != 4 {
+		t.Fatalf("initial CountHint = %d, want 4", got)
+	}
+	if got, ok := it.Next(); !ok || got != (globalRecordID{volume: 2, local: 1}) {
+		t.Fatalf("Next = %+v/%v, want volume 2 local 1", got, ok)
+	}
+	if got := it.CountHint(); got != 3 {
+		t.Fatalf("CountHint after Next = %d, want 3", got)
+	}
+	if got, ok := it.SeekGE(globalRecordID{volume: 2, local: 8}); !ok || got != (globalRecordID{volume: 2, local: 9}) {
+		t.Fatalf("SeekGE local 8 = %+v/%v, want volume 2 local 9", got, ok)
+	}
+	if got, ok := it.SeekGE(globalRecordID{volume: 1, local: 99}); !ok || got != (globalRecordID{volume: 2, local: 15}) {
+		t.Fatalf("SeekGE prior volume = %+v/%v, want volume 2 local 15", got, ok)
+	}
+	if got, ok := it.SeekGE(globalRecordID{volume: 3, local: 0}); ok {
+		t.Fatalf("SeekGE later volume = %+v/%v, want exhausted", got, ok)
+	}
+	if got, ok := it.Next(); ok {
+		t.Fatalf("Next after exhausted = %+v/%v, want exhausted", got, ok)
+	}
+	if got := it.CountHint(); got != 0 {
+		t.Fatalf("CountHint after exhausted = %d, want 0", got)
+	}
+}
+
+func TestGlobalPostingIteratorAdaptsPostingCandidate(t *testing.T) {
+	it := newGlobalPostingIterator(3, postingCountCandidate{ids: []uint32{2, 5, 11}})
+	if got := it.CountHint(); got != 3 {
+		t.Fatalf("posting CountHint = %d, want 3", got)
+	}
+	if got, ok := it.SeekGE(globalRecordID{volume: 3, local: 4}); !ok || got != (globalRecordID{volume: 3, local: 5}) {
+		t.Fatalf("posting SeekGE = %+v/%v, want volume 3 local 5", got, ok)
+	}
+	if got, ok := it.Next(); !ok || got != (globalRecordID{volume: 3, local: 11}) {
+		t.Fatalf("posting Next = %+v/%v, want volume 3 local 11", got, ok)
+	}
+}
+
+func TestGlobalExtPostingIDsMatchPerVolumePostings(t *testing.T) {
+	volumes := []*serviceVolumeIndex{
+		workspaceAlphaModelVolume("C:", false),
+		workspaceAlphaModelVolume("F:", true),
+	}
+	got, ok := globalExtPostingIDs(volumes, "bin", 0, nil)
+	if !ok {
+		t.Fatal("globalExtPostingIDs declined ext source")
+	}
+	want := make([]globalRecordID, 0, 8)
+	for _, id := range volumes[1].extPosting("bin") {
+		want = append(want, globalRecordID{volume: 1, local: id})
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("global ext ids = %+v, want %+v", got, want)
+	}
+}
+
+func TestGlobalExtPostingIDsRespectsLimit(t *testing.T) {
+	volumes := []*serviceVolumeIndex{
+		workspaceAlphaModelVolume("C:", false),
+		workspaceAlphaModelVolume("F:", true),
+	}
+	got, ok := globalExtPostingIDs(volumes, "bin", 3, nil)
+	if !ok {
+		t.Fatal("globalExtPostingIDs declined ext source")
+	}
+	want := []globalRecordID{
+		{volume: 1, local: volumes[1].extPosting("bin")[0]},
+		{volume: 1, local: volumes[1].extPosting("bin")[1]},
+		{volume: 1, local: volumes[1].extPosting("bin")[2]},
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("limited global ext ids = %+v, want %+v", got, want)
+	}
+}
+
+func TestGlobalExtPostingIDsTraceMissingPostingVolume(t *testing.T) {
+	volumes := []*serviceVolumeIndex{
+		workspaceAlphaModelVolume("C:", false),
+		workspaceAlphaModelVolume("F:", true),
+	}
+	if volumes[0].queryIndex == nil {
+		volumes[0].queryIndex = &residentQueryIndex{}
+	}
+	volumes[0].queryIndex.ext = nil
+	trace := &searchTrace{}
+	if _, ok := globalExtPostingIDs(volumes, "bin", 0, trace); ok {
+		t.Fatal("globalExtPostingIDs unexpectedly handled missing ext source")
+	}
+	if trace.Decline != "global-ext:missing-posting" {
+		t.Fatalf("decline = %q, want global-ext:missing-posting", trace.Decline)
+	}
+	if len(trace.Declines) != 1 || trace.Declines[0].Volume != "C:" || trace.Declines[0].Source != "global-ext" || trace.Declines[0].Reason != "missing-posting" {
+		t.Fatalf("declines = %+v, want C: missing-posting", trace.Declines)
+	}
+}
+
+func TestGlobalPlannerExtRankedPathTraceMissingPostingVolume(t *testing.T) {
+	t.Setenv("SEEKFS_GLOBAL_PLANNER", "1")
+	volumes := []*serviceVolumeIndex{
+		workspaceAlphaModelVolume("C:", false),
+		workspaceAlphaModelVolume("F:", true),
+	}
+	if volumes[0].queryIndex == nil {
+		volumes[0].queryIndex = &residentQueryIndex{}
+	}
+	volumes[0].queryIndex.ext = nil
+	trace := &searchTrace{}
+	opts := queryOptions{Query: "ext:bin", Limit: 5, Trace: trace}
+	if got, handled, err := searchServiceVolumesGlobalExtOnly(volumes, opts, false); err != nil {
+		t.Fatal(err)
+	} else if handled {
+		t.Fatalf("global ext unexpectedly handled missing posting source with results=%v", got)
+	}
+	if trace.Decline != "global-ext:missing-posting" {
+		t.Fatalf("decline = %q, want global-ext:missing-posting", trace.Decline)
+	}
+	if len(trace.Declines) != 1 || trace.Declines[0].Volume != "C:" || trace.Declines[0].Source != "global-ext" || trace.Declines[0].Reason != "missing-posting" {
+		t.Fatalf("declines = %+v, want C: missing-posting", trace.Declines)
+	}
+}
+
+func TestGlobalComponentRootIDsMatchPerVolumeRoots(t *testing.T) {
+	volumes := []*serviceVolumeIndex{
+		workspaceAlphaModelVolume("C:", false),
+		workspaceAlphaModelVolume("F:", true),
+	}
+	got, ok := globalComponentRootIDs(volumes, "workspace-alpha", 0)
+	if !ok {
+		t.Fatal("globalComponentRootIDs declined component source")
+	}
+	want := make([]globalRecordID, 0, 9)
+	for volumeIndex, vol := range volumes {
+		for _, id := range vol.pathComponentRootIDs("workspace-alpha") {
+			want = append(want, globalRecordID{volume: volumeIndex, local: id})
+		}
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("global component roots = %+v, want %+v", got, want)
+	}
+}
+
+func TestGlobalComponentRootIDsRespectsLimit(t *testing.T) {
+	volumes := []*serviceVolumeIndex{
+		workspaceAlphaModelVolume("C:", false),
+		workspaceAlphaModelVolume("F:", true),
+	}
+	got, ok := globalComponentRootIDs(volumes, "workspace-alpha", 2)
+	if !ok {
+		t.Fatal("globalComponentRootIDs declined component source")
+	}
+	want := []globalRecordID{
+		{volume: 0, local: volumes[0].pathComponentRootIDs("workspace-alpha")[0]},
+		{volume: 1, local: volumes[1].pathComponentRootIDs("workspace-alpha")[0]},
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("limited global component roots = %+v, want %+v", got, want)
+	}
+}
+
+func TestGlobalSubtreeIDsExpandsAndDedupesRoots(t *testing.T) {
+	volumes := []*serviceVolumeIndex{
+		workspaceAlphaModelVolume("C:", false),
+		workspaceAlphaModelVolume("F:", true),
+	}
+	roots, ok := globalComponentRootIDs(volumes, "workspace-alpha", 0)
+	if !ok {
+		t.Fatal("globalComponentRootIDs declined component source")
+	}
+	roots = append(roots, roots[0])
+	got, ok := globalSubtreeIDs(volumes, roots, 0)
+	if !ok {
+		t.Fatal("globalSubtreeIDs declined subtree source")
+	}
+	want := make([]globalRecordID, 0)
+	seen := make(map[globalRecordID]struct{})
+	for _, root := range roots {
+		for _, id := range volumes[root.volume].underDescendants(root.local) {
+			globalID := globalRecordID{volume: root.volume, local: id}
+			if _, exists := seen[globalID]; exists {
+				continue
+			}
+			seen[globalID] = struct{}{}
+			want = append(want, globalID)
+		}
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("global subtree ids = %+v, want %+v", got, want)
+	}
+}
+
+func TestGlobalSubtreeIDsRespectsLimit(t *testing.T) {
+	volumes := []*serviceVolumeIndex{
+		workspaceAlphaModelVolume("C:", false),
+		workspaceAlphaModelVolume("F:", true),
+	}
+	roots, ok := globalComponentRootIDs(volumes, "workspace-alpha", 0)
+	if !ok {
+		t.Fatal("globalComponentRootIDs declined component source")
+	}
+	got, ok := globalSubtreeIDs(volumes, roots, 3)
+	if !ok {
+		t.Fatal("globalSubtreeIDs declined subtree source")
+	}
+	if len(got) != 3 {
+		t.Fatalf("limited global subtree ids len = %d, want 3; ids=%+v", len(got), got)
+	}
+}
+
+func TestGlobalSubtreeLimitDoesNotMaterializeBroadRoot(t *testing.T) {
+	vol := broadUnderTestVolume(2050)
+	roots := vol.underRootIDs(`C:\broad`)
+	if len(roots) != 1 {
+		t.Fatalf("under roots = %v, want one broad root", roots)
+	}
+	got, ok := globalSubtreeIDs([]*serviceVolumeIndex{vol}, []globalRecordID{{volume: 0, local: roots[0]}}, 3)
+	if !ok || len(got) != 3 {
+		t.Fatalf("limited subtree = (%+v, %v), want three ids", got, ok)
+	}
+	if _, cached := vol.underCache[roots[0]]; cached {
+		t.Fatal("limited global subtree materialized and cached the full broad root")
+	}
+}
+
+func TestGlobalUnderIntersectionFiltersSelectivePostingFirst(t *testing.T) {
+	vol := broadUnderTestVolume(2050)
+	roots := vol.underRootIDs(`C:\broad`)
+	if len(roots) != 1 {
+		t.Fatalf("under roots = %v, want one broad root", roots)
+	}
+	pq := mustParseQuery(t, queryOptions{Query: "path:target.bin", MatchPath: true, Under: `C:\broad`, Limit: 10})
+	ids, ok := globalComponentQueryIDs([]*serviceVolumeIndex{vol}, pq, &searchTrace{})
+	if !ok || len(ids) != 1 || vol.index.compactRecord(ids[0].local).Name != "target.bin" {
+		t.Fatalf("global under ids = (%+v, %v), want target.bin", ids, ok)
+	}
+	if _, cached := vol.underCache[roots[0]]; cached {
+		t.Fatal("global under intersection materialized the broad subtree before filtering the selective posting")
+	}
+}
+
+func TestGlobalComponentPathIDsMaterializesOnlySelectiveProbe(t *testing.T) {
+	vol := broadUnderTestVolume(2050)
+	ids, ok := globalComponentPathIDs([]*serviceVolumeIndex{vol}, []string{"broad", "target.bin"})
+	if !ok || len(ids) != 1 || vol.index.compactRecord(ids[0].local).Name != "target.bin" {
+		t.Fatalf("component ids = (%+v, %v), want target.bin", ids, ok)
+	}
+	if _, cached := vol.pathTermCache["broad"]; cached {
+		t.Fatal("multi-term global component query materialized the broad path posting before intersection")
+	}
+	if _, cached := vol.underCache[1]; cached {
+		t.Fatal("multi-term global component query materialized the broad directory subtree")
+	}
+}
+
+func broadUnderTestVolume(children int) *serviceVolumeIndex {
+	idx := &Index{Source: "usn", Volume: "C:", Compact: true}
+	idx.Records = append(idx.Records,
+		CompactRecord{FRN: 1, ParentFRN: 1, Parent: -1, Name: ".", Mode: uint32(os.ModeDir)},
+		CompactRecord{FRN: 2, ParentFRN: 1, Parent: 0, Name: "broad", Mode: uint32(os.ModeDir)},
+	)
+	for i := 0; i < children; i++ {
+		name := fmt.Sprintf("noise-%04d.dat", i)
+		if i == children-1 {
+			name = "target.bin"
+		}
+		idx.Records = append(idx.Records, CompactRecord{FRN: uint64(i + 3), ParentFRN: 2, Parent: 1, Name: name})
+	}
+	buildOrders(idx)
+	return newServiceVolumeIndex("broad-under.gsi", idx)
+}
+
+func TestGlobalIteratorSetOperations(t *testing.T) {
+	left := newGlobalRecordIterator(0, []int{1, 3, 5, 9})
+	right := newGlobalRecordIterator(0, []int{3, 4, 5, 10})
+	if got, want := intersectGlobalIterators(&left, &right, 0), []globalRecordID{
+		{volume: 0, local: 3},
+		{volume: 0, local: 5},
+	}; !slices.Equal(got, want) {
+		t.Fatalf("intersect = %+v, want %+v", got, want)
+	}
+
+	left = newGlobalRecordIterator(0, []int{1, 3, 5})
+	right = newGlobalRecordIterator(0, []int{3, 4, 5})
+	if got, want := unionGlobalIterators(&left, &right, 0), []globalRecordID{
+		{volume: 0, local: 1},
+		{volume: 0, local: 3},
+		{volume: 0, local: 4},
+		{volume: 0, local: 5},
+	}; !slices.Equal(got, want) {
+		t.Fatalf("union = %+v, want %+v", got, want)
+	}
+
+	include := newGlobalRecordIterator(1, []int{1, 2, 3, 4})
+	exclude := newGlobalRecordIterator(1, []int{2, 4})
+	if got, want := excludeGlobalIterator(&include, &exclude, 0), []globalRecordID{
+		{volume: 1, local: 1},
+		{volume: 1, local: 3},
+	}; !slices.Equal(got, want) {
+		t.Fatalf("exclude = %+v, want %+v", got, want)
+	}
+}
+
+func TestGlobalIteratorSetOperationsRespectVolumeAndLimit(t *testing.T) {
+	left := newGlobalRecordIterator(0, []int{1, 2, 3})
+	right := newGlobalRecordIterator(1, []int{1, 2, 3})
+	if got := intersectGlobalIterators(&left, &right, 0); len(got) != 0 {
+		t.Fatalf("cross-volume intersect = %+v, want empty", got)
+	}
+
+	left = newGlobalRecordIterator(0, []int{1, 2, 3})
+	right = newGlobalRecordIterator(1, []int{1, 2, 3})
+	if got, want := unionGlobalIterators(&left, &right, 4), []globalRecordID{
+		{volume: 0, local: 1},
+		{volume: 0, local: 2},
+		{volume: 0, local: 3},
+		{volume: 1, local: 1},
+	}; !slices.Equal(got, want) {
+		t.Fatalf("limited cross-volume union = %+v, want %+v", got, want)
+	}
+}
+
+func TestCollectGlobalTopNOrdersByRankThenGlobalID(t *testing.T) {
+	left := newGlobalRecordIterator(0, []int{1, 2, 3})
+	right := newGlobalRecordIterator(1, []int{1, 2, 3})
+	ranks := map[globalRecordID]int{
+		{volume: 0, local: 1}: 50,
+		{volume: 0, local: 2}: 10,
+		{volume: 0, local: 3}: 20,
+		{volume: 1, local: 1}: 10,
+		{volume: 1, local: 2}: 40,
+		{volume: 1, local: 3}: 20,
+	}
+	got := collectGlobalTopN([]globalIDIterator{&left, &right}, 4, func(id globalRecordID) int {
+		return ranks[id]
+	})
+	want := []globalRecordID{
+		{volume: 0, local: 2},
+		{volume: 1, local: 1},
+		{volume: 0, local: 3},
+		{volume: 1, local: 3},
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("global top-n = %+v, want %+v", got, want)
+	}
+}
+
+func TestCollectGlobalTopNHandlesEmptyInputs(t *testing.T) {
+	got := collectGlobalTopN(nil, 10, func(id globalRecordID) int { return 0 })
+	if len(got) != 0 {
+		t.Fatalf("nil iterator top-n = %+v, want empty", got)
+	}
+	it := newGlobalRecordIterator(0, []int{1})
+	got = collectGlobalTopN([]globalIDIterator{&it}, 0, func(id globalRecordID) int { return 0 })
+	if len(got) != 0 {
+		t.Fatalf("zero limit top-n = %+v, want empty", got)
+	}
+}
+
+func TestSortIDsByRankOrdersByRankThenID(t *testing.T) {
+	ids := []int{9, 2, 8, 5, 3, 1}
+	ranks := map[int]int{
+		1: 10,
+		2: 20,
+		3: 10,
+		5: 30,
+		8: 20,
+		9: 10,
+	}
+	sortIDsByRank(ids, func(id int) int {
+		return ranks[id]
+	})
+	want := []int{1, 3, 9, 2, 8, 5}
+	if !slices.Equal(ids, want) {
+		t.Fatalf("sorted ids = %v, want %v", ids, want)
+	}
+}
 
 func TestPlannedCandidatesMatchFullSearchForStructuralFilters(t *testing.T) {
 	idx := commonSearchFixture()
@@ -437,16 +1755,19 @@ func TestSearchTraceReportsCandidateSource(t *testing.T) {
 		name       string
 		opts       queryOptions
 		wantSource string
+		wantTerms  []traceTerm
 	}{
 		{
 			name:       "dotted path extension",
 			opts:       queryOptions{Query: "path:.nrrd", Limit: 20},
 			wantSource: "planned:ext-top",
+			wantTerms:  []traceTerm{{Term: "nrrd", Kind: "extension", Source: "planned:ext-top", Exact: true}},
 		},
 		{
 			name:       "extension planner",
 			opts:       queryOptions{Query: "ext:.pdf", MatchPath: true, Limit: 20},
 			wantSource: "planned:ext:pdf",
+			wantTerms:  []traceTerm{{Term: "pdf", Kind: "extension", Source: "ext:pdf", Exact: true}},
 		},
 		{
 			name:       "limited missing term",
@@ -457,6 +1778,10 @@ func TestSearchTraceReportsCandidateSource(t *testing.T) {
 			name:       "broad path terms",
 			opts:       queryOptions{Query: "workspace plain", MatchPath: true, Limit: 20},
 			wantSource: "planned:path-term:plain+path-term:workspace",
+			wantTerms: []traceTerm{
+				{Term: "plain", Kind: "path-substring", Source: "path-term:plain", Exact: false},
+				{Term: "workspace", Kind: "path-substring", Source: "path-term:workspace", Exact: false},
+			},
 		},
 	}
 	for _, tc := range cases {
@@ -473,7 +1798,88 @@ func TestSearchTraceReportsCandidateSource(t *testing.T) {
 			if trace.Candidates < 0 {
 				t.Fatalf("trace candidates = %d, want non-negative", trace.Candidates)
 			}
+			for _, want := range tc.wantTerms {
+				if !traceHasTerm(trace.Terms, want) {
+					t.Fatalf("trace terms = %+v, missing %+v", trace.Terms, want)
+				}
+			}
 		})
+	}
+}
+
+func traceHasTerm(terms []traceTerm, want traceTerm) bool {
+	for _, term := range terms {
+		if term.Term == want.Term && term.Kind == want.Kind && term.Source == want.Source && term.Exact == want.Exact {
+			return true
+		}
+	}
+	return false
+}
+
+func TestSearchTraceRecordsDeclineList(t *testing.T) {
+	trace := &searchTrace{}
+	trace.setDecline("component-trigram:unsupported-query")
+	trace.replaceDecline("global-components:missing-source")
+	trace.addDeclineForVolume("global-ext:missing-posting", "F:")
+
+	if trace.Decline != "global-ext:missing-posting" {
+		t.Fatalf("decline = %q, want latest decline", trace.Decline)
+	}
+	if len(trace.Declines) != 3 {
+		t.Fatalf("declines = %+v, want three entries", trace.Declines)
+	}
+	if trace.Declines[0].Source != "component-trigram" || trace.Declines[0].Reason != "unsupported-query" {
+		t.Fatalf("first decline = %+v", trace.Declines[0])
+	}
+	if trace.Declines[1].Source != "global-components" || trace.Declines[1].Reason != "missing-source" {
+		t.Fatalf("second decline = %+v", trace.Declines[1])
+	}
+	if trace.Declines[2].Source != "global-ext" || trace.Declines[2].Reason != "missing-posting" || trace.Declines[2].Volume != "F:" {
+		t.Fatalf("third decline = %+v", trace.Declines[2])
+	}
+}
+
+func TestServiceResponseJSONIncludesStructuredTraceFields(t *testing.T) {
+	complete := true
+	resp := serviceResponse{
+		OK:              true,
+		Count:           2,
+		SearchMS:        1.25,
+		Source:          "global:components",
+		PlannerMode:     "global-components",
+		EligibleVolumes: []string{"C:", "F:"},
+		Terms: []traceTerm{
+			{Term: "workspace-alpha", Kind: "path-substring", Source: "global:component-subtree", CountHint: 16},
+			{Term: "file", Kind: "type", Source: "global:type", CountHint: 16, Exact: true},
+		},
+		Declines: []traceDecline{
+			{Source: "global-ext", Reason: "missing-posting", Volume: "F:"},
+		},
+		Fallback: "global-bounded-scan",
+		Complete: &complete,
+	}
+	data, err := json.Marshal(resp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded serviceResponse
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.PlannerMode != resp.PlannerMode || decoded.Source != resp.Source || decoded.Fallback != resp.Fallback {
+		t.Fatalf("decoded trace route fields = %+v", decoded)
+	}
+	if !slices.Equal(decoded.EligibleVolumes, resp.EligibleVolumes) {
+		t.Fatalf("eligible volumes = %v, want %v", decoded.EligibleVolumes, resp.EligibleVolumes)
+	}
+	if decoded.Complete == nil || !*decoded.Complete {
+		t.Fatalf("complete = %v, want true pointer", decoded.Complete)
+	}
+	if !traceHasTerm(decoded.Terms, traceTerm{Term: "workspace-alpha", Kind: "path-substring", Source: "global:component-subtree"}) {
+		t.Fatalf("decoded terms = %+v, missing component-subtree term", decoded.Terms)
+	}
+	if len(decoded.Declines) != 1 || decoded.Declines[0].Source != "global-ext" || decoded.Declines[0].Reason != "missing-posting" || decoded.Declines[0].Volume != "F:" {
+		t.Fatalf("decoded declines = %+v", decoded.Declines)
 	}
 }
 
@@ -2279,6 +3685,9 @@ func renderParsedQueryForTest(pq parsedQuery) string {
 	for _, dir := range pq.Dirs {
 		fields = append(fields, "dir:"+dir)
 	}
+	for _, parent := range pq.Parents {
+		fields = append(fields, "parent:"+parent)
+	}
 	for _, glob := range pq.Globs {
 		fields = append(fields, "glob:"+glob)
 	}
@@ -2518,6 +3927,1629 @@ func TestServiceVolumesHighFanoutMultiPartPathQueries(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestServiceVolumesPathModePrioritizesFullComponentVolume(t *testing.T) {
+	cVol := workspaceAlphaModelVolume("C:", false)
+	fVol := workspaceAlphaModelVolume("F:", true)
+	opts := queryOptions{Query: "workspace-alpha model_v2 type:file", MatchPath: true, Limit: 10}
+
+	volumes := prioritizeServiceVolumesForPathTerms([]*serviceVolumeIndex{cVol, fVol}, opts)
+	if len(volumes) != 2 || volumes[0] != fVol {
+		t.Fatalf("prioritized volumes = [%s %s], want F: before partial C:", volumes[0].volume, volumes[1].volume)
+	}
+}
+
+func TestServiceVolumesPathModeLaterFullVolumeSearchCountParity(t *testing.T) {
+	volumes := []*serviceVolumeIndex{
+		workspaceAlphaModelVolume("C:", false),
+		workspaceAlphaModelVolume("F:", true),
+	}
+	trace := &searchTrace{}
+	opts := queryOptions{Query: "path:workspace-alpha model_v2 type:file", Limit: 10, Trace: trace}
+
+	got, err := searchServiceVolumes(volumes, opts, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if trace.PlannerMode != "global-components" {
+		t.Fatalf("planner mode = %q, want global-components", trace.PlannerMode)
+	}
+	if want := []string{"F:", "C:"}; !slices.Equal(trace.EligibleVolumes, want) {
+		t.Fatalf("eligible volumes = %v, want %v", trace.EligibleVolumes, want)
+	}
+	want := make([]string, 0, 8)
+	for i := 0; i < 8; i++ {
+		want = append(want, fmt.Sprintf(`F:\project-%02d\workspace-alpha\model_v2\target-model-%02d.bin`, i, i))
+	}
+	if paths := pathsOf(got); !sameOrderedStrings(paths, want) {
+		t.Fatalf("search paths = %v, want %v", paths, want)
+	}
+
+	countTrace := &searchTrace{}
+	countOpts := opts
+	countOpts.Trace = countTrace
+	countMatches, err := searchServiceVolumes(volumes, countOpts, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if countTrace.PlannerMode != "global-components" {
+		t.Fatalf("count planner mode = %q, want global-components", countTrace.PlannerMode)
+	}
+	if want := []string{"F:", "C:"}; !slices.Equal(countTrace.EligibleVolumes, want) {
+		t.Fatalf("count eligible volumes = %v, want %v", countTrace.EligibleVolumes, want)
+	}
+	if gotCount := len(countMatches); gotCount != len(got) {
+		t.Fatalf("count/search parity = %d/%d, want equal", gotCount, len(got))
+	}
+
+	fastCountTrace := &searchTrace{}
+	fastCountOpts := opts
+	fastCountOpts.Trace = fastCountTrace
+	fastCount, ok, err := countServiceVolumes(volumes, fastCountOpts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("countServiceVolumes declined exact fast count")
+	}
+	if fastCount != len(got) {
+		t.Fatalf("fast count/search parity = %d/%d, want equal", fastCount, len(got))
+	}
+	if fastCountTrace.PlannerMode != "global-count-components" {
+		t.Fatalf("fast count planner mode = %q, want global-count-components", fastCountTrace.PlannerMode)
+	}
+	if want := []string{"F:", "C:"}; !slices.Equal(fastCountTrace.EligibleVolumes, want) {
+		t.Fatalf("fast count eligible volumes = %v, want %v", fastCountTrace.EligibleVolumes, want)
+	}
+}
+
+func TestServiceVolumesPathModeExpiredDeadlineDoesNotReturnCompleteZero(t *testing.T) {
+	volumes := []*serviceVolumeIndex{
+		workspaceAlphaModelVolume("C:", false),
+		workspaceAlphaModelVolume("F:", true),
+	}
+	opts := queryOptions{
+		Query:        "workspace-alpha model_v2 type:file",
+		MatchPath:    true,
+		Limit:        10,
+		DeadlineUnix: time.Now().Add(-time.Second).UnixNano(),
+	}
+
+	got, err := searchServiceVolumes(volumes, opts, false)
+	if !errors.Is(err, errQueryCanceled) {
+		t.Fatalf("searchServiceVolumes err = %v, want %v; results=%v", err, errQueryCanceled, pathsOf(got))
+	}
+}
+
+func TestGlobalPlannerExtOnlyMatchesServiceVolumes(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		query  string
+		source string
+	}{
+		{name: "ext", query: "ext:bin", source: "global:ext:bin"},
+		{name: "simple-glob", query: "glob:*.bin", source: "global:glob-ext:bin"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			volumes := []*serviceVolumeIndex{
+				workspaceAlphaModelVolume("C:", false),
+				workspaceAlphaModelVolume("F:", true),
+			}
+			opts := queryOptions{Query: tc.query, Limit: 10}
+
+			want, err := searchServiceVolumes(volumes, opts, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantCount, ok, err := countServiceVolumes(volumes, opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !ok {
+				t.Fatal("legacy ext count declined")
+			}
+			trace := &searchTrace{}
+			globalOpts := opts
+			globalOpts.Trace = trace
+			got, err := searchServiceVolumes(volumes, globalOpts, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if trace.PlannerMode != "global-ext" {
+				t.Fatalf("planner mode = %q, want global-ext", trace.PlannerMode)
+			}
+			if trace.Source != tc.source {
+				t.Fatalf("trace source = %q, want %s", trace.Source, tc.source)
+			}
+			if gotPaths, wantPaths := pathsOf(got), pathsOf(want); !slices.Equal(gotPaths, wantPaths) {
+				t.Fatalf("global ext paths = %v, want %v", gotPaths, wantPaths)
+			}
+			countSearchTrace := &searchTrace{}
+			countSearchOpts := opts
+			countSearchOpts.Trace = countSearchTrace
+			countMatches, err := searchServiceVolumes(volumes, countSearchOpts, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if countSearchTrace.PlannerMode != "global-ext" {
+				t.Fatalf("count-search planner mode = %q, want global-ext", countSearchTrace.PlannerMode)
+			}
+			if len(countMatches) != wantCount {
+				t.Fatalf("global ext count-search len = %d, want %d", len(countMatches), wantCount)
+			}
+			countTrace := &searchTrace{}
+			countOpts := opts
+			countOpts.Trace = countTrace
+			count, ok, err := countServiceVolumes(volumes, countOpts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !ok {
+				t.Fatal("global ext count declined")
+			}
+			if countTrace.PlannerMode != "global-count-ext" {
+				t.Fatalf("count planner mode = %q, want global-count-ext", countTrace.PlannerMode)
+			}
+			if count != wantCount {
+				t.Fatalf("global ext count = %d, want %d", count, wantCount)
+			}
+		})
+	}
+}
+
+func TestGlobalPlannerExtTypeFileDeclinesUnsafeTopN(t *testing.T) {
+	volumes := []*serviceVolumeIndex{
+		newServiceVolumeIndex("c-ext-type.gsi", singleEntryKindCompactIndex("C:", "foo.bin", uint32(os.ModeDir))),
+		newServiceVolumeIndex("f-ext-type.gsi", singleEntryKindCompactIndex("F:", "bar.bin", 0)),
+	}
+	trace := &searchTrace{}
+	opts := queryOptions{Query: "type:file ext:bin", Limit: 1, Trace: trace}
+	got, err := searchServiceVolumes(volumes, opts, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if trace.PlannerMode == "global-ext" || trace.PlannerMode == "global-count-ext" {
+		t.Fatalf("planner mode = %q, want safe fallback for type:file ext", trace.PlannerMode)
+	}
+	if trace.PlannerMode != "global-components" {
+		t.Fatalf("planner mode = %q, want global-components; decline=%s fallback=%s", trace.PlannerMode, trace.Decline, trace.Fallback)
+	}
+	if gotPaths := pathsOf(got); !sameOrderedStrings(gotPaths, []string{`F:\workspace\bar.bin`}) {
+		t.Fatalf("paths = %v, want only file result", gotPaths)
+	}
+	countTrace := &searchTrace{}
+	count, ok, err := countServiceVolumes(volumes, queryOptions{Query: "type:file ext:bin", Trace: countTrace})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("countServiceVolumes declined type:file ext:bin")
+	}
+	if countTrace.PlannerMode != "global-count-components" {
+		t.Fatalf("count planner mode = %q, want global-count-components; decline=%s", countTrace.PlannerMode, countTrace.Decline)
+	}
+	if count != 1 {
+		t.Fatalf("count = %d, want 1", count)
+	}
+}
+
+func TestGlobalPlannerExtDeclinesCaseSensitiveShortcut(t *testing.T) {
+	volumes := []*serviceVolumeIndex{
+		newServiceVolumeIndex("c-case-ext.gsi", singleFileCompactIndex("C:", "case.txt")),
+		newServiceVolumeIndex("f-case-ext.gsi", singleFileCompactIndex("F:", "case.TXT")),
+	}
+	trace := &searchTrace{}
+	got, err := searchServiceVolumes(volumes, queryOptions{Query: "case: ext:TXT", Limit: 10, Trace: trace}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if trace.PlannerMode == "global-ext" || trace.PlannerMode == "global-count-ext" {
+		t.Fatalf("planner mode = %q, want verified fallback for case-sensitive ext", trace.PlannerMode)
+	}
+	if gotPaths := pathsOf(got); !sameOrderedStrings(gotPaths, []string{`F:\workspace\case.TXT`}) {
+		t.Fatalf("paths = %v, want only exact-case TXT extension", gotPaths)
+	}
+}
+
+func TestGlobalPlannerExtSortPathUsesGlobalPathOrder(t *testing.T) {
+	volumes := []*serviceVolumeIndex{
+		workspaceAlphaModelVolume("F:", true),
+		workspaceAlphaModelVolume("C:", true),
+	}
+	trace := &searchTrace{}
+	opts := queryOptions{Query: "ext:bin sort:path", Limit: 3, Trace: trace}
+	got, err := searchServiceVolumes(volumes, opts, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if trace.PlannerMode != "global-ext" {
+		t.Fatalf("planner mode = %q, want global-ext; decline=%s fallback=%s", trace.PlannerMode, trace.Decline, trace.Fallback)
+	}
+	paths := pathsOf(got)
+	if len(paths) != 3 {
+		t.Fatalf("paths = %v, want 3 results", paths)
+	}
+	for _, path := range paths {
+		if !strings.HasPrefix(path, `C:\`) {
+			t.Fatalf("global sort:path paths = %v, want C: paths before F: despite reversed volume order", paths)
+		}
+	}
+}
+
+func TestGlobalPlannerExtDefaultTopNUsesGlobalNameOrder(t *testing.T) {
+	makeVolume := func(volume, match string, earlier int) *serviceVolumeIndex {
+		idx := &Index{
+			Source:  "usn",
+			Volume:  volume,
+			Compact: true,
+			Records: []CompactRecord{{FRN: 1, ParentFRN: 1, Parent: -1, Name: ".", Mode: uint32(os.ModeDir)}},
+		}
+		for i := 0; i < earlier; i++ {
+			idx.Records = append(idx.Records, CompactRecord{FRN: uint64(2 + i), ParentFRN: 1, Parent: 0, Name: fmt.Sprintf("a-%03d.go", i)})
+		}
+		idx.Records = append(idx.Records, CompactRecord{FRN: uint64(2 + earlier), ParentFRN: 1, Parent: 0, Name: match})
+		buildOrders(idx)
+		return newServiceVolumeIndex(volume+"-ext-global-rank.gsi", idx)
+	}
+	volumes := []*serviceVolumeIndex{
+		makeVolume("C:", "b-target.txt", 100),
+		makeVolume("F:", "z-target.txt", 0),
+	}
+	trace := &searchTrace{}
+	got, err := searchServiceVolumes(volumes, queryOptions{Query: "ext:txt", Limit: 1, Trace: trace}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if trace.PlannerMode != "global-ext" {
+		t.Fatalf("planner mode = %q, want global-ext; decline=%s fallback=%s", trace.PlannerMode, trace.Decline, trace.Fallback)
+	}
+	if gotPaths := pathsOf(got); !sameOrderedStrings(gotPaths, []string{`C:\b-target.txt`}) {
+		t.Fatalf("paths = %v, want globally first name despite worse local rank", gotPaths)
+	}
+}
+
+func TestGlobalPlannerExtNonPathSortsUseGlobalOrder(t *testing.T) {
+	makeVolume := func(volume, firstName, secondName string, firstMode, secondMode uint32, firstSize, secondSize int64, firstMod, secondMod int64) *serviceVolumeIndex {
+		idx := &Index{
+			Source:  "usn",
+			Volume:  volume,
+			Compact: true,
+		}
+		add := func(frn, parentFRN uint64, parent int32, name string, mode uint32, size int64, mod int64) int32 {
+			idx.Records = append(idx.Records, CompactRecord{
+				FRN:       frn,
+				ParentFRN: parentFRN,
+				Parent:    parent,
+				Name:      name,
+				Mode:      mode,
+				Size:      size,
+				ModUnix:   mod,
+			})
+			return int32(len(idx.Records) - 1)
+		}
+		root := add(1, 1, -1, ".", uint32(os.ModeDir), 0, 1)
+		add(2, 1, root, firstName, firstMode, firstSize, firstMod)
+		add(3, 1, root, secondName, secondMode, secondSize, secondMod)
+		buildOrders(idx)
+		return newServiceVolumeIndex(strings.ToLower(strings.TrimSuffix(volume, ":"))+"-sort.gsi", idx)
+	}
+	volumes := []*serviceVolumeIndex{
+		makeVolume("C:", "z-large.txt", "folder.txt", 0, uint32(os.ModeDir), 900, 200, 20, 10),
+		makeVolume("F:", "a-small.txt", "newest.txt", 0, 0, 5, 100, 30, 100),
+	}
+	cases := []struct {
+		query string
+		want  string
+	}{
+		{query: "ext:txt sort:size", want: `F:\a-small.txt`},
+		{query: "ext:txt sort:modified", want: `F:\newest.txt`},
+		{query: "ext:txt sort:extension", want: `F:\a-small.txt`},
+		{query: "ext:txt sort:type", want: `C:\folder.txt`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.query, func(t *testing.T) {
+			trace := &searchTrace{}
+			got, err := searchServiceVolumes(volumes, queryOptions{Query: tc.query, Limit: 1, Trace: trace}, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if trace.PlannerMode != "global-ext" {
+				t.Fatalf("planner mode = %q, want global-ext; decline=%s fallback=%s", trace.PlannerMode, trace.Decline, trace.Fallback)
+			}
+			if gotPaths := pathsOf(got); !sameOrderedStrings(gotPaths, []string{tc.want}) {
+				t.Fatalf("paths = %v, want %s", gotPaths, tc.want)
+			}
+		})
+	}
+}
+
+func TestGlobalPlannerComponentNonPathSortsUseGlobalOrder(t *testing.T) {
+	volumes := []*serviceVolumeIndex{
+		componentSortVolume("C:", []componentSortFixtureEntry{
+			{name: "target-large.zzz", size: 900, modUnix: 100},
+			{name: "target-dir", mode: uint32(os.ModeDir), size: 0, modUnix: 50},
+			{name: "target-new.bin", size: 100, modUnix: 300},
+		}),
+		componentSortVolume("F:", []componentSortFixtureEntry{
+			{name: "target-small.bin", size: 5, modUnix: 200},
+			{name: "target-alpha.aaa", size: 20, modUnix: 150},
+		}),
+	}
+	cases := []struct {
+		query string
+		want  string
+		count int
+	}{
+		{query: "path:workspace-alpha target type:file sort:size", want: `F:\project\workspace-alpha\model_v2\target-small.bin`, count: 4},
+		{query: "path:workspace-alpha target type:file sort:modified", want: `C:\project\workspace-alpha\model_v2\target-new.bin`, count: 4},
+		{query: "path:workspace-alpha target type:file sort:extension", want: `F:\project\workspace-alpha\model_v2\target-alpha.aaa`, count: 4},
+		{query: "path:workspace-alpha target sort:type", want: `C:\project\workspace-alpha\model_v2\target-dir`, count: 5},
+	}
+	for _, tc := range cases {
+		t.Run(tc.query, func(t *testing.T) {
+			trace := &searchTrace{}
+			got, err := searchServiceVolumes(volumes, queryOptions{Query: tc.query, Limit: 1, Trace: trace}, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if trace.PlannerMode != "global-components" {
+				t.Fatalf("planner mode = %q, want global-components; decline=%s fallback=%s", trace.PlannerMode, trace.Decline, trace.Fallback)
+			}
+			if gotPaths := pathsOf(got); !sameOrderedStrings(gotPaths, []string{tc.want}) {
+				t.Fatalf("paths = %v, want %s", gotPaths, tc.want)
+			}
+			countTrace := &searchTrace{}
+			count, ok, err := countServiceVolumes(volumes, queryOptions{Query: tc.query, Trace: countTrace})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !ok {
+				t.Fatal("countServiceVolumes declined component sort query")
+			}
+			if countTrace.PlannerMode != "global-count-components" {
+				t.Fatalf("count planner mode = %q, want global-count-components; decline=%s", countTrace.PlannerMode, countTrace.Decline)
+			}
+			if count != tc.count {
+				t.Fatalf("count = %d, want %d", count, tc.count)
+			}
+		})
+	}
+}
+
+func singleEntryKindCompactIndex(volume, name string, mode uint32) *Index {
+	idx := singleFileCompactIndex(volume, name)
+	idx.Records[len(idx.Records)-1].Mode = mode
+	buildOrders(idx)
+	return idx
+}
+
+func TestGlobalPlannerOverlayExtMatchesServiceVolumes(t *testing.T) {
+	t.Setenv("SEEKFS_ENGINE_V9", "1")
+	vol := engineV9OverlaySearchTestVolume(t)
+	vol.applyUSNChanges([]usnChange{
+		{FRN: 101, USN: 10, Reason: usnReasonFileDelete},
+		{FRN: 301, ParentFRN: 100, USN: 11, Reason: usnReasonFileCreate, Name: "aaa-overlay.txt"},
+	})
+	opts := queryOptions{Query: "ext:txt", Limit: 10}
+	want, err := searchServiceVolumes([]*serviceVolumeIndex{vol}, opts, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantCount, ok, err := countServiceVolumes([]*serviceVolumeIndex{vol}, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("legacy overlay ext count declined")
+	}
+
+	t.Setenv("SEEKFS_GLOBAL_PLANNER", "1")
+	trace := &searchTrace{}
+	globalOpts := opts
+	globalOpts.Trace = trace
+	got, err := searchServiceVolumes([]*serviceVolumeIndex{vol}, globalOpts, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if trace.PlannerMode != "global-ext" {
+		t.Fatalf("planner mode = %q, want global-ext; decline=%s", trace.PlannerMode, trace.Decline)
+	}
+	if gotPaths, wantPaths := pathsOf(got), pathsOf(want); !slices.Equal(gotPaths, wantPaths) {
+		t.Fatalf("global overlay ext paths = %v, want %v", gotPaths, wantPaths)
+	}
+	countTrace := &searchTrace{}
+	countOpts := opts
+	countOpts.Trace = countTrace
+	count, ok, err := countServiceVolumes([]*serviceVolumeIndex{vol}, countOpts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("global overlay ext count declined")
+	}
+	if countTrace.PlannerMode != "global-count-ext" {
+		t.Fatalf("count planner mode = %q, want global-count-ext; decline=%s", countTrace.PlannerMode, countTrace.Decline)
+	}
+	if count != wantCount {
+		t.Fatalf("global overlay ext count = %d, want %d", count, wantCount)
+	}
+}
+
+func TestGlobalPlannerComplexGlobFallsBack(t *testing.T) {
+	volumes := []*serviceVolumeIndex{
+		workspaceAlphaModelVolume("C:", false),
+		workspaceAlphaModelVolume("F:", true),
+	}
+	opts := queryOptions{Query: "glob:target-*.bin", Limit: 10}
+	wantPaths := make([]string, 0, 8)
+	for i := 0; i < 8; i++ {
+		wantPaths = append(wantPaths, fmt.Sprintf(`F:\project-%02d\workspace-alpha\model_v2\target-model-%02d.bin`, i, i))
+	}
+	trace := &searchTrace{}
+	globalOpts := opts
+	globalOpts.Trace = trace
+	got, err := searchServiceVolumes(volumes, globalOpts, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if trace.PlannerMode != "global-bounded-scan" {
+		t.Fatalf("planner mode = %q, want global-bounded-scan; decline=%s fallback=%s", trace.PlannerMode, trace.Decline, trace.Fallback)
+	}
+	if trace.Fallback != "global-bounded-scan" {
+		t.Fatalf("fallback = %q, want global-bounded-scan; decline=%s declines=%+v", trace.Fallback, trace.Decline, trace.Declines)
+	}
+	if gotPaths := pathsOf(got); !slices.Equal(gotPaths, wantPaths) {
+		t.Fatalf("fallback glob paths = %v, want %v", gotPaths, wantPaths)
+	}
+	countTrace := &searchTrace{}
+	countOpts := opts
+	countOpts.Trace = countTrace
+	count, ok, err := countServiceVolumes(volumes, countOpts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("global bounded fallback count declined")
+	}
+	if countTrace.PlannerMode != "global-bounded-scan" {
+		t.Fatalf("count planner mode = %q, want global-bounded-scan", countTrace.PlannerMode)
+	}
+	if countTrace.Source != "global:bounded-scan" {
+		t.Fatalf("count source = %q, want global:bounded-scan", countTrace.Source)
+	}
+	if countTrace.Fallback != "global-bounded-scan" {
+		t.Fatalf("count fallback = %q, want global-bounded-scan", countTrace.Fallback)
+	}
+	if countTrace.Complete == nil || !*countTrace.Complete {
+		t.Fatalf("count complete = %v, want true", countTrace.Complete)
+	}
+	if countTrace.Candidates == 0 {
+		t.Fatalf("count candidates = %d, want populated", countTrace.Candidates)
+	}
+	if count != len(wantPaths) {
+		t.Fatalf("global bounded fallback count = %d, want %d", count, len(wantPaths))
+	}
+}
+
+func TestGlobalPlannerCompleteFallbackDefaultsForRemainingFamilies(t *testing.T) {
+	makeVolume := func(volume, match string, earlier int) *serviceVolumeIndex {
+		idx := &Index{
+			Source:  "usn",
+			Volume:  volume,
+			Compact: true,
+			Records: []CompactRecord{{FRN: 1, ParentFRN: 1, Parent: -1, Name: ".", Mode: uint32(os.ModeDir)}},
+		}
+		for i := 0; i < earlier; i++ {
+			idx.Records = append(idx.Records, CompactRecord{FRN: uint64(2 + i), ParentFRN: 1, Parent: 0, Name: fmt.Sprintf("a-%03d.go", i)})
+		}
+		idx.Records = append(idx.Records, CompactRecord{FRN: uint64(2 + earlier), ParentFRN: 1, Parent: 0, Name: match})
+		buildOrders(idx)
+		return newServiceVolumeIndex(volume+"-complete-fallback.gsi", idx)
+	}
+	volumes := []*serviceVolumeIndex{
+		makeVolume("C:", "b-needle.txt", 100),
+		makeVolume("F:", "z-needle.txt", 0),
+	}
+
+	trace := &searchTrace{}
+	got, err := searchServiceVolumes(volumes, queryOptions{Query: "needle", Limit: 1, Trace: trace}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if trace.PlannerMode != "global-bounded-scan" || trace.Complete == nil || !*trace.Complete {
+		t.Fatalf("trace = %+v, want complete global fallback", trace)
+	}
+	if gotPaths := pathsOf(got); !sameOrderedStrings(gotPaths, []string{`C:\b-needle.txt`}) {
+		t.Fatalf("paths = %v, want globally first remaining-family match", gotPaths)
+	}
+	countTrace := &searchTrace{}
+	count, ok, err := countServiceVolumes(volumes, queryOptions{Query: "needle", Trace: countTrace})
+	if err != nil || !ok || count != 2 {
+		t.Fatalf("count = %d handled=%v err=%v, want 2 true nil", count, ok, err)
+	}
+	if countTrace.PlannerMode != "global-bounded-scan" {
+		t.Fatalf("count planner mode = %q, want global-bounded-scan", countTrace.PlannerMode)
+	}
+
+	for _, opts := range []queryOptions{
+		{Query: "x|needle", Limit: 1},
+		{Query: "case: regex:.*needle.*", Limit: 1},
+		{Query: "type:file", Exists: true, Limit: 1},
+	} {
+		routeTrace := &searchTrace{}
+		opts.Trace = routeTrace
+		if _, err := searchServiceVolumes(volumes, opts, false); err != nil {
+			t.Fatalf("query %q: %v", opts.Query, err)
+		}
+		if routeTrace.PlannerMode != "global-bounded-scan" {
+			t.Fatalf("query %q planner mode = %q, want global-bounded-scan; decline=%s", opts.Query, routeTrace.PlannerMode, routeTrace.Decline)
+		}
+	}
+}
+
+func TestGlobalPlannerComponentPathMatchesServiceVolumes(t *testing.T) {
+	volumes := []*serviceVolumeIndex{
+		workspaceAlphaModelVolume("C:", false),
+		workspaceAlphaModelVolume("F:", true),
+	}
+	opts := queryOptions{Query: "path:workspace-alpha model_v2", Limit: 10}
+
+	wantPaths := make([]string, 0, 16)
+	for i := 0; i < 8; i++ {
+		wantPaths = append(wantPaths, fmt.Sprintf(`F:\project-%02d\workspace-alpha\model_v2`, i))
+	}
+	for i := 0; i < 8; i++ {
+		wantPaths = append(wantPaths, fmt.Sprintf(`F:\project-%02d\workspace-alpha\model_v2\target-model-%02d.bin`, i, i))
+	}
+	trace := &searchTrace{}
+	globalOpts := opts
+	globalOpts.Trace = trace
+	got, err := searchServiceVolumes(volumes, globalOpts, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if trace.PlannerMode != "global-components" {
+		t.Fatalf("planner mode = %q, want global-components", trace.PlannerMode)
+	}
+	if trace.Source != "global:components" {
+		t.Fatalf("trace source = %q, want global:components", trace.Source)
+	}
+	for _, want := range []traceTerm{
+		{Term: "workspace-alpha", Kind: "path-substring", Source: "global:component-subtree", Exact: false},
+		{Term: "model_v2", Kind: "path-substring", Source: "global:component-subtree", Exact: false},
+	} {
+		if !traceHasTerm(trace.Terms, want) {
+			t.Fatalf("trace terms = %+v, missing %+v", trace.Terms, want)
+		}
+	}
+	if gotPaths := pathsOf(got); !slices.Equal(gotPaths, wantPaths[:len(gotPaths)]) {
+		t.Fatalf("global component paths = %v, want prefix %v", gotPaths, wantPaths[:len(gotPaths)])
+	}
+	countSearchTrace := &searchTrace{}
+	countSearchOpts := opts
+	countSearchOpts.Trace = countSearchTrace
+	countMatches, err := searchServiceVolumes(volumes, countSearchOpts, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if countSearchTrace.PlannerMode != "global-components" {
+		t.Fatalf("count-search planner mode = %q, want global-components", countSearchTrace.PlannerMode)
+	}
+	if len(countMatches) != len(wantPaths) {
+		t.Fatalf("global component count-search len = %d, want %d", len(countMatches), len(wantPaths))
+	}
+	countTrace := &searchTrace{}
+	countOpts := opts
+	countOpts.Trace = countTrace
+	count, ok, err := countServiceVolumes(volumes, countOpts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("global component count declined")
+	}
+	if countTrace.PlannerMode != "global-count-components" {
+		t.Fatalf("count planner mode = %q, want global-count-components", countTrace.PlannerMode)
+	}
+	if count != len(wantPaths) {
+		t.Fatalf("global component count = %d, want %d", count, len(wantPaths))
+	}
+}
+
+func TestGlobalPlannerComponentSortPathUsesGlobalPathOrder(t *testing.T) {
+	volumes := []*serviceVolumeIndex{
+		workspaceAlphaModelVolume("F:", true),
+		workspaceAlphaModelVolume("C:", true),
+	}
+	trace := &searchTrace{}
+	opts := queryOptions{Query: "path:workspace-alpha model_v2 sort:path", Limit: 3, Trace: trace}
+	got, err := searchServiceVolumes(volumes, opts, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if trace.PlannerMode != "global-components" {
+		t.Fatalf("planner mode = %q, want global-components; decline=%s fallback=%s", trace.PlannerMode, trace.Decline, trace.Fallback)
+	}
+	paths := pathsOf(got)
+	if len(paths) != 3 {
+		t.Fatalf("paths = %v, want 3 results", paths)
+	}
+	for _, path := range paths {
+		if !strings.HasPrefix(path, `C:\`) {
+			t.Fatalf("global component sort:path paths = %v, want C: paths before F: despite reversed volume order", paths)
+		}
+	}
+}
+
+func TestGlobalPlannerOverlayComponentMatchesServiceVolumes(t *testing.T) {
+	t.Setenv("SEEKFS_ENGINE_V9", "1")
+	vol := engineV9OverlaySearchTestVolume(t)
+	vol.applyUSNChanges([]usnChange{{
+		FRN:       301,
+		ParentFRN: 200,
+		USN:       11,
+		Reason:    usnReasonFileCreate,
+		Name:      "needle-overlay.bin",
+	}})
+	opts := queryOptions{Query: "path:base-parent needle-overlay", MatchPath: true, Limit: 10}
+	want, err := searchServiceVolumes([]*serviceVolumeIndex{vol}, opts, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantCount, ok, err := countServiceVolumes([]*serviceVolumeIndex{vol}, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		countMatches, err := searchServiceVolumes([]*serviceVolumeIndex{vol}, opts, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantCount = len(countMatches)
+	}
+
+	t.Setenv("SEEKFS_GLOBAL_PLANNER", "1")
+	trace := &searchTrace{}
+	globalOpts := opts
+	globalOpts.Trace = trace
+	got, err := searchServiceVolumes([]*serviceVolumeIndex{vol}, globalOpts, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if trace.PlannerMode != "global-components" {
+		t.Fatalf("planner mode = %q, want global-components; decline=%s", trace.PlannerMode, trace.Decline)
+	}
+	if gotPaths, wantPaths := pathsOf(got), pathsOf(want); !slices.Equal(gotPaths, wantPaths) {
+		t.Fatalf("global overlay component paths = %v, want %v", gotPaths, wantPaths)
+	}
+	countTrace := &searchTrace{}
+	countOpts := opts
+	countOpts.Trace = countTrace
+	count, ok, err := countServiceVolumes([]*serviceVolumeIndex{vol}, countOpts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("global overlay component count declined")
+	}
+	if countTrace.PlannerMode != "global-count-components" {
+		t.Fatalf("count planner mode = %q, want global-count-components; decline=%s", countTrace.PlannerMode, countTrace.Decline)
+	}
+	if count != wantCount {
+		t.Fatalf("global overlay component count = %d, want %d", count, wantCount)
+	}
+}
+
+func TestGlobalPlannerOverlayDirectoryRenameUpdatesComponentDescendants(t *testing.T) {
+	t.Setenv("SEEKFS_ENGINE_V9", "1")
+	t.Setenv("SEEKFS_GLOBAL_PLANNER", "1")
+	vol := engineV9OverlaySearchTestVolume(t)
+	vol.applyUSNChanges([]usnChange{
+		{FRN: 301, ParentFRN: 100, USN: 11, Reason: usnReasonFileCreate, Name: "staging", Attr: fileAttributeDir},
+		{FRN: 302, ParentFRN: 301, USN: 12, Reason: usnReasonFileCreate, Name: "model_v2", Attr: fileAttributeDir},
+		{FRN: 303, ParentFRN: 302, USN: 13, Reason: usnReasonFileCreate, Name: "result.bin"},
+		{FRN: 301, ParentFRN: 100, USN: 14, Reason: usnReasonRenameOld, Name: "staging", Attr: fileAttributeDir},
+		{FRN: 301, ParentFRN: 100, USN: 15, Reason: usnReasonRenameNew, Name: "workspace-alpha", Attr: fileAttributeDir},
+	})
+
+	assertMatches := func(want []string) {
+		t.Helper()
+		opts := queryOptions{Query: "path:workspace-alpha model_v2 type:file", Limit: 10}
+		trace := &searchTrace{}
+		opts.Trace = trace
+		got, err := searchServiceVolumes([]*serviceVolumeIndex{vol}, opts, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if trace.PlannerMode != "global-components" {
+			t.Fatalf("planner mode = %q, want global-components; decline=%s", trace.PlannerMode, trace.Decline)
+		}
+		if gotPaths := pathsOf(got); !slices.Equal(gotPaths, want) {
+			t.Fatalf("renamed overlay component paths = %v, want %v", gotPaths, want)
+		}
+		countTrace := &searchTrace{}
+		opts.Trace = countTrace
+		count, ok, err := countServiceVolumes([]*serviceVolumeIndex{vol}, opts)
+		if err != nil || !ok {
+			t.Fatalf("renamed overlay component count handled=%v err=%v", ok, err)
+		}
+		if countTrace.PlannerMode != "global-count-components" {
+			t.Fatalf("count planner mode = %q, want global-count-components; decline=%s", countTrace.PlannerMode, countTrace.Decline)
+		}
+		if count != len(want) {
+			t.Fatalf("renamed overlay component count = %d, want %d", count, len(want))
+		}
+	}
+
+	assertMatches([]string{`F:\workspace-alpha\model_v2\result.bin`})
+	vol.applyUSNChanges([]usnChange{
+		{FRN: 301, ParentFRN: 100, USN: 16, Reason: usnReasonRenameOld, Name: "workspace-alpha", Attr: fileAttributeDir},
+		{FRN: 301, ParentFRN: 100, USN: 17, Reason: usnReasonRenameNew, Name: "archive", Attr: fileAttributeDir},
+	})
+	assertMatches(nil)
+}
+
+func TestGlobalPlannerOverlayParentMatchesServiceVolumes(t *testing.T) {
+	cases := []struct {
+		name    string
+		query   string
+		changes []usnChange
+	}{
+		{
+			name:  "overlay-child-under-base-parent",
+			query: "parent:base-parent",
+			changes: []usnChange{{
+				FRN:       301,
+				ParentFRN: 200,
+				USN:       11,
+				Reason:    usnReasonFileCreate,
+				Name:      "overlay-child.txt",
+			}},
+		},
+		{
+			name:  "overlay-child-under-overlay-parent",
+			query: "parent:overlay-parent",
+			changes: []usnChange{
+				{FRN: 301, ParentFRN: 100, USN: 11, Reason: usnReasonFileCreate, Name: "overlay-parent", Attr: fileAttributeDir},
+				{FRN: 302, ParentFRN: 301, USN: 12, Reason: usnReasonFileCreate, Name: "overlay-child.txt"},
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("SEEKFS_ENGINE_V9", "1")
+			vol := engineV9OverlaySearchTestVolume(t)
+			vol.applyUSNChanges(tc.changes)
+			opts := queryOptions{Query: tc.query, Limit: 10}
+			want, err := searchServiceVolumes([]*serviceVolumeIndex{vol}, opts, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantCount, ok, err := countServiceVolumes([]*serviceVolumeIndex{vol}, opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !ok {
+				countMatches, err := searchServiceVolumes([]*serviceVolumeIndex{vol}, opts, true)
+				if err != nil {
+					t.Fatal(err)
+				}
+				wantCount = len(countMatches)
+			}
+
+			t.Setenv("SEEKFS_GLOBAL_PLANNER", "1")
+			trace := &searchTrace{}
+			globalOpts := opts
+			globalOpts.Trace = trace
+			got, err := searchServiceVolumes([]*serviceVolumeIndex{vol}, globalOpts, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if trace.PlannerMode != "global-components" {
+				t.Fatalf("planner mode = %q, want global-components; decline=%s", trace.PlannerMode, trace.Decline)
+			}
+			if gotPaths, wantPaths := pathsOf(got), pathsOf(want); !slices.Equal(gotPaths, wantPaths) {
+				t.Fatalf("global overlay parent paths = %v, want %v", gotPaths, wantPaths)
+			}
+			countTrace := &searchTrace{}
+			countOpts := opts
+			countOpts.Trace = countTrace
+			count, ok, err := countServiceVolumes([]*serviceVolumeIndex{vol}, countOpts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !ok {
+				t.Fatal("global overlay parent count declined")
+			}
+			if countTrace.PlannerMode != "global-count-components" {
+				t.Fatalf("count planner mode = %q, want global-count-components; decline=%s", countTrace.PlannerMode, countTrace.Decline)
+			}
+			if count != wantCount {
+				t.Fatalf("global overlay parent count = %d, want %d", count, wantCount)
+			}
+		})
+	}
+}
+
+func TestGlobalPlannerComponentOrNotMatchesServiceVolumes(t *testing.T) {
+	cases := []string{
+		"path:workspace-alpha model_v2|alpha-notes",
+		"path:workspace-alpha !model_v2",
+		"path:workspace-alpha parent:model_v2|parent:workspace-alpha sort:path",
+		"path:workspace-alpha !parent:model_v2 sort:path",
+	}
+	for _, query := range cases {
+		t.Run(query, func(t *testing.T) {
+			volumes := []*serviceVolumeIndex{
+				workspaceAlphaModelVolume("C:", false),
+				workspaceAlphaModelVolume("F:", true),
+			}
+			opts := queryOptions{Query: query, Limit: 20}
+			want, err := searchServiceVolumes(volumes, opts, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantCount, ok, err := countServiceVolumes(volumes, opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !ok {
+				t.Fatal("legacy component count declined")
+			}
+
+			t.Setenv("SEEKFS_GLOBAL_PLANNER", "1")
+			trace := &searchTrace{}
+			globalOpts := opts
+			globalOpts.Trace = trace
+			got, err := searchServiceVolumes(volumes, globalOpts, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if trace.PlannerMode != "global-components" {
+				t.Fatalf("planner mode = %q, want global-components", trace.PlannerMode)
+			}
+			if gotPaths, wantPaths := pathsOf(got), pathsOf(want); !slices.Equal(gotPaths, wantPaths) {
+				t.Fatalf("global component paths = %v, want %v", gotPaths, wantPaths)
+			}
+
+			countTrace := &searchTrace{}
+			countOpts := opts
+			countOpts.Trace = countTrace
+			count, ok, err := countServiceVolumes(volumes, countOpts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !ok {
+				t.Fatal("global component count declined")
+			}
+			if countTrace.PlannerMode != "global-count-components" {
+				t.Fatalf("count planner mode = %q, want global-count-components", countTrace.PlannerMode)
+			}
+			if count != wantCount {
+				t.Fatalf("global component count = %d, want %d", count, wantCount)
+			}
+		})
+	}
+}
+
+func TestGlobalPlannerComponentTypeFilterMatchesServiceVolumes(t *testing.T) {
+	cases := []string{
+		"path:workspace-alpha model_v2 type:file",
+		"path:workspace-alpha model_v2 type:dir",
+	}
+	for _, query := range cases {
+		t.Run(query, func(t *testing.T) {
+			volumes := []*serviceVolumeIndex{
+				workspaceAlphaModelVolume("C:", false),
+				workspaceAlphaModelVolume("F:", true),
+			}
+			opts := queryOptions{Query: query, Limit: 5}
+			want, err := searchServiceVolumes(volumes, opts, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantCount, ok, err := countServiceVolumes(volumes, opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !ok {
+				t.Fatal("legacy component count declined")
+			}
+
+			t.Setenv("SEEKFS_GLOBAL_PLANNER", "1")
+			trace := &searchTrace{}
+			globalOpts := opts
+			globalOpts.Trace = trace
+			got, err := searchServiceVolumes(volumes, globalOpts, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if trace.PlannerMode != "global-components" {
+				t.Fatalf("planner mode = %q, want global-components", trace.PlannerMode)
+			}
+			if gotPaths, wantPaths := pathsOf(got), pathsOf(want); !slices.Equal(gotPaths, wantPaths) {
+				t.Fatalf("global component paths = %v, want %v", gotPaths, wantPaths)
+			}
+
+			countTrace := &searchTrace{}
+			countOpts := opts
+			countOpts.Trace = countTrace
+			count, ok, err := countServiceVolumes(volumes, countOpts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !ok {
+				t.Fatal("global component count declined")
+			}
+			if countTrace.PlannerMode != "global-count-components" {
+				t.Fatalf("count planner mode = %q, want global-count-components", countTrace.PlannerMode)
+			}
+			if count != wantCount {
+				t.Fatalf("global component count = %d, want %d", count, wantCount)
+			}
+		})
+	}
+}
+
+func TestGlobalPlannerComponentExtMatchesServiceVolumes(t *testing.T) {
+	for _, query := range []string{"path:workspace-alpha model_v2 ext:bin", "path:workspace-alpha model_v2 glob:*.bin"} {
+		t.Run(query, func(t *testing.T) {
+			volumes := []*serviceVolumeIndex{
+				workspaceAlphaModelVolume("C:", false),
+				workspaceAlphaModelVolume("F:", true),
+			}
+			opts := queryOptions{Query: query, Limit: 5}
+			want, err := searchServiceVolumes(volumes, opts, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantCount, ok, err := countServiceVolumes(volumes, opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !ok {
+				countMatches, err := searchServiceVolumes(volumes, opts, true)
+				if err != nil {
+					t.Fatal(err)
+				}
+				wantCount = len(countMatches)
+			}
+
+			t.Setenv("SEEKFS_GLOBAL_PLANNER", "1")
+			trace := &searchTrace{}
+			globalOpts := opts
+			globalOpts.Trace = trace
+			got, err := searchServiceVolumes(volumes, globalOpts, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if trace.PlannerMode != "global-components" {
+				t.Fatalf("planner mode = %q, want global-components", trace.PlannerMode)
+			}
+			extSource := "global:ext:bin"
+			if strings.Contains(query, "glob:") {
+				extSource = "global:glob-ext:bin"
+			}
+			for _, want := range []traceTerm{
+				{Term: "workspace-alpha", Kind: "path-substring", Source: "global:component-subtree", Exact: false},
+				{Term: "model_v2", Kind: "path-substring", Source: "global:component-subtree", Exact: false},
+				{Term: "bin", Kind: "extension", Source: extSource, Exact: true},
+			} {
+				if !traceHasTerm(trace.Terms, want) {
+					t.Fatalf("trace terms = %+v, missing %+v for query %q", trace.Terms, want, query)
+				}
+			}
+			if gotPaths, wantPaths := pathsOf(got), pathsOf(want); !slices.Equal(gotPaths, wantPaths) {
+				t.Fatalf("global component+ext paths = %v, want %v", gotPaths, wantPaths)
+			}
+			countTrace := &searchTrace{}
+			countOpts := opts
+			countOpts.Trace = countTrace
+			count, ok, err := countServiceVolumes(volumes, countOpts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !ok {
+				t.Fatal("global component+ext count declined")
+			}
+			if countTrace.PlannerMode != "global-count-components" {
+				t.Fatalf("count planner mode = %q, want global-count-components", countTrace.PlannerMode)
+			}
+			if count != wantCount {
+				t.Fatalf("global component+ext count = %d, want %d", count, wantCount)
+			}
+		})
+	}
+}
+
+func TestGlobalPlannerComponentExtTraceMissingPostingVolume(t *testing.T) {
+	t.Setenv("SEEKFS_GLOBAL_PLANNER", "1")
+	volumes := []*serviceVolumeIndex{
+		workspaceAlphaModelVolume("C:", false),
+		workspaceAlphaModelVolume("F:", true),
+	}
+	if volumes[0].queryIndex == nil {
+		volumes[0].queryIndex = &residentQueryIndex{}
+	}
+	volumes[0].queryIndex.ext = nil
+	trace := &searchTrace{}
+	opts := queryOptions{Query: "path:workspace-alpha model_v2 ext:bin", Limit: 5, Trace: trace}
+	if got, handled, err := searchServiceVolumesGlobalComponentsOnly(volumes, opts, false); err != nil {
+		t.Fatal(err)
+	} else if handled {
+		t.Fatalf("global components unexpectedly handled missing ext posting source with results=%v", got)
+	}
+	if trace.Decline != "global-ext:missing-posting" {
+		t.Fatalf("decline = %q, want global-ext:missing-posting", trace.Decline)
+	}
+	if len(trace.Declines) == 0 {
+		t.Fatalf("declines = %+v, want missing posting decline", trace.Declines)
+	}
+	last := trace.Declines[len(trace.Declines)-1]
+	if last.Volume != "C:" || last.Source != "global-ext" || last.Reason != "missing-posting" {
+		t.Fatalf("last decline = %+v, want C: global-ext missing-posting", last)
+	}
+}
+
+func TestGlobalPlannerSupportedComponentsDefaultWithoutEnv(t *testing.T) {
+	volumes := []*serviceVolumeIndex{
+		workspaceAlphaModelVolume("C:", false),
+		workspaceAlphaModelVolume("F:", true),
+	}
+	cases := []struct {
+		opts queryOptions
+		mode string
+	}{
+		{opts: queryOptions{Query: "path:workspace-alpha model_v2 ext:bin", Limit: 20}, mode: "global-components"},
+		{opts: queryOptions{Query: "workspace-alpha model_v2 ext:bin", MatchPath: true, Limit: 20}, mode: "global-components"},
+		{opts: queryOptions{Query: "workspace-alpha model_v2", MatchPath: true, Limit: 20}, mode: "global-components"},
+		{opts: queryOptions{Query: "path:workspace-alpha model_v2|alpha-notes", Limit: 20}, mode: "global-components"},
+		{opts: queryOptions{Query: "path:workspace-alpha !model_v2", Limit: 20}, mode: "global-components"},
+		{opts: queryOptions{Query: "parent:model_v2 type:file", Limit: 20}, mode: "global-components"},
+		{opts: queryOptions{Query: "dir:workspace-alpha ext:bin type:file", Limit: 20}, mode: "global-components"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.opts.Query, func(t *testing.T) {
+			trace := &searchTrace{}
+			opts := tc.opts
+			opts.Trace = trace
+			got, err := searchServiceVolumes(volumes, opts, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if trace.PlannerMode != tc.mode {
+				t.Fatalf("planner mode = %q, want %q; decline=%s fallback=%s results=%v", trace.PlannerMode, tc.mode, trace.Decline, trace.Fallback, pathsOf(got))
+			}
+			if strings.Contains(opts.Query, "dir:workspace-alpha") && !traceHasTerm(trace.Terms, traceTerm{Term: "workspace-alpha", Kind: "directory-component", Source: "global:dir"}) {
+				t.Fatalf("trace terms = %+v, missing dir source", trace.Terms)
+			}
+			countTrace := &searchTrace{}
+			countOpts := opts
+			countOpts.Trace = countTrace
+			count, ok, err := countServiceVolumes(volumes, countOpts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !ok {
+				t.Fatal("default global component count declined")
+			}
+			if countTrace.PlannerMode != "global-count-components" {
+				t.Fatalf("count planner mode = %q, want global-count-components; decline=%s", countTrace.PlannerMode, countTrace.Decline)
+			}
+			if count != len(got) {
+				t.Fatalf("count = %d, search matches = %d (%v)", count, len(got), pathsOf(got))
+			}
+		})
+	}
+}
+
+func TestGlobalPlannerVolumeAnchoredAndExplicitSinglePathTermsDefault(t *testing.T) {
+	cIndex := dottedPathBenchmarkIndex(80)
+	fIndex := dottedPathBenchmarkIndex(80)
+	fIndex.Volume = "F:"
+	volumes := []*serviceVolumeIndex{
+		newServiceVolumeIndex("single-path-c.gsi", cIndex),
+		newServiceVolumeIndex("single-path-f.gsi", fIndex),
+	}
+	cases := []struct {
+		query      string
+		searchMode string
+		countMode  string
+	}{
+		{query: "F: fixtureproj", searchMode: "service-single-volume", countMode: "service-count-single-volume"},
+		{query: "path:F: raw", searchMode: "global-components", countMode: "global-count-components"},
+		{query: "path:trainingdata", searchMode: "global-components", countMode: "global-count-components"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.query, func(t *testing.T) {
+			query := tc.query
+			opts := queryOptions{Query: query, Limit: 20}
+			want, err := searchAll([]*Index{cIndex, fIndex}, opts, false)
+			if err != nil {
+				t.Fatalf("oracle search: %v", err)
+			}
+			trace := &searchTrace{}
+			opts.Trace = trace
+			got, err := searchServiceVolumes(volumes, opts, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if trace.PlannerMode != tc.searchMode {
+				t.Fatalf("planner mode = %q, want %s; source=%s decline=%s fallback=%s", trace.PlannerMode, tc.searchMode, trace.Source, trace.Decline, trace.Fallback)
+			}
+			if gotPaths, wantPaths := pathsOf(got), pathsOf(want); !slices.Equal(gotPaths, wantPaths) {
+				t.Fatalf("paths = %v, want %v", gotPaths, wantPaths)
+			}
+			countTrace := &searchTrace{}
+			countWant, err := searchAll([]*Index{cIndex, fIndex}, queryOptions{Query: query}, true)
+			if err != nil {
+				t.Fatalf("oracle count: %v", err)
+			}
+			count, ok, err := countServiceVolumes(volumes, queryOptions{Query: query, Trace: countTrace})
+			if err != nil || !ok || count != len(countWant) {
+				t.Fatalf("count = %d, handled=%v, err=%v; want %d", count, ok, err, len(countWant))
+			}
+			if countTrace.PlannerMode != tc.countMode {
+				t.Fatalf("count planner mode = %q, want %s; source=%s decline=%s fallback=%s", countTrace.PlannerMode, tc.countMode, countTrace.Source, countTrace.Decline, countTrace.Fallback)
+			}
+		})
+	}
+
+	trace := &searchTrace{}
+	if _, err := searchServiceVolumes(volumes, queryOptions{Query: "fixtureproj", Limit: 20, Trace: trace}, false); err != nil {
+		t.Fatal(err)
+	}
+	if trace.PlannerMode == "global-components" {
+		t.Fatal("unanchored bare single term unexpectedly used global components")
+	}
+}
+
+func TestGlobalPlannerCountVerifiesMalformedLegacyComponentCandidates(t *testing.T) {
+	t.Setenv("SEEKFS_GLOBAL_PLANNER", "1")
+	cases := []struct {
+		name    string
+		query   string
+		corrupt []string
+	}{
+		{name: "volume-anchor", query: "path:F: workspace-alpha", corrupt: []string{"workspace-alpha"}},
+		{name: "common", query: "path:workspace-alpha", corrupt: []string{"workspace-alpha"}},
+		{name: "rare", query: "path:target-model-00", corrupt: []string{"target-model-00"}},
+		{name: "no-hit", query: "path:missingneedle", corrupt: []string{"missingneedle"}},
+		{name: "or", query: "path:workspace-alpha|missingneedle", corrupt: []string{"workspace-alpha", "missingneedle"}},
+		{name: "not", query: "path:workspace-alpha !model_v2", corrupt: []string{"workspace-alpha"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			volumes := []*serviceVolumeIndex{
+				workspaceAlphaModelVolume("C:", false),
+				workspaceAlphaModelVolume("F:", true),
+			}
+			indexes := []*Index{volumes[0].index, volumes[1].index}
+			want, err := searchAll(indexes, queryOptions{Query: tc.query}, true)
+			if err != nil {
+				t.Fatalf("oracle count: %v", err)
+			}
+			for _, vol := range volumes {
+				// Legacy indexes can have component candidates without the
+				// canonical subtree metadata needed for exact interval coverage.
+				vol.subtreeOrder = nil
+				vol.subtreeStart = nil
+				vol.subtreeEnd = nil
+				if vol.queryIndex == nil {
+					vol.queryIndex = &residentQueryIndex{}
+				}
+				if vol.queryIndex.components == nil {
+					vol.queryIndex.components = make(map[string][]uint32)
+				}
+				for _, term := range tc.corrupt {
+					// Simulate a malformed legacy derived posting: root zero is a
+					// complete candidate superset, but not an exact path predicate.
+					vol.queryIndex.components[term] = []uint32{0}
+				}
+			}
+
+			trace := &searchTrace{}
+			got, handled, err := countServiceVolumes(volumes, queryOptions{Query: tc.query, Trace: trace})
+			if err != nil || !handled {
+				t.Fatalf("count handled=%v err=%v; trace=%+v", handled, err, trace)
+			}
+			if got != len(want) {
+				t.Fatalf("count = %d, want oracle %d; source=%s", got, len(want), trace.Source)
+			}
+		})
+	}
+}
+
+func TestGlobalPlannerComponentShortExtensionDefaultKeepsGlobalNameOrder(t *testing.T) {
+	volumes := []*serviceVolumeIndex{
+		newServiceVolumeIndex("c-short-ext.gsi", singleDownloadFileCompactIndex("C:", "z-notes.md")),
+		newServiceVolumeIndex("f-short-ext.gsi", singleDownloadFileCompactIndex("F:", "a-notes.md")),
+	}
+	trace := &searchTrace{}
+	got, err := searchServiceVolumes(volumes, queryOptions{Query: "path:Downloads md", Limit: 1, Trace: trace}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if trace.PlannerMode != "global-components" {
+		t.Fatalf("planner mode = %q, want global-components; decline=%s fallback=%s", trace.PlannerMode, trace.Decline, trace.Fallback)
+	}
+	if gotPaths := pathsOf(got); !sameOrderedStrings(gotPaths, []string{`F:\Downloads\a-notes.md`}) {
+		t.Fatalf("paths = %v, want F volume global best promoted extension match", gotPaths)
+	}
+}
+
+func TestGlobalPlannerImplicitPathSeparatorDefault(t *testing.T) {
+	volumes := []*serviceVolumeIndex{
+		workspaceAlphaModelVolume("C:", false),
+		workspaceAlphaModelVolume("F:", true),
+	}
+	opts := queryOptions{Query: `project-03\workspace-alpha\model_v2 type:file`, Limit: 20}
+	trace := &searchTrace{}
+	searchOpts := opts
+	searchOpts.Trace = trace
+	got, err := searchServiceVolumes(volumes, searchOpts, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if trace.PlannerMode != "global-components" {
+		t.Fatalf("planner mode = %q, want global-components; decline=%s fallback=%s", trace.PlannerMode, trace.Decline, trace.Fallback)
+	}
+	if gotPaths := pathsOf(got); !sameOrderedStrings(gotPaths, []string{`F:\project-03\workspace-alpha\model_v2\target-model-03.bin`}) {
+		t.Fatalf("paths = %v, want F project-03 model result", gotPaths)
+	}
+	countTrace := &searchTrace{}
+	countOpts := opts
+	countOpts.Trace = countTrace
+	count, ok, err := countServiceVolumes(volumes, countOpts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("countServiceVolumes declined implicit path separator query")
+	}
+	if countTrace.PlannerMode != "global-count-components" {
+		t.Fatalf("count planner mode = %q, want global-count-components; decline=%s", countTrace.PlannerMode, countTrace.Decline)
+	}
+	if count != 1 {
+		t.Fatalf("count = %d, want 1", count)
+	}
+}
+
+func TestGlobalPlannerImplicitPathSeparatorShortComponentsDefault(t *testing.T) {
+	makeVolume := func(volume, leaf string) *serviceVolumeIndex {
+		idx := &Index{
+			Source:  "usn",
+			Volume:  volume,
+			Compact: true,
+			Records: []CompactRecord{
+				{FRN: 1, ParentFRN: 1, Parent: -1, Name: ".", Mode: uint32(os.ModeDir)},
+				{FRN: 2, ParentFRN: 1, Parent: 0, Name: "x", Mode: uint32(os.ModeDir)},
+				{FRN: 3, ParentFRN: 2, Parent: 1, Name: "y", Mode: uint32(os.ModeDir)},
+				{FRN: 4, ParentFRN: 3, Parent: 2, Name: leaf},
+			},
+		}
+		buildOrders(idx)
+		return newServiceVolumeIndex(volume+"-short-path.gsi", idx)
+	}
+	volumes := []*serviceVolumeIndex{makeVolume("C:", "other.bin"), makeVolume("F:", "target.bin")}
+	opts := queryOptions{Query: `x\y\target.bin type:file`, Limit: 10}
+	pq := mustParseQuery(t, opts)
+	if !slices.Equal(pq.ImplicitPathTerms, []string{"x", "y", "target.bin"}) {
+		t.Fatalf("implicit path terms = %v", pq.ImplicitPathTerms)
+	}
+	bare := mustParseQuery(t, queryOptions{Query: "x y target.bin", MatchPath: true})
+	if globalComponentDefaultSupported(bare, nonVolumeTerms(bare.Terms)) {
+		t.Fatal("bare short terms unexpectedly enabled the default global planner")
+	}
+
+	trace := &searchTrace{}
+	opts.Trace = trace
+	got, err := searchServiceVolumes(volumes, opts, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if trace.PlannerMode != "global-components" {
+		t.Fatalf("planner mode = %q, want global-components; decline=%s fallback=%s", trace.PlannerMode, trace.Decline, trace.Fallback)
+	}
+	if gotPaths := pathsOf(got); !sameOrderedStrings(gotPaths, []string{`F:\x\y\target.bin`}) {
+		t.Fatalf("paths = %v, want short separator-derived match", gotPaths)
+	}
+	countTrace := &searchTrace{}
+	opts.Trace = countTrace
+	count, ok, err := countServiceVolumes(volumes, opts)
+	if err != nil || !ok || count != 1 {
+		t.Fatalf("count = %d, handled=%v, err=%v; want 1, true, nil", count, ok, err)
+	}
+	if countTrace.PlannerMode != "global-count-components" {
+		t.Fatalf("count planner mode = %q, want global-count-components; decline=%s", countTrace.PlannerMode, countTrace.Decline)
+	}
+}
+
+func TestGlobalPlannerUnderMatchesServiceVolumes(t *testing.T) {
+	cases := []queryOptions{
+		{Query: "ext:bin", Under: `F:\project-03\workspace-alpha`, Limit: 20},
+		{Query: "path:workspace-alpha model_v2", MatchPath: true, Under: `F:\project-03`, Limit: 20},
+	}
+	for _, opts := range cases {
+		t.Run(opts.Query+"/under", func(t *testing.T) {
+			volumes := []*serviceVolumeIndex{
+				workspaceAlphaModelVolume("C:", false),
+				workspaceAlphaModelVolume("F:", true),
+			}
+			want, err := searchServiceVolumes(volumes, opts, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantCount, ok, err := countServiceVolumes(volumes, opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !ok {
+				countMatches, err := searchServiceVolumes(volumes, opts, true)
+				if err != nil {
+					t.Fatal(err)
+				}
+				wantCount = len(countMatches)
+			}
+
+			t.Setenv("SEEKFS_GLOBAL_PLANNER", "1")
+			trace := &searchTrace{}
+			globalOpts := opts
+			globalOpts.Trace = trace
+			got, err := searchServiceVolumes(volumes, globalOpts, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if trace.PlannerMode != "global-components" {
+				t.Fatalf("planner mode = %q, want global-components", trace.PlannerMode)
+			}
+			if gotPaths, wantPaths := pathsOf(got), pathsOf(want); !slices.Equal(gotPaths, wantPaths) {
+				t.Fatalf("global under paths = %v, want %v", gotPaths, wantPaths)
+			}
+			countTrace := &searchTrace{}
+			countOpts := opts
+			countOpts.Trace = countTrace
+			count, ok, err := countServiceVolumes(volumes, countOpts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !ok {
+				t.Fatal("global under count declined")
+			}
+			if countTrace.PlannerMode != "global-count-components" {
+				t.Fatalf("count planner mode = %q, want global-count-components", countTrace.PlannerMode)
+			}
+			if count != wantCount {
+				t.Fatalf("global under count = %d, want %d", count, wantCount)
+			}
+		})
+	}
+}
+
+func TestParentFilterSearchCountParity(t *testing.T) {
+	volumes := []*serviceVolumeIndex{
+		workspaceAlphaModelVolume("C:", false),
+		workspaceAlphaModelVolume("F:", true),
+	}
+	cases := []struct {
+		query string
+		want  []string
+	}{
+		{
+			query: "parent:model_v2 type:file",
+			want: []string{
+				`F:\project-00\workspace-alpha\model_v2\target-model-00.bin`,
+				`F:\project-01\workspace-alpha\model_v2\target-model-01.bin`,
+				`F:\project-02\workspace-alpha\model_v2\target-model-02.bin`,
+				`F:\project-03\workspace-alpha\model_v2\target-model-03.bin`,
+				`F:\project-04\workspace-alpha\model_v2\target-model-04.bin`,
+				`F:\project-05\workspace-alpha\model_v2\target-model-05.bin`,
+				`F:\project-06\workspace-alpha\model_v2\target-model-06.bin`,
+				`F:\project-07\workspace-alpha\model_v2\target-model-07.bin`,
+			},
+		},
+		{
+			query: "parent:workspace-alpha type:dir",
+			want: []string{
+				`F:\project-00\workspace-alpha\model_v2`,
+				`F:\project-01\workspace-alpha\model_v2`,
+				`F:\project-02\workspace-alpha\model_v2`,
+				`F:\project-03\workspace-alpha\model_v2`,
+				`F:\project-04\workspace-alpha\model_v2`,
+				`F:\project-05\workspace-alpha\model_v2`,
+				`F:\project-06\workspace-alpha\model_v2`,
+				`F:\project-07\workspace-alpha\model_v2`,
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.query, func(t *testing.T) {
+			opts := queryOptions{Query: tc.query, Limit: 20}
+			got, err := searchServiceVolumes(volumes, opts, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if paths := pathsOf(got); !slices.Equal(paths, tc.want) {
+				t.Fatalf("paths = %v, want %v", paths, tc.want)
+			}
+			count, ok, err := countServiceVolumes(volumes, opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !ok {
+				countMatches, err := searchServiceVolumes(volumes, opts, true)
+				if err != nil {
+					t.Fatal(err)
+				}
+				count = len(countMatches)
+			}
+			if count != len(tc.want) {
+				t.Fatalf("count = %d, want %d", count, len(tc.want))
+			}
+		})
+	}
+}
+
+func TestParentFilterBuildsCandidateSource(t *testing.T) {
+	vol := workspaceAlphaModelVolume("F:", true)
+	pq := mustParseQuery(t, queryOptions{Query: "parent:model_v2 type:file"})
+	plan, ok := vol.buildCandidatePlan(pq)
+	if !ok {
+		t.Fatal("buildCandidatePlan declined parent filter")
+	}
+	if len(plan.sources) == 0 || plan.sources[0].name != "parent:model_v2" {
+		t.Fatalf("plan sources = %+v, want parent:model_v2 source", plan.sources)
+	}
+	if got := plan.execute(); len(got) != 8 {
+		t.Fatalf("parent candidate count = %d, want 8; ids=%v", len(got), got)
+	}
+}
+
+func TestGlobalPlannerParentFilterMatchesServiceVolumes(t *testing.T) {
+	volumes := []*serviceVolumeIndex{
+		workspaceAlphaModelVolume("C:", false),
+		workspaceAlphaModelVolume("F:", true),
+	}
+	opts := queryOptions{Query: "path:workspace-alpha model_v2 parent:workspace-alpha", Limit: 20}
+	want, err := searchServiceVolumes(volumes, opts, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantCount, ok, err := countServiceVolumes(volumes, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		countMatches, err := searchServiceVolumes(volumes, opts, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantCount = len(countMatches)
+	}
+
+	t.Setenv("SEEKFS_GLOBAL_PLANNER", "1")
+	trace := &searchTrace{}
+	globalOpts := opts
+	globalOpts.Trace = trace
+	got, err := searchServiceVolumes(volumes, globalOpts, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if trace.PlannerMode != "global-components" {
+		t.Fatalf("planner mode = %q, want global-components", trace.PlannerMode)
+	}
+	if gotPaths, wantPaths := pathsOf(got), pathsOf(want); !slices.Equal(gotPaths, wantPaths) {
+		t.Fatalf("global parent paths = %v, want %v", gotPaths, wantPaths)
+	}
+	countTrace := &searchTrace{}
+	countOpts := opts
+	countOpts.Trace = countTrace
+	count, ok, err := countServiceVolumes(volumes, countOpts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("global parent count declined")
+	}
+	if countTrace.PlannerMode != "global-count-components" {
+		t.Fatalf("count planner mode = %q, want global-count-components", countTrace.PlannerMode)
+	}
+	if count != wantCount {
+		t.Fatalf("global parent count = %d, want %d", count, wantCount)
+	}
+}
+
+func TestGlobalPlannerParentOnlyMatchesServiceVolumes(t *testing.T) {
+	for _, query := range []string{"parent:model_v2", "parent:model_v2 ext:bin"} {
+		t.Run(query, func(t *testing.T) {
+			volumes := []*serviceVolumeIndex{
+				workspaceAlphaModelVolume("C:", false),
+				workspaceAlphaModelVolume("F:", true),
+			}
+			opts := queryOptions{Query: query, Limit: 20}
+			want, err := searchServiceVolumes(volumes, opts, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantCount, ok, err := countServiceVolumes(volumes, opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !ok {
+				countMatches, err := searchServiceVolumes(volumes, opts, true)
+				if err != nil {
+					t.Fatal(err)
+				}
+				wantCount = len(countMatches)
+			}
+
+			t.Setenv("SEEKFS_GLOBAL_PLANNER", "1")
+			trace := &searchTrace{}
+			globalOpts := opts
+			globalOpts.Trace = trace
+			got, err := searchServiceVolumes(volumes, globalOpts, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if trace.PlannerMode != "global-components" {
+				t.Fatalf("planner mode = %q, want global-components", trace.PlannerMode)
+			}
+			if gotPaths, wantPaths := pathsOf(got), pathsOf(want); !slices.Equal(gotPaths, wantPaths) {
+				t.Fatalf("global parent paths = %v, want %v", gotPaths, wantPaths)
+			}
+			countTrace := &searchTrace{}
+			countOpts := opts
+			countOpts.Trace = countTrace
+			count, ok, err := countServiceVolumes(volumes, countOpts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !ok {
+				t.Fatal("global parent count declined")
+			}
+			if countTrace.PlannerMode != "global-count-components" {
+				t.Fatalf("count planner mode = %q, want global-count-components", countTrace.PlannerMode)
+			}
+			if count != wantCount {
+				t.Fatalf("global parent count = %d, want %d", count, wantCount)
+			}
+		})
+	}
+}
+
+func TestGlobalPlannerRequestSeqDoesNotStopAfterFirstHit(t *testing.T) {
+	volumes := []*serviceVolumeIndex{
+		workspaceAlphaModelVolume("C:", true),
+		workspaceAlphaModelVolume("F:", true),
+	}
+	opts := queryOptions{
+		Query:      "path:workspace-alpha model_v2 type:file sort:size",
+		Limit:      20,
+		RequestSeq: time.Now().UnixNano(),
+	}
+	trace := &searchTrace{}
+	opts.Trace = trace
+	got, err := searchServiceVolumes(volumes, opts, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if trace.PlannerMode != "global-components" {
+		t.Fatalf("planner mode = %q, want global-components", trace.PlannerMode)
+	}
+	paths := pathsOf(got)
+	var cHits, fHits int
+	for _, path := range paths {
+		if strings.HasPrefix(path, `C:\`) {
+			cHits++
+		}
+		if strings.HasPrefix(path, `F:\`) {
+			fHits++
+		}
+	}
+	if cHits == 0 || fHits == 0 {
+		t.Fatalf("paths = %v, want hits from both C: and F:", paths)
 	}
 }
 
@@ -3073,6 +6105,59 @@ func TestFilenameTrigramCandidatesMatchFullSearch(t *testing.T) {
 	}
 }
 
+func TestFilenameTrigramCompletePNGRExactEmptyDeclinesNoFallback(t *testing.T) {
+	t.Setenv("SEEKFS_NAME_TRIGRAMS", "1")
+	idx := pathSyntaxFixture()
+	vol := newServiceVolumeIndex("fixture.gsi", idx)
+	trigrams := buildNameTrigramIndex(idx)
+	trigrams.gramCountsComplete = true
+	vol.nameTrigrams.Store(trigrams)
+
+	trace := &searchTrace{}
+	pq := mustParseQuery(t, queryOptions{Query: "zzzz-no-hit", Limit: 20, Trace: trace})
+	candidates, ok := vol.filenameTrigramCandidates(pq)
+	if !ok || len(candidates) != 0 {
+		t.Fatalf("complete PNGR candidates=%v ok=%v, want exact empty", candidates, ok)
+	}
+	if trace.Source != "exact-empty" || trace.Candidates != 0 || trace.Decline != "" {
+		t.Fatalf("exact-empty trace=%+v, want terminal exact-empty without decline", trace)
+	}
+
+	searchRunTrace := &searchTrace{}
+	got, err := searchServiceVolumes([]*serviceVolumeIndex{vol}, queryOptions{
+		Query: "zzzz-no-hit", Limit: 20, Trace: searchRunTrace,
+	}, false)
+	if err != nil || len(got) != 0 {
+		t.Fatalf("complete PNGR search got=%v err=%v, want zero", got, err)
+	}
+	if searchRunTrace.Source != "exact-empty" || searchRunTrace.Candidates != 0 {
+		t.Fatalf("complete PNGR search trace=%+v, want exact-empty zero", searchRunTrace)
+	}
+
+	countTrace := &searchTrace{}
+	count, handled, err := countServiceVolumes([]*serviceVolumeIndex{vol}, queryOptions{
+		Query: "zzzz-no-hit", Trace: countTrace,
+	})
+	if err != nil || !handled || count != 0 {
+		t.Fatalf("complete PNGR count=%d handled=%v err=%v, want zero handled", count, handled, err)
+	}
+	if countTrace.Source != "exact-empty" || countTrace.Candidates != 0 {
+		t.Fatalf("complete PNGR count trace=%+v, want exact-empty zero", countTrace)
+	}
+
+	legacy := *trigrams
+	legacy.gramCountsComplete = false
+	vol.nameTrigrams.Store(&legacy)
+	legacyTrace := &searchTrace{}
+	legacyPQ := mustParseQuery(t, queryOptions{Query: "zzzz-no-hit", Limit: 20, Trace: legacyTrace})
+	if candidates, ok := vol.filenameTrigramCandidates(legacyPQ); ok {
+		t.Fatalf("legacy PNGR returned %d candidates, want safe decline", len(candidates))
+	}
+	if legacyTrace.Decline != "name-trigram:missing-section" {
+		t.Fatalf("legacy PNGR trace=%+v, want missing-section decline", legacyTrace)
+	}
+}
+
 func TestFilenameTrigramRecentOverlayFindsMissingBaseGram(t *testing.T) {
 	t.Setenv("SEEKFS_NAME_TRIGRAMS", "1")
 	idx := pathSyntaxFixture()
@@ -3355,6 +6440,99 @@ func TestRegexLiteralCandidatesDeclinesAlternationLiterals(t *testing.T) {
 	}
 	if _, ok := vol.regexLiteralCandidates(pq); ok {
 		t.Fatal("regexLiteralCandidates accepted ambiguous alternation literals")
+	}
+}
+
+func TestGlobalPlannerRegexLiteralUsesGlobalSource(t *testing.T) {
+	idx := dottedPathBenchmarkIndex(200)
+	vol := newServiceVolumeIndex("regex.gsi", idx)
+	trace := &searchTrace{}
+	opts := queryOptions{Query: `regex:.*filtered-volume-cleaned.*`, MatchPath: true, Limit: 10, Trace: trace}
+	got, err := searchServiceVolumes([]*serviceVolumeIndex{vol}, opts, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if trace.PlannerMode != "global-components" {
+		t.Fatalf("planner mode = %q, want global-components; decline=%s fallback=%s", trace.PlannerMode, trace.Decline, trace.Fallback)
+	}
+	if !traceHasTerm(trace.Terms, traceTerm{Term: "filtered-volume-cleaned", Kind: "regex-literal", Source: "global:regex-literal"}) {
+		t.Fatalf("trace terms = %+v, missing regex literal source", trace.Terms)
+	}
+	if gotPaths := pathsOf(got); !sameOrderedStrings(gotPaths, []string{`C:\Users\exampleuser\Downloads\filtered-volume-cleaned.nrrd`}) {
+		t.Fatalf("paths = %v, want filtered-volume-cleaned.nrrd only", gotPaths)
+	}
+	countTrace := &searchTrace{}
+	count, ok, err := countServiceVolumes([]*serviceVolumeIndex{vol}, queryOptions{Query: opts.Query, MatchPath: true, Trace: countTrace})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("countServiceVolumes declined regex literal")
+	}
+	if countTrace.PlannerMode != "global-count-components" {
+		t.Fatalf("count planner mode = %q, want global-count-components; decline=%s", countTrace.PlannerMode, countTrace.Decline)
+	}
+	if count != 1 {
+		t.Fatalf("count = %d, want 1", count)
+	}
+}
+
+func TestGlobalPlannerRegexLiteralDeclinesAmbiguousAlternation(t *testing.T) {
+	idx := commonSearchFixture()
+	vol := newServiceVolumeIndex("fixture.gsi", idx)
+	trace := &searchTrace{}
+	opts := queryOptions{Query: `regex:Assets.*\.(dat|txt)$`, MatchPath: true, Limit: 10, Trace: trace}
+	got, err := searchServiceVolumes([]*serviceVolumeIndex{vol}, opts, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if trace.PlannerMode == "global-components" {
+		t.Fatalf("planner mode = %q, want legacy fallback for ambiguous regex; terms=%+v", trace.PlannerMode, trace.Terms)
+	}
+	if len(got) == 0 {
+		t.Fatal("ambiguous regex fallback returned no matches")
+	}
+}
+
+func TestGlobalPlannerRegexLiteralIntersectsExtensionSource(t *testing.T) {
+	idx := dottedPathBenchmarkIndex(200)
+	vol := newServiceVolumeIndex("regex-ext.gsi", idx)
+	trace := &searchTrace{}
+	opts := queryOptions{Query: `ext:nrrd regex:.*filtered-volume-cleaned.*`, MatchPath: true, Limit: 10, Trace: trace}
+	got, err := searchServiceVolumes([]*serviceVolumeIndex{vol}, opts, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if trace.PlannerMode != "global-components" {
+		t.Fatalf("planner mode = %q, want global-components; decline=%s fallback=%s", trace.PlannerMode, trace.Decline, trace.Fallback)
+	}
+	for _, want := range []traceTerm{
+		{Term: "filtered-volume-cleaned", Kind: "regex-literal", Source: "global:regex-literal"},
+		{Term: "nrrd", Kind: "extension", Source: "global:ext:nrrd", Exact: true},
+	} {
+		if !traceHasTerm(trace.Terms, want) {
+			t.Fatalf("trace terms = %+v, missing %+v", trace.Terms, want)
+		}
+	}
+	if gotPaths := pathsOf(got); !sameOrderedStrings(gotPaths, []string{`C:\Users\exampleuser\Downloads\filtered-volume-cleaned.nrrd`}) {
+		t.Fatalf("paths = %v, want filtered-volume-cleaned.nrrd only", gotPaths)
+	}
+}
+
+func TestGlobalPlannerRegexLiteralDeclinesCaseSensitive(t *testing.T) {
+	idx := dottedPathBenchmarkIndex(200)
+	vol := newServiceVolumeIndex("regex-case.gsi", idx)
+	trace := &searchTrace{}
+	opts := queryOptions{Query: `case: regex:.*Filtered.*`, MatchPath: true, Limit: 10, Trace: trace}
+	got, err := searchServiceVolumes([]*serviceVolumeIndex{vol}, opts, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if trace.PlannerMode == "global-components" {
+		t.Fatalf("planner mode = %q, want verified fallback for case-sensitive regex; terms=%+v", trace.PlannerMode, trace.Terms)
+	}
+	if len(got) != 0 {
+		t.Fatalf("case-sensitive regex matches = %v, want none for lowercase path", pathsOf(got))
 	}
 }
 
@@ -3856,6 +7034,86 @@ func fixtureprojTrainingdataFixture(matches int) *Index {
 	}
 	buildOrders(idx)
 	return idx
+}
+
+func workspaceAlphaModelVolume(volume string, includeModel bool) *serviceVolumeIndex {
+	idx := &Index{
+		Source:  "usn",
+		Volume:  volume,
+		Compact: true,
+	}
+	add := func(frn, parentFRN uint64, parent int32, name string, mode uint32) int32 {
+		idx.Records = append(idx.Records, CompactRecord{
+			FRN:       frn,
+			ParentFRN: parentFRN,
+			Parent:    parent,
+			Name:      name,
+			Mode:      mode,
+			Size:      1024,
+			ModUnix:   time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC).UnixNano(),
+		})
+		return int32(len(idx.Records) - 1)
+	}
+	root := add(1, 1, -1, ".", uint32(os.ModeDir))
+	if !includeModel {
+		workspace := add(2, 1, root, "workspace-alpha", uint32(os.ModeDir))
+		add(3, 2, workspace, "alpha-notes.txt", 0)
+	} else {
+		nextFRN := uint64(2)
+		for i := 0; i < 8; i++ {
+			project := add(nextFRN, 1, root, fmt.Sprintf("project-%02d", i), uint32(os.ModeDir))
+			projectFRN := nextFRN
+			nextFRN++
+			workspace := add(nextFRN, projectFRN, project, "workspace-alpha", uint32(os.ModeDir))
+			workspaceFRN := nextFRN
+			nextFRN++
+			model := add(nextFRN, workspaceFRN, workspace, "model_v2", uint32(os.ModeDir))
+			modelFRN := nextFRN
+			nextFRN++
+			add(nextFRN, modelFRN, model, fmt.Sprintf("target-model-%02d.bin", i), 0)
+			nextFRN++
+		}
+	}
+	buildOrders(idx)
+	return newServiceVolumeIndex(strings.ToLower(strings.TrimSuffix(volume, ":"))+"-workspace-alpha.gsi", idx)
+}
+
+type componentSortFixtureEntry struct {
+	name    string
+	mode    uint32
+	size    int64
+	modUnix int64
+}
+
+func componentSortVolume(volume string, entries []componentSortFixtureEntry) *serviceVolumeIndex {
+	idx := &Index{
+		Source:  "usn",
+		Volume:  volume,
+		Compact: true,
+	}
+	add := func(frn, parentFRN uint64, parent int32, name string, mode uint32, size int64, modUnix int64) int32 {
+		idx.Records = append(idx.Records, CompactRecord{
+			FRN:       frn,
+			ParentFRN: parentFRN,
+			Parent:    parent,
+			Name:      name,
+			Mode:      mode,
+			Size:      size,
+			ModUnix:   modUnix,
+		})
+		return int32(len(idx.Records) - 1)
+	}
+	root := add(1, 1, -1, ".", uint32(os.ModeDir), 0, 1)
+	project := add(2, 1, root, "project", uint32(os.ModeDir), 0, 2)
+	workspace := add(3, 2, project, "workspace-alpha", uint32(os.ModeDir), 0, 3)
+	model := add(4, 3, workspace, "model_v2", uint32(os.ModeDir), 0, 4)
+	nextFRN := uint64(5)
+	for _, entry := range entries {
+		add(nextFRN, 4, model, entry.name, entry.mode, entry.size, entry.modUnix)
+		nextFRN++
+	}
+	buildOrders(idx)
+	return newServiceVolumeIndex(strings.ToLower(strings.TrimSuffix(volume, ":"))+"-component-sort.gsi", idx)
 }
 
 func manyDirectNameMatchIndex(term string, matches int) *Index {

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -20,6 +21,42 @@ func TestParseQueryInfersPathModeForPathSeparators(t *testing.T) {
 	wantTerms := []string{"client_base_new_workspaces_since_20260619", "clean_surface_dead_time_outlier_metrics_since_20260619.json"}
 	if !sameStringSet(pq.Terms, wantTerms) {
 		t.Fatalf("terms = %v, want %v", pq.Terms, wantTerms)
+	}
+}
+
+func TestSearchJSONIncludesCompletionDiagnostic(t *testing.T) {
+	payload, err := json.Marshal(jsonSearchResponse{
+		OK:              true,
+		Query:           "needle",
+		Count:           1,
+		PlannerMode:     "global-components",
+		EligibleVolumes: []string{"C:", "F:"},
+		Terms:           []traceTerm{{Term: "workspace-alpha", Kind: "path-substring", Source: "global:component-subtree"}},
+		Declines:        []traceDecline{{Source: "global-ext", Reason: "missing-posting", Volume: "F:"}},
+		Fallback:        "global-bounded-scan",
+		Complete:        boolPtr(true),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(payload), `"complete":true`) {
+		t.Fatalf("json response missing complete=true: %s", payload)
+	}
+	var decoded jsonSearchResponse
+	if err := json.Unmarshal(payload, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.PlannerMode != "global-components" || decoded.Fallback != "global-bounded-scan" {
+		t.Fatalf("decoded route fields = %+v", decoded)
+	}
+	if !sameOrderedStrings(decoded.EligibleVolumes, []string{"C:", "F:"}) {
+		t.Fatalf("eligible volumes = %v, want C:/F:", decoded.EligibleVolumes)
+	}
+	if !traceHasTerm(decoded.Terms, traceTerm{Term: "workspace-alpha", Kind: "path-substring", Source: "global:component-subtree"}) {
+		t.Fatalf("terms = %+v, want component-subtree term", decoded.Terms)
+	}
+	if len(decoded.Declines) != 1 || decoded.Declines[0].Volume != "F:" {
+		t.Fatalf("declines = %+v, want F: decline", decoded.Declines)
 	}
 }
 
@@ -99,16 +136,82 @@ func TestDateFilterMatchesToday(t *testing.T) {
 }
 
 func TestUnknownFilterIsRejected(t *testing.T) {
-	for _, q := range []string{"size2:>1mb", "attrib:H", "parent:foo", "color:red"} {
+	for _, q := range []string{"size2:>1mb", "color:red"} {
 		if _, err := parseQuery(queryOptions{Query: q}); err == nil {
 			t.Errorf("parseQuery(%q) should reject unknown filter, got nil error", q)
 		}
 	}
 }
 
+func TestAttribFilterParsing(t *testing.T) {
+	pq, err := parseQuery(queryOptions{Query: "attrib:HS"})
+	if err != nil {
+		t.Fatalf("parseQuery attrib: %v", err)
+	}
+	want := uint32(fileAttributeHidden | fileAttributeSystem)
+	if len(pq.AttrFilters) != 1 || pq.AttrFilters[0] != want {
+		t.Fatalf("AttrFilters = %#v, want %#x", pq.AttrFilters, want)
+	}
+	if _, err := parseQuery(queryOptions{Query: "attrib:Z"}); err == nil {
+		t.Fatal("parseQuery(attrib:Z) should reject unsupported attribute flag")
+	}
+}
+
+func TestSortSizeParsing(t *testing.T) {
+	pq, err := parseQuery(queryOptions{Query: "ext:txt sort:size"})
+	if err != nil {
+		t.Fatalf("parseQuery sort:size: %v", err)
+	}
+	if pq.SortColumn != "size" {
+		t.Fatalf("SortColumn = %q, want size", pq.SortColumn)
+	}
+	pq, err = parseQuery(queryOptions{Query: "ext:txt sort:modified"})
+	if err != nil {
+		t.Fatalf("parseQuery sort:modified: %v", err)
+	}
+	if pq.SortColumn != "modified" {
+		t.Fatalf("SortColumn = %q, want modified", pq.SortColumn)
+	}
+	pq, err = parseQuery(queryOptions{Query: "type:file sort:extension"})
+	if err != nil {
+		t.Fatalf("parseQuery sort:extension: %v", err)
+	}
+	if pq.SortColumn != "extension" {
+		t.Fatalf("SortColumn = %q, want extension", pq.SortColumn)
+	}
+	pq, err = parseQuery(queryOptions{Query: "path:fixture sort:type"})
+	if err != nil {
+		t.Fatalf("parseQuery sort:type: %v", err)
+	}
+	if pq.SortColumn != "type" {
+		t.Fatalf("SortColumn = %q, want type", pq.SortColumn)
+	}
+	pq, err = parseQuery(queryOptions{Query: "path:fixture sort:path"})
+	if err != nil {
+		t.Fatalf("parseQuery sort:path: %v", err)
+	}
+	if pq.SortColumn != "path" {
+		t.Fatalf("SortColumn = %q, want path", pq.SortColumn)
+	}
+	if _, err := parseQuery(queryOptions{Query: "sort:size"}); err == nil {
+		t.Fatal("sort:size without a searchable term/filter should be rejected")
+	}
+	if _, err := parseQuery(queryOptions{Query: "ext:txt sort:owner"}); err == nil {
+		t.Fatal("parseQuery(sort:owner) should reject unsupported sort")
+	}
+}
+
+func TestInvalidParentFilterIsRejected(t *testing.T) {
+	for _, q := range []string{`parent:C:\repo`, "parent:foo/bar", "parent:foo*", "parent:foo?"} {
+		if _, err := parseQuery(queryOptions{Query: q}); err == nil {
+			t.Errorf("parseQuery(%q) should reject invalid parent filter, got nil error", q)
+		}
+	}
+}
+
 func TestKnownFiltersAndPathsAreNotRejected(t *testing.T) {
 	// Drive-letter paths and supported filters must still parse.
-	for _, q := range []string{`c:\windows main`, "ext:go", "size:>1mb", "dm:today", "type:file"} {
+	for _, q := range []string{`c:\windows main`, "ext:go", "parent:src", "size:>1mb", "dm:today", "attrib:H", "type:file"} {
 		if _, err := parseQuery(queryOptions{Query: q, MatchPath: true}); err != nil {
 			t.Errorf("parseQuery(%q) unexpectedly rejected: %v", q, err)
 		}
@@ -578,7 +681,7 @@ func TestSizeAndModFiltersRequireCapableIndex(t *testing.T) {
 	bare.Records = []CompactRecord{{FRN: 1, Parent: -1, Name: "C:", Mode: uint32(os.ModeDir)}}
 	buildOrders(bare)
 
-	for _, q := range []string{"size:>1mb", "dm:today"} {
+	for _, q := range []string{"size:>1mb", "dm:today", "ext:txt sort:modified"} {
 		opts := queryOptions{Query: q}
 		if _, err := searchCompactWithCache(bare, opts, false, make(map[int]string), nil); err == nil {
 			t.Errorf("query %q on a size/mtime-less index should error", q)
@@ -586,6 +689,9 @@ func TestSizeAndModFiltersRequireCapableIndex(t *testing.T) {
 	}
 	if _, err := searchCompactWithCache(bare, queryOptions{Query: "ext:go", Recent: "24h"}, false, make(map[int]string), nil); err == nil {
 		t.Error("--recent on an mtime-less index should error")
+	}
+	if _, err := searchCompactWithCache(bare, queryOptions{Query: "attrib:H"}, false, make(map[int]string), nil); err == nil {
+		t.Error("attrib: on an attr-less index should error")
 	}
 
 	// The standard fixture carries sizes and mtimes, so the same filters work.
@@ -598,6 +704,402 @@ func TestSizeAndModFiltersRequireCapableIndex(t *testing.T) {
 	}
 	if _, err := searchCompactWithCache(idx, queryOptions{Query: "size:>1kb"}, false, make(map[int]string), nil); err != nil {
 		t.Errorf("size: on a capable index should not error: %v", err)
+	}
+}
+
+func TestAttribFilterMatchesCompactRecords(t *testing.T) {
+	idx := attribSearchFixture()
+	vol := newServiceVolumeIndex("attrs.gsi", idx)
+	cases := []struct {
+		query string
+		want  []string
+	}{
+		{"attrib:H", []string{"hidden.txt", "hidden-system.dat"}},
+		{"attrib:HS", []string{"hidden-system.dat"}},
+		{"ext:txt attrib:H", []string{"hidden.txt"}},
+		{"!attrib:H ext:txt", []string{"plain.txt"}},
+		{"attrib:D", []string{".", "attrs"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.query, func(t *testing.T) {
+			full, err := searchCompactWithCache(idx, queryOptions{Query: tc.query, Limit: 20}, false, make(map[int]string), nil)
+			if err != nil {
+				t.Fatalf("full search: %v", err)
+			}
+			fast, err := searchCompactWithCache(idx, queryOptions{Query: tc.query, Limit: 20}, false, vol.pathCache, vol.nameTermCandidates)
+			if err != nil {
+				t.Fatalf("planner search: %v", err)
+			}
+			if !sameStringSet(namesOf(full), tc.want) {
+				t.Fatalf("full names = %v, want %v", namesOf(full), tc.want)
+			}
+			if !sameStringSet(namesOf(fast), tc.want) {
+				t.Fatalf("planner names = %v, want %v", namesOf(fast), tc.want)
+			}
+			fullCount, err := searchCompactWithCache(idx, queryOptions{Query: tc.query}, true, make(map[int]string), nil)
+			if err != nil {
+				t.Fatalf("full count: %v", err)
+			}
+			fastCount, err := searchCompactWithCache(idx, queryOptions{Query: tc.query}, true, vol.pathCache, vol.nameTermCandidates)
+			if err != nil {
+				t.Fatalf("planner count: %v", err)
+			}
+			if len(fullCount) != len(tc.want) || len(fastCount) != len(tc.want) {
+				t.Fatalf("counts full=%d fast=%d want=%d", len(fullCount), len(fastCount), len(tc.want))
+			}
+		})
+	}
+}
+
+func TestAttribFilterDoesNotPrecapBeforeVerification(t *testing.T) {
+	idx := attribSearchFixture()
+	vol := newServiceVolumeIndex("attrs.gsi", idx)
+	got, err := searchCompactWithCache(idx, queryOptions{Query: "ext:txt attrib:H", Limit: 1}, false, vol.pathCache, vol.nameTermCandidates)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if names := namesOf(got); !sameStringSet(names, []string{"hidden.txt"}) {
+		t.Fatalf("names = %v, want hidden.txt", names)
+	}
+}
+
+func TestAttribFilterBuildsCandidateSource(t *testing.T) {
+	idx := attribSearchFixture()
+	vol := newServiceVolumeIndex("attrs.gsi", idx)
+	pq := mustParseQuery(t, queryOptions{Query: "attrib:HS"})
+	plan, ok := vol.buildCandidatePlan(pq)
+	if !ok {
+		t.Fatal("buildCandidatePlan did not handle attrib:HS")
+	}
+	if len(plan.sources) != 1 || plan.sources[0].name != "attrib:HS" {
+		t.Fatalf("plan sources = %+v, want attrib:HS source", plan.sources)
+	}
+	ids := plan.execute()
+	if names := namesOf(entriesForIDs(idx, ids)); !sameStringSet(names, []string{"hidden-system.dat"}) {
+		t.Fatalf("candidate source names = %v, want hidden-system.dat", names)
+	}
+}
+
+func TestAttribFilterRejectsNonCompactIndex(t *testing.T) {
+	idx := &Index{
+		Source: "walk",
+		Entries: []Entry{
+			{Path: `C:\plain.txt`, Name: "plain.txt", Mode: 0},
+		},
+		NameOrder: []int{0},
+		PathOrder: []int{0},
+	}
+	if _, err := search(idx, queryOptions{Query: "attrib:H"}, false); err == nil {
+		t.Fatal("attrib: on noncompact index should error")
+	}
+}
+
+func TestAttribFilterUsesGlobalPlannerSource(t *testing.T) {
+	t.Setenv("SEEKFS_GLOBAL_PLANNER", "1")
+	vol := newServiceVolumeIndex("attrs.gsi", attribSearchFixture())
+	trace := &searchTrace{}
+	got, err := searchServiceVolumes([]*serviceVolumeIndex{vol}, queryOptions{Query: "attrib:H", Limit: 10, Trace: trace}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if trace.PlannerMode != "global-components" {
+		t.Fatalf("planner mode = %q, want global-components; decline=%s", trace.PlannerMode, trace.Decline)
+	}
+	if names := namesOf(got); !sameStringSet(names, []string{"hidden.txt", "hidden-system.dat"}) {
+		t.Fatalf("names = %v, want hidden attrib matches", names)
+	}
+	countTrace := &searchTrace{}
+	count, ok, err := countServiceVolumes([]*serviceVolumeIndex{vol}, queryOptions{Query: "attrib:H", Trace: countTrace})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("countServiceVolumes did not handle attrib:H")
+	}
+	if count != 2 {
+		t.Fatalf("count = %d, want 2", count)
+	}
+	if countTrace.PlannerMode != "global-count-components" {
+		t.Fatalf("count planner mode = %q, want global-count-components; decline=%s", countTrace.PlannerMode, countTrace.Decline)
+	}
+}
+
+func TestAttribFilterUsesMappedLowmemSource(t *testing.T) {
+	t.Setenv("SEEKFS_ENGINE_V9", "1")
+	t.Setenv("SEEKFS_MEMORY_MODE", "lowmem")
+	t.Setenv("SEEKFS_GLOBAL_PLANNER", "1")
+	idx := attribSearchFixture()
+	db := filepath.Join(t.TempDir(), "attrs.gsi")
+	if err := saveIndex(db, idx); err != nil {
+		t.Fatalf("save v9: %v", err)
+	}
+	loaded, err := loadIndexForService(db)
+	if err != nil {
+		t.Fatalf("load for service: %v", err)
+	}
+	defer loaded.MMapRecords.file.close()
+	if len(loaded.Derived.AttrBits) == 0 {
+		t.Fatal("mapped attr postings were not loaded")
+	}
+	vol := newServiceVolumeIndex(db, loaded)
+	trace := &searchTrace{}
+	got, err := searchServiceVolumes([]*serviceVolumeIndex{vol}, queryOptions{Query: "attrib:H", Limit: 10, Trace: trace}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if trace.PlannerMode != "global-components" {
+		t.Fatalf("planner mode = %q, want global-components; decline=%s", trace.PlannerMode, trace.Decline)
+	}
+	if names := namesOf(got); !sameStringSet(names, []string{"hidden.txt", "hidden-system.dat"}) {
+		t.Fatalf("mapped attr names = %v, want hidden attr matches", names)
+	}
+}
+
+func TestAttribOrUsesGlobalPlannerSource(t *testing.T) {
+	vol := newServiceVolumeIndex("attrs.gsi", attribSearchFixture())
+	trace := &searchTrace{}
+	got, err := searchServiceVolumes([]*serviceVolumeIndex{vol}, queryOptions{Query: "attrib:H|attrib:A", Limit: 10, Trace: trace}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if trace.PlannerMode != "global-components" {
+		t.Fatalf("planner mode = %q, want global-components; decline=%s", trace.PlannerMode, trace.Decline)
+	}
+	if names := namesOf(got); !sameStringSet(names, []string{"plain.txt", "hidden.txt", "hidden-system.dat"}) {
+		t.Fatalf("names = %v, want archive or hidden attr matches", names)
+	}
+	countTrace := &searchTrace{}
+	count, ok, err := countServiceVolumes([]*serviceVolumeIndex{vol}, queryOptions{Query: "attrib:H|attrib:A", Trace: countTrace})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("countServiceVolumes declined attrib OR")
+	}
+	if countTrace.PlannerMode != "global-count-components" {
+		t.Fatalf("count planner mode = %q, want global-count-components; decline=%s", countTrace.PlannerMode, countTrace.Decline)
+	}
+	if count != 3 {
+		t.Fatalf("count = %d, want 3", count)
+	}
+}
+
+func TestSortSizeRanksCompactResults(t *testing.T) {
+	idx := &Index{
+		Source:  "usn",
+		Volume:  "C:",
+		Compact: true,
+		Records: []CompactRecord{
+			{FRN: 1, ParentFRN: 1, Parent: -1, Name: ".", Mode: uint32(os.ModeDir)},
+			{FRN: 2, ParentFRN: 1, Parent: 0, Name: "a-large.txt", Size: 300},
+			{FRN: 3, ParentFRN: 1, Parent: 0, Name: "b-small.txt", Size: 10},
+			{FRN: 4, ParentFRN: 1, Parent: 0, Name: "c-mid.txt", Size: 100},
+		},
+	}
+	buildOrders(idx)
+	vol := newServiceVolumeIndex("sort-size.gsi", idx)
+	got, err := searchCompactWithCache(idx, queryOptions{Query: "ext:txt sort:size", Limit: 3}, false, vol.pathCache, vol.nameTermCandidates)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if names := namesOf(got); !sameStringSet(names, []string{"a-large.txt", "b-small.txt", "c-mid.txt"}) {
+		t.Fatalf("names set = %v", names)
+	}
+	if got[0].Name != "b-small.txt" || got[1].Name != "c-mid.txt" || got[2].Name != "a-large.txt" {
+		t.Fatalf("size order = %v, want b-small, c-mid, a-large", []string{got[0].Name, got[1].Name, got[2].Name})
+	}
+	limited, err := searchCompactWithCache(idx, queryOptions{Query: "ext:txt sort:size", Limit: 1}, false, vol.pathCache, vol.nameTermCandidates)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(limited) != 1 || limited[0].Name != "b-small.txt" {
+		t.Fatalf("limited size order = %v, want b-small.txt", namesOf(limited))
+	}
+}
+
+func TestGlobalPlannerExtVerifierFiltersDefault(t *testing.T) {
+	idx := &Index{
+		Source:  "usn",
+		Volume:  "C:",
+		Compact: true,
+	}
+	add := func(frn, parentFRN uint64, parent int32, name string, size int64, mod time.Time, mode uint32) int32 {
+		idx.Records = append(idx.Records, CompactRecord{
+			FRN:       frn,
+			ParentFRN: parentFRN,
+			Parent:    parent,
+			Name:      name,
+			Mode:      mode,
+			Size:      size,
+			ModUnix:   mod.UnixNano(),
+		})
+		return int32(len(idx.Records) - 1)
+	}
+	rootTime := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
+	root := add(1, 1, -1, ".", 0, rootTime, uint32(os.ModeDir))
+	add(2, 1, root, "small-old.txt", 10, time.Date(2026, 4, 30, 12, 0, 0, 0, time.UTC), 0)
+	add(3, 1, root, "large-new.txt", 100, rootTime, 0)
+	add(4, 1, root, "large-new.bin", 100, rootTime, 0)
+	buildOrders(idx)
+	vol := newServiceVolumeIndex("verifier-filters.gsi", idx)
+
+	for _, tc := range []struct {
+		query string
+		want  []string
+	}{
+		{query: "ext:txt size:>50", want: []string{"large-new.txt"}},
+		{query: "ext:txt dm:2026-05-01", want: []string{"large-new.txt"}},
+	} {
+		t.Run(tc.query, func(t *testing.T) {
+			trace := &searchTrace{}
+			got, err := searchServiceVolumes([]*serviceVolumeIndex{vol}, queryOptions{Query: tc.query, Limit: 10, Trace: trace}, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if trace.PlannerMode != "global-components" {
+				t.Fatalf("planner mode = %q, want global-components; decline=%s fallback=%s", trace.PlannerMode, trace.Decline, trace.Fallback)
+			}
+			if names := namesOf(got); !sameStringSet(names, tc.want) {
+				t.Fatalf("names = %v, want %v", names, tc.want)
+			}
+			countTrace := &searchTrace{}
+			count, ok, err := countServiceVolumes([]*serviceVolumeIndex{vol}, queryOptions{Query: tc.query, Trace: countTrace})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !ok {
+				t.Fatal("countServiceVolumes declined verifier filter")
+			}
+			if countTrace.PlannerMode != "global-count-components" {
+				t.Fatalf("count planner mode = %q, want global-count-components; decline=%s", countTrace.PlannerMode, countTrace.Decline)
+			}
+			if count != len(tc.want) {
+				t.Fatalf("count = %d, want %d", count, len(tc.want))
+			}
+		})
+	}
+}
+
+func TestSortModifiedRanksCompactResults(t *testing.T) {
+	idx := &Index{
+		Source:  "usn",
+		Volume:  "C:",
+		Compact: true,
+		Records: []CompactRecord{
+			{FRN: 1, ParentFRN: 1, Parent: -1, Name: ".", Mode: uint32(os.ModeDir), ModUnix: 1},
+			{FRN: 2, ParentFRN: 1, Parent: 0, Name: "old.txt", ModUnix: 10},
+			{FRN: 3, ParentFRN: 1, Parent: 0, Name: "new.txt", ModUnix: 30},
+			{FRN: 4, ParentFRN: 1, Parent: 0, Name: "mid.txt", ModUnix: 20},
+		},
+	}
+	buildOrders(idx)
+	vol := newServiceVolumeIndex("sort-modified.gsi", idx)
+	got, err := searchCompactWithCache(idx, queryOptions{Query: "ext:txt sort:modified", Limit: 3}, false, vol.pathCache, vol.nameTermCandidates)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got[0].Name != "new.txt" || got[1].Name != "mid.txt" || got[2].Name != "old.txt" {
+		t.Fatalf("modified order = %v, want new, mid, old", []string{got[0].Name, got[1].Name, got[2].Name})
+	}
+	limited, err := searchCompactWithCache(idx, queryOptions{Query: "ext:txt sort:modified", Limit: 1}, false, vol.pathCache, vol.nameTermCandidates)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(limited) != 1 || limited[0].Name != "new.txt" {
+		t.Fatalf("limited modified order = %v, want new.txt", namesOf(limited))
+	}
+}
+
+func TestSortExtensionRanksCompactResults(t *testing.T) {
+	idx := &Index{
+		Source:  "usn",
+		Volume:  "C:",
+		Compact: true,
+		Records: []CompactRecord{
+			{FRN: 1, ParentFRN: 1, Parent: -1, Name: ".", Mode: uint32(os.ModeDir)},
+			{FRN: 2, ParentFRN: 1, Parent: 0, Name: "b.go"},
+			{FRN: 3, ParentFRN: 1, Parent: 0, Name: "a.md"},
+			{FRN: 4, ParentFRN: 1, Parent: 0, Name: "c.go"},
+			{FRN: 5, ParentFRN: 1, Parent: 0, Name: "z.txt"},
+		},
+	}
+	buildOrders(idx)
+	vol := newServiceVolumeIndex("sort-extension.gsi", idx)
+	got, err := searchCompactWithCache(idx, queryOptions{Query: "type:file sort:extension", Limit: 4}, false, vol.pathCache, vol.nameTermCandidates)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got[0].Name != "b.go" || got[1].Name != "c.go" || got[2].Name != "a.md" || got[3].Name != "z.txt" {
+		t.Fatalf("extension order = %v, want b.go, c.go, a.md, z.txt", namesOf(got))
+	}
+	limited, err := searchCompactWithCache(idx, queryOptions{Query: "type:file sort:extension", Limit: 1}, false, vol.pathCache, vol.nameTermCandidates)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(limited) != 1 || limited[0].Name != "b.go" {
+		t.Fatalf("limited extension order = %v, want b.go", namesOf(limited))
+	}
+}
+
+func TestSortTypeRanksCompactResults(t *testing.T) {
+	idx := &Index{
+		Source:  "usn",
+		Volume:  "C:",
+		Compact: true,
+		Records: []CompactRecord{
+			{FRN: 1, ParentFRN: 1, Parent: -1, Name: ".", Mode: uint32(os.ModeDir)},
+			{FRN: 2, ParentFRN: 1, Parent: 0, Name: "fixture", Mode: uint32(os.ModeDir)},
+			{FRN: 3, ParentFRN: 2, Parent: 1, Name: "b.go"},
+			{FRN: 4, ParentFRN: 2, Parent: 1, Name: "src", Mode: uint32(os.ModeDir)},
+			{FRN: 5, ParentFRN: 2, Parent: 1, Name: "a.md"},
+		},
+	}
+	buildOrders(idx)
+	vol := newServiceVolumeIndex("sort-type.gsi", idx)
+	got, err := searchCompactWithCache(idx, queryOptions{Query: "path:fixture sort:type", Limit: 4}, false, vol.pathCache, vol.nameTermCandidates)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got[0].Name != "fixture" || got[1].Name != "src" || got[2].Name != "a.md" || got[3].Name != "b.go" {
+		t.Fatalf("type order = %v, want fixture, src, a.md, b.go", namesOf(got))
+	}
+	limited, err := searchCompactWithCache(idx, queryOptions{Query: "path:fixture sort:type", Limit: 1}, false, vol.pathCache, vol.nameTermCandidates)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(limited) != 1 || limited[0].Name != "fixture" {
+		t.Fatalf("limited type order = %v, want fixture", namesOf(limited))
+	}
+}
+
+func TestSortPathRanksCompactResults(t *testing.T) {
+	idx := &Index{
+		Source:  "usn",
+		Volume:  "C:",
+		Compact: true,
+		Records: []CompactRecord{
+			{FRN: 1, ParentFRN: 1, Parent: -1, Name: ".", Mode: uint32(os.ModeDir)},
+			{FRN: 2, ParentFRN: 1, Parent: 0, Name: "zeta", Mode: uint32(os.ModeDir)},
+			{FRN: 3, ParentFRN: 2, Parent: 1, Name: "a.txt"},
+			{FRN: 4, ParentFRN: 1, Parent: 0, Name: "alpha", Mode: uint32(os.ModeDir)},
+			{FRN: 5, ParentFRN: 4, Parent: 3, Name: "z.txt"},
+		},
+	}
+	buildOrders(idx)
+	vol := newServiceVolumeIndex("sort-path.gsi", idx)
+	got, err := searchCompactWithCache(idx, queryOptions{Query: "path:txt sort:path", Limit: 2}, false, vol.pathCache, vol.nameTermCandidates)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got[0].Path != `C:\alpha\z.txt` || got[1].Path != `C:\zeta\a.txt` {
+		t.Fatalf("path order = %v, want alpha before zeta", pathsOf(got))
+	}
+	limited, err := searchCompactWithCache(idx, queryOptions{Query: "path:txt sort:path", Limit: 1}, false, vol.pathCache, vol.nameTermCandidates)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(limited) != 1 || limited[0].Path != `C:\alpha\z.txt` {
+		t.Fatalf("limited path order = %v, want C:\\alpha\\z.txt", pathsOf(limited))
 	}
 }
 
@@ -687,6 +1189,33 @@ func pathSyntaxFixture() *Index {
 	add(13, 2, 1, "Reports", uint32(os.ModeDir))
 	add(14, 13, 12, "manual.pdf", 0)
 	add(15, 13, 12, "manual.pdf.bak", 0)
+	buildOrders(idx)
+	return idx
+}
+
+func attribSearchFixture() *Index {
+	idx := &Index{
+		Source:       "usn",
+		Volume:       "C:",
+		Compact:      true,
+		CompactAttrs: true,
+	}
+	add := func(frn, parentFRN uint64, parent int32, name string, mode uint32) {
+		idx.Records = append(idx.Records, CompactRecord{
+			FRN:       frn,
+			ParentFRN: parentFRN,
+			Parent:    parent,
+			Name:      name,
+			Mode:      mode,
+			Size:      1024,
+			ModUnix:   time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC).UnixNano(),
+		})
+	}
+	add(1, 1, -1, ".", modeFromAttrs(fileAttributeDir))
+	add(2, 1, 0, "attrs", modeFromAttrs(fileAttributeDir))
+	add(3, 2, 1, "plain.txt", modeFromAttrs(fileAttributeArchive))
+	add(4, 2, 1, "hidden.txt", modeFromAttrs(fileAttributeHidden|fileAttributeArchive))
+	add(5, 2, 1, "hidden-system.dat", modeFromAttrs(fileAttributeHidden|fileAttributeSystem|fileAttributeArchive))
 	buildOrders(idx)
 	return idx
 }

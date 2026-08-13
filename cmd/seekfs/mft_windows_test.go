@@ -22,6 +22,7 @@ type synthOpts struct {
 	parentFRN   uint64
 	modUnixNano int64
 	size        int64
+	attrs       uint32
 	nonResident bool
 	namedData   bool // a named $DATA stream that must NOT count as file size
 }
@@ -87,6 +88,13 @@ func synthMFTRecord(o synthOpts) []byte {
 	if o.modUnixNano != 0 {
 		ft := uint64(o.modUnixNano/100) + filetimeToUnix100ns
 		binary.LittleEndian.PutUint64(si[8:16], ft)
+	}
+	attrs := o.attrs
+	if o.isDir {
+		attrs |= fileAttributeDir
+	}
+	if attrs != 0 {
+		binary.LittleEndian.PutUint32(si[32:36], attrs)
 	}
 	writeAttrHeader(attrStandardInformation, len(si), si)
 
@@ -207,6 +215,32 @@ func TestParseMFTRecordResidentSizeAndDir(t *testing.T) {
 	}
 	if modeFromAttrs(de.attr) == 0 {
 		t.Error("dir mode should have ModeDir bit")
+	}
+}
+
+func TestParseMFTRecordReadsStandardInformationAttributes(t *testing.T) {
+	rec := synthMFTRecord(synthOpts{
+		inUse: true, name: "secret.txt", namespace: fileNameWin32,
+		parentFRN: 7, attrs: fileAttributeHidden | fileAttributeSystem | fileAttributeArchive,
+	})
+	e, ok := parseMFTRecord(rec, 12, 512)
+	if !ok {
+		t.Fatal("expected parse")
+	}
+	want := uint32(fileAttributeHidden | fileAttributeSystem | fileAttributeArchive)
+	if e.attr&want != want {
+		t.Fatalf("attrs = %#x, want %#x", e.attr, want)
+	}
+	if modeFromAttrs(e.attr)&want != want {
+		t.Fatalf("mode did not preserve attrs: %#x", modeFromAttrs(e.attr))
+	}
+}
+
+func TestParseStandardInformationShortAttributeDoesNotPanic(t *testing.T) {
+	var entry mftEntry
+	parseStandardInformation([]byte{1, 2, 3}, &entry)
+	if entry.modUnix != 0 || entry.attr != 0 {
+		t.Fatalf("short standard information mutated entry: %+v", entry)
 	}
 }
 

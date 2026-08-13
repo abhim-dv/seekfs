@@ -2,11 +2,14 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"slices"
 	"sort"
 	"strings"
@@ -15,18 +18,55 @@ import (
 	"time"
 )
 
+func TestPostingRankBoundsDecodeLegacyV9WithoutNameBounds(t *testing.T) {
+	legacy := encodeUint32Section(
+		[]uint32{10, 20},
+		[]uint32{11, 21},
+		[]uint32{12, 22},
+		[]uint32{13, 23},
+		[]uint32{14, 24},
+	)
+	got := decodePostingRankBounds(legacy)
+	if got.BlockCount != 2 || len(got.Name) != 0 || !slices.Equal(got.Path, []uint32{14, 24}) {
+		t.Fatalf("legacy rank bounds = %+v, want five-column bounds without Name", got)
+	}
+	if got.ranksForSort("") != nil {
+		t.Fatalf("legacy default rank bounds = %v, want nil fallback", got.ranksForSort(""))
+	}
+}
+
+func TestPostingRankBoundsRoundTripIncludesDefaultNameOrder(t *testing.T) {
+	want := postingRankBounds{
+		BlockCount: 2,
+		Name:       []uint32{1, 2},
+		Size:       []uint32{3, 4},
+		Modified:   []uint32{5, 6},
+		Extension:  []uint32{7, 8},
+		Type:       []uint32{9, 10},
+		Path:       []uint32{11, 12},
+	}
+	got := decodePostingRankBounds(encodePostingRankBounds(want))
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("round-tripped rank bounds = %+v, want %+v", got, want)
+	}
+	if ranks := got.ranksForSort(""); !slices.Equal(ranks, want.Name) {
+		t.Fatalf("default rank bounds = %v, want %v", ranks, want.Name)
+	}
+}
+
 func TestCompactIndexV8RoundTripKeepsFRNMetadata(t *testing.T) {
 	builtAt := time.Unix(0, 123456789)
 	modified := time.Unix(0, 987654321)
 	idx := &Index{
-		Version:    indexVersion,
-		Roots:      []string{`C:\`},
-		BuiltAt:    builtAt,
-		Source:     "usn",
-		Volume:     "C:",
-		JournalID:  42,
-		Checkpoint: 99,
-		Compact:    true,
+		Version:      indexVersion,
+		Roots:        []string{`C:\`},
+		BuiltAt:      builtAt,
+		Source:       "usn",
+		Volume:       "C:",
+		JournalID:    42,
+		Checkpoint:   99,
+		Compact:      true,
+		CompactAttrs: true,
 		Records: []CompactRecord{
 			{
 				FRN:       10,
@@ -42,7 +82,7 @@ func TestCompactIndexV8RoundTripKeepsFRNMetadata(t *testing.T) {
 				ParentFRN: 10,
 				Parent:    0,
 				Name:      "main.go",
-				Mode:      0,
+				Mode:      modeFromAttrs(fileAttributeHidden | fileAttributeArchive),
 				Size:      1234,
 				ModUnix:   modified.Add(time.Second).UnixNano(),
 				Deleted:   true,
@@ -68,13 +108,16 @@ func TestCompactIndexV8RoundTripKeepsFRNMetadata(t *testing.T) {
 	if !got.Compact || len(got.Records) != 2 {
 		t.Fatalf("records = %d compact=%v, want 2 compact records", len(got.Records), got.Compact)
 	}
+	if !got.CompactAttrs {
+		t.Fatal("compact attr capability was not preserved")
+	}
 
 	root := got.Records[0]
 	if root.FRN != 10 || root.ParentFRN != 10 || root.Parent != -1 || root.Mode != uint32(1<<31) || root.ModUnix != modified.UnixNano() {
 		t.Fatalf("root record metadata mismatch: %+v", root)
 	}
 	file := got.Records[1]
-	if file.FRN != 11 || file.ParentFRN != 10 || file.Parent != 0 || file.Name != "main.go" || file.Size != 1234 || file.ModUnix != modified.Add(time.Second).UnixNano() || !file.Deleted {
+	if file.FRN != 11 || file.ParentFRN != 10 || file.Parent != 0 || file.Name != "main.go" || file.Size != 1234 || file.ModUnix != modified.Add(time.Second).UnixNano() || !file.Deleted || file.Mode&fileAttributeHidden == 0 || file.Mode&fileAttributeArchive == 0 {
 		t.Fatalf("file record metadata mismatch: %+v", file)
 	}
 	if got.reconstructCompactPath(1) != `C:\main.go` {
@@ -86,18 +129,19 @@ func TestCompactIndexMMapRoundTripKeepsPathAndMetadata(t *testing.T) {
 	t.Setenv("SEEKFS_MEMORY_MODE", "lowmem")
 	modified := time.Unix(0, 987654321)
 	idx := &Index{
-		Version:    indexVersion,
-		Roots:      []string{`F:\`},
-		BuiltAt:    time.Unix(0, 123456789),
-		Source:     "usn",
-		Volume:     "F:",
-		JournalID:  42,
-		Checkpoint: 99,
-		Compact:    true,
+		Version:      indexVersion,
+		Roots:        []string{`F:\`},
+		BuiltAt:      time.Unix(0, 123456789),
+		Source:       "usn",
+		Volume:       "F:",
+		JournalID:    42,
+		Checkpoint:   99,
+		Compact:      true,
+		CompactAttrs: true,
 		Records: []CompactRecord{
 			{FRN: 10, ParentFRN: 10, Parent: -1, Name: ".", Mode: uint32(os.ModeDir), ModUnix: modified.UnixNano()},
 			{FRN: 11, ParentFRN: 10, Parent: 0, Name: "Projects", Mode: uint32(os.ModeDir), ModUnix: modified.Add(time.Second).UnixNano()},
-			{FRN: 12, ParentFRN: 11, Parent: 1, Name: "Scan.NRRD", Size: 4096, ModUnix: modified.Add(2 * time.Second).UnixNano()},
+			{FRN: 12, ParentFRN: 11, Parent: 1, Name: "Scan.NRRD", Mode: modeFromAttrs(fileAttributeHidden | fileAttributeArchive), Size: 4096, ModUnix: modified.Add(2 * time.Second).UnixNano()},
 		},
 	}
 	path := filepath.Join(t.TempDir(), "compact.gsi")
@@ -116,11 +160,11 @@ func TestCompactIndexMMapRoundTripKeepsPathAndMetadata(t *testing.T) {
 	if got.MMapRecords == nil || got.PackedRecords != nil || len(got.Records) != 0 {
 		t.Fatalf("mmap records not active: mmap=%v packed=%v records=%d", got.MMapRecords != nil, got.PackedRecords != nil, len(got.Records))
 	}
-	if got.compactRecordCount() != 3 || !got.compactHasSize() || !got.compactHasModTime() {
-		t.Fatalf("mmap capabilities count=%d size=%v mod=%v", got.compactRecordCount(), got.compactHasSize(), got.compactHasModTime())
+	if got.compactRecordCount() != 3 || !got.compactHasSize() || !got.compactHasModTime() || !got.compactHasAttrs() {
+		t.Fatalf("mmap capabilities count=%d size=%v mod=%v attr=%v", got.compactRecordCount(), got.compactHasSize(), got.compactHasModTime(), got.compactHasAttrs())
 	}
 	rec := got.compactRecord(2)
-	if rec.Name != "Scan.NRRD" || rec.Size != 4096 || rec.Parent != 1 || rec.ParentFRN != 11 {
+	if rec.Name != "Scan.NRRD" || rec.Size != 4096 || rec.Parent != 1 || rec.ParentFRN != 11 || rec.Mode&fileAttributeHidden == 0 || rec.Mode&fileAttributeArchive == 0 {
 		t.Fatalf("mmap record mismatch: %+v", rec)
 	}
 	if lower := got.compactLowerNameAt(2); lower != "scan.nrrd" {
@@ -176,16 +220,17 @@ func TestCompactDiskRecordBytesSwitchesToWideAtNarrowLimit(t *testing.T) {
 func TestEngineV9WritesAndLoadsDerivedSections(t *testing.T) {
 	t.Setenv("SEEKFS_ENGINE_V9", "1")
 	idx := &Index{
-		Version: indexVersion,
-		Roots:   []string{`C:\`},
-		BuiltAt: time.Unix(0, 123),
-		Source:  "usn",
-		Volume:  "C:",
-		Compact: true,
+		Version:      indexVersion,
+		Roots:        []string{`C:\`},
+		BuiltAt:      time.Unix(0, 123),
+		Source:       "usn",
+		Volume:       "C:",
+		Compact:      true,
+		CompactAttrs: true,
 		Records: []CompactRecord{
-			{FRN: 10, ParentFRN: 10, Parent: -1, Name: ".", Mode: uint32(os.ModeDir)},
-			{FRN: 11, ParentFRN: 10, Parent: 0, Name: "docs", Mode: uint32(os.ModeDir)},
-			{FRN: 12, ParentFRN: 11, Parent: 1, Name: "Alpha.TXT"},
+			{FRN: 10, ParentFRN: 10, Parent: -1, Name: ".", Mode: modeFromAttrs(fileAttributeDir)},
+			{FRN: 11, ParentFRN: 10, Parent: 0, Name: "docs", Mode: modeFromAttrs(fileAttributeDir)},
+			{FRN: 12, ParentFRN: 11, Parent: 1, Name: "Alpha.TXT", Mode: modeFromAttrs(fileAttributeHidden | fileAttributeArchive)},
 			{FRN: 13, ParentFRN: 11, Parent: 1, Name: "Résumé.GO"},
 			{FRN: 14, ParentFRN: 11, Parent: 1, Name: "Alpha.TXT"},
 			{FRN: 15, ParentFRN: 11, Parent: 1, Name: "İ.TXT"},
@@ -203,6 +248,9 @@ func TestEngineV9WritesAndLoadsDerivedSections(t *testing.T) {
 	defer loaded.MMapRecords.file.close()
 	if loaded.Version != indexVersionV9 {
 		t.Fatalf("version = %d, want %d", loaded.Version, indexVersionV9)
+	}
+	if !loaded.compactHasAttrs() {
+		t.Fatal("v9 compact attr capability was not preserved")
 	}
 	if len(loaded.Derived.NameOrder) != loaded.compactRecordCount() || len(loaded.Derived.NameRank) != loaded.compactRecordCount() {
 		t.Fatalf("rank section missing: %+v", loaded.Derived)
@@ -230,7 +278,7 @@ func TestEngineV9WritesAndLoadsDerivedSections(t *testing.T) {
 		t.Fatalf("mapped unicode variable lower name = %q, want %q", got, want)
 	}
 	sections, _ := derivedSectionInfo(loaded.Derived)
-	for _, want := range []string{"LOWR", "PEXT", "PCMP", "PNGR"} {
+	for _, want := range []string{"LOWR", "PATR", "PEXT", "PXRB", "PXRC", "PCMP", "PNGR"} {
 		if !slices.Contains(sections, want) {
 			t.Fatalf("sections = %v, missing %s", sections, want)
 		}
@@ -305,6 +353,19 @@ func TestEngineV9LowmemMappedStartupSkipsResidentPathRebuilds(t *testing.T) {
 	}
 	if got := vol.nameTrigramStateString(); got != "ready" {
 		t.Fatalf("mapped trigram state = %q, want ready", got)
+	}
+	servicePostingBlockCache = postingBlockLRU{}
+	t.Cleanup(func() { servicePostingBlockCache = postingBlockLRU{} })
+	t.Setenv("SEEKFS_POSTING_CACHE_MB", "1")
+	extCount, extOK, extErr := countServiceVolumes([]*serviceVolumeIndex{vol}, queryOptions{Query: "ext:txt"})
+	if extErr != nil || !extOK || extCount != 1 {
+		t.Fatalf("mapped ext count = %d, handled=%v, err=%v; want 1, true, nil", extCount, extOK, extErr)
+	}
+	servicePostingBlockCache.mu.Lock()
+	cachedBlocks := len(servicePostingBlockCache.items)
+	servicePostingBlockCache.mu.Unlock()
+	if cachedBlocks != 0 {
+		t.Fatalf("mapped ext count decoded %d posting blocks, want metadata-only count", cachedBlocks)
 	}
 	lazyPQ := mustParseQuery(t, queryOptions{Query: "ext:txt dir:docs alpha", MatchPath: true, Limit: 10})
 	lazyPQ.Limit = normalizedLimit(10, false)
@@ -384,6 +445,73 @@ func TestEngineV9LowmemMappedStartupSkipsResidentPathRebuilds(t *testing.T) {
 	}
 }
 
+func TestReadIndexV9LoadsDerivedSectionsWithoutMMap(t *testing.T) {
+	t.Setenv("SEEKFS_ENGINE_V9", "1")
+	t.Setenv("SEEKFS_MEMORY_MODE", "")
+	idx := &Index{
+		Version:      indexVersion,
+		Roots:        []string{`F:\`},
+		BuiltAt:      time.Unix(0, 456),
+		Source:       "usn",
+		Volume:       "F:",
+		Compact:      true,
+		CompactAttrs: true,
+		Records: []CompactRecord{
+			{FRN: 10, ParentFRN: 10, Parent: -1, Name: ".", Mode: uint32(os.ModeDir)},
+			{FRN: 11, ParentFRN: 10, Parent: 0, Name: "Projects", Mode: uint32(os.ModeDir)},
+			{FRN: 12, ParentFRN: 11, Parent: 1, Name: "Alpha.TXT", Mode: modeFromAttrs(fileAttributeHidden | fileAttributeArchive), Size: 100, ModUnix: 10},
+			{FRN: 13, ParentFRN: 11, Parent: 1, Name: "Beta.GO", Mode: modeFromAttrs(fileAttributeArchive), Size: 200, ModUnix: 20},
+		},
+	}
+	buildOrders(idx)
+	db := filepath.Join(t.TempDir(), "v9-resident.gsi")
+	if err := saveIndex(db, idx); err != nil {
+		t.Fatalf("save v9: %v", err)
+	}
+	loaded, err := loadIndex(db)
+	if err != nil {
+		t.Fatalf("loadIndex: %v", err)
+	}
+	if loaded.MMapRecords != nil {
+		t.Fatal("resident load unexpectedly used mmap records")
+	}
+	sections, _ := derivedSectionInfo(loaded.Derived)
+	for _, want := range []string{"RANK", "ERNK", "TRNK", "PRNK", "CHLD", "SUBT", "FRNS", "LOWR", "PATR", "PEXT", "PXRB", "PXRC", "PCMP", "PNGR"} {
+		if !slices.Contains(sections, want) {
+			t.Fatalf("sections = %v, missing %s", sections, want)
+		}
+	}
+	vol := newServiceVolumeIndex(db, loaded)
+	if got := vol.nameOrderStateString(); got != "ready" {
+		t.Fatalf("resident v9 name order state = %q, want ready", got)
+	}
+	if got := vol.nameTrigramStateString(); got != "ready" {
+		t.Fatalf("resident v9 trigram state = %q, want ready", got)
+	}
+	if vol.nameTrigramIndex() == nil {
+		t.Fatal("resident v9 trigram section was not wired")
+	}
+	if vol.queryIndex == nil || len(vol.queryIndex.nameOrder) != loaded.compactRecordCount() || len(vol.queryIndex.extOrder) != loaded.compactRecordCount() {
+		t.Fatalf("resident v9 ranks not wired: queryIndex=%v nameOrder=%d extOrder=%d records=%d",
+			vol.queryIndex != nil, len(vol.queryIndex.nameOrder), len(vol.queryIndex.extOrder), loaded.compactRecordCount())
+	}
+	if len(vol.queryIndex.ext) != 0 {
+		t.Fatalf("resident v9 ext postings were rebuilt instead of using derived PEXT: %v", vol.queryIndex.ext)
+	}
+	if len(vol.queryIndex.components) != 0 {
+		t.Fatalf("resident v9 component postings were rebuilt instead of using derived PCMP: %v", vol.queryIndex.components)
+	}
+	if got := vol.extPosting("txt"); !reflect.DeepEqual(got, []int{2}) {
+		t.Fatalf("resident v9 derived ext lookup = %v, want [2]", got)
+	}
+	if got := vol.pathComponentRootIDs("projects"); !reflect.DeepEqual(got, []int{1}) {
+		t.Fatalf("resident v9 derived component lookup = %v, want [1]", got)
+	}
+	if ids, ok := vol.nameTrigramIndex().candidateIDs("alpha"); !ok || len(ids) == 0 {
+		t.Fatalf("resident v9 trigram lookup ok=%v ids=%v", ok, ids)
+	}
+}
+
 func TestEngineV9LowmemMappedBoundedScanUsesMappedRankOrder(t *testing.T) {
 	t.Setenv("SEEKFS_ENGINE_V9", "1")
 	t.Setenv("SEEKFS_MEMORY_MODE", "lowmem")
@@ -435,6 +563,353 @@ func TestEngineV9LowmemMappedBoundedScanUsesMappedRankOrder(t *testing.T) {
 	}
 }
 
+func TestEngineV9MappedExtTopTraceReportsSkippedBlocks(t *testing.T) {
+	t.Setenv("SEEKFS_ENGINE_V9", "1")
+	t.Setenv("SEEKFS_MEMORY_MODE", "lowmem")
+	idx := &Index{
+		Version: indexVersion,
+		Roots:   []string{`C:\`},
+		BuiltAt: time.Unix(0, 791),
+		Source:  "usn",
+		Volume:  "C:",
+		Compact: true,
+		Records: []CompactRecord{
+			{FRN: 10, ParentFRN: 10, Parent: -1, Name: ".", Mode: uint32(os.ModeDir)},
+		},
+	}
+	for i := 0; i < 1100; i++ {
+		idx.Records = append(idx.Records, CompactRecord{
+			FRN:       uint64(11 + i),
+			ParentFRN: 10,
+			Parent:    0,
+			Name:      fmt.Sprintf("file-%04d.txt", i),
+			Size:      int64(1100 - i),
+			ModUnix:   int64(i + 1),
+		})
+	}
+	buildOrders(idx)
+	db := filepath.Join(t.TempDir(), "v9-lowmem-ext-blocks.gsi")
+	if err := saveIndex(db, idx); err != nil {
+		t.Fatalf("save v9: %v", err)
+	}
+	loaded, err := loadIndexForService(db)
+	if err != nil {
+		t.Fatalf("load for service: %v", err)
+	}
+	defer loaded.MMapRecords.file.close()
+	vol := newServiceVolumeIndex(db, loaded)
+	extPosting := loaded.Derived.Postings[indexSectionPEXT]
+	if extPosting.RankBounds.BlockCount < 2 {
+		t.Fatalf("PEXT rank bounds block count = %d, want at least 2", extPosting.RankBounds.BlockCount)
+	}
+	trace := &searchTrace{}
+	opts := queryOptions{Query: "ext:txt", Limit: 1, Trace: trace}
+	got, err := searchCompactWithCache(loaded, opts, false, make(map[int]string), vol.nameTermCandidates)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if paths := pathsOf(got); !reflect.DeepEqual(paths, []string{`C:\file-0000.txt`}) {
+		t.Fatalf("paths = %v, want first txt file", paths)
+	}
+	if trace.Source != "planned:ext-top" {
+		t.Fatalf("trace source = %q, want planned:ext-top", trace.Source)
+	}
+	if trace.BlocksDecoded != 1 || trace.BlocksSkipped == 0 {
+		t.Fatalf("blocks decoded/skipped = %d/%d, want 1/>0", trace.BlocksDecoded, trace.BlocksSkipped)
+	}
+	if !traceHasTerm(trace.Terms, traceTerm{Term: "txt", Kind: "extension", Source: "planned:ext-top", Exact: true}) {
+		t.Fatalf("trace terms = %+v, missing planned ext-top term", trace.Terms)
+	}
+
+	globalTrace := &searchTrace{}
+	global, handled, err := searchServiceVolumesGlobalExtOnly([]*serviceVolumeIndex{vol, vol}, queryOptions{Query: "ext:txt", Limit: 1, Trace: globalTrace}, false)
+	if err != nil || !handled {
+		t.Fatalf("global mapped ext top handled=%v err=%v", handled, err)
+	}
+	if paths := pathsOf(global); !reflect.DeepEqual(paths, []string{`C:\file-0000.txt`}) {
+		t.Fatalf("global mapped ext paths = %v, want first txt file", paths)
+	}
+	if globalTrace.PlannerMode != "global-ext" || globalTrace.BlocksDecoded != 2 || globalTrace.BlocksSkipped == 0 {
+		t.Fatalf("global planner/blocks = %q %d/%d, want global-ext 2/>0", globalTrace.PlannerMode, globalTrace.BlocksDecoded, globalTrace.BlocksSkipped)
+	}
+
+	sizeTrace := &searchTrace{}
+	sizeOpts := queryOptions{Query: "ext:txt sort:size", Limit: 1, Trace: sizeTrace}
+	sizeSorted, err := searchCompactWithCache(loaded, sizeOpts, false, make(map[int]string), vol.nameTermCandidates)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if paths := pathsOf(sizeSorted); !reflect.DeepEqual(paths, []string{`C:\file-1099.txt`}) {
+		t.Fatalf("sort:size paths = %v, want smallest txt file", paths)
+	}
+	if sizeTrace.Source != "planned:ext-top" {
+		t.Fatalf("sort:size trace source = %q, want planned:ext-top", sizeTrace.Source)
+	}
+	if sizeTrace.BlocksDecoded != 1 || sizeTrace.BlocksSkipped == 0 {
+		t.Fatalf("sort:size blocks decoded/skipped = %d/%d, want 1/>0 with size block bounds", sizeTrace.BlocksDecoded, sizeTrace.BlocksSkipped)
+	}
+	if !traceHasTerm(sizeTrace.Terms, traceTerm{Term: "txt", Kind: "extension", Source: "planned:ext-top", Exact: true}) {
+		t.Fatalf("sort:size trace terms = %+v, missing planned ext-top term", sizeTrace.Terms)
+	}
+
+	modTrace := &searchTrace{}
+	modOpts := queryOptions{Query: "ext:txt sort:modified", Limit: 1, Trace: modTrace}
+	modSorted, err := searchCompactWithCache(loaded, modOpts, false, make(map[int]string), vol.nameTermCandidates)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if paths := pathsOf(modSorted); !reflect.DeepEqual(paths, []string{`C:\file-1099.txt`}) {
+		t.Fatalf("sort:modified paths = %v, want newest txt file", paths)
+	}
+	if modTrace.Source != "planned:ext-top" {
+		t.Fatalf("sort:modified trace source = %q, want planned:ext-top", modTrace.Source)
+	}
+	if modTrace.BlocksDecoded != 1 || modTrace.BlocksSkipped == 0 {
+		t.Fatalf("sort:modified blocks decoded/skipped = %d/%d, want 1/>0 with modified block bounds", modTrace.BlocksDecoded, modTrace.BlocksSkipped)
+	}
+	if !traceHasTerm(modTrace.Terms, traceTerm{Term: "txt", Kind: "extension", Source: "planned:ext-top", Exact: true}) {
+		t.Fatalf("sort:modified trace terms = %+v, missing planned ext-top term", modTrace.Terms)
+	}
+
+	extTrace := &searchTrace{}
+	extOpts := queryOptions{Query: "ext:txt sort:extension", Limit: 1, Trace: extTrace}
+	extSorted, err := searchCompactWithCache(loaded, extOpts, false, make(map[int]string), vol.nameTermCandidates)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if paths := pathsOf(extSorted); !reflect.DeepEqual(paths, []string{`C:\file-0000.txt`}) {
+		t.Fatalf("sort:extension paths = %v, want first txt name", paths)
+	}
+	if extTrace.Source != "planned:ext-top" {
+		t.Fatalf("sort:extension trace source = %q, want planned:ext-top", extTrace.Source)
+	}
+	if extTrace.BlocksDecoded != 1 || extTrace.BlocksSkipped == 0 {
+		t.Fatalf("sort:extension blocks decoded/skipped = %d/%d, want 1/>0 with extension block bounds", extTrace.BlocksDecoded, extTrace.BlocksSkipped)
+	}
+
+	typeTrace := &searchTrace{}
+	typeOpts := queryOptions{Query: "ext:txt sort:type", Limit: 1, Trace: typeTrace}
+	typeSorted, err := searchCompactWithCache(loaded, typeOpts, false, make(map[int]string), vol.nameTermCandidates)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if paths := pathsOf(typeSorted); !reflect.DeepEqual(paths, []string{`C:\file-0000.txt`}) {
+		t.Fatalf("sort:type paths = %v, want first txt name", paths)
+	}
+	if typeTrace.Source != "planned:ext-top" {
+		t.Fatalf("sort:type trace source = %q, want planned:ext-top", typeTrace.Source)
+	}
+	if typeTrace.BlocksDecoded != 1 || typeTrace.BlocksSkipped == 0 {
+		t.Fatalf("sort:type blocks decoded/skipped = %d/%d, want 1/>0 with type block bounds", typeTrace.BlocksDecoded, typeTrace.BlocksSkipped)
+	}
+
+	pathTrace := &searchTrace{}
+	pathOpts := queryOptions{Query: "ext:txt sort:path", Limit: 1, Trace: pathTrace}
+	pathSorted, err := searchCompactWithCache(loaded, pathOpts, false, make(map[int]string), vol.nameTermCandidates)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if paths := pathsOf(pathSorted); !reflect.DeepEqual(paths, []string{`C:\file-0000.txt`}) {
+		t.Fatalf("sort:path paths = %v, want first txt path", paths)
+	}
+	if pathTrace.Source != "planned:ext-top" {
+		t.Fatalf("sort:path trace source = %q, want planned:ext-top", pathTrace.Source)
+	}
+	if pathTrace.BlocksDecoded != 1 || pathTrace.BlocksSkipped == 0 {
+		t.Fatalf("sort:path blocks decoded/skipped = %d/%d, want 1/>0 with path block bounds", pathTrace.BlocksDecoded, pathTrace.BlocksSkipped)
+	}
+}
+
+func TestEngineV9WritesAndLoadsSizeRankSection(t *testing.T) {
+	t.Setenv("SEEKFS_ENGINE_V9", "1")
+	idx := &Index{
+		Version: indexVersion,
+		Roots:   []string{`C:\`},
+		BuiltAt: time.Unix(0, 124),
+		Source:  "usn",
+		Volume:  "C:",
+		Compact: true,
+		Records: []CompactRecord{
+			{FRN: 10, ParentFRN: 10, Parent: -1, Name: ".", Mode: uint32(os.ModeDir)},
+			{FRN: 11, ParentFRN: 10, Parent: 0, Name: "large.txt", Size: 300},
+			{FRN: 12, ParentFRN: 10, Parent: 0, Name: "small.txt", Size: 10},
+		},
+	}
+	buildOrders(idx)
+	db := filepath.Join(t.TempDir(), "v9-size-rank.gsi")
+	if err := saveIndex(db, idx); err != nil {
+		t.Fatalf("save v9: %v", err)
+	}
+	loaded, err := loadIndexMMap(db)
+	if err != nil {
+		t.Fatalf("load v9 mmap: %v", err)
+	}
+	defer loaded.MMapRecords.file.close()
+	if len(loaded.Derived.SizeOrder) != loaded.compactRecordCount() || len(loaded.Derived.SizeRank) != loaded.compactRecordCount() {
+		t.Fatalf("size rank section missing: %+v", loaded.Derived)
+	}
+	if got := loaded.compactRecord(int(loaded.Derived.SizeOrder[0])).Name; got != "." {
+		t.Fatalf("first size-ranked record = %q, want root", got)
+	}
+	if got := loaded.compactRecord(int(loaded.Derived.SizeOrder[1])).Name; got != "small.txt" {
+		t.Fatalf("second size-ranked record = %q, want small.txt", got)
+	}
+	sections, _ := derivedSectionInfo(loaded.Derived)
+	if !slices.Contains(sections, "SRNK") {
+		t.Fatalf("sections = %v, missing SRNK", sections)
+	}
+}
+
+func TestEngineV9WritesAndLoadsModifiedRankSection(t *testing.T) {
+	t.Setenv("SEEKFS_ENGINE_V9", "1")
+	idx := &Index{
+		Version: indexVersion,
+		Roots:   []string{`C:\`},
+		BuiltAt: time.Unix(0, 125),
+		Source:  "usn",
+		Volume:  "C:",
+		Compact: true,
+		Records: []CompactRecord{
+			{FRN: 10, ParentFRN: 10, Parent: -1, Name: ".", Mode: uint32(os.ModeDir), ModUnix: 1},
+			{FRN: 11, ParentFRN: 10, Parent: 0, Name: "old.txt", ModUnix: 10},
+			{FRN: 12, ParentFRN: 10, Parent: 0, Name: "new.txt", ModUnix: 30},
+		},
+	}
+	buildOrders(idx)
+	db := filepath.Join(t.TempDir(), "v9-modified-rank.gsi")
+	if err := saveIndex(db, idx); err != nil {
+		t.Fatalf("save v9: %v", err)
+	}
+	loaded, err := loadIndexMMap(db)
+	if err != nil {
+		t.Fatalf("load v9 mmap: %v", err)
+	}
+	defer loaded.MMapRecords.file.close()
+	if len(loaded.Derived.ModOrder) != loaded.compactRecordCount() || len(loaded.Derived.ModRank) != loaded.compactRecordCount() {
+		t.Fatalf("modified rank section missing: %+v", loaded.Derived)
+	}
+	if got := loaded.compactRecord(int(loaded.Derived.ModOrder[0])).Name; got != "new.txt" {
+		t.Fatalf("first modified-ranked record = %q, want new.txt", got)
+	}
+	sections, _ := derivedSectionInfo(loaded.Derived)
+	if !slices.Contains(sections, "MRNK") {
+		t.Fatalf("sections = %v, missing MRNK", sections)
+	}
+}
+
+func TestEngineV9WritesAndLoadsExtensionRankSection(t *testing.T) {
+	t.Setenv("SEEKFS_ENGINE_V9", "1")
+	idx := &Index{
+		Version: indexVersion,
+		Roots:   []string{`C:\`},
+		BuiltAt: time.Unix(0, 126),
+		Source:  "usn",
+		Volume:  "C:",
+		Compact: true,
+		Records: []CompactRecord{
+			{FRN: 10, ParentFRN: 10, Parent: -1, Name: ".", Mode: uint32(os.ModeDir)},
+			{FRN: 11, ParentFRN: 10, Parent: 0, Name: "z.txt"},
+			{FRN: 12, ParentFRN: 10, Parent: 0, Name: "a.go"},
+		},
+	}
+	buildOrders(idx)
+	db := filepath.Join(t.TempDir(), "v9-extension-rank.gsi")
+	if err := saveIndex(db, idx); err != nil {
+		t.Fatalf("save v9: %v", err)
+	}
+	loaded, err := loadIndexMMap(db)
+	if err != nil {
+		t.Fatalf("load v9 mmap: %v", err)
+	}
+	defer loaded.MMapRecords.file.close()
+	if len(loaded.Derived.ExtOrder) != loaded.compactRecordCount() || len(loaded.Derived.ExtRank) != loaded.compactRecordCount() {
+		t.Fatalf("extension rank section missing: %+v", loaded.Derived)
+	}
+	if got := loaded.compactRecord(int(loaded.Derived.ExtOrder[1])).Name; got != "a.go" {
+		t.Fatalf("second extension-ranked record = %q, want a.go", got)
+	}
+	sections, _ := derivedSectionInfo(loaded.Derived)
+	if !slices.Contains(sections, "ERNK") {
+		t.Fatalf("sections = %v, missing ERNK", sections)
+	}
+}
+
+func TestEngineV9WritesAndLoadsTypeRankSection(t *testing.T) {
+	t.Setenv("SEEKFS_ENGINE_V9", "1")
+	idx := &Index{
+		Version: indexVersion,
+		Roots:   []string{`C:\`},
+		BuiltAt: time.Unix(0, 127),
+		Source:  "usn",
+		Volume:  "C:",
+		Compact: true,
+		Records: []CompactRecord{
+			{FRN: 10, ParentFRN: 10, Parent: -1, Name: ".", Mode: uint32(os.ModeDir)},
+			{FRN: 11, ParentFRN: 10, Parent: 0, Name: "z.txt"},
+			{FRN: 12, ParentFRN: 10, Parent: 0, Name: "src", Mode: uint32(os.ModeDir)},
+		},
+	}
+	buildOrders(idx)
+	db := filepath.Join(t.TempDir(), "v9-type-rank.gsi")
+	if err := saveIndex(db, idx); err != nil {
+		t.Fatalf("save v9: %v", err)
+	}
+	loaded, err := loadIndexMMap(db)
+	if err != nil {
+		t.Fatalf("load v9 mmap: %v", err)
+	}
+	defer loaded.MMapRecords.file.close()
+	if len(loaded.Derived.TypeOrder) != loaded.compactRecordCount() || len(loaded.Derived.TypeRank) != loaded.compactRecordCount() {
+		t.Fatalf("type rank section missing: %+v", loaded.Derived)
+	}
+	if got := loaded.compactRecord(int(loaded.Derived.TypeOrder[1])).Name; got != "src" {
+		t.Fatalf("second type-ranked record = %q, want src", got)
+	}
+	sections, _ := derivedSectionInfo(loaded.Derived)
+	if !slices.Contains(sections, "TRNK") {
+		t.Fatalf("sections = %v, missing TRNK", sections)
+	}
+}
+
+func TestEngineV9WritesAndLoadsPathRankSection(t *testing.T) {
+	t.Setenv("SEEKFS_ENGINE_V9", "1")
+	idx := &Index{
+		Version: indexVersion,
+		Roots:   []string{`C:\`},
+		BuiltAt: time.Unix(0, 128),
+		Source:  "usn",
+		Volume:  "C:",
+		Compact: true,
+		Records: []CompactRecord{
+			{FRN: 10, ParentFRN: 10, Parent: -1, Name: ".", Mode: uint32(os.ModeDir)},
+			{FRN: 11, ParentFRN: 10, Parent: 0, Name: "zeta", Mode: uint32(os.ModeDir)},
+			{FRN: 12, ParentFRN: 11, Parent: 1, Name: "a.txt"},
+			{FRN: 13, ParentFRN: 10, Parent: 0, Name: "alpha", Mode: uint32(os.ModeDir)},
+			{FRN: 14, ParentFRN: 13, Parent: 3, Name: "z.txt"},
+		},
+	}
+	buildOrders(idx)
+	db := filepath.Join(t.TempDir(), "v9-path-rank.gsi")
+	if err := saveIndex(db, idx); err != nil {
+		t.Fatalf("save v9: %v", err)
+	}
+	loaded, err := loadIndexMMap(db)
+	if err != nil {
+		t.Fatalf("load v9 mmap: %v", err)
+	}
+	defer loaded.MMapRecords.file.close()
+	if len(loaded.Derived.PathOrder) != loaded.compactRecordCount() || len(loaded.Derived.PathRank) != loaded.compactRecordCount() {
+		t.Fatalf("path rank section missing: %+v", loaded.Derived)
+	}
+	if got := loaded.reconstructCompactPath(int(loaded.Derived.PathOrder[1])); got != `C:\alpha` {
+		t.Fatalf("second path-ranked record = %q, want C:\\alpha", got)
+	}
+	sections, _ := derivedSectionInfo(loaded.Derived)
+	if !slices.Contains(sections, "PRNK") {
+		t.Fatalf("sections = %v, missing PRNK", sections)
+	}
+}
+
 func TestEngineV9UpgradeIndexCommand(t *testing.T) {
 	idx := &Index{
 		Version: indexVersion,
@@ -467,12 +942,136 @@ func TestEngineV9UpgradeIndexCommand(t *testing.T) {
 		t.Fatalf("version = %d, want %d", loaded.Version, indexVersionV9)
 	}
 	sections, bytes := derivedSectionInfo(loaded.Derived)
-	if !reflect.DeepEqual(sections, []string{"RANK", "CHLD", "SUBT", "FRNS", "LOWR", "PEXT", "PCMP", "PNGR"}) {
+	if !reflect.DeepEqual(sections, []string{"RANK", "ERNK", "TRNK", "PRNK", "CHLD", "SUBT", "FRNS", "LOWR", "PEXT", "PXRB", "PXRC", "PCMP", "PNGR"}) {
 		t.Fatalf("sections = %v", sections)
 	}
 	if bytes == 0 {
 		t.Fatal("derived byte count was not reported")
 	}
+}
+
+func TestServiceSearchCountCompatibilityMatrixV8V9AndMissingDerived(t *testing.T) {
+	base := compatibilityMatrixIndex()
+	queries := []queryOptions{
+		{Query: "path:workspace alpha", Limit: 20},
+		{Query: "dir:workspace alpha", MatchPath: true, Limit: 20},
+		{Query: "ext:txt", Limit: 20},
+		{Query: "glob:*.go", Limit: 20},
+		{Query: "path:workspace alpha|beta", Limit: 20},
+		{Query: "path:workspace !beta", Limit: 20},
+		{Query: "path:workspace regex:alpha-[0-9]+\\.txt", Limit: 20},
+	}
+	cases := []struct {
+		name  string
+		index *Index
+	}{
+		{name: "v8", index: roundTripCompatibilityIndex(t, base, false, false)},
+		{name: "v9-derived", index: roundTripCompatibilityIndex(t, base, true, false)},
+		{name: "v9-missing-derived", index: roundTripCompatibilityIndex(t, base, true, true)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			vol := newServiceVolumeIndex(tc.name+".gsi", tc.index)
+			for _, opts := range queries {
+				t.Run(opts.Query, func(t *testing.T) {
+					full, err := searchCompactWithCache(tc.index, opts, false, make(map[int]string), nil)
+					if err != nil {
+						t.Fatalf("full search: %v", err)
+					}
+					got, err := searchServiceVolumes([]*serviceVolumeIndex{vol}, opts, false)
+					if err != nil {
+						t.Fatalf("service search: %v", err)
+					}
+					if gotPaths, wantPaths := pathsOf(got), pathsOf(full); !slices.Equal(gotPaths, wantPaths) {
+						t.Fatalf("service paths = %v, want full paths %v", gotPaths, wantPaths)
+					}
+					countOpts := opts
+					countOpts.Limit = 0
+					fullCount, err := searchCompactWithCache(tc.index, countOpts, true, make(map[int]string), nil)
+					if err != nil {
+						t.Fatalf("full count search: %v", err)
+					}
+					countMatches, err := searchServiceVolumes([]*serviceVolumeIndex{vol}, countOpts, true)
+					if err != nil {
+						t.Fatalf("service count search: %v", err)
+					}
+					if len(countMatches) != len(fullCount) {
+						t.Fatalf("service count-search len = %d, want %d", len(countMatches), len(fullCount))
+					}
+					fastCount, ok, err := countServiceVolumes([]*serviceVolumeIndex{vol}, countOpts)
+					if err != nil {
+						t.Fatalf("fast count: %v", err)
+					}
+					if ok && fastCount != len(fullCount) {
+						t.Fatalf("fast count = %d, want %d", fastCount, len(fullCount))
+					}
+				})
+			}
+		})
+	}
+}
+
+func compatibilityMatrixIndex() *Index {
+	idx := &Index{
+		Version: indexVersion,
+		Roots:   []string{`C:\`},
+		BuiltAt: time.Unix(0, 987),
+		Source:  "usn",
+		Volume:  "C:",
+		Compact: true,
+		Records: []CompactRecord{
+			{FRN: 1, ParentFRN: 1, Parent: -1, Name: ".", Mode: uint32(os.ModeDir)},
+			{FRN: 2, ParentFRN: 1, Parent: 0, Name: "workspace", Mode: uint32(os.ModeDir)},
+			{FRN: 3, ParentFRN: 2, Parent: 1, Name: "alpha-01.txt", Size: 10, ModUnix: 10},
+			{FRN: 4, ParentFRN: 2, Parent: 1, Name: "beta.go", Size: 20, ModUnix: 20},
+			{FRN: 5, ParentFRN: 2, Parent: 1, Name: "gamma.md", Size: 30, ModUnix: 30},
+			{FRN: 6, ParentFRN: 1, Parent: 0, Name: "outside-alpha.txt", Size: 40, ModUnix: 40},
+		},
+	}
+	buildOrders(idx)
+	return idx
+}
+
+func roundTripCompatibilityIndex(t *testing.T, idx *Index, v9, clearDerived bool) *Index {
+	t.Helper()
+	if v9 {
+		t.Setenv("SEEKFS_ENGINE_V9", "1")
+		db := filepath.Join(t.TempDir(), "compat-v9.gsi")
+		if err := saveIndex(db, cloneCompactIndex(idx)); err != nil {
+			t.Fatalf("save v9: %v", err)
+		}
+		loaded, err := loadIndex(db)
+		if err != nil {
+			t.Fatalf("load v9: %v", err)
+		}
+		if clearDerived {
+			loaded.Derived = indexDerivedSections{}
+		}
+		return loaded
+	}
+	var buf bytes.Buffer
+	if err := writeIndex(&buf, cloneCompactIndex(idx)); err != nil {
+		t.Fatalf("write v8: %v", err)
+	}
+	loaded, err := readIndex(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatalf("read v8: %v", err)
+	}
+	return loaded
+}
+
+func cloneCompactIndex(idx *Index) *Index {
+	if idx == nil {
+		return nil
+	}
+	out := *idx
+	out.Roots = append([]string(nil), idx.Roots...)
+	out.Records = append([]CompactRecord(nil), idx.Records...)
+	out.Entries = append([]Entry(nil), idx.Entries...)
+	out.NameOrder = append([]int(nil), idx.NameOrder...)
+	out.PathOrder = append([]int(nil), idx.PathOrder...)
+	out.CompactNameOrder = append([]int(nil), idx.CompactNameOrder...)
+	return &out
 }
 
 func TestEngineV9DisabledDoesNotAllocateOverlay(t *testing.T) {
@@ -601,6 +1200,67 @@ func TestEngineV9OverlayServiceSearchMergesCreatesAndDeletes(t *testing.T) {
 	}
 }
 
+func TestEngineV9OverlayAttribFilterMatchesCreates(t *testing.T) {
+	t.Setenv("SEEKFS_ENGINE_V9", "1")
+	t.Setenv("SEEKFS_GLOBAL_PLANNER", "1")
+	idx := &Index{
+		Version:      indexVersion,
+		Roots:        []string{`F:\`},
+		BuiltAt:      time.Unix(0, 790),
+		Source:       "usn",
+		Volume:       "F:",
+		Compact:      true,
+		CompactAttrs: true,
+		Records: []CompactRecord{
+			{FRN: 100, ParentFRN: 100, Parent: -1, Name: ".", Mode: modeFromAttrs(fileAttributeDir)},
+			{FRN: 101, ParentFRN: 100, Parent: 0, Name: "plain.txt", Mode: modeFromAttrs(fileAttributeArchive)},
+		},
+	}
+	buildOrders(idx)
+	db := filepath.Join(t.TempDir(), "overlay-attrs.gsi")
+	if err := saveIndex(db, idx); err != nil {
+		t.Fatalf("save v9: %v", err)
+	}
+	loaded, err := loadIndexMMap(db)
+	if err != nil {
+		t.Fatalf("load v9 mmap: %v", err)
+	}
+	defer loaded.MMapRecords.file.close()
+	vol := newServiceVolumeIndex(db, loaded)
+	vol.applyUSNChanges([]usnChange{{
+		FRN:       102,
+		ParentFRN: 100,
+		USN:       20,
+		Reason:    usnReasonFileCreate,
+		Name:      "hidden.txt",
+		Attr:      fileAttributeHidden | fileAttributeArchive,
+	}})
+
+	trace := &searchTrace{}
+	opts := queryOptions{Query: "attrib:H", Limit: 10, Trace: trace}
+	got, err := searchServiceVolumes([]*serviceVolumeIndex{vol}, opts, false)
+	if err != nil {
+		t.Fatalf("search overlay attrib: %v", err)
+	}
+	if trace.PlannerMode != "global-components" {
+		t.Fatalf("planner mode = %q, want global-components; decline=%s", trace.PlannerMode, trace.Decline)
+	}
+	if !sameStringSet(pathsOf(got), []string{`F:\hidden.txt`}) {
+		t.Fatalf("overlay attrib paths = %v", pathsOf(got))
+	}
+	countTrace := &searchTrace{}
+	count, ok, err := countServiceVolumes([]*serviceVolumeIndex{vol}, queryOptions{Query: "attrib:H", Trace: countTrace})
+	if err != nil {
+		t.Fatalf("count overlay attrib: %v", err)
+	}
+	if !ok || count != 1 {
+		t.Fatalf("overlay attrib count = %d ok=%v, want 1 true", count, ok)
+	}
+	if countTrace.PlannerMode != "global-count-components" {
+		t.Fatalf("count planner mode = %q, want global-count-components; decline=%s", countTrace.PlannerMode, countTrace.Decline)
+	}
+}
+
 func TestEngineV9OverlayMergeFillsLimitAndRanksCreates(t *testing.T) {
 	t.Setenv("SEEKFS_ENGINE_V9", "1")
 	records := []CompactRecord{{FRN: 100, ParentFRN: 100, Parent: -1, Name: ".", Mode: uint32(os.ModeDir)}}
@@ -654,6 +1314,38 @@ func TestEngineV9OverlayMergeFillsLimitAndRanksCreates(t *testing.T) {
 	}
 	if !slices.Contains(paths, `F:\needle-33.txt`) {
 		t.Fatalf("later base matches did not backfill limit: %v", paths)
+	}
+}
+
+func TestEngineV9OverlaySortPathRanksCreateBeforeBaseInsertionPoint(t *testing.T) {
+	t.Setenv("SEEKFS_ENGINE_V9", "1")
+	idx := &Index{
+		Version: indexVersion,
+		Roots:   []string{`F:\`},
+		Source:  "usn",
+		Volume:  "F:",
+		Compact: true,
+		Records: []CompactRecord{
+			{FRN: 100, ParentFRN: 100, Parent: -1, Name: ".", Mode: uint32(os.ModeDir)},
+			{FRN: 101, ParentFRN: 100, Parent: 0, Name: "needle-b.txt"},
+		},
+	}
+	buildOrders(idx)
+	vol := newServiceVolumeIndex(`F:\state.gsi`, idx)
+	vol.applyUSNChanges([]usnChange{{
+		FRN:       999,
+		ParentFRN: 100,
+		USN:       30,
+		Reason:    usnReasonFileCreate,
+		Name:      "needle-a.txt",
+	}})
+
+	got, err := searchServiceVolumes([]*serviceVolumeIndex{vol}, queryOptions{Query: "needle sort:path", Limit: 2}, false)
+	if err != nil {
+		t.Fatalf("search with overlay sort:path: %v", err)
+	}
+	if paths := pathsOf(got); !reflect.DeepEqual(paths, []string{`F:\needle-a.txt`, `F:\needle-b.txt`}) {
+		t.Fatalf("sort:path overlay paths = %v, want overlay create before base", paths)
 	}
 }
 
@@ -845,6 +1537,8 @@ func TestEngineV9PersistVolumeCompactsOverlayToMappedBase(t *testing.T) {
 		{FRN: 102, ParentFRN: 100, USN: 41, Reason: usnReasonFileCreate, Name: "created.txt"},
 	})
 	vol.dirty = true
+	vol.nameOrderState.Store(nameTrigramStatePending)
+	vol.nameOrderMillis.Store(123)
 	svc := &goSearchService{
 		indexes: []*Index{vol.index},
 		volumes: []*serviceVolumeIndex{vol},
@@ -855,6 +1549,19 @@ func TestEngineV9PersistVolumeCompactsOverlayToMappedBase(t *testing.T) {
 	}
 	if vol.overlay != nil && vol.overlay.watermark.Load() != 0 {
 		t.Fatalf("overlay survived compaction with watermark %d", vol.overlay.watermark.Load())
+	}
+	if got := vol.nameOrderStateString(); got != "ready" {
+		t.Fatalf("compacted resident name order state = %q, want ready", got)
+	}
+	if got := vol.nameTrigramStateString(); got != "ready" {
+		t.Fatalf("compacted resident trigram state = %q, want ready", got)
+	}
+	if vol.nameTrigramIndex() == nil {
+		t.Fatal("compacted resident trigram section was not wired")
+	}
+	if vol.queryIndex == nil || len(vol.queryIndex.nameOrder) != vol.index.compactRecordCount() {
+		t.Fatalf("compacted resident rank not wired: queryIndex=%v nameOrder=%d records=%d",
+			vol.queryIndex != nil, len(vol.queryIndex.nameOrder), vol.index.compactRecordCount())
 	}
 	got, err := searchServiceVolumes([]*serviceVolumeIndex{vol}, queryOptions{Query: "created", MatchPath: true, Limit: 10}, false)
 	if err != nil {
@@ -867,7 +1574,19 @@ func TestEngineV9PersistVolumeCompactsOverlayToMappedBase(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reload compacted fixture: %v", err)
 	}
+	sections, _ := derivedSectionInfo(reloaded.Derived)
+	for _, want := range []string{"RANK", "PEXT", "PNGR"} {
+		if !slices.Contains(sections, want) {
+			t.Fatalf("reloaded compacted sections = %v, missing %s", sections, want)
+		}
+	}
 	reloadedVol := newServiceVolumeIndex(db, reloaded)
+	if got := reloadedVol.nameOrderStateString(); got != "ready" {
+		t.Fatalf("reloaded compacted name order state = %q, want ready", got)
+	}
+	if got := reloadedVol.nameTrigramStateString(); got != "ready" {
+		t.Fatalf("reloaded compacted trigram state = %q, want ready", got)
+	}
 	got, err = searchServiceVolumes([]*serviceVolumeIndex{reloadedVol}, queryOptions{Query: "created", MatchPath: true, Limit: 10}, false)
 	if err != nil {
 		t.Fatalf("search reloaded compacted overlay: %v", err)
@@ -2127,6 +2846,235 @@ func syntheticCompactIndex(n int) *Index {
 	}
 	buildOrders(idx)
 	return idx
+}
+
+func BenchmarkV9DerivedSectionStreaming(b *testing.B) {
+	idx := syntheticCompactIndex(20_000)
+	nameTokens := make([]string, len(idx.Records))
+	for i := range idx.Records {
+		nameTokens[i] = idx.Records[i].Name
+	}
+	maxSectionBytes := 0
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		maxSectionBytes = 0
+		_, err := writeDerivedSectionStreamObserved(&countingWriter{w: io.Discard}, idx, nameTokens, func(inFlight int) {
+			if inFlight > maxSectionBytes {
+				maxSectionBytes = inFlight
+			}
+		})
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+	b.ReportMetric(float64(maxSectionBytes), "max_section_bytes")
+}
+
+func TestV9DerivedSectionLifetimeBound(t *testing.T) {
+	idx := syntheticCompactIndex(20_000)
+	nameTokens := make([]string, len(idx.Records))
+	for i := range idx.Records {
+		nameTokens[i] = idx.Records[i].Name
+	}
+	retained := buildDerivedSectionBlobs(idx, nameTokens)
+	retainedBytes := 0
+	for _, section := range retained {
+		retainedBytes += len(section.data)
+	}
+	maxInFlight := 0
+	if _, err := writeDerivedSectionStreamObserved(&countingWriter{w: io.Discard}, idx, nameTokens, func(inFlight int) {
+		if inFlight > maxInFlight {
+			maxInFlight = inFlight
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if maxInFlight <= 0 || maxInFlight >= retainedBytes {
+		t.Fatalf("derived section lifetime max=%d retained=%d; want one-section streaming bound", maxInFlight, retainedBytes)
+	}
+	t.Logf("derived section bytes retained-all=%d streamed-max=%d", retainedBytes, maxInFlight)
+}
+
+func TestV9SubtreeSectionStreamingGoldenAndScratchCap(t *testing.T) {
+	if subtreeSectionScratchBytes > 64*1024 {
+		t.Fatalf("SUBT scratch cap=%d; want <= 65536", subtreeSectionScratchBytes)
+	}
+	idx := syntheticCompactIndex(20_000)
+	nameTokens := make([]string, len(idx.Records))
+	for i := range idx.Records {
+		nameTokens[i] = idx.Records[i].Name
+	}
+	var compared bool
+	err := forEachDerivedSection(idx, nameTokens, func(section indexSectionBlob) error {
+		if section.tag != indexSectionSUBT || section.subtree == nil {
+			return nil
+		}
+		legacy := encodeUint32Section(section.subtree.parts...)
+		var streamed bytes.Buffer
+		written, err := writeSubtreeSection(&streamed, section.subtree)
+		if err != nil {
+			return err
+		}
+		if written != int64(len(legacy)) || !bytes.Equal(streamed.Bytes(), legacy) {
+			return fmt.Errorf("streamed SUBT differs: streamed=%d legacy=%d", written, len(legacy))
+		}
+		if sha256.Sum256(streamed.Bytes()) != sha256.Sum256(legacy) {
+			return errors.New("streamed SUBT hash differs from legacy encoding")
+		}
+		compared = true
+		t.Logf("SUBT encoded_bytes=%d scratch_cap=%d sha256=%x", written, subtreeSectionScratchBytes, sha256.Sum256(streamed.Bytes()))
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !compared {
+		t.Fatal("staged derived sections did not emit SUBT")
+	}
+}
+
+type partialWriteErrorWriter struct {
+	limit int
+	wrote int
+}
+
+func (w *partialWriteErrorWriter) Write(p []byte) (int, error) {
+	remaining := w.limit - w.wrote
+	if remaining <= 0 {
+		return 0, errors.New("injected subtree write failure")
+	}
+	if len(p) > remaining {
+		p = p[:remaining]
+	}
+	w.wrote += len(p)
+	if w.wrote >= w.limit {
+		return len(p), errors.New("injected subtree write failure")
+	}
+	return len(p), nil
+}
+
+func TestV9SubtreeSectionWriteFailureReportsPartialWrite(t *testing.T) {
+	section := &subtreeSectionBlob{parts: [][]uint32{make([]uint32, 10_000)}}
+	w := &partialWriteErrorWriter{limit: 97}
+	written, err := writeSubtreeSection(w, section)
+	if err == nil {
+		t.Fatal("writeSubtreeSection unexpectedly succeeded after injected partial write")
+	}
+	if written != int64(w.wrote) || written <= 0 || written >= int64(4+len(section.parts[0])*4) {
+		t.Fatalf("partial SUBT write=%d writer=%d; want bounded partial output", written, w.wrote)
+	}
+}
+
+func TestV9SaveIndexFailureDoesNotReplaceSource(t *testing.T) {
+	t.Setenv("SEEKFS_ENGINE_V9", "1")
+	dir := t.TempDir()
+	path := filepath.Join(dir, "atomic.gsi")
+	valid := syntheticCompactIndex(32)
+	if err := saveIndex(path, valid); err != nil {
+		t.Fatalf("save valid source: %v", err)
+	}
+	want, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	invalid := cloneCompactIndex(valid)
+	invalid.Records[1].Parent = int32(compactNarrowParentSentinel)
+	if err := saveIndex(path, invalid); err == nil {
+		t.Fatal("save invalid index unexpectedly succeeded")
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatal("partial failed write replaced the existing source index")
+	}
+	tmp, err := filepath.Glob(filepath.Join(dir, "atomic.gsi.*.tmp"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tmp) != 0 {
+		t.Fatalf("failed save left temporary outputs: %v", tmp)
+	}
+}
+
+func TestV9PersistencePreparationStagesBoundLiveHeap(t *testing.T) {
+	measure := func(staged bool) map[string]uint64 {
+		idx := syntheticCompactIndex(100_000)
+		nameTokens := make([]string, len(idx.Records))
+		for i := range idx.Records {
+			nameTokens[i] = idx.Records[i].Name
+		}
+		stages := make(map[string]uint64)
+		v9PersistStageObserver = func(stage string, _ runtime.MemStats) {
+			runtime.GC()
+			var mem runtime.MemStats
+			runtime.ReadMemStats(&mem)
+			if mem.HeapAlloc > stages[stage] {
+				stages[stage] = mem.HeapAlloc
+			}
+		}
+		defer func() { v9PersistStageObserver = nil }()
+		if staged {
+			if _, err := writeDerivedSectionStreamObserved(&countingWriter{w: io.Discard}, idx, nameTokens, nil); err != nil {
+				t.Fatal(err)
+			}
+		} else if err := forEachDerivedSectionLegacy(idx, nameTokens, func(indexSectionBlob) error { return nil }); err != nil {
+			t.Fatal(err)
+		}
+		return stages
+	}
+	t.Setenv("SEEKFS_V9_PERSIST_TRACE", "1")
+	runtime.GC()
+	legacy := measure(false)
+	runtime.GC()
+	staged := measure(true)
+	legacyPeak, stagedPeak := uint64(0), uint64(0)
+	for _, bytes := range legacy {
+		if bytes > legacyPeak {
+			legacyPeak = bytes
+		}
+	}
+	for _, bytes := range staged {
+		if bytes > stagedPeak {
+			stagedPeak = bytes
+		}
+	}
+	for _, stage := range []string{"resident-prepared", "name-rank-ready", "extension-rank-ready", "derived-prepared"} {
+		t.Logf("stage=%s legacy_heap=%d staged_heap=%d", stage, legacy[stage], staged[stage])
+	}
+	t.Logf("bounded preparation heap legacy_peak=%d staged_peak=%d", legacyPeak, stagedPeak)
+	legacyPrepared, stagedPrepared := legacy["derived-prepared"], staged["derived-prepared"]
+	if legacyPrepared == 0 || stagedPrepared == 0 || stagedPrepared*100 > legacyPrepared*80 {
+		t.Fatalf("staged derived-prepared heap=%d legacy=%d; want at least 20%% live-heap reduction", stagedPrepared, legacyPrepared)
+	}
+}
+
+func TestV9PersistenceBoundedChildMode(t *testing.T) {
+	mode := os.Getenv("SEEKFS_V9_PERSIST_MODE")
+	if mode != "legacy" && mode != "staged" {
+		t.Skip("set SEEKFS_V9_PERSIST_MODE=legacy or staged for child-process measurement")
+	}
+	idx := syntheticCompactIndex(100_000)
+	nameTokens := make([]string, len(idx.Records))
+	for i := range idx.Records {
+		nameTokens[i] = idx.Records[i].Name
+	}
+	runtime.GC()
+	start := time.Now()
+	if mode == "legacy" {
+		if err := forEachDerivedSectionLegacy(idx, nameTokens, func(indexSectionBlob) error { return nil }); err != nil {
+			t.Fatal(err)
+		}
+	} else {
+		if _, err := writeDerivedSectionStreamObserved(&countingWriter{w: io.Discard}, idx, nameTokens, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	runtime.GC()
+	var mem runtime.MemStats
+	runtime.ReadMemStats(&mem)
+	t.Logf("bounded child mode=%s duration=%s heap_alloc=%d heap_inuse=%d", mode, time.Since(start), mem.HeapAlloc, mem.HeapInuse)
 }
 
 func commonSearchFixture() *Index {
