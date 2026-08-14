@@ -5,6 +5,7 @@ import (
 	"container/heap"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"sort"
 	"strings"
@@ -3986,17 +3987,6 @@ func (vol *serviceVolumeIndex) buildCandidatePlan(pq parsedQuery) (candidatePlan
 			roots: uniqueSortedInts(roots),
 		})
 	}
-	if len(plan.sources) == 0 && pq.MatchPath && hasNonVolumeTerm(pq.Terms) {
-		for _, term := range pathPlanProbeTerms(pq.Terms) {
-			ids, ok := vol.boundedPathTermPlanSource(term)
-			if !ok {
-				continue
-			}
-			if !addRequired("path-term:"+term, ids) {
-				return plan, true
-			}
-		}
-	}
 	// OR groups: a record must match at least one alternative, so the candidate
 	// source is the union of each alternative's posting. We only build a posting
 	// source when every alternative is cheaply postable (ext/glob-ext/term);
@@ -4014,24 +4004,32 @@ func (vol *serviceVolumeIndex) buildCandidatePlan(pq parsedQuery) (candidatePlan
 	}
 
 	// Cheap structural filters above are verified against the full query later.
-	// Only build broad term postings when no narrower source exists.
-	if len(plan.sources) == 0 {
-		if pq.MatchPath && hasNonVolumeTerm(pq.Terms) {
-			// Path mode: build a path posting for only the single most selective
-			// term and verify the rest in entryMatches. Building a path posting
-			// for a broad term (e.g. "src") materializes millions of ids that
-			// exceed the posting cache cap and are rebuilt on every call. If no
-			// term is selective enough AND there is no other source (under /
-			// regex literals) to bound the query, decline so the search uses the
-			// streaming name-order scan instead — how Everything scans columns.
-			if len(underRoots) == 0 {
-				return plan, false
+	// Add bounded path/name term postings for remaining terms so the plan drives
+	// off the smallest source and intersects the rest lazily.  This keeps a
+	// loose multi-term query like `Dataset trainingdata nrrd` from materializing
+	// a huge promoted extension posting and verifying every other term against
+	// it.  Only selective (bounded) postings are added; a broad term that cannot
+	// be bounded stays verification-only so correctness never depends on a cap.
+	if pq.MatchPath && hasNonVolumeTerm(pq.Terms) {
+		for _, term := range pathPlanProbeTerms(pq.Terms) {
+			ids, ok := vol.boundedPathTermPlanSource(term)
+			if !ok {
+				continue
 			}
-		} else if !pq.MatchPath {
-			for _, term := range pq.Terms {
-				if !addRequired("term:"+term, vol.namePlanTermPosting(term)) {
-					return plan, true
-				}
+			if !addRequired("path-term:"+term, ids) {
+				return plan, true
+			}
+		}
+		if len(plan.sources) == 0 && len(underRoots) == 0 {
+			// Path mode with no usable source at all: decline so the search
+			// uses the streaming name-order scan instead of materializing a
+			// broad posting on every call.
+			return plan, false
+		}
+	} else if !pq.MatchPath {
+		for _, term := range pq.Terms {
+			if !addRequired("term:"+term, vol.namePlanTermPosting(term)) {
+				return plan, true
 			}
 		}
 		if !globsOK {
@@ -4064,9 +4062,34 @@ func (vol *serviceVolumeIndex) boundedPathTermPlanSource(term string) ([]int, bo
 		strings.ContainsAny(term, `\/*?[]:`) || len(term) < 3 {
 		return nil, false
 	}
+	// A term whose required filename grams are proven absent by the complete
+	// name-gram metadata (PNGR counts complete, or the PNGC companion) cannot
+	// match anything: return a proven empty source so the plan marks itself
+	// empty instead of materializing a broad extension/scan.  This is the same
+	// exact-zero proof the fast count path uses.
+	if _, _, exactZero, complete := completeSelfNameGramIterators(vol.index, term); complete && exactZero {
+		return []int{}, true
+	}
+	// First try the posting path; it is cheaper than a scan for a selective
+	// term that has persisted gram or component postings.
 	ids, ok := vol.completeNameTrigramPathTermPosting(term)
 	if ok && len(ids) <= serviceComponentTrigramExpansionMaxIDs {
 		return ids, true
+	}
+	// The posting path declined (for example an omitted-common gram, a subtree
+	// estimate above the expansion cap, or a term with zero name matches).  For
+	// a loose multi-term query the plan still needs a bounded source so it does
+	// not drive off a huge promoted extension posting and verify every other
+	// term against it.  A bounded parallel name scan proves a zero-match term
+	// empty immediately, and a small match set becomes a path posting source
+	// (name self-hits expanded to descendants) for the driving term.
+	if scanned := vol.scanNameTermBounded(term, serviceComponentTrigramExpansionMaxIDs); scanned != nil {
+		if len(scanned) == 0 {
+			return []int{}, true
+		}
+		if ids, ok := vol.expandNameMatchesToPathTermPosting("", term, scanned); ok && len(ids) <= serviceComponentTrigramExpansionMaxIDs {
+			return ids, true
+		}
 	}
 	if vol.index.compactRecordCount() > serviceResidentChildRangeMaxRecords {
 		return nil, false
@@ -4076,6 +4099,88 @@ func (vol *serviceVolumeIndex) boundedPathTermPlanSource(term string) ([]int, bo
 		return nil, false
 	}
 	return ids, true
+}
+
+// scanNameTermBounded scans the compact records in parallel up to maxMatches
+// and returns the matched record IDs.  It returns nil when the match set
+// exceeds the bound, so the caller declines to the exhaustive scan rather than
+// materializing a huge posting.  A term with provably zero matches returns an
+// empty non-nil slice.  This works in every mode (resident, lowmem, mapped)
+// because it scans record IDs directly, mirroring scanNameTermPosting.
+func (vol *serviceVolumeIndex) scanNameTermBounded(term string, maxMatches int) []int {
+	if vol == nil || vol.index == nil || term == "" || maxMatches <= 0 {
+		return nil
+	}
+	recordCount := vol.index.compactRecordCount()
+	if recordCount == 0 {
+		return []int{}
+	}
+	// The mapped fast path scans the persisted lower-name blob in bulk instead
+	// of reconstructing every CompactRecord; reuse it when available.
+	if ids, ok := vol.index.scanCompactLowerNameTerm(term); ok {
+		if len(ids) > maxMatches {
+			return nil
+		}
+		return ids
+	}
+	workers := min(runtime.GOMAXPROCS(0), max(1, recordCount/250_000))
+	if workers <= 1 {
+		out := make([]int, 0, 64)
+		for i := 0; i < recordCount; i++ {
+			rec := vol.index.compactRecord(i)
+			if rec.Deleted {
+				continue
+			}
+			if strings.Contains(vol.index.compactLowerNameAt(i), term) {
+				out = append(out, i)
+				if len(out) > maxMatches {
+					return nil
+				}
+			}
+		}
+		return out
+	}
+	parts := make([][]int, workers)
+	exceeded := make([]bool, workers)
+	var wg sync.WaitGroup
+	for worker := 0; worker < workers; worker++ {
+		start := worker * recordCount / workers
+		end := (worker + 1) * recordCount / workers
+		wg.Add(1)
+		go func(worker, start, end int) {
+			defer wg.Done()
+			local := make([]int, 0, 64)
+			for i := start; i < end; i++ {
+				rec := vol.index.compactRecord(i)
+				if rec.Deleted {
+					continue
+				}
+				if strings.Contains(vol.index.compactLowerNameAt(i), term) {
+					local = append(local, i)
+					if len(local) > maxMatches {
+						exceeded[worker] = true
+						return
+					}
+				}
+			}
+			parts[worker] = local
+		}(worker, start, end)
+	}
+	wg.Wait()
+	total := 0
+	for _, ex := range exceeded {
+		if ex {
+			return nil
+		}
+	}
+	for _, part := range parts {
+		total += len(part)
+	}
+	out := make([]int, 0, total)
+	for _, part := range parts {
+		out = append(out, part...)
+	}
+	return out
 }
 
 func (vol *serviceVolumeIndex) completeNameTrigramNameTermPostingLimited(term string, maxIDs int) ([]int, bool) {
@@ -4806,8 +4911,24 @@ func (vol *serviceVolumeIndex) pathDirectoryTermSource(term string) (nameMatches
 		strings.ContainsAny(term, `\/*?[]:`) {
 		return nil, nil, false
 	}
+	// A term whose required filename grams are proven absent cannot match any
+	// directory: report a complete empty source instead of running an expensive
+	// trigram intersect that will only decline.
+	if _, _, exactZero, completeGrams := completeSelfNameGramIterators(vol.index, term); completeGrams && exactZero {
+		return nil, nil, true
+	}
 	nameMatches, ok := vol.completeNameTrigramNameTermPostingLimited(term, servicePathNameTrigramCandidateMaxIDs)
 	if !ok {
+		// The trigram posting is unavailable (omitted-common gram, incomplete
+		// metadata).  Use the bounded name scan instead of pathComponentRootIDs,
+		// which on a large volume without a resident name order falls back to a
+		// full-record scan just to answer a membership question.
+		if scanned := vol.scanNameTermBounded(term, servicePathNameTrigramCandidateMaxIDs); scanned != nil {
+			if len(scanned) == 0 {
+				return nil, nil, true
+			}
+			return scanned, nil, true
+		}
 		roots = vol.pathComponentRootIDs(term)
 		return nil, roots, false
 	}

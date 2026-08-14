@@ -1479,6 +1479,80 @@ func TestCandidatePlanUsesCheapestUnderOrPostingSource(t *testing.T) {
 	}
 }
 
+// TestCandidatePlanMultiTermIncludesBoundedTermSources reproduces the R5
+// performance gap where a loose multi-term path query like
+// `Dataset trainingdata nrrd` promoted `nrrd` to an extension and drove the
+// whole plan off the (huge) extension posting, verifying every other term
+// against it.  The plan must instead add bounded sources for the remaining
+// terms so the intersection drives off the smallest (a zero-match term makes
+// the plan empty immediately).
+func TestCandidatePlanMultiTermIncludesBoundedTermSources(t *testing.T) {
+	idx := &Index{
+		Source:  "usn",
+		Volume:  "F:",
+		Compact: true,
+	}
+	add := func(frn, parentFRN uint64, parent int32, name string, mode uint32) int32 {
+		idx.Records = append(idx.Records, CompactRecord{
+			FRN:       frn,
+			ParentFRN: parentFRN,
+			Parent:    parent,
+			Name:      name,
+			Mode:      mode,
+			Size:      1024,
+			ModUnix:   time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC).UnixNano(),
+		})
+		return int32(len(idx.Records) - 1)
+	}
+	root := add(1, 1, -1, ".", uint32(os.ModeDir))
+	dataset := add(2, 1, root, "Dataset", uint32(os.ModeDir))
+	datasetFRN := idx.Records[dataset].FRN
+	notes := add(3, 2, dataset, "notes.txt", 0)
+	_ = notes
+	for i := 0; i < 40; i++ {
+		add(100+uint64(i), datasetFRN, dataset, fmt.Sprintf("scan-%02d.nrrd", i), 0)
+	}
+	buildOrders(idx)
+	vol := newServiceVolumeIndex("fixture.gsi", idx)
+
+	pq, err := parseQuery(queryOptions{Query: "Dataset notes nrrd", MatchPath: true, Limit: 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !pq.MatchPath {
+		t.Fatal("parseQuery lost MatchPath")
+	}
+	plan, ok := vol.buildCandidatePlan(pq)
+	if !ok {
+		t.Fatal("buildCandidatePlan declined multi-term path query")
+	}
+	sawTerm := false
+	for _, source := range plan.sources {
+		if strings.HasPrefix(source.name, "term:") || strings.HasPrefix(source.name, "path-term:") {
+			sawTerm = true
+		}
+	}
+	if !sawTerm {
+		t.Fatalf("plan sources = %+v, want a bounded term source alongside the extension posting", plan.sources)
+	}
+	// A zero-match required term must make the plan empty rather than
+	// materialize the extension posting and verify every candidate against it.
+	pqZero, err := parseQuery(queryOptions{Query: "Dataset zzz-missing-keyword nrrd", MatchPath: true, Limit: 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	planZero, okZero := vol.buildCandidatePlan(pqZero)
+	if !okZero {
+		t.Fatal("buildCandidatePlan declined multi-term query with a zero-match term")
+	}
+	if !planZero.empty {
+		t.Fatalf("plan sources = %+v, want empty plan because a required term has zero matches", planZero.sources)
+	}
+	if got := planZero.execute(); len(got) != 0 {
+		t.Fatalf("empty plan executed to %v, want zero candidates", got)
+	}
+}
+
 func TestCandidatePlanUsesNameTermBeforeUnderSubtree(t *testing.T) {
 	idx := commonSearchFixture()
 	vol := newServiceVolumeIndex("fixture.gsi", idx)
@@ -1671,8 +1745,9 @@ func TestDottedExtensionMultiPathUsesExtensionPosting(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if trace.Source != "planned:ext:nrrd" && trace.Source != "path-directory-term-top" {
-		t.Fatalf("source = %q, want planned:ext:nrrd or path-directory-term-top", trace.Source)
+	if trace.Source != "planned:ext:nrrd" && trace.Source != "path-directory-term-top" &&
+		trace.Source != "planned:ext:nrrd+path-term:downloads" && trace.Source != "planned:empty" {
+		t.Fatalf("source = %q, want planned:ext:nrrd, path-directory-term-top, or the bounded plan route", trace.Source)
 	}
 	full, err := searchCompactWithCache(idx, opts, false, make(map[int]string), nil)
 	if err != nil {
@@ -1692,8 +1767,9 @@ func TestBareExtensionMultiPathUsesExtensionPosting(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if trace.Source != "path-bare-extension-multi-top" && trace.Source != "path-directory-term-top" {
-		t.Fatalf("source = %q, want path-bare-extension-multi-top or path-directory-term-top", trace.Source)
+	if trace.Source != "path-bare-extension-multi-top" && trace.Source != "path-directory-term-top" &&
+		trace.Source != "planned:ext:nrrd+path-term:downloads" && trace.Source != "planned:empty" {
+		t.Fatalf("source = %q, want path-bare-extension-multi-top, path-directory-term-top, or the bounded plan route", trace.Source)
 	}
 	dotted, err := searchCompactWithCache(idx, queryOptions{Query: "Downloads .nrrd", MatchPath: true, Limit: 20}, false, make(map[int]string), vol.nameTermCandidates)
 	if err != nil {
