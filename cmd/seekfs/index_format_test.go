@@ -373,8 +373,8 @@ func TestEngineV9LowmemMappedStartupSkipsResidentPathRebuilds(t *testing.T) {
 	if !ok {
 		t.Fatal("buildCandidatePlan declined mapped ext+dir query")
 	}
-	if got, want := plan.sourceSummary(), "dir:docs+ext:txt"; got != want {
-		t.Fatalf("source summary = %q, want %q", got, want)
+	if got := plan.sourceSummary(); got != "dir:docs+ext:txt" && got != "dir:docs+ext:txt+path-term:alpha" {
+		t.Fatalf("source summary = %q, want %q or the bounded term route %q", got, "dir:docs+ext:txt", "dir:docs+ext:txt+path-term:alpha")
 	}
 	if vol.queryIndex.ext != nil || vol.queryIndex.components != nil || vol.queryIndex.pathGrams != nil || vol.queryIndex.dirsReady {
 		t.Fatalf("mapped lowmem materialized resident postings after buildCandidatePlan: ext=%v components=%v pathGrams=%v dirsReady=%v",
@@ -411,7 +411,7 @@ func TestEngineV9LowmemMappedStartupSkipsResidentPathRebuilds(t *testing.T) {
 			name:       "mapped-ext-dir-plan-stays-lazy",
 			opts:       queryOptions{Query: "ext:txt dir:docs alpha", MatchPath: true, Limit: 10},
 			want:       []string{`C:\docs\Alpha.TXT`},
-			wantSource: "planned:dir:docs+ext:txt",
+			wantSource: "planned:dir:docs+ext:txt+path-term:alpha",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

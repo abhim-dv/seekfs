@@ -13301,8 +13301,15 @@ func (vol *serviceVolumeIndex) pathComponentPostingAvailable(term string) bool {
 	if len(vol.componentPosting32(term)) > 0 {
 		return true
 	}
-	if len(vol.exactNameIDs(strings.ToLower(term))) > 0 {
-		return true
+	// exactNameIDs is only a cheap membership probe when the resident name
+	// order (or exact-names map) is available.  In lowmem/mapped mode that
+	// would fall back to a full-record scan just to answer "is this a
+	// component?", which is far more expensive than any posting this function
+	// gates.  The pathGrams check below is the actual lowmem posting source.
+	if vol.exactNames != nil || (vol.queryIndex != nil && len(vol.queryIndex.nameOrder) > 0) {
+		if len(vol.exactNameIDs(strings.ToLower(term))) > 0 {
+			return true
+		}
 	}
 	return vol.queryIndex != nil && vol.queryIndex.pathGrams != nil
 }
