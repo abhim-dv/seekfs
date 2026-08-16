@@ -4069,12 +4069,17 @@ func (vol *serviceVolumeIndex) buildCandidatePlan(pq parsedQuery) (candidatePlan
 				return plan, true
 			}
 		}
-		if !globsOK {
-			for _, term := range globLiteralTerms(pq.Globs, pq.CaseSensitive) {
-				if list := vol.nameTermPosting(term); len(list) > 0 {
-					if !addRequired("glob-literal:"+term, list) {
-						return plan, true
-					}
+	}
+	// Glob literals are a safe name-substring prefilter for complex globs (a
+	// record matching `glob:*foo*` necessarily has `foo` in its name), so add
+	// them as sources regardless of path scope.  This narrows the candidate set
+	// before the full glob is verified, avoiding a full-volume scan for broad
+	// globs that are not reducible to a single extension posting.
+	if !globsOK {
+		for _, term := range globLiteralTerms(pq.Globs, pq.CaseSensitive) {
+			if list := vol.nameTermPosting(term); len(list) > 0 {
+				if !addRequired("glob-literal:"+term, list) {
+					return plan, true
 				}
 			}
 		}
