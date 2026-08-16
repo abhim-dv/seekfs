@@ -15166,7 +15166,13 @@ func queryLooksLoosePathScoped(query string) bool {
 			switch strings.ToLower(strings.TrimSpace(key)) {
 			case "path", "fullpath", "full-path", "full_path", "fullpathname", "full-path-name", "location":
 				return true
-			case "ext", "extension", "glob", "regex", "size", "sz", "dm", "date", "date-modified", "datemodified", "modified", "type", "case", "attrib", "sort":
+			case "regex", "regexp", "re":
+				// A regex is matched against the full path, so it is inherently
+				// path-scoped.  Treat a bare regex: query as path-scoped so the
+				// regex-literal planner can serve it instead of declining to an
+				// exhaustive scan.
+				return true
+			case "ext", "extension", "glob", "size", "sz", "dm", "date", "date-modified", "datemodified", "modified", "type", "case", "attrib", "sort":
 				continue
 			}
 			if value != "" {
