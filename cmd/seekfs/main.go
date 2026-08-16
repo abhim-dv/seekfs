@@ -13015,8 +13015,7 @@ func (vol *serviceVolumeIndex) scanNameTermPosting(term string) []int {
 				out = append(out, i)
 			}
 		}
-		return out
-	}
+		return out	}
 	parts := make([][]int, workers)
 	var wg sync.WaitGroup
 	for worker := 0; worker < workers; worker++ {
@@ -13048,6 +13047,80 @@ func (vol *serviceVolumeIndex) scanNameTermPosting(term string) []int {
 		out = append(out, part...)
 	}
 	return out
+}
+
+// countBareTermParallel counts records whose lower name contains the term, in
+// parallel, without materializing the matching ID slice.  It returns ok=false
+// when a mapped bulk scan is available so the caller keeps using the
+// slice-based posting (which is cached and reused by search), and only pays the
+// count-only walk when a full materialization would be required anyway.
+func (vol *serviceVolumeIndex) countBareTermParallel(term string, hidden hiddenBaseIDs, pq parsedQuery) (int, bool) {
+	if vol == nil || vol.index == nil || term == "" {
+		return 0, false
+	}
+	if vol.index.MMapRecords != nil {
+		// The mapped fast path returns the slice cheaply; prefer it so search
+		// and count share the same cached posting.
+		if _, ok := vol.index.scanCompactLowerNameTerm(term); ok {
+			return 0, false
+		}
+	}
+	recordCount := vol.index.compactRecordCount()
+	workers := min(runtime.GOMAXPROCS(0), max(1, recordCount/250_000))
+	count := 0
+	if workers <= 1 {
+		for i := 0; i < recordCount; i++ {
+			if i&1023 == 0 && queryCanceled(pq) {
+				return 0, false
+			}
+			rec := vol.index.compactRecord(i)
+			if rec.Deleted {
+				continue
+			}
+			if !hidden.empty() && hidden.contains(i) {
+				continue
+			}
+			if strings.Contains(vol.index.compactLowerNameAt(i), term) {
+				count++
+			}
+		}
+		return count, true
+	}
+	parts := make([]int, workers)
+	var wg sync.WaitGroup
+	for worker := 0; worker < workers; worker++ {
+		start := worker * recordCount / workers
+		end := (worker + 1) * recordCount / workers
+		wg.Add(1)
+		go func(worker, start, end int) {
+			defer wg.Done()
+			local := 0
+			for i := start; i < end; i++ {
+				if i&1023 == 0 && queryCanceled(pq) {
+					return
+				}
+				rec := vol.index.compactRecord(i)
+				if rec.Deleted {
+					continue
+				}
+				if !hidden.empty() && hidden.contains(i) {
+					continue
+				}
+				if strings.Contains(vol.index.compactLowerNameAt(i), term) {
+					local++
+				}
+			}
+			parts[worker] = local
+		}(worker, start, end)
+	}
+	wg.Wait()
+	if queryCanceled(pq) {
+		return 0, false
+	}
+	for _, part := range parts {
+		count += part
+	}
+	return count, true
 }
 
 // scanCompactLowerNameTerm is the complete mapped-name fallback used when a

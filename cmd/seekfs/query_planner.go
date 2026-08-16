@@ -3726,6 +3726,24 @@ func (vol *serviceVolumeIndex) plannedCount(pq parsedQuery) (int, bool) {
 // stay exact while an overlay is active (review G7 / plan R2.6).
 func (vol *serviceVolumeIndex) plannedCountHidden(pq parsedQuery, hidden hiddenBaseIDs) (int, bool) {
 	pq.CountOnly = true
+	// Single bare term with no path scope and no other filters: count directly
+	// over records in parallel without materializing the candidate slice.  A
+	// short/broad term like `x` matches millions of names, so building the full
+	// name posting just to count it is wasteful.
+	if terms := nonVolumeTerms(pq.Terms); len(terms) == 1 && !pq.MatchPath &&
+		pq.Type == "" && pq.Under == "" && !pq.Exists && !pq.HasModAfter &&
+		len(pq.Exts) == 0 && len(pq.Dirs) == 0 && len(pq.Globs) == 0 &&
+		len(pq.Regexps) == 0 && len(pq.RegexTerms) == 0 && len(pq.Parents) == 0 &&
+		len(pq.SizeFilters) == 0 && len(pq.DateFilters) == 0 && len(pq.AttrFilters) == 0 &&
+		len(pq.OrGroups) == 0 && len(pq.NotGroups) == 0 &&
+		pq.CWDBias == "" && pq.RootBias == "" && !pq.CaseSensitive {
+		if count, ok := vol.countBareTermParallel(terms[0], hidden, pq); ok {
+			pq.Trace.addTerm(traceTerm{Term: terms[0], Kind: "name-substring", Source: "parallel-name-count", CountHint: count, Exact: true})
+			pq.Trace.setSource("parallel-name-count", count)
+			pq.Trace.setComplete(true)
+			return count, true
+		}
+	}
 	plan, ok := vol.buildCandidatePlan(pq)
 	if !ok {
 		return 0, false
