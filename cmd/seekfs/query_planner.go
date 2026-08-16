@@ -1772,14 +1772,33 @@ func countServiceVolumesGlobalOnlySnapshot(snapshot globalQuerySnapshot, opts qu
 				opts.Trace.addComponentStats("interval-count", coverage.rootCount, len(coverage.intervals), coverage.cardinality, len(coverage.selfIDs), verified, false)
 				continue
 			}
-			it := newGlobalRecordIterator(volumeIndex, vol.pathTermPosting(term))
-			count, verified, err := countGlobalVerifiedIterator(&it, volumes, snapshots, pq)
-			if err != nil {
-				return 0, true, err
+			var hidden func(int) bool
+			if volumeIndex >= 0 && volumeIndex < len(snapshots) && snapshots[volumeIndex] != nil {
+				h := hiddenBaseIDs{tombstone: snapshots[volumeIndex].tombstoneIDs, shadowed: snapshots[volumeIndex].shadowedIDs}
+				hidden = h.contains
+			}
+			// Count the exact path component without materializing the full
+			// posting slice.  This is exact for a bare term and avoids building
+			// a huge []int that the verified iterator would only walk once.
+			if strings.ContainsAny(term, `\/*?[]:`) {
+				it := newGlobalRecordIterator(volumeIndex, vol.pathTermPosting(term))
+				count, verified, err := countGlobalVerifiedIterator(&it, volumes, snapshots, pq)
+				if err != nil {
+					return 0, true, err
+				}
+				baseCount += count
+				if opts.Trace != nil {
+					opts.Trace.ComponentRecordsVerified += verified
+				}
+				continue
+			}
+			count := vol.countPathTermPostingLive(term, hidden)
+			if queryCanceled(pq) {
+				return 0, true, errQueryCanceled
 			}
 			baseCount += count
 			if opts.Trace != nil {
-				opts.Trace.ComponentRecordsVerified += verified
+				opts.Trace.ComponentRecordsVerified += count
 			}
 		}
 		total := baseCount + globalOverlayMatchCount(volumes, snapshots, pq)

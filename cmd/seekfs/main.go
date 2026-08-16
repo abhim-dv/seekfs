@@ -13251,6 +13251,111 @@ func (vol *serviceVolumeIndex) pathTermPosting(term string) []int {
 	return out
 }
 
+// countPathTermPostingLive is the count-only analogue of pathTermPosting.  It
+// counts live records whose name contains the term plus live descendants of
+// directory roots whose name contains the term, without materializing the ID
+// slice.  It is exact for the same input as pathTermPosting (bare term, no
+// path separators) and is intended for the count terminal where only the total
+// is needed.  `hidden` applies overlay tombstone/shadow filtering to match the
+// verified iterator path.  Every counted record is verified with
+// compactPathContainsTerm so a malformed/legacy component posting that is a
+// superset (rather than an exact path predicate) cannot over-count.
+func (vol *serviceVolumeIndex) countPathTermPostingLive(term string, hidden func(int) bool) int {
+	if vol == nil || vol.index == nil || term == "" {
+		return 0
+	}
+	recordCount := vol.index.compactRecordCount()
+	count := 0
+	seen := make(map[int]struct{}, 64)
+	// Name self-hits: records whose name contains the term.
+	for _, id := range vol.nameTermPosting(term) {
+		if id < 0 || id >= recordCount {
+			continue
+		}
+		rec := vol.index.compactRecord(id)
+		if rec.Deleted {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		if hidden != nil && hidden(id) {
+			continue
+		}
+		if !vol.index.compactPathContainsTerm(id, term) {
+			continue
+		}
+		count++
+	}
+	if strings.ContainsAny(term, `\/*?[]:`) {
+		return count
+	}
+	if len(vol.childOffsets) > 0 || vol.children != nil {
+		traversed := make(map[int]struct{}, 64)
+		for _, rootID := range vol.pathTermRootIDs(term) {
+			if rootID < 0 || rootID >= recordCount {
+				continue
+			}
+			root := vol.index.compactRecord(rootID)
+			if root.Deleted || root.Mode&uint32(os.ModeDir) == 0 {
+				continue
+			}
+			// A legitimate directory root whose own name contains the term
+			// guarantees every descendant's path contains the term, so the
+			// descendant walk needs no per-record path check.  A malformed or
+			// legacy component posting can supply a superset root whose name
+			// does NOT contain the term; those descendants must be verified
+			// individually so the count stays exact.
+			rootExact := strings.Contains(vol.index.compactLowerNameAt(rootID), term) ||
+				(vol.index.Volume != "" && containsFoldASCII(vol.index.Volume, term))
+			stack := []int{rootID}
+			for len(stack) > 0 {
+				last := len(stack) - 1
+				id := stack[last]
+				stack = stack[:last]
+				if _, ok := traversed[id]; ok || id < 0 || id >= recordCount {
+					continue
+				}
+				traversed[id] = struct{}{}
+				rec := vol.index.compactRecord(id)
+				if !rec.Deleted {
+					if _, ok := seen[id]; !ok {
+						seen[id] = struct{}{}
+						if hidden == nil || !hidden(id) {
+							if rootExact || vol.index.compactPathContainsTerm(id, term) {
+								count++
+							}
+						}
+					}
+				}
+				for _, childID := range vol.childIDsForRecord(id) {
+					stack = append(stack, int(childID))
+				}
+			}
+		}
+		return count
+	}
+	// No child graph: scan paths directly.
+	for _, id := range vol.scanPathTermPosting(term) {
+		if id < 0 || id >= recordCount {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		if hidden != nil && hidden(id) {
+			continue
+		}
+		if !vol.index.compactPathContainsTerm(id, term) {
+			continue
+		}
+		count++
+	}
+	return count
+}
+
 func (vol *serviceVolumeIndex) pathComponentPosting(term string) []int {
 	if vol == nil || vol.index == nil || term == "" || strings.ContainsAny(term, `\/*?[]:`) {
 		return vol.pathTermPosting(term)
