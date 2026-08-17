@@ -1509,11 +1509,11 @@ func countServiceVolumesGlobalOnly(volumes []*serviceVolumeIndex, opts queryOpti
 	return countServiceVolumesGlobalOnlySnapshot(newGlobalQuerySnapshot(volumes, opts.Trace), opts)
 }
 
-// globalDirTermCountShape reports whether pq is a bare `type:dir <term>`
+// globalTypeTermCountShape reports whether pq is a bare `type:<typ> <term>`
 // query: exactly one non-volume term and no other filter.  These shapes used
 // to force the global bounded fallback into a full per-volume record scan.
-func globalDirTermCountShape(pq parsedQuery) (string, bool) {
-	if pq.Type != "dir" {
+func globalTypeTermCountShape(pq parsedQuery, typ string) (string, bool) {
+	if pq.Type != typ {
 		return "", false
 	}
 	terms := nonVolumeTerms(pq.Terms)
@@ -1525,6 +1525,18 @@ func globalDirTermCountShape(pq parsedQuery) (string, bool) {
 		return "", false
 	}
 	return terms[0], true
+}
+
+// globalDirTermCountShape reports whether pq is a bare `type:dir <term>`
+// query routed through the capped dir-posting count.
+func globalDirTermCountShape(pq parsedQuery) (string, bool) {
+	return globalTypeTermCountShape(pq, "dir")
+}
+
+// globalFileTermCountShape reports whether pq is a bare `type:file <term>`
+// query routed through the capped term-posting count.
+func globalFileTermCountShape(pq parsedQuery) (string, bool) {
+	return globalTypeTermCountShape(pq, "file")
 }
 
 // boundedDirTermPosting returns the term's posting capped to
@@ -1606,6 +1618,61 @@ func (vol *serviceVolumeIndex) countDirTermLive(term string, matchPath bool, hid
 	return count, true
 }
 
+// countFileTermLive is the type:file mirror of countDirTermLive.  The term's
+// bounded name/path posting drives the intersection; each candidate is kept
+// only when its record is not a directory.  There is no persisted file posting
+// (a complement of dirs would be the full volume), so the predicate is applied
+// per candidate exactly as the verified path does, keeping count/search parity.
+func (vol *serviceVolumeIndex) countFileTermLive(term string, matchPath bool, hidden hiddenBaseIDs) (int, bool) {
+	if vol == nil || vol.index == nil {
+		return 0, false
+	}
+	ids, ok := vol.boundedDirTermPosting(term, matchPath)
+	if !ok || len(ids) > serviceComponentMultiTermScanMaxIDs {
+		return 0, false
+	}
+	var seen map[int]struct{}
+	if len(vol.recentIDs) > 0 {
+		seen = make(map[int]struct{}, len(ids))
+	}
+	count := 0
+	for _, id := range ids {
+		if id < 0 || id >= vol.index.compactRecordCount() || !hidden.empty() && hidden.contains(id) {
+			continue
+		}
+		rec := vol.index.compactRecord(id)
+		if rec.Deleted || rec.Mode&uint32(os.ModeDir) != 0 {
+			continue
+		}
+		count++
+		if seen != nil {
+			seen[id] = struct{}{}
+		}
+	}
+	for id := range vol.recentIDs {
+		if id < 0 || id >= vol.index.compactRecordCount() || !hidden.empty() && hidden.contains(id) {
+			continue
+		}
+		if seen != nil {
+			if _, exists := seen[id]; exists {
+				continue
+			}
+		}
+		rec := vol.index.compactRecord(id)
+		if rec.Deleted || rec.Mode&uint32(os.ModeDir) != 0 {
+			continue
+		}
+		if matchPath {
+			if vol.index.compactPathContainsTerm(id, term) {
+				count++
+			}
+		} else if strings.Contains(vol.index.compactLowerNameAt(id), term) {
+			count++
+		}
+	}
+	return count, true
+}
+
 func countServiceVolumesGlobalBoundedFallbackSnapshot(snapshot globalQuerySnapshot, opts queryOptions) (int, bool, error) {	if len(snapshot.volumes) < 2 {
 		return 0, false, nil
 	}
@@ -1639,6 +1706,12 @@ func countServiceVolumesGlobalBoundedFallbackSnapshot(snapshot globalQuerySnapsh
 		}
 		if term, ok := globalDirTermCountShape(volumePQ); ok {
 			if count, ok := vol.countDirTermLive(term, volumePQ.MatchPath, hidden); ok {
+				total += count
+				continue
+			}
+		}
+		if term, ok := globalFileTermCountShape(volumePQ); ok {
+			if count, ok := vol.countFileTermLive(term, volumePQ.MatchPath, hidden); ok {
 				total += count
 				continue
 			}
