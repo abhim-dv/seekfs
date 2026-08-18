@@ -6,6 +6,8 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"path/filepath"
+	"strings"
 	"time"
 	"unsafe"
 
@@ -304,6 +306,116 @@ func queryNTFSVolumeData(handle windows.Handle) (ntfsVolumeDataBuffer, error) {
 		return data, fmt.Errorf("FSCTL_GET_NTFS_VOLUME_DATA: %w", err)
 	}
 	return data, nil
+}
+
+// directV9VolumeSource builds a record source for one NTFS volume from the raw
+// $MFT, merging FSCTL_ENUM_USN_DATA names for any FRNs the MFT read missed.
+// This is the Everything-style fast build path (no directory walk), and like
+// Everything it requires an elevated raw-volume handle.  It returns the source,
+// the volume root string, and the USN journal identity/checkpoint so the
+// published v9 index can resume incremental replay from exactly this point.
+// exclusions are paths (on this volume) whose whole subtrees are dropped from
+// the result; the seekfs dir and standard system folders are passed in.
+func directV9VolumeSource(volume string, exclusions []string) (directV9RecordSource, []string, uint64, int64, error) {
+	vol := normalizeVolume(volume)
+	handle, err := openVolume(vol)
+	if err != nil {
+		return nil, nil, 0, 0, err
+	}
+	defer windows.CloseHandle(handle)
+	journal, err := queryUSNJournal(handle)
+	if err != nil {
+		return nil, nil, 0, 0, err
+	}
+	entries, err := enumMFT(handle)
+	if err != nil {
+		return nil, nil, 0, 0, err
+	}
+	if nodes, usnErr := enumUSN(handle, journal.NextUsn); usnErr == nil {
+		if added := mergeUSNNodesIntoMFT(entries, nodes); added > 0 {
+			serviceLog("direct v9 volume=%s mft=%d usn-merged=%d", vol, len(entries), added)
+		}
+	} else {
+		serviceLog("direct v9 volume=%s usn merge skipped err=%v", vol, usnErr)
+	}
+	if filtered := filterMFTExclusions(entries, vol, exclusions); filtered > 0 {
+		serviceLog("direct v9 volume=%s excluded=%d remaining=%d", vol, filtered, len(entries))
+	}
+	return newDirectV9MFTSource(entries), []string{vol + `\`}, journal.UsnJournalID, journal.NextUsn, nil
+}
+
+// mftRootFRN is the MFT record number of the NTFS root directory.
+const mftRootFRN = 5
+
+// filterMFTExclusions removes every entry under any exclusion path that lives on
+// this volume. Each exclusion is resolved to a directory FRN by descending the
+// parent links from the volume root, then the whole subtree under that FRN is
+// dropped from entries. It returns the number of entries removed.
+func filterMFTExclusions(entries map[uint64]mftEntry, vol string, exclusions []string) int {
+	if len(exclusions) == 0 || len(entries) == 0 {
+		return 0
+	}
+	children := make(map[uint64][]uint64, len(entries)/2)
+	for frn, e := range entries {
+		if e.parentFRN != 0 && e.parentFRN != frn {
+			children[e.parentFRN] = append(children[e.parentFRN], frn)
+		}
+	}
+	var roots []uint64
+	volRoot := strings.ToUpper(strings.TrimRight(vol, `\`)) + `\`
+	for _, exclusion := range exclusions {
+		canonical, err := filepath.Abs(exclusion)
+		if err != nil {
+			continue
+		}
+		canonical = filepath.Clean(canonical)
+		rel, err := filepath.Rel(volRoot, canonical)
+		if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			continue
+		}
+		components := strings.FieldsFunc(rel, func(r rune) bool { return r == '/' || r == '\\' })
+		cur := uint64(mftRootFRN)
+		resolved := true
+		for _, component := range components {
+			var next uint64
+			for _, frn := range children[cur] {
+				if strings.EqualFold(entries[frn].name, component) {
+					next = frn
+					break
+				}
+			}
+			if next == 0 {
+				resolved = false
+				break
+			}
+			cur = next
+		}
+		if resolved {
+			roots = append(roots, cur)
+		}
+	}
+	if len(roots) == 0 {
+		return 0
+	}
+	excluded := make(map[uint64]bool, len(roots))
+	queue := roots
+	for len(queue) > 0 {
+		frn := queue[0]
+		queue = queue[1:]
+		if excluded[frn] {
+			continue
+		}
+		excluded[frn] = true
+		queue = append(queue, children[frn]...)
+	}
+	removed := 0
+	for frn := range excluded {
+		if _, ok := entries[frn]; ok {
+			delete(entries, frn)
+			removed++
+		}
+	}
+	return removed
 }
 
 // enumMFT reads every in-use file/dir record from the volume's $MFT and returns
