@@ -8,6 +8,12 @@ every invocation.
 `seekfs` is independent software. It is not affiliated with, endorsed by, or
 sponsored by voidtools or Everything.
 
+> **Getting the most out of seekfs:** use `seekfs search`/`seekfs count` against
+> the resident service, put flags before the query (`--under <folder>` to scope,
+> `-path` for path syntax), and write quoted multi-term or filter-style queries
+> like `ext:go dir:cmd main` — then drop to `rg` only for file-content or line
+> matching, which seekfs intentionally does not index.
+
 ## Who It Is For
 
 `seekfs` is for local developer and agent workflows that need fast,
