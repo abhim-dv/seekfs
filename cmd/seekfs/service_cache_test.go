@@ -1062,16 +1062,15 @@ func TestServiceRequestRoundTripPreservesControlFields(t *testing.T) {
 	}
 }
 
-func TestServiceRequestInfersLoosePathMode(t *testing.T) {
+func TestServiceRequestStaysNameModeForPlainMultiTerm(t *testing.T) {
 	req := serviceRequestFromOptions(queryOptions{Query: "Downloads nrrd"}, false)
+	if req.MatchPath {
+		t.Fatal("plain multi-term query must stay name mode; loose path inference would force a slow path scan")
+	}
+	req = serviceRequestFromOptions(queryOptions{Query: "path:Downloads nrrd"}, false)
 	if !req.MatchPath {
-		t.Fatal("service request did not infer path mode for loose multi-term query")
+		t.Fatal("explicit path: filter must force service path mode")
 	}
-	got := requestToOptionsFromService(req)
-	if !got.MatchPath {
-		t.Fatal("round-trip options lost inferred path mode")
-	}
-
 	req = serviceRequestFromOptions(queryOptions{Query: "ext:raw !path:Assets"}, false)
 	if req.MatchPath {
 		t.Fatal("negated path filter should not force top-level service path mode")

@@ -15152,7 +15152,6 @@ func queryLooksPathScoped(query string) bool {
 
 func queryLooksLoosePathScoped(query string) bool {
 	fields := strings.Fields(query)
-	plain := 0
 	for _, field := range fields {
 		if strings.HasPrefix(field, "!") || strings.HasPrefix(field, "-") {
 			continue
@@ -15161,7 +15160,7 @@ func queryLooksLoosePathScoped(query string) bool {
 		if raw == "" {
 			continue
 		}
-		key, value, hasPrefix := strings.Cut(raw, ":")
+		key, _, hasPrefix := strings.Cut(raw, ":")
 		if hasPrefix {
 			switch strings.ToLower(strings.TrimSpace(key)) {
 			case "path", "fullpath", "full-path", "full_path", "fullpathname", "full-path-name", "location":
@@ -15172,17 +15171,18 @@ func queryLooksLoosePathScoped(query string) bool {
 				// regex-literal planner can serve it instead of declining to an
 				// exhaustive scan.
 				return true
-			case "ext", "extension", "glob", "size", "sz", "dm", "date", "date-modified", "datemodified", "modified", "type", "case", "attrib", "sort":
-				continue
-			}
-			if value != "" {
-				plain++
 			}
 			continue
 		}
-		plain++
+		// An explicit path-like token (with a path separator) is the only
+		// remaining auto path trigger.  Plain multi-term queries stay name
+		// matching so they can use the fast filename posting instead of forcing
+		// an exhaustive path scan.
+		if strings.ContainsAny(raw, `\/`) {
+			return true
+		}
 	}
-	return plain >= 2
+	return false
 }
 
 func dottedExtensionTerm(term string) (string, bool) {

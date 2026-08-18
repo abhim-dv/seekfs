@@ -231,12 +231,41 @@ func TestPathFilterEnablesPathMatching(t *testing.T) {
 	}
 }
 
-func TestLooseMultiTermQueryInfersPathMode(t *testing.T) {
-	if !queryLooksLoosePathScoped("Downloads nrrd") {
-		t.Fatal("Downloads nrrd should infer path mode at the request layer")
+func TestGlobalBoundedScanBudgetGate(t *testing.T) {
+	vol := func(records int) *serviceVolumeIndex {
+		idx := &Index{Source: "usn", Volume: "C:", Compact: true, Records: make([]CompactRecord, records)}
+		return newServiceVolumeIndex("budget.gsi", idx)
+	}
+	now := time.Now()
+	if !globalBoundedScanBudgetOK(nil, parsedQuery{}, 3) {
+		t.Fatal("no deadline must allow the scan")
+	}
+	if globalBoundedScanBudgetOK([]*serviceVolumeIndex{vol(100)}, parsedQuery{DeadlineUnix: now.Add(-time.Second).UnixNano()}, 3) {
+		t.Fatal("expired deadline must decline the scan")
+	}
+	if !globalBoundedScanBudgetOK([]*serviceVolumeIndex{vol(100)}, parsedQuery{DeadlineUnix: now.Add(30 * time.Second).UnixNano()}, 3) {
+		t.Fatal("tiny volume with generous deadline must run the scan")
+	}
+	if globalBoundedScanBudgetOK([]*serviceVolumeIndex{vol(40_000_000)}, parsedQuery{DeadlineUnix: now.Add(5 * time.Second).UnixNano()}, 3) {
+		t.Fatal("40M records need far more than 5s; must decline early instead of blocking to the deadline")
+	}
+}
+
+func TestLooseMultiTermQueryStaysNameMode(t *testing.T) {
+	if queryLooksLoosePathScoped("Downloads nrrd") {
+		t.Fatal("plain multi-term query must stay name mode; loose path inference would force a slow path scan")
+	}
+	if queryLooksLoosePathScoped("aker log") {
+		t.Fatal("plain multi-term name query must stay name mode")
 	}
 	if queryLooksLoosePathScoped("ext:raw !path:Assets") {
 		t.Fatal("negated path filters should not force top-level path mode")
+	}
+	if !queryLooksLoosePathScoped("path:Downloads nrrd") {
+		t.Fatal("explicit path: filter must enable path mode")
+	}
+	if !queryLooksLoosePathScoped(`Downloads\Incoming nrrd`) {
+		t.Fatal("a term with a path separator must enable path mode")
 	}
 }
 
