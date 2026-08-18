@@ -442,6 +442,11 @@ func configureUIServiceEnvironment(cmd *exec.Cmd) {
 	env := os.Environ()
 	env = upsertEnv(env, "SEEKFS_MEMORY_MODE", "lowmem")
 	env = upsertEnv(env, "SEEKFS_STARTUP_WORKERS", "1")
+	// The UI is the primary interface for the v9 engine; always run the
+	// service against memory-mapped indexes with the global planner so v9
+	// volumes stay at low RSS regardless of how the UI was launched.
+	env = upsertEnv(env, "SEEKFS_ENGINE_V9", "1")
+	env = upsertEnv(env, "SEEKFS_GLOBAL_PLANNER", "1")
 	cmd.Env = env
 }
 
