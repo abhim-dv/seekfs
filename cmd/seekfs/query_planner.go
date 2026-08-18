@@ -1453,6 +1453,10 @@ func searchServiceVolumesGlobalBoundedFallbackSnapshot(snapshot globalQuerySnaps
 		opts.Trace.replaceDecline("global-bounded-scan:overlay-snapshot-missing")
 		return nil, false, nil
 	}
+	if !globalBoundedScanBudgetOK(volumes, pq, 3) {
+		opts.Trace.replaceDecline("global-bounded-scan:budget")
+		return nil, false, nil
+	}
 	limit := normalizedLimit(opts.Limit, countOnly)
 	if countOnly {
 		limit = 0
@@ -1507,6 +1511,30 @@ func searchServiceVolumesGlobalBoundedFallbackSnapshot(snapshot globalQuerySnaps
 
 func countServiceVolumesGlobalOnly(volumes []*serviceVolumeIndex, opts queryOptions) (int, bool, error) {
 	return countServiceVolumesGlobalOnlySnapshot(newGlobalQuerySnapshot(volumes, opts.Trace), opts)
+}
+
+// globalBoundedScanBudgetOK reports whether the remaining query deadline can
+// plausibly cover a full per-volume record scan.  A full scan is linear in the
+// compact record count (roughly 300ms per million records observed on a
+// 27.6M-record two-volume service), so starting one when the remaining budget
+// is already tight would only block until the deadline and then cancel.  The
+// margin keeps the check generous so legitimate path queries still run.
+func globalBoundedScanBudgetOK(volumes []*serviceVolumeIndex, pq parsedQuery, margin float64) bool {
+	if pq.DeadlineUnix <= 0 {
+		return true
+	}
+	remaining := time.Until(time.Unix(0, pq.DeadlineUnix))
+	if remaining <= 0 {
+		return false
+	}
+	var records int64
+	for _, vol := range volumes {
+		if vol != nil && vol.index != nil {
+			records += int64(vol.index.compactRecordCount())
+		}
+	}
+	estimatedMS := float64(records) / 1e6 * 300
+	return float64(remaining.Milliseconds()) >= estimatedMS*margin
 }
 
 // globalTypeTermCountShape reports whether pq is a bare `type:<typ> <term>`
@@ -1686,6 +1714,10 @@ func countServiceVolumesGlobalBoundedFallbackSnapshot(snapshot globalQuerySnapsh
 	}
 	if !snapshot.overlaysOK {
 		opts.Trace.replaceDecline("global-bounded-scan:overlay-snapshot-missing")
+		return 0, false, nil
+	}
+	if !globalBoundedScanBudgetOK(snapshot.volumes, pq, 3) {
+		opts.Trace.replaceDecline("global-bounded-scan:budget")
 		return 0, false, nil
 	}
 	total := 0

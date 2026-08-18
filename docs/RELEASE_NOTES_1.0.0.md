@@ -23,6 +23,11 @@ prefilters and multi-volume `type:file` counts).
 - **Cleaner artifact naming**. The release zip ships `seekfs.exe` (CLI/search
   tool) and `seekfs-ui.exe` (desktop UI). `seekfs.exe` matches the README and
   docs throughout; there is no separate `seekfs-service.exe` any more.
+- **Fast multi-term name queries**. Plain multi-term queries (e.g. `aker log`)
+  stay in the fast name-trigram path instead of being auto-inferred as path
+  searches and dropped into a slow full-record scan; the built-in path-scan
+  fallback is now budget-gated and declines early when the remaining deadline
+  cannot cover the record scan. Same query went from ~20+ s to ~50 ms.
 
 ## Query Coverage
 
