@@ -88,6 +88,11 @@ type directV9BuildOptions struct {
 	// permission/race must not turn a multi-hour build into a wasted run, but a
 	// grossly incomplete walk must not be silently persisted.
 	MaxInaccessible int
+
+	// PhaseReporter receives per-phase build durations; it may be called from
+	// worker goroutines during the rank-family phase, so implementations must be
+	// safe for concurrent use.
+	PhaseReporter func(name string, d time.Duration)
 }
 
 type directV9BuildStats struct {
@@ -120,6 +125,7 @@ type directV9BuildStats struct {
 	SourceSkipExamples       []string                `json:"source_skip_examples,omitempty"`
 	SourceDegraded           bool                    `json:"source_degraded,omitempty"`
 	SourceMaxInaccessible    int                     `json:"source_max_inaccessible,omitempty"`
+	PhaseMillis              []string                `json:"phase_millis,omitempty"`
 }
 
 type directV9RunFile struct {
@@ -971,20 +977,18 @@ func directV9ReadChildPair(r *bufio.Reader) (directV9ChildPair, error) {
 }
 
 func directV9CheckParentCycles(ctx context.Context, parentPath string, recordCount int) error {
-	f, err := os.Open(parentPath)
+	data, err := os.ReadFile(parentPath)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	if len(data) < recordCount*4 {
+		return errors.New("direct v9 topology parents file too short")
+	}
 	state := make([]byte, recordCount)
 	stamp := make([]uint32, recordCount)
 	var walkID uint32
 	readParent := func(id int) (int32, error) {
-		var b [4]byte
-		if _, err := f.ReadAt(b[:], int64(id)*4); err != nil {
-			return -1, err
-		}
-		value := binary.LittleEndian.Uint32(b[:])
+		value := binary.LittleEndian.Uint32(data[id*4:])
 		if value == ^uint32(0) {
 			return -1, nil
 		}
@@ -1207,6 +1211,7 @@ func directV9WriteTopologySections(ctx context.Context, cw *countingWriter, fina
 	if err != nil {
 		return nil, nil, err
 	}
+	offsetWriter := bufio.NewWriterSize(offsets, 256*1024)
 	var childCount uint64
 	var off [4]byte
 	for _, count := range counts {
@@ -1218,10 +1223,14 @@ func directV9WriteTopologySections(ctx context.Context, cw *countingWriter, fina
 			running += counts[i-1]
 		}
 		binary.LittleEndian.PutUint32(off[:], running)
-		if _, err := offsets.Write(off[:]); err != nil {
+		if _, err := offsetWriter.Write(off[:]); err != nil {
 			_ = offsets.Close()
 			return nil, nil, err
 		}
+	}
+	if err := offsetWriter.Flush(); err != nil {
+		_ = offsets.Close()
+		return nil, nil, err
 	}
 	_ = offsets.Close()
 	if childCount > uint64(^uint32(0)) {
@@ -1358,9 +1367,10 @@ func directV9WriteSubtreeSection(ctx context.Context, cw *countingWriter, parent
 	if err != nil {
 		return indexSectionTableEntry{}, directV9SectionReport{}, nil, err
 	}
+	parentReader := bufio.NewReaderSize(f, 256*1024)
 	for id := range parents {
 		var b [4]byte
-		if _, err := f.ReadAt(b[:], int64(id)*4); err != nil {
+		if _, err := io.ReadFull(parentReader, b[:]); err != nil {
 			_ = f.Close()
 			return indexSectionTableEntry{}, directV9SectionReport{}, nil, err
 		}
@@ -1475,8 +1485,9 @@ func directV9WriteSubtreeSection(ctx context.Context, cw *countingWriter, parent
 			best[id] = ^uint32(0)
 		}
 		var buf [4]byte
+		rankReader := bufio.NewReaderSize(rankFile, 256*1024)
 		for id := range ranks {
-			if _, err := rankFile.ReadAt(buf[:], int64(id)*4); err != nil {
+			if _, err := io.ReadFull(rankReader, buf[:]); err != nil {
 				_ = rankFile.Close()
 				return indexSectionTableEntry{}, directV9SectionReport{}, nil, err
 			}
@@ -1535,12 +1546,14 @@ func directV9ScanNames(finalPath, tokenPath string) (int64, int, error) {
 	}
 	defer f.Close()
 	var tokens *os.File
+	var tokenWriter *bufio.Writer
 	if tokenPath != "" {
 		tokens, err = os.Create(tokenPath)
 		if err != nil {
 			return 0, 0, err
 		}
 		defer tokens.Close()
+		tokenWriter = bufio.NewWriterSize(tokens, 256*1024)
 	}
 	r := bufio.NewReaderSize(f, 256*1024)
 	var offset uint64
@@ -1556,16 +1569,21 @@ func directV9ScanNames(finalPath, tokenPath string) (int64, int, error) {
 		if len(rec.Name) > int(^uint16(0)) || offset > uint64(^uint32(0))-uint64(len(rec.Name)) {
 			return 0, 0, errors.New("direct v9 name table exceeds on-disk limits")
 		}
-		if tokens != nil {
+		if tokenWriter != nil {
 			var entry [6]byte
 			binary.LittleEndian.PutUint32(entry[:4], uint32(offset))
 			binary.LittleEndian.PutUint16(entry[4:], uint16(len(rec.Name)))
-			if _, err := tokens.Write(entry[:]); err != nil {
+			if _, err := tokenWriter.Write(entry[:]); err != nil {
 				return 0, 0, err
 			}
 		}
 		offset += uint64(len(rec.Name))
 		count++
+	}
+	if tokenWriter != nil {
+		if err := tokenWriter.Flush(); err != nil {
+			return 0, 0, err
+		}
 	}
 	// The name-table temp is owned scratch consumed later in this process.
 	return int64(offset), count, nil
@@ -2006,6 +2024,11 @@ func directV9CompactFlags(recordCount int) uint32 {
 }
 
 func directV9WriteAtomic(ctx context.Context, opts directV9BuildOptions, finalPath, frnPath string, recordCount int, nameBlobLen int64, tokenPath string, rankSpecs []directV9RankSpec, baseScratch int64, reports *[]directV9RankReport, sectionReports *[]directV9SectionReport, scratchHigh *int64, owned *[]string) (int64, error) {
+	reportPhase := func(name string, d time.Duration) {
+		if opts.PhaseReporter != nil {
+			opts.PhaseReporter(name, d)
+		}
+	}
 	dir := filepath.Dir(opts.OutputPath)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return 0, err
@@ -2022,17 +2045,21 @@ func directV9WriteAtomic(ctx context.Context, opts directV9BuildOptions, finalPa
 	}
 	bw := bufio.NewWriterSize(f, 4*1024*1024)
 	cw := &countingWriter{w: bw}
+	t0 := time.Now()
 	if _, err := directV9WriteHeaderAndBase(ctx, cw, finalPath, tokenPath, frnPath, opts, recordCount, nameBlobLen); err != nil {
 		cleanup()
 		return 0, err
 	}
+	reportPhase("header-base", time.Since(t0))
 	entries := make([]indexSectionTableEntry, 0, len(rankSpecs))
 	rankScratchPaths := make([]string, 0, len(rankSpecs))
+	t0 = time.Now()
 	sharedRankRuns, sharedRankErr := directV9BuildRankRunsShared(ctx, finalPath, filepath.Dir(finalPath), opts.RunRecords, opts.RankWorkers, rankSpecs, owned)
 	if sharedRankErr != nil {
 		cleanup()
 		return 0, sharedRankErr
 	}
+	reportPhase("rank-runs", time.Since(t0))
 	// Compute every rank family concurrently with a bounded worker pool, then
 	// emit the finished sections serially in tag order.  The section bytes are
 	// written to private temp files during the merge so the parallel phase is
@@ -2055,6 +2082,7 @@ func directV9WriteAtomic(ctx context.Context, opts directV9BuildOptions, finalPa
 	results := make([]*rankFamilyResult, len(rankSpecs))
 	ctxRanks, cancelRanks := context.WithCancel(ctx)
 	defer cancelRanks()
+	t0 = time.Now()
 	jobs := make(chan int, len(rankSpecs))
 	var workerWG sync.WaitGroup
 	var firstRankErr error
@@ -2101,6 +2129,7 @@ func directV9WriteAtomic(ctx context.Context, opts directV9BuildOptions, finalPa
 	}
 	close(jobs)
 	workerWG.Wait()
+	reportPhase("rank-families", time.Since(t0))
 	if firstRankErr != nil {
 		cleanup()
 		return 0, firstRankErr
@@ -2141,30 +2170,36 @@ func directV9WriteAtomic(ctx context.Context, opts directV9BuildOptions, finalPa
 		}
 		_ = os.Remove(sectionPath)
 	}
+	t0 = time.Now()
 	topologyEntries, topologyReports, topologyErr := directV9WriteTopologySections(ctx, cw, finalPath, frnPath, filepath.Dir(finalPath), recordCount, opts.RunRecords, owned, scratchHigh)
 	if topologyErr != nil {
 		cleanup()
 		return 0, topologyErr
 	}
+	reportPhase("topology", time.Since(t0))
 	entries = append(entries, topologyEntries...)
 	if sectionReports != nil {
 		*sectionReports = append(*sectionReports, topologyReports...)
 	}
 	parentPath := filepath.Join(filepath.Dir(finalPath), "direct-v9-parents.tmp")
+	t0 = time.Now()
 	subtreeEntry, subtreeReport, subtreeRankPaths, subtreeErr := directV9WriteSubtreeSection(ctx, cw, parentPath, recordCount, rankScratchPaths, owned, scratchHigh)
 	if subtreeErr != nil {
 		cleanup()
 		return 0, subtreeErr
 	}
+	reportPhase("subtree", time.Since(t0))
 	entries = append(entries, subtreeEntry)
 	if sectionReports != nil {
 		*sectionReports = append(*sectionReports, subtreeReport)
 	}
+	t0 = time.Now()
 	auxEntries, auxReports, auxErr := directV9WriteAuxiliarySections(ctx, cw, finalPath, recordCount, opts.RunRecords, rankScratchPaths[0], subtreeRankPaths, filepath.Dir(finalPath), owned, scratchHigh)
 	if auxErr != nil {
 		cleanup()
 		return 0, auxErr
 	}
+	reportPhase("aux", time.Since(t0))
 	entries = append(entries, auxEntries...)
 	if sectionReports != nil {
 		*sectionReports = append(*sectionReports, auxReports...)
@@ -2175,6 +2210,7 @@ func directV9WriteAtomic(ctx context.Context, opts directV9BuildOptions, finalPa
 	for _, rankPath := range subtreeRankPaths {
 		_ = os.Remove(rankPath)
 	}
+	t0 = time.Now()
 	if err := writeAlignment(cw, 8); err != nil {
 		cleanup()
 		return 0, err
@@ -2222,6 +2258,7 @@ func directV9WriteAtomic(ctx context.Context, opts directV9BuildOptions, finalPa
 		_ = dirFile.Sync()
 		_ = dirFile.Close()
 	}
+	reportPhase("finalize", time.Since(t0))
 	return fileSize(opts.OutputPath)
 }
 
@@ -2241,6 +2278,11 @@ func directV9RemoveOwned(paths []string) {
 
 func buildDirectV9(ctx context.Context, opts directV9BuildOptions) (stats directV9BuildStats, err error) {
 	start := time.Now()
+	report := func(name string, d time.Duration) {
+		if opts.PhaseReporter != nil {
+			opts.PhaseReporter(name, d)
+		}
+	}
 	if opts.OutputPath == "" || opts.Records == nil {
 		return stats, errors.New("direct v9 build requires output path and record source")
 	}
@@ -2277,9 +2319,17 @@ func buildDirectV9(ctx context.Context, opts directV9BuildOptions) (stats direct
 	if opts.MaxInaccessible < 0 {
 		return stats, errors.New("direct v9 max inaccessible must be non-negative")
 	}
+	t0 := time.Now()
 	runs, maxRunBytes, err := directV9BuildRuns(ctx, opts.Records, opts.SpoolDir, opts.RunRecords, opts.RunBytes, &owned)
 	if err != nil {
 		return stats, err
+	}
+	report("runs", time.Since(t0))
+	stats.Runs = len(runs)
+	stats.MaxRunBytes = maxRunBytes
+	var runBytes int64
+	for _, run := range runs {
+		runBytes += run.bytes
 	}
 	if opts.WalkReport != nil && !opts.WalkReport.SourceComplete {
 		if opts.WalkReport.Inaccessible > 0 && opts.WalkReport.Inaccessible <= opts.MaxInaccessible {
@@ -2288,28 +2338,26 @@ func buildDirectV9(ctx context.Context, opts directV9BuildOptions) (stats direct
 			return stats, fmt.Errorf("direct v9 source incomplete: skipped=%d inaccessible=%d reparse=%d max-inaccessible=%d examples=%v", opts.WalkReport.Skipped, opts.WalkReport.Inaccessible, opts.WalkReport.ReparseSkipped, opts.MaxInaccessible, opts.WalkReport.SkipExamples)
 		}
 	}
-	stats.Runs = len(runs)
-	stats.MaxRunBytes = maxRunBytes
-	var runBytes int64
-	for _, run := range runs {
-		runBytes += run.bytes
-	}
+	t0 = time.Now()
 	finalPath := filepath.Join(opts.SpoolDir, "direct-v9-records.final.tmp")
 	frnPath := filepath.Join(opts.SpoolDir, "direct-v9-frns.tmp")
 	recordCount, spoolBytes, err := directV9MergeRuns(ctx, runs, finalPath, frnPath, &owned)
 	if err != nil {
 		return stats, err
 	}
+	report("merge-runs", time.Since(t0))
 	stats.Records = recordCount
 	stats.SpoolBytes = spoolBytes
 	stats.FinalIDRule = "ascending-frn; duplicate-frn-rejected"
 	stats.SpoolSchema = "u64 frn,parent_frn; u32 mode; i64 size,mod_unix; u32 name_bytes,path_bytes; utf8 name,path"
 	tokenPath := filepath.Join(opts.SpoolDir, "direct-v9-name-table.tmp")
 	owned = append(owned, tokenPath)
+	t0 = time.Now()
 	nameBlobLen, tokenCount, err := directV9ScanNames(finalPath, tokenPath)
 	if err != nil {
 		return stats, err
 	}
+	report("scan-names", time.Since(t0))
 	if tokenCount != recordCount {
 		return stats, errors.New("direct v9 token count mismatch")
 	}
@@ -2343,10 +2391,12 @@ func buildDirectV9(ctx context.Context, opts directV9BuildOptions) (stats direct
 	}
 	stats.RankFamilies = nil
 	stats.SectionReports = nil
+	t0 = time.Now()
 	outputBytes, err := directV9WriteAtomic(ctx, opts, finalPath, frnPath, recordCount, nameBlobLen, tokenPath, rankSpecs, baseRankScratch, &stats.RankFamilies, &stats.SectionReports, &stats.ScratchBytes, &owned)
 	if err != nil {
 		return stats, err
 	}
+	report("write-atomic", time.Since(t0))
 	stats.OutputBytes = outputBytes
 	stats.Sections = make([]string, 0, len(stats.SectionReports))
 	for _, section := range stats.SectionReports {
@@ -2425,6 +2475,7 @@ func directV9WalkPreflightFor(root, output, spool string) (directV9WalkPreflight
 		filepath.Join(rootAbs, "$Recycle.Bin"),
 		filepath.Join(rootAbs, "System Volume Information"),
 	}
+	exclusions = append(exclusions, seekFSExclusionDirsUnder(rootAbs)...)
 	for parent := runRoot; parent != filepath.Dir(parent); parent = filepath.Dir(parent) {
 		if strings.EqualFold(filepath.Base(parent), ".r5tmp") {
 			exclusions = append(exclusions, parent)
@@ -2480,12 +2531,27 @@ func directV9WriteWalkPreflight(runRoot string, preflight directV9WalkPreflight)
 	return os.WriteFile(filepath.Join(runRoot, "direct-v9-startup.log"), []byte(log.String()), 0o600)
 }
 
+// directV9VolumeExclusions returns the paths on vol that a raw-MFT build must
+// drop: the seekfs dir plus the standard system folders the walk preflight also
+// excludes. Paths are left as canonical absolute paths; filterMFTExclusions
+// resolves them to FRN subtrees and skips any not present on the volume.
+func directV9VolumeExclusions(vol string) []string {
+	volRoot := strings.ToUpper(strings.TrimRight(vol, `\`)) + `\`
+	exclusions := seekFSExclusionDirsUnder(volRoot)
+	exclusions = append(exclusions,
+		filepath.Join(volRoot, "$Recycle.Bin"),
+		filepath.Join(volRoot, "System Volume Information"),
+	)
+	return exclusions
+}
+
 // cmdDirectV9 exposes only the bounded prototype sources.  It deliberately
 // has no service, elevation, compactor, or existing-index input path.
 func cmdDirectV9(args []string) error {
 	fs := flag.NewFlagSet("direct-v9", flag.ContinueOnError)
 	out := fs.String("out", "", "new v9 output path")
 	root := fs.String("root", "", "read-only filesystem root for the walk fallback")
+	volume := fs.String("volume", "", "NTFS volume to build from the raw MFT/USN journal (elevated, Everything-style fast build)")
 	records := fs.Int("records", 0, "deterministic synthetic record count")
 	spool := fs.String("spool-dir", "", "owned scratch directory")
 	runRecords := fs.Int("run-records", directV9DefaultRunRecords, "records per external-sort run")
@@ -2503,8 +2569,18 @@ func cmdDirectV9(args []string) error {
 	if *out == "" {
 		return errors.New("direct-v9 requires -out")
 	}
-	if (*root == "") == (*records == 0) {
-		return errors.New("direct-v9 requires exactly one of -root or -records")
+	provided := 0
+	if *root != "" {
+		provided++
+	}
+	if *volume != "" {
+		provided++
+	}
+	if *records != 0 {
+		provided++
+	}
+	if provided != 1 {
+		return errors.New("direct-v9 requires exactly one of -root, -volume, or -records")
 	}
 	if *dryRun {
 		if *root == "" {
@@ -2525,10 +2601,25 @@ func cmdDirectV9(args []string) error {
 	}
 	var source directV9RecordSource
 	var roots []string
-	var sourceName, volume string
+	var sourceName, volName string
 	var closeSource func()
 	var walkReport *directV9WalkReport
-	if *root != "" {
+	var journalID uint64
+	var checkpoint int64
+	builtAt := time.Unix(0, 0)
+	if *volume != "" {
+		src, vols, jid, cp, err := directV9VolumeSource(*volume, directV9VolumeExclusions(normalizeVolume(*volume)))
+		if err != nil {
+			return err
+		}
+		source = src
+		roots = vols
+		sourceName = "usn"
+		volName = normalizeVolume(*volume)
+		journalID = jid
+		checkpoint = cp
+		builtAt = time.Now()
+	} else if *root != "" {
 		preflight, err := directV9WalkPreflightFor(*root, *out, *spool)
 		if err != nil {
 			return err
@@ -2545,7 +2636,7 @@ func cmdDirectV9(args []string) error {
 		source = walk
 		roots = []string{rootAbs}
 		sourceName = "direct-walk"
-		volume = filepath.VolumeName(rootAbs)
+		volName = filepath.VolumeName(rootAbs)
 		closeSource = walk.(interface{ Close() }).Close
 	} else {
 		if *records < 0 {
@@ -2560,22 +2651,35 @@ func cmdDirectV9(args []string) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
+	var phaseMillis []string
+	var phaseMu sync.Mutex
 	stats, err := buildDirectV9(ctx, directV9BuildOptions{
-		OutputPath:  *out,
-		SpoolDir:    *spool,
-		Roots:       roots,
-		Volume:      volume,
-		Source:      sourceName,
-		BuiltAt:     time.Unix(0, 0),
-		Records:     source,
-		RunRecords:  *runRecords,
-		RunBytes:    *runBytes,
-		RankWorkers: *rankWorkers,
-		WalkWorkers: *walkWorkers,
-		WalkQueue:   *walkQueue,
-		WalkReport:  walkReport,
+		OutputPath:     *out,
+		SpoolDir:       *spool,
+		Roots:          roots,
+		Volume:         volName,
+		Source:         sourceName,
+		BuiltAt:        builtAt,
+		JournalID:      journalID,
+		Checkpoint:     checkpoint,
+		Records:        source,
+		RunRecords:     *runRecords,
+		RunBytes:       *runBytes,
+		RankWorkers:    *rankWorkers,
+		WalkWorkers:    *walkWorkers,
+		WalkQueue:      *walkQueue,
+		WalkReport:     walkReport,
 		MaxInaccessible: *maxInaccessible,
+		PhaseReporter: func(name string, d time.Duration) {
+			phaseMu.Lock()
+			phaseMillis = append(phaseMillis, fmt.Sprintf("%s=%dms", name, d.Milliseconds()))
+			phaseMu.Unlock()
+		},
 	})
+	if err != nil {
+		return err
+	}
+	stats.PhaseMillis = phaseMillis
 	if err != nil {
 		return err
 	}

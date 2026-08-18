@@ -397,6 +397,7 @@ type appConfig struct {
 	ServicePipe  string
 	DefaultLimit int
 	OutputFormat string
+	SeekFSDir    string
 }
 
 type queryOptions struct {
@@ -1086,9 +1087,11 @@ Performance guidance:
     seekfs search -path "ext:go dir:cmd main"
 
 Config:
-  seekfs reads seekfs.toml from the current directory or user config dir.
+  seekfs reads seekfs.toml from the current directory, the user config dir, or
+  the seekfs dir (SEEKFS_DIR env, else %ProgramData%\seekfs). The seekfs dir is
+  where the config and volume indexes live; it is never indexed itself.
   Supported keys: dbs, db, db_paths, db_path, volumes, volume, service_pipe,
-  default_limit, output_format.
+  default_limit, output_format, seekfs_dir.
 
 Errors:
   With --json, errors are written to stderr as:
@@ -3297,7 +3300,7 @@ func printConfigKey(cfg appConfig, key string) error {
 }
 
 func setConfigKey(path, key, value string) error {
-	allowed := map[string]bool{"dbs": true, "db_paths": true, "volumes": true, "service_pipe": true, "default_limit": true, "output_format": true}
+	allowed := map[string]bool{"dbs": true, "db_paths": true, "volumes": true, "service_pipe": true, "default_limit": true, "output_format": true, "seekfs_dir": true}
 	if !allowed[key] {
 		return fmt.Errorf("unknown config key %q", key)
 	}
@@ -19097,6 +19100,8 @@ func loadConfig(path string) (appConfig, error) {
 			if _, err := fmt.Sscanf(value, "%d", &n); err == nil {
 				cfg.DefaultLimit = n
 			}
+		case "seekfs_dir":
+			cfg.SeekFSDir = parseTOMLString(value)
 		}
 	}
 	return cfg, nil
@@ -19120,10 +19125,7 @@ func findDefaultConfig() string {
 }
 
 func defaultConfigPath() string {
-	if dir, err := os.UserConfigDir(); err == nil {
-		return filepath.Join(dir, "seekfs", "seekfs.toml")
-	}
-	return "seekfs.toml"
+	return filepath.Join(defaultSeekFSDir(), "seekfs.toml")
 }
 
 func parseTOMLString(value string) string {
@@ -19175,17 +19177,54 @@ func defaultDB() string {
 	return filepath.Join(dir, "seekfs", "index.gsi")
 }
 
-func defaultIndexDir() string {
-	base := os.Getenv("ProgramData")
-	if base == "" {
-		if dir, err := os.UserCacheDir(); err == nil {
-			base = dir
+func defaultSeekFSDir() string {
+	if v := os.Getenv("SEEKFS_DIR"); v != "" {
+		return filepath.Clean(v)
+	}
+	if base := os.Getenv("ProgramData"); base != "" {
+		return filepath.Join(base, "seekfs")
+	}
+	if dir, err := os.UserCacheDir(); err == nil {
+		return filepath.Join(dir, "seekfs")
+	}
+	return "seekfs"
+}
+
+// seekFSExclusionDirsUnder returns the canonical folders that must never be
+// indexed: the configured seekfs_dir and the default seekfs dir (SEEKFS_DIR
+// env, else %ProgramData%\seekfs). Only paths covered by sourceRoot are
+// returned; a seekfs dir on a different volume is irrelevant to that build.
+func seekFSExclusionDirsUnder(sourceRoot string) []string {
+	candidates := []string{}
+	if cfg, err := loadConfig(""); err == nil && cfg.SeekFSDir != "" {
+		candidates = append(candidates, cfg.SeekFSDir)
+	}
+	candidates = append(candidates, defaultSeekFSDir())
+	seen := make(map[string]struct{}, len(candidates))
+	out := make([]string, 0, len(candidates))
+	for _, candidate := range candidates {
+		if candidate == "" {
+			continue
 		}
+		canonical, err := directV9CanonicalPath(candidate)
+		if err != nil {
+			continue
+		}
+		if !directV9PathUnderAny(canonical, []string{sourceRoot}) {
+			continue
+		}
+		key := strings.ToLower(canonical)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, canonical)
 	}
-	if base == "" {
-		return "."
-	}
-	return filepath.Join(base, "seekfs", "indexes")
+	return out
+}
+
+func defaultIndexDir() string {
+	return filepath.Join(defaultSeekFSDir(), "indexes")
 }
 
 func defaultVolumeDB(indexDir, volume string) string {

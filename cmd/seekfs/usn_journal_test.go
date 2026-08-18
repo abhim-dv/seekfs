@@ -93,6 +93,52 @@ func TestMergeUSNNodesIntoMFTAddsMissingRecords(t *testing.T) {
 	}
 }
 
+func TestFilterMFTExclusions(t *testing.T) {
+	entries := map[uint64]mftEntry{
+		5:  {frn: 5, parentFRN: 5, name: "", attr: fileAttributeDir, isDir: true},
+		6:  {frn: 6, parentFRN: 5, name: "ProgramData", attr: fileAttributeDir, isDir: true},
+		7:  {frn: 7, parentFRN: 6, name: "seekfs", attr: fileAttributeDir, isDir: true},
+		8:  {frn: 8, parentFRN: 7, name: "seekfs.toml", attr: 0x20},
+		9:  {frn: 9, parentFRN: 7, name: "indexes", attr: fileAttributeDir, isDir: true},
+		10: {frn: 10, parentFRN: 9, name: "seekfs_c.gsi", attr: 0x20},
+		11: {frn: 11, parentFRN: 5, name: "keep.txt", attr: 0x20},
+		12: {frn: 12, parentFRN: 5, name: "System Volume Information", attr: fileAttributeDir, isDir: true},
+		13: {frn: 13, parentFRN: 12, name: "{GUID}", attr: fileAttributeDir, isDir: true},
+	}
+	removed := filterMFTExclusions(entries, `C:`, []string{ // C: like normalizeVolume returns
+		`C:\ProgramData\seekfs`,
+		`C:\System Volume Information`,
+		`D:\Other-Volume\seekfs`, // not on this volume: ignored
+		`C:\NoSuch\Thing`,        // unresolvable: ignored
+	})
+	if removed != 6 {
+		t.Fatalf("removed = %d, want 6 (seekfs subtree + SVI subtree)", removed)
+	}
+	for frn, want := range map[uint64]bool{7: false, 8: false, 9: false, 10: false, 12: false, 13: false} {
+		if _, ok := entries[frn]; ok != want {
+			t.Fatalf("frn %d present=%v want %v", frn, ok, want)
+		}
+	}
+	for _, frn := range []uint64{5, 6, 11} {
+		if _, ok := entries[frn]; !ok {
+			t.Fatalf("frn %d unexpectedly removed", frn)
+		}
+	}
+}
+
+func TestFilterMFTExclusionsNoMatchKeepsAll(t *testing.T) {
+	entries := map[uint64]mftEntry{
+		5: {frn: 5, parentFRN: 5, name: "", attr: fileAttributeDir, isDir: true},
+		11: {frn: 11, parentFRN: 5, name: "keep.txt", attr: 0x20},
+	}
+	if got := filterMFTExclusions(entries, `C:\`, []string{`C:\ProgramData\seekfs`}); got != 0 {
+		t.Fatalf("removed = %d, want 0", got)
+	}
+	if _, ok := entries[11]; !ok {
+		t.Fatal("keep.txt removed despite no matching exclusion")
+	}
+}
+
 func makeUSNRecordV2(frn, parent uint64, usn int64, reason, attr uint32, name string) []byte {
 	nameUTF16 := utf16.Encode([]rune(name))
 	nameBytes := make([]byte, len(nameUTF16)*2)
