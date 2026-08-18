@@ -1064,14 +1064,29 @@ func cloneCompactIndex(idx *Index) *Index {
 	if idx == nil {
 		return nil
 	}
-	out := *idx
-	out.Roots = append([]string(nil), idx.Roots...)
-	out.Records = append([]CompactRecord(nil), idx.Records...)
-	out.Entries = append([]Entry(nil), idx.Entries...)
-	out.NameOrder = append([]int(nil), idx.NameOrder...)
-	out.PathOrder = append([]int(nil), idx.PathOrder...)
-	out.CompactNameOrder = append([]int(nil), idx.CompactNameOrder...)
-	return &out
+	out := &Index{
+		Version:          idx.Version,
+		Roots:            append([]string(nil), idx.Roots...),
+		BuiltAt:          idx.BuiltAt,
+		Source:           idx.Source,
+		Volume:           idx.Volume,
+		JournalID:        idx.JournalID,
+		Checkpoint:       idx.Checkpoint,
+		ContentHash:      idx.ContentHash,
+		Entries:          append([]Entry(nil), idx.Entries...),
+		NameOrder:        append([]int(nil), idx.NameOrder...),
+		PathOrder:        append([]int(nil), idx.PathOrder...),
+		Compact:          idx.Compact,
+		Records:          append([]CompactRecord(nil), idx.Records...),
+		PackedRecords:    idx.PackedRecords,
+		MMapRecords:      idx.MMapRecords,
+		CompactAttrs:     idx.CompactAttrs,
+		CompactNameOrder: append([]int(nil), idx.CompactNameOrder...),
+		NameBlob:         idx.NameBlob,
+		Derived:          idx.Derived,
+		DBPath:           idx.DBPath,
+	}
+	return out
 }
 
 func TestEngineV9DisabledDoesNotAllocateOverlay(t *testing.T) {
