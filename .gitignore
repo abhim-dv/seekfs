@@ -26,3 +26,9 @@ __pycache__/
 dist/
 build/
 bin/
+.r5tmp/
+.gocache/
+.codex/
+.codex-tmp/
+.agents/
+.tools/
