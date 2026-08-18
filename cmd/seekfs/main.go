@@ -19104,6 +19104,9 @@ func loadConfig(path string) (appConfig, error) {
 
 func findDefaultConfig() string {
 	candidates := []string{"seekfs.toml"}
+	if home, err := os.UserHomeDir(); err == nil {
+		candidates = append(candidates, filepath.Join(home, "seekfs.toml"))
+	}
 	candidates = append(candidates, defaultConfigPath())
 	if exe, err := os.Executable(); err == nil {
 		candidates = append(candidates, filepath.Join(filepath.Dir(exe), "seekfs.toml"))
