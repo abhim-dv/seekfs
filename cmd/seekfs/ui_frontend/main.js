@@ -1,7 +1,10 @@
 const state = {
   seq: 0,
   rows: [],
-  selected: -1,
+  selectedSet: new Set(),
+  anchor: -1,
+  lastClicked: -1,
+  sort: "",
   lastQuery: "",
 };
 
@@ -12,6 +15,7 @@ const els = {
   summary: document.getElementById("summary"),
   selected: document.getElementById("selected"),
   menu: document.getElementById("menu"),
+  headers: Array.from(document.querySelectorAll("th")),
 };
 
 function api() {
@@ -61,21 +65,90 @@ function debounce(fn, delay) {
 }
 
 function selectedRows() {
-  if (state.selected < 0 || state.selected >= state.rows.length) return [];
-  return [state.rows[state.selected]];
+  if (!state.rows.length) return [];
+  const rows = [];
+  state.selectedSet.forEach((index) => {
+    if (index >= 0 && index < state.rows.length) rows.push(state.rows[index]);
+  });
+  return rows;
 }
 
 function selectedPaths() {
   return selectedRows().map((row) => row.path);
 }
 
-function setSelected(index) {
-  state.selected = index;
-  [...els.results.querySelectorAll("tr")].forEach((tr, i) => {
-    tr.classList.toggle("selected", i === index);
-  });
-  const row = selectedRows()[0];
-  els.selected.textContent = row ? row.path : "";
+function clearSelection() {
+  state.selectedSet.clear();
+  state.anchor = -1;
+  state.lastClicked = -1;
+}
+
+function setSelected(index, opts) {
+  opts = opts || {};
+  const count = state.rows.length;
+  if (!count) {
+    clearSelection();
+    applySelectionClasses();
+    updateSelectedFooter();
+    return;
+  }
+  const clamped = Math.max(0, Math.min(count - 1, index));
+  if (opts.range && state.anchor >= 0) {
+    state.selectedSet.clear();
+    const lo = Math.min(state.anchor, clamped);
+    const hi = Math.max(state.anchor, clamped);
+    for (let i = lo; i <= hi; i++) state.selectedSet.add(i);
+  } else if (opts.extend) {
+    if (state.anchor < 0) state.anchor = clamped;
+    const lo = Math.min(state.anchor, clamped);
+    const hi = Math.max(state.anchor, clamped);
+    for (let i = lo; i <= hi; i++) state.selectedSet.add(i);
+  } else if (opts.toggle) {
+    if (state.selectedSet.has(clamped)) {
+      state.selectedSet.delete(clamped);
+    } else {
+      state.selectedSet.add(clamped);
+    }
+    if (opts.anchor !== undefined) state.anchor = opts.anchor;
+  } else if (opts.add) {
+    state.selectedSet.add(clamped);
+  } else {
+    state.selectedSet.clear();
+    state.selectedSet.add(clamped);
+    state.anchor = clamped;
+  }
+  if (opts.lastClicked !== undefined) state.lastClicked = opts.lastClicked;
+  else state.lastClicked = clamped;
+  applySelectionClasses();
+  updateSelectedFooter();
+}
+
+function applySelectionClasses() {
+  const rows = els.results.querySelectorAll("tr");
+  for (let i = 0; i < rows.length; i++) {
+    rows[i].classList.toggle("selected", state.selectedSet.has(i));
+    rows[i].classList.toggle("focused", i === state.lastClicked);
+    rows[i].setAttribute("aria-selected", state.selectedSet.has(i) ? "true" : "false");
+    rows[i].setAttribute("aria-current", i === state.lastClicked ? "true" : "false");
+  }
+  if (state.lastClicked >= 0 && state.lastClicked < rows.length) {
+    els.results.setAttribute("aria-activedescendant", `row-${state.lastClicked}`);
+  } else {
+    els.results.removeAttribute("aria-activedescendant");
+  }
+}
+
+function updateSelectedFooter() {
+  const size = state.selectedSet.size;
+  if (size > 1) {
+    els.selected.textContent = `${size} selected`;
+  } else if (size === 1) {
+    const first = state.selectedSet.values().next().value;
+    const row = first >= 0 && first < state.rows.length ? state.rows[first] : null;
+    els.selected.textContent = row ? row.path : "";
+  } else {
+    els.selected.textContent = "";
+  }
 }
 
 function formatSize(row) {
@@ -107,35 +180,373 @@ function fileGlyph(row) {
   return row.is_dir ? "▸" : "◻";
 }
 
+// Per-row file-type icons (16x16 shell icons as PNG data URIs), cached by
+// extension key so a result set costs at most a few backend calls.
+const iconCache = new Map();
+const iconPending = new Map();
+
+function iconKeyFor(row) {
+  if (row.is_dir) return "dir";
+  const dot = (row.name || "").lastIndexOf(".");
+  if (dot > 0) return row.name.slice(dot + 1).toLowerCase();
+  return "file";
+}
+
+function ensureIcon(key, path, isDir) {
+  if (iconCache.has(key)) return Promise.resolve(iconCache.get(key));
+  if (iconPending.has(key)) return iconPending.get(key);
+  const pending = call("GetFileIcon", path, isDir)
+    .then((uri) => {
+      const data = uri || "";
+      iconCache.set(key, data);
+      iconPending.delete(key);
+      return data;
+    })
+    .catch(() => {
+      iconCache.set(key, "");
+      iconPending.delete(key);
+      return "";
+    });
+  iconPending.set(key, pending);
+  return pending;
+}
+
+function iconImg(row) {
+  const key = iconKeyFor(row);
+  const src = iconCache.has(key) && iconCache.get(key) ? ` src="${iconCache.get(key)}"` : "";
+  return `<img class="row-icon" data-icon-key="${key}" alt=""${src} />`;
+}
+
+// primeIcons requests icons for every row's extension once and fills the
+// matching <img> elements as each resolves.
+function primeIcons() {
+  const pending = [];
+  const rows = els.results.querySelectorAll("tr[data-index]");
+  for (const tr of rows) {
+    const img = tr.querySelector("img.row-icon");
+    if (!img || img.src) continue;
+    const key = img.dataset.iconKey;
+    const row = state.rows[Number(tr.dataset.index)];
+    if (!row) continue;
+    pending.push({ key, path: row.path, isDir: !!row.is_dir });
+  }
+  const seen = new Set();
+  for (const item of pending) {
+    if (seen.has(item.key)) continue;
+    seen.add(item.key);
+    ensureIcon(item.key, item.path, item.isDir).then((uri) => {
+      if (!uri) return;
+      const imgs = els.results.querySelectorAll(`img.row-icon[data-icon-key="${item.key}"]`);
+      for (const img of imgs) {
+        if (!img.src) img.src = uri;
+      }
+    });
+  }
+}
+
 function renderRows(rows) {
+  const wasSingle = state.selectedSet.size === 1;
+  const oldActivePath = wasSingle
+    ? (state.rows[state.lastClicked] || state.rows[state.selectedSet.values().next().value] || {}).path
+    : undefined;
   state.rows = rows;
-  state.selected = rows.length ? 0 : -1;
+  state.selectedSet.clear();
+  state.anchor = -1;
+  if (rows.length) {
+    if (oldActivePath !== undefined) {
+      const preserved = rows.findIndex((row) => row.path === oldActivePath);
+      if (preserved >= 0) {
+        state.selectedSet.add(preserved);
+        state.lastClicked = preserved;
+        state.anchor = preserved;
+      } else {
+        state.lastClicked = -1;
+      }
+    } else {
+      state.lastClicked = -1;
+    }
+  } else {
+    state.lastClicked = -1;
+  }
   els.results.textContent = "";
+  els.results.setAttribute("role", "listbox");
+  els.results.setAttribute("aria-label", "Search results");
   const frag = document.createDocumentFragment();
   rows.forEach((row, index) => {
     const tr = document.createElement("tr");
     tr.title = row.path;
     tr.dataset.index = String(index);
-    tr.className = index === state.selected ? "selected" : "";
+    tr.id = `row-${index}`;
+    tr.className = "";
+    tr.setAttribute("role", "option");
+    tr.setAttribute("aria-selected", "false");
+    tr.setAttribute("aria-current", "false");
     tr.innerHTML = `
-      <td>${escapeHtml(row.name || "")}</td>
+      <td>${iconImg(row)}${escapeHtml(row.name || "")}</td>
       <td class="path-cell">${escapeHtml(row.dir || row.path || "")}</td>
       <td class="size-cell">${escapeHtml(formatSize(row))}</td>
       <td class="date-cell">${escapeHtml(formatDate(row.modified))}</td>
     `;
-    tr.addEventListener("click", () => setSelected(index));
-    tr.addEventListener("dblclick", () => openSelected());
-    tr.addEventListener("contextmenu", (event) => {
-      event.preventDefault();
-      setSelected(index);
-      showMenu(event.clientX, event.clientY);
-    });
     frag.appendChild(tr);
   });
   els.results.appendChild(frag);
+  cacheRowMetrics();
+  primeIcons();
+  applySelectionClasses();
   els.empty.style.display = rows.length ? "none" : "block";
-  const row = selectedRows()[0];
-  els.selected.textContent = row ? row.path : "";
+  updateSelectedFooter();
+}
+
+function rowFromEvent(event) {
+  const tr = event.target && event.target.closest ? event.target.closest("tr[data-index]") : null;
+  if (!tr) return -1;
+  return Number(tr.dataset.index);
+}
+
+// Drag-to-select gestures, Explorer-style. Two modes:
+//   "row"    - mousedown on a row, then drag to extend the selection range.
+//   "marquee"- mousedown on empty space, then drag to draw a rubber-band box
+//              that selects every row it touches.
+// Both are driven by document-level mouse events (the most reliable mechanism
+// in WebView2).
+let dragMode = "";
+let dragAnchorIndex = -1;
+let dragRaf = 0;
+let dragPointerX = 0;
+let dragPointerY = 0;
+let dragAutoScroll = 0;
+let marqueeEl = null;
+let marqueeStartX = 0;
+let marqueeStartY = 0;
+let marqueeRaf = 0;
+let pendingX = 0;
+let pendingY = 0;
+let rowMetrics = { scrollTopAtRender: 0, rows: [] };
+
+// Row vertical positions cached at render time (viewport coords). Since the
+// results list scrolls only inside .results-wrap, the current viewport position
+// of row i is rowMetrics.rows[i].top - (wrap.scrollTop - scrollTopAtRender).
+// This lets the marquee and row drag do pure arithmetic instead of measuring
+// every row's bounding rect on each mouse move.
+function cacheRowMetrics() {
+  const wrap = els.results.closest(".results-wrap");
+  const rows = els.results.querySelectorAll("tr");
+  const metrics = { scrollTopAtRender: wrap ? wrap.scrollTop : 0, rows: [] };
+  for (const tr of rows) {
+    const rect = tr.getBoundingClientRect();
+    metrics.rows.push({ top: rect.top, height: rect.height });
+  }
+  rowMetrics = metrics;
+}
+
+function marqueeElement() {
+  if (marqueeEl) return marqueeEl;
+  const wrap = els.results.closest(".results-wrap");
+  marqueeEl = document.createElement("div");
+  marqueeEl.className = "marquee";
+  wrap.appendChild(marqueeEl);
+  return marqueeEl;
+}
+
+function endDragSelection() {
+  dragMode = "";
+  dragAnchorIndex = -1;
+  if (marqueeEl) marqueeEl.style.display = "none";
+  if (dragRaf) cancelAnimationFrame(dragRaf);
+  dragRaf = 0;
+  if (marqueeRaf) cancelAnimationFrame(marqueeRaf);
+  marqueeRaf = 0;
+  if (dragAutoScroll) cancelAnimationFrame(dragAutoScroll);
+  dragAutoScroll = 0;
+}
+
+function rowIndexAtY(clientY) {
+  const wrap = els.results.closest(".results-wrap");
+  const rows = rowMetrics.rows;
+  const count = rows.length;
+  if (!count || !wrap) return -1;
+  const delta = wrap.scrollTop - rowMetrics.scrollTopAtRender;
+  if (clientY < rows[0].top - delta) return 0;
+  if (clientY >= rows[count - 1].top - delta + rows[count - 1].height) return count - 1;
+  let lo = 0;
+  let hi = count - 1;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (rows[mid].top - delta <= clientY) lo = mid + 1;
+    else hi = mid;
+  }
+  return Math.max(0, lo - 1);
+}
+
+function applyDragRange(toIndex) {
+  const count = state.rows.length;
+  if (!count || dragAnchorIndex < 0) return;
+  const lo = Math.min(dragAnchorIndex, toIndex);
+  const hi = Math.max(dragAnchorIndex, toIndex);
+  state.selectedSet.clear();
+  for (let i = lo; i <= hi; i++) state.selectedSet.add(i);
+  state.lastClicked = toIndex;
+  applySelectionClasses();
+  updateSelectedFooter();
+}
+
+// Draw the rubber-band box between marqueeStart and the current pointer, and
+// select every row it touches. Like Explorer's details view, selection is by
+// row band (vertical intersection) regardless of horizontal position, so
+// dragging over the empty space right of the columns still selects rows. Uses
+// the cached row metrics so no per-row layout is triggered.
+function updateMarquee(clientX, clientY) {
+  const wrap = els.results.closest(".results-wrap");
+  if (!wrap) return;
+  dragPointerX = clientX;
+  dragPointerY = clientY;
+  const wrapRect = wrap.getBoundingClientRect();
+  const left = Math.max(wrapRect.left, Math.min(marqueeStartX, clientX));
+  const top = Math.max(wrapRect.top, Math.min(marqueeStartY, clientY));
+  const right = Math.min(wrapRect.right, Math.max(marqueeStartX, clientX));
+  const bottom = Math.min(wrapRect.bottom, Math.max(marqueeStartY, clientY));
+  const el = marqueeElement();
+  el.style.display = "block";
+  el.style.left = `${left}px`;
+  el.style.top = `${top}px`;
+  el.style.width = `${Math.max(0, right - left)}px`;
+  el.style.height = `${Math.max(0, bottom - top)}px`;
+  // A near-zero box (a plain click) selects nothing.
+  if (right - left < 3 || bottom - top < 3) {
+    state.selectedSet.clear();
+    applySelectionClasses();
+    updateSelectedFooter();
+    return;
+  }
+  const delta = wrap.scrollTop - rowMetrics.scrollTopAtRender;
+  const rows = rowMetrics.rows;
+  state.selectedSet.clear();
+  for (let i = 0; i < rows.length; i++) {
+    const r = rows[i];
+    const rtop = r.top - delta;
+    if (rtop <= bottom && rtop + r.height >= top) {
+      state.selectedSet.add(i);
+    }
+  }
+  state.lastClicked = -1;
+  applySelectionClasses();
+  updateSelectedFooter();
+}
+
+function dragScrollTick() {
+  const wrap = els.results.closest(".results-wrap");
+  if (!wrap) {
+    dragAutoScroll = 0;
+    return;
+  }
+  const rect = wrap.getBoundingClientRect();
+  const margin = 28;
+  let dy = 0;
+  if (dragPointerY < rect.top + margin) {
+    dy = -Math.max(1, Math.ceil((rect.top + margin - dragPointerY) / 3));
+  } else if (dragPointerY > rect.bottom - margin) {
+    dy = Math.max(1, Math.ceil((dragPointerY - (rect.bottom - margin)) / 3));
+  }
+  if (dy) {
+    wrap.scrollTop += dy;
+    if (dragMode === "row") {
+      const index = rowIndexAtY(dragPointerY);
+      if (index >= 0 && index !== dragAnchorIndex) {
+        dragAnchorIndex = index;
+        applyDragRange(index);
+      }
+    } else if (dragMode === "marquee") {
+      updateMarquee(dragPointerX, dragPointerY);
+    }
+    dragAutoScroll = requestAnimationFrame(dragScrollTick);
+  } else {
+    dragAutoScroll = 0;
+  }
+}
+
+function onDocumentMouseDown(event) {
+  if (event.button !== 0) return;
+  const target = event.target;
+  if (target && target.closest) {
+    if (target.closest(".searchbar") || target.closest("thead") || target.closest("#menu") || target.closest(".footer")) {
+      return;
+    }
+  }
+  els.results.focus();
+  const index = rowFromEvent(event);
+  if (index < 0) {
+    // Empty space: start a rubber-band selection box.
+    clearSelection();
+    applySelectionClasses();
+    updateSelectedFooter();
+    dragMode = "marquee";
+    marqueeStartX = event.clientX;
+    marqueeStartY = event.clientY;
+    updateMarquee(event.clientX, event.clientY);
+    return;
+  }
+  if (event.ctrlKey || event.metaKey) {
+    setSelected(index, { toggle: true, anchor: index, lastClicked: index });
+    endDragSelection();
+    return;
+  }
+  if (event.shiftKey) {
+    setSelected(index, { range: true, lastClicked: index });
+    endDragSelection();
+    return;
+  }
+  setSelected(index, { lastClicked: index });
+  dragMode = "row";
+  dragAnchorIndex = index;
+  dragPointerY = event.clientY;
+}
+
+function onDocumentMouseMove(event) {
+  if (dragMode === "marquee") {
+    event.preventDefault();
+    pendingX = event.clientX;
+    pendingY = event.clientY;
+    if (marqueeRaf) return;
+    marqueeRaf = requestAnimationFrame(() => {
+      marqueeRaf = 0;
+      updateMarquee(pendingX, pendingY);
+      if (!dragAutoScroll) dragScrollTick();
+    });
+    return;
+  }
+  if (dragMode !== "row") return;
+  event.preventDefault();
+  dragPointerY = event.clientY;
+  const index = rowIndexAtY(event.clientY);
+  if (index < 0) return;
+  if (index === dragAnchorIndex) return;
+  dragAnchorIndex = index;
+  if (dragRaf) return;
+  dragRaf = requestAnimationFrame(() => {
+    dragRaf = 0;
+    applyDragRange(dragAnchorIndex);
+    dragScrollTick();
+  });
+}
+
+function onDocumentMouseUp(event) {
+  if (!dragMode) return;
+  endDragSelection();
+}
+
+document.addEventListener("mousedown", onDocumentMouseDown);
+document.addEventListener("mousemove", onDocumentMouseMove);
+document.addEventListener("mouseup", onDocumentMouseUp);
+
+function scrollToIndex(index) {
+  const tr = els.results.querySelectorAll("tr")[index];
+  if (tr) tr.scrollIntoView({ block: "nearest" });
+}
+
+function activeIndex() {
+  if (state.lastClicked >= 0 && state.lastClicked < state.rows.length) return state.lastClicked;
+  if (state.selectedSet.size) return state.selectedSet.values().next().value;
+  return state.rows.length ? 0 : -1;
 }
 
 async function refreshStatus() {
@@ -154,9 +565,29 @@ async function refreshStatus() {
   }
 }
 
+function buildQueryWithSort(rawQuery) {
+  const fields = rawQuery.split(/\s+/).filter(Boolean);
+  const kept = fields.filter((field) => !/^sort:/i.test(field));
+  const query = kept.join(" ");
+  if (state.sort) {
+    return query ? `${query} sort:${state.sort}` : `sort:${state.sort}`;
+  }
+  const existing = fields.find((field) => /^sort:/i.test(field));
+  if (existing) {
+    const matched = /^sort:([a-z]+)/i.exec(existing);
+    const column = matched ? matched[1].toLowerCase() : "";
+    if (sortSupported(column)) {
+      state.sort = column;
+      applySortIndicator();
+      return query;
+    }
+  }
+  return query;
+}
+
 async function searchNow() {
   const rawQuery = els.query.value.trim();
-  const query = normalizeLiveQuery(rawQuery);
+  const query = normalizeLiveQuery(buildQueryWithSort(rawQuery));
   state.lastQuery = rawQuery;
   const seq = ++state.seq;
   hideMenu();
@@ -218,6 +649,147 @@ function handleSearchResponse(response) {
 
 const searchSoon = debounce(searchNow, 90);
 
+function sortSupported(column) {
+  return column === "size" || column === "modified" || column === "extension" || column === "type" || column === "path";
+}
+
+function headerColumn(header) {
+  return header && header.dataset ? header.dataset.sort || "" : "";
+}
+
+function applySortIndicator() {
+  for (const header of els.headers) {
+    const column = headerColumn(header);
+    header.classList.toggle("sorted", column === state.sort);
+    const arrow = header.querySelector(".sort-arrow");
+    if (column === state.sort) {
+      if (!arrow) {
+        const span = document.createElement("span");
+        span.className = "sort-arrow";
+        span.textContent = " ▲";
+        header.appendChild(span);
+      }
+    } else if (arrow) {
+      arrow.remove();
+    }
+  }
+}
+
+function setSort(column) {
+  if (column === "name") {
+    if (state.sort !== "") {
+      state.sort = "";
+      applySortIndicator();
+      searchNow();
+    }
+    return;
+  }
+  if (state.sort === column) {
+    state.sort = "";
+  } else {
+    state.sort = column;
+  }
+  applySortIndicator();
+  searchNow();
+}
+
+els.headers.forEach((header) => {
+  header.addEventListener("click", () => {
+    const column = headerColumn(header);
+    if (column) setSort(column);
+  });
+});
+
+const COLUMN_WIDTHS_KEY = "seekfs.columnWidths";
+const COLUMN_MIN_WIDTH = 60;
+
+function colWidths() {
+  let saved = {};
+  try {
+    saved = JSON.parse(localStorage.getItem(COLUMN_WIDTHS_KEY) || "{}");
+  } catch (err) {
+    saved = {};
+  }
+  return saved;
+}
+
+function saveColWidths() {
+  try {
+    localStorage.setItem(COLUMN_WIDTHS_KEY, JSON.stringify(state.colWidths));
+  } catch (err) {
+    // Ignore storage errors (e.g. private mode).
+  }
+}
+
+function applyColWidths() {
+  const cols = document.querySelectorAll(".results col");
+  const map = { name: 0, path: 1, size: 2, modified: 3 };
+  const saved = colWidths();
+  state.colWidths = state.colWidths || saved;
+  for (const header of els.headers) {
+    const column = headerColumn(header) || "name";
+    const index = map[column];
+    if (index === undefined || !cols[index]) continue;
+    const width = state.colWidths[column];
+    if (width) cols[index].style.width = `${width}px`;
+  }
+}
+
+function beginColumnResize(header, event) {
+  const column = headerColumn(header) || "name";
+  const cols = document.querySelectorAll(".results col");
+  const map = { name: 0, path: 1, size: 2, modified: 3 };
+  const index = map[column];
+  if (index === undefined || !cols[index]) return;
+  event.preventDefault();
+  event.stopPropagation();
+  const startX = event.clientX;
+  const startWidth = cols[index].getBoundingClientRect().width;
+  const table = header.closest("table");
+  table.classList.add("resizing");
+  const onMove = (moveEvent) => {
+    const delta = moveEvent.clientX - startX;
+    const width = Math.max(COLUMN_MIN_WIDTH, Math.round(startWidth + delta));
+    cols[index].style.width = `${width}px`;
+  };
+  const onUp = () => {
+    table.classList.remove("resizing");
+    window.removeEventListener("pointermove", onMove);
+    window.removeEventListener("pointerup", onUp);
+    state.colWidths = state.colWidths || {};
+    state.colWidths[column] = Math.round(cols[index].getBoundingClientRect().width);
+    saveColWidths();
+  };
+  try {
+    header.setPointerCapture(event.pointerId);
+  } catch (err) {
+    // Ignore: window listeners still track the drag.
+  }
+  window.addEventListener("pointermove", onMove);
+  window.addEventListener("pointerup", onUp);
+}
+
+function initColumnResize() {
+  state.colWidths = colWidths();
+  applyColWidths();
+  els.headers.forEach((header) => {
+    const resizer = document.createElement("div");
+    resizer.className = "th-resizer";
+    header.appendChild(resizer);
+    resizer.addEventListener("pointerdown", (event) => beginColumnResize(header, event));
+    resizer.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+    });
+  });
+  window.addEventListener("resize", () => {
+    // Preserve explicit widths on relayout; colgroup widths are sticky.
+    applyColWidths();
+  });
+}
+
+initColumnResize();
+
 function showMenu(x, y) {
   const width = 190;
   const height = 198;
@@ -230,14 +802,19 @@ function hideMenu() {
   els.menu.classList.remove("open");
 }
 
-async function openSelected() {
-  const [path] = selectedPaths();
+async function openPath(path) {
   if (path) await call("Open", path);
 }
 
+async function openSelected() {
+  const index = activeIndex();
+  if (index < 0) return;
+  await call("Open", state.rows[index].path);
+}
+
 async function revealSelected() {
-  const [path] = selectedPaths();
-  if (path) await call("Reveal", path);
+  const paths = selectedPaths();
+  if (paths.length) await call("Reveal", paths[0]);
 }
 
 async function copySelected() {
@@ -246,22 +823,69 @@ async function copySelected() {
 }
 
 async function copyNameSelected() {
-  const row = selectedRows()[0];
-  if (row) await call("CopyPaths", [row.name]);
+  const rows = selectedRows();
+  if (rows.length) {
+    await call("CopyPaths", rows.map((row) => row.name));
+  }
 }
 
 async function propsSelected() {
-  const [path] = selectedPaths();
-  if (path) await call("Properties", path);
+  const rows = selectedRows();
+  if (rows.length) await call("Properties", rows[0].path);
+}
+
+let renameActive = false;
+
+function startRename(index) {
+  if (renameActive || index < 0 || index >= state.rows.length) return;
+  const tr = els.results.querySelectorAll("tr")[index];
+  const nameCell = tr ? tr.querySelector("td") : null;
+  if (!nameCell) return;
+  const row = state.rows[index];
+  const dot = row.name.lastIndexOf(".");
+  const prefix = dot > 0 ? row.name.slice(0, dot) : row.name;
+  const input = document.createElement("input");
+  input.className = "rename-input";
+  input.value = row.name;
+  nameCell.textContent = "";
+  nameCell.appendChild(input);
+  input.focus();
+  input.setSelectionRange(0, prefix.length);
+  renameActive = true;
+
+  const finish = async (commit) => {
+    if (!renameActive) return;
+    renameActive = false;
+    const value = input.value.trim();
+    input.remove();
+    nameCell.textContent = escapeHtml(state.rows[index] ? state.rows[index].name || "" : "");
+    if (!commit) return;
+    if (!value || value === row.name) return;
+    try {
+      await call("Rename", row.path, value);
+      await searchNow();
+    } catch (err) {
+      els.summary.textContent = err.message || "Rename failed";
+    }
+  };
+
+  input.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      event.stopPropagation();
+      finish(true);
+    } else if (event.key === "Escape") {
+      event.preventDefault();
+      event.stopPropagation();
+      finish(false);
+    }
+  });
+  input.addEventListener("blur", () => finish(true));
 }
 
 async function renameSelected() {
-  const row = selectedRows()[0];
-  if (!row) return;
-  const next = prompt("Rename", row.name);
-  if (!next || next === row.name) return;
-  await call("Rename", row.path, next);
-  await searchNow();
+  const index = activeIndex();
+  if (index >= 0) startRename(index);
 }
 
 async function deleteSelected() {
@@ -272,15 +896,215 @@ async function deleteSelected() {
   await searchNow();
 }
 
-function moveSelection(delta) {
+function moveActive(delta) {
   if (!state.rows.length) return;
-  const next = Math.max(0, Math.min(state.rows.length - 1, state.selected + delta));
-  setSelected(next);
-  const tr = els.results.querySelectorAll("tr")[next];
-  if (tr) tr.scrollIntoView({ block: "nearest" });
+  let next = activeIndex();
+  next = next < 0 ? 0 : next;
+  next = Math.max(0, Math.min(state.rows.length - 1, next + delta));
+  state.selectedSet.clear();
+  state.selectedSet.add(next);
+  state.anchor = next;
+  state.lastClicked = next;
+  applySelectionClasses();
+  updateSelectedFooter();
+  scrollToIndex(next);
 }
 
-els.query.addEventListener("input", searchSoon);
+function extendActive(delta) {
+  if (!state.rows.length) return;
+  let next = activeIndex();
+  next = next < 0 ? 0 : next;
+  next = Math.max(0, Math.min(state.rows.length - 1, next + delta));
+  if (state.anchor < 0) state.anchor = next;
+  const lo = Math.min(state.anchor, next);
+  const hi = Math.max(state.anchor, next);
+  state.selectedSet.clear();
+  for (let i = lo; i <= hi; i++) state.selectedSet.add(i);
+  state.lastClicked = next;
+  applySelectionClasses();
+  updateSelectedFooter();
+  scrollToIndex(next);
+}
+
+function moveFocus(delta) {
+  if (!state.rows.length) return;
+  let next = activeIndex();
+  next = next < 0 ? 0 : next;
+  next = Math.max(0, Math.min(state.rows.length - 1, next + delta));
+  state.lastClicked = next;
+  applySelectionClasses();
+  updateSelectedFooter();
+  scrollToIndex(next);
+}
+
+function selectAll() {
+  state.selectedSet.clear();
+  for (let i = 0; i < state.rows.length; i++) state.selectedSet.add(i);
+  if (state.rows.length) state.anchor = 0;
+  applySelectionClasses();
+  updateSelectedFooter();
+}
+
+function goToEdge(edge) {
+  if (!state.rows.length) return;
+  const next = edge === "home" ? 0 : state.rows.length - 1;
+  state.selectedSet.clear();
+  state.selectedSet.add(next);
+  state.anchor = next;
+  state.lastClicked = next;
+  applySelectionClasses();
+  updateSelectedFooter();
+  scrollToIndex(next);
+}
+
+function toggleFocused() {
+  const index = activeIndex();
+  if (index < 0) return;
+  if (state.selectedSet.has(index)) {
+    state.selectedSet.delete(index);
+  } else {
+    state.selectedSet.add(index);
+  }
+  state.anchor = index;
+  state.lastClicked = index;
+  applySelectionClasses();
+  updateSelectedFooter();
+  scrollToIndex(index);
+}
+
+async function openContextMenuAt(index, x, y) {
+  if (index < 0) {
+    showMenu(x, y);
+    return;
+  }
+  if (!state.selectedSet.has(index)) {
+    setSelected(index, { lastClicked: index });
+  }
+  hideMenu();
+  try {
+    const result = await call("ShowShellContextMenu", selectedPaths(), Math.round(x), Math.round(y));
+    if (result === true) return;
+    console.log("shell context menu not shown:", result);
+    showMenu(x, y);
+  } catch (err) {
+    console.log("shell context menu error:", err);
+    els.summary.textContent = `menu: ${err.message || err}`;
+    showMenu(x, y);
+  }
+}
+
+function showMenuForEvent(event) {
+  const index = rowFromEvent(event);
+  openContextMenuAt(index, event.clientX, event.clientY);
+}
+
+els.results.addEventListener("dblclick", (event) => {
+  const index = rowFromEvent(event);
+  if (index < 0) return;
+  openPath(state.rows[index].path);
+});
+
+els.results.addEventListener("contextmenu", (event) => {
+  event.preventDefault();
+  showMenuForEvent(event);
+});
+
+// Prebuild the native shell context menu on hover so a right-click on the same
+// selection shows instantly instead of paying the ~300ms QueryContextMenu cost.
+// Uses the same selection logic as a right-click: the whole selection when the
+// hovered row is part of it, otherwise just the hovered row.
+const prebuildContextMenu = debounce((index) => {
+  if (index < 0 || !state.rows.length) return;
+  const paths = state.selectedSet.has(index) ? selectedPaths() : [state.rows[index].path];
+  if (!paths.length) return;
+  call("PrebuildShellContextMenu", paths);
+}, 250);
+
+els.results.addEventListener("pointermove", (event) => {
+  prebuildContextMenu(rowFromEvent(event));
+});
+
+els.results.addEventListener("keydown", async (event) => {
+  const key = event.key;
+  if (key === "Escape") {
+    hideMenu();
+    return;
+  }
+  if (key === "ArrowDown") {
+    event.preventDefault();
+    if (event.shiftKey) extendActive(1);
+    else if (event.ctrlKey || event.metaKey) moveFocus(1);
+    else moveActive(1);
+    return;
+  }
+  if (key === "ArrowUp") {
+    event.preventDefault();
+    if (event.shiftKey) extendActive(-1);
+    else if (event.ctrlKey || event.metaKey) moveFocus(-1);
+    else moveActive(-1);
+    return;
+  }
+  if (key === "Home") {
+    event.preventDefault();
+    goToEdge("home");
+    return;
+  }
+  if (key === "End") {
+    event.preventDefault();
+    goToEdge("end");
+    return;
+  }
+  if (key === " ") {
+    event.preventDefault();
+    toggleFocused();
+    return;
+  }
+  if ((event.ctrlKey || event.metaKey) && key.toLowerCase() === "a") {
+    event.preventDefault();
+    selectAll();
+    return;
+  }
+  if ((event.ctrlKey || event.metaKey) && key.toLowerCase() === "c") {
+    if (window.getSelection && window.getSelection().toString().length > 0) {
+      return;
+    }
+    event.preventDefault();
+    await copySelected();
+    return;
+  }
+  if (key === "Enter") {
+    event.preventDefault();
+    await openSelected();
+    return;
+  }
+  if (key === "F2") {
+    event.preventDefault();
+    await renameSelected();
+    return;
+  }
+  if (key === "Delete") {
+    event.preventDefault();
+    await deleteSelected();
+    return;
+  }
+  if (key === "ContextMenu" || event.keyCode === 93) {
+    event.preventDefault();
+    const index = activeIndex();
+    const tr = index >= 0 ? els.results.querySelectorAll("tr")[index] : null;
+    const rect = tr ? tr.getBoundingClientRect() : els.results.getBoundingClientRect();
+    openContextMenuAt(index, Math.round(rect.left + rect.width / 2), Math.round(rect.top + rect.height / 2));
+    return;
+  }
+});
+
+els.query.addEventListener("input", (event) => {
+  if (event.target.value !== state.lastQuery) {
+    state.sort = "";
+    applySortIndicator();
+  }
+  searchSoon();
+});
+
 els.menu.addEventListener("click", async (event) => {
   const button = event.target.closest("button[data-action]");
   if (!button) return;
@@ -295,28 +1119,35 @@ els.menu.addEventListener("click", async (event) => {
   if (action === "delete") await deleteSelected();
 });
 
-document.addEventListener("click", hideMenu);
-document.addEventListener("keydown", async (event) => {
-  if (event.key === "Escape") {
-    hideMenu();
-  } else if (event.key === "ArrowDown") {
+document.addEventListener("mousedown", (event) => {
+  if (!els.menu.contains(event.target)) hideMenu();
+});
+
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape") hideMenu();
+});
+
+// Global shortcut fallbacks so Explorer-style shortcuts work even when the
+// search input holds focus (the results table may not have DOM focus).
+document.addEventListener("keydown", (event) => {
+  const tag = event.target && event.target.tagName ? event.target.tagName.toLowerCase() : "";
+  const inEditable = tag === "input" || tag === "textarea" || (event.target && event.target.isContentEditable);
+  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "a") {
+    if (inEditable) {
+      // The search input selects its own text on Ctrl+A; treat a
+      // non-empty query as "keep typing" and do not steal the keystroke.
+      return;
+    }
+    if (!state.rows.length) return;
     event.preventDefault();
-    moveSelection(1);
-  } else if (event.key === "ArrowUp") {
+    selectAll();
+    return;
+  }
+  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "c" && !inEditable && state.selectedSet.size) {
+    if (window.getSelection && window.getSelection().toString().length > 0) return;
     event.preventDefault();
-    moveSelection(-1);
-  } else if (event.key === "Enter") {
-    event.preventDefault();
-    await openSelected();
-  } else if (event.key === "F2") {
-    event.preventDefault();
-    await renameSelected();
-  } else if (event.key === "Delete") {
-    event.preventDefault();
-    await deleteSelected();
-  } else if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "c") {
-    event.preventDefault();
-    await copySelected();
+    copySelected();
+    return;
   }
 });
 
