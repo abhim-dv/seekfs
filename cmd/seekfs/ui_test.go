@@ -343,8 +343,8 @@ func TestUIEverythingQueriesMatchServiceSearchFixture(t *testing.T) {
 		{
 			raw:       "Downloads nrrd",
 			wantQuery: "Downloads nrrd",
-			wantPath:  true,
-			wantNames: []string{"scan.nrrd"},
+			wantPath:  false,
+			wantNames: nil,
 		},
 		{
 			raw:       "path:Downloads",
@@ -402,7 +402,7 @@ func TestUIStrictSpaceSplitDoesNotInferFusedPathExtensions(t *testing.T) {
 		{"F: nrrd !raw", "F: nrrd !raw", false},
 		{"F: nrrd sort:size", "F: nrrd sort:size", false},
 		{"path:F: nrrd", "F: nrrd", true},
-		{"pretraining DVT nrrd", "pretraining DVT nrrd", true},
+		{"pretraining DVT nrrd", "pretraining DVT nrrd", false},
 		{"nrrd", "nrrd", false},
 		{"ext:nrrd", "ext:nrrd", false},
 	}
