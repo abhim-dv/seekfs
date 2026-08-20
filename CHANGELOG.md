@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.11.0 - Multi-Term Posting Intersection and Service Wedge Fix
+
+### Added
+
+- Added `completeMultiTermNameGramCandidates` to intersect PNGR/PNGC postings
+  across all query terms (driver term = smallest complete gram), so multi-word
+  name queries such as `aker log`, `coterra log`, and `discovery log` answer in
+  ~10-30 ms instead of falling to a 2s+ bounded scan. This matches the
+  Everything posting-intersection model.
+- Direct-v9 MFT/USN volume builds with phase timing and I/O fixes, and seekfs-dir
+  consolidation.
+- Startup sweep of stale `*.gsi.*.tmp` files (7.8 GB had accumulated).
+
+### Changed
+
+- Removed the v8 engine entirely; readers and savers are v9-only, and
+  non-compact walk indexes auto-compact on save.
+- Background persist and index-usn disk writes are staged outside the global
+  index lock (per-volume `vol.mu` only); the global lock is held only for the
+  fast swap-in, and searches hold an RLock through the query so the mmap swap
+  cannot race them.
+
+### Fixed
+
+- Fixed a resident-service wedge where background persist and index-usn held the
+  global index lock for the entire multi-GB v9 write + reload, blocking every
+  `info`/`search` pipe request for minutes. Measured after the fix: startup load
+  ~431 ms (was ~30s), `service-info` 0.06 s (was 30 s timeout), no wedge during
+  an active background persist.
+- Fixed `index-usn` swapping in an in-memory index that never carried
+  `Index.Derived`, leaving the live volume without RANK/PNGR/PNGC so multi-term
+  queries declined to the bounded scan. Indexes now reload from disk after
+  commit in `index-usn`, `rebuildVolumeInPlace`, and `rebuildServiceVolumeIndex`.
+
+### Validation
+
+- `go test ./cmd/seekfs -count=1`
+- `go build -trimpath -ldflags "-s -w -X main.version=0.11.0 ..." -o seekfs.exe ./cmd/seekfs`
+- `go build -trimpath -tags "seekfs_ui production" -ldflags "-s -w ... -H windowsgui" -o seekfs-ui.exe ./cmd/seekfs`
+
 ## 0.10.0 - Mapped Query Index and Lazy Planner Sources
 
 ### Added
