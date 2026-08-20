@@ -272,6 +272,173 @@ func (vol *serviceVolumeIndex) completeFilenameRankedPosting(term string, limit 
 	return out, true
 }
 
+// completeMultiTermNameGramCandidates intersects PNGR/PNGC postings across
+// all query terms.  It picks the term whose smallest complete gram has the
+// fewest postings as the driver, materializes those IDs, then probes the
+// remaining terms' gram iterators with bounded membership checks.  Unlike the
+// single-term fast paths, this handles multi-word name queries such as
+// "aker log" whose grams are all common (>25k) and thus live in PNGC instead
+// of the selective PNGR section.
+func (vol *serviceVolumeIndex) completeMultiTermNameGramCandidates(terms []string, maxIDs int, pq parsedQuery) ([]int, bool) {
+	if vol == nil || vol.index == nil || len(terms) < 2 || maxIDs <= 0 {
+		return nil, false
+	}
+	// Collect complete gram iterators for every term.  A term is complete
+	// only when each required gram is stored in PNGR or PNGC, or the
+	// completeness metadata proves an exact empty.
+	type termIters struct {
+		term   string
+		its    []postingBlockIterator
+		counts []int
+	}
+	perTerm := make([]termIters, 0, len(terms))
+	exactEmpty := false
+	for _, term := range terms {
+		if len(term) < 3 {
+			return nil, false
+		}
+		its, counts, exactZero, complete := completeSelfNameGramIterators(vol.index, term)
+		if !complete {
+			return nil, false
+		}
+		if exactZero {
+			exactEmpty = true
+			continue
+		}
+		if len(its) == 0 || len(counts) != len(its) || counts[0] <= 0 {
+			return nil, false
+		}
+		perTerm = append(perTerm, termIters{term: term, its: its, counts: counts})
+	}
+	if len(perTerm) == 0 {
+		if exactEmpty {
+			if pq.Trace != nil {
+				pq.Trace.FilenameDriver = "exact-empty"
+				pq.Trace.setSource("exact-empty", 0)
+				pq.Trace.setComplete(true)
+			}
+			return []int{}, true
+		}
+		return nil, false
+	}
+	// Driver term = smallest first-gram posting count.  The driver's posting
+	// count may exceed maxIDs for common grams in PNGC; the cap applies to the
+	// intersected result, not the intermediate posting, so we do not reject
+	// here.
+	sort.Slice(perTerm, func(i, j int) bool { return perTerm[i].counts[0] < perTerm[j].counts[0] })
+	driver := perTerm[0]
+	ids := materializePostingBlockIterator(driver.its[0], driver.counts[0])
+	if ids == nil {
+		return nil, false
+	}
+	// Intersect the driver's remaining grams for its own term.
+	for i := 1; i < len(driver.its) && len(ids) > 0; i++ {
+		ids = intersectSortedUint32sWithPostingIterator(ids, driver.its[i])
+	}
+	// Probe every other term's grams.
+	for t := 1; t < len(perTerm) && len(ids) > 0; t++ {
+		pt := perTerm[t]
+		for g := 0; g < len(pt.its) && len(ids) > 0; g++ {
+			ids = intersectSortedUint32sWithPostingIterator(ids, pt.its[g])
+		}
+	}
+	if len(ids) == 0 {
+		return []int{}, true
+	}
+	// The intersected result must fit within maxIDs; intermediate posting
+	// counts for common PNGC grams are expected to exceed it.
+	if len(ids) > maxIDs {
+		if pq.Trace != nil {
+			pq.Trace.setDecline("name-trigram:multi-term-result-too-large")
+		}
+		return nil, false
+	}
+	// Merge recent (overlay) record IDs into the candidate pool.  The final
+	// fold verifies every term substring, so recent additions are admitted
+	// exactly when they match the full query.
+	if len(vol.recentIDs) > 0 {
+		seen := make(map[int]struct{}, len(ids)+len(vol.recentIDs))
+		for _, id := range ids {
+			seen[int(id)] = struct{}{}
+		}
+		for id := range vol.recentIDs {
+			seen[id] = struct{}{}
+		}
+		ids = ids[:0]
+		for id := range seen {
+			ids = append(ids, uint32(id))
+		}
+		sortUint32s(ids)
+	}
+	// Final fold: each candidate must contain every query term as a
+	// substring of its name.
+	ints := uint32sToInts(ids)
+	if len(ints) < serviceTrigramParallelVerifyMinIDs {
+		out := make([]int, 0, len(ints))
+		for _, id := range ints {
+			matched := true
+			for _, term := range terms {
+				if !vol.nameTrigramCandidateMatches(id, term) {
+					matched = false
+					break
+				}
+			}
+			if matched {
+				out = append(out, id)
+			}
+		}
+		out = uniqueSortedInts(out)
+		if pq.Trace != nil {
+			usedPNGC := false
+			for _, pt := range perTerm {
+				if vol.nameGramUnionUsesExtra(pt.term) {
+					usedPNGC = true
+					break
+				}
+			}
+			if usedPNGC {
+				pq.Trace.FilenameDriver = "posting-intersection-pngc-multi"
+				pq.Trace.setSource("filename-pngc-multi-term", len(out))
+			} else {
+				pq.Trace.FilenameDriver = "posting-intersection-pngr-multi"
+				pq.Trace.setSource("filename-pngr-multi-term", len(out))
+			}
+			pq.Trace.FilenameRequiredGrams = len(driver.its)
+			pq.Trace.setComplete(true)
+		}
+		return out, true
+	}
+	// Parallel fold for large candidate sets.
+	verifyMultiTerm := func(id int) bool {
+		for _, term := range terms {
+			if !vol.nameTrigramCandidateMatches(id, term) {
+				return false
+			}
+		}
+		return true
+	}
+	verified := vol.verifyMultiTermCandidateIDs(ints, verifyMultiTerm)
+	if pq.Trace != nil {
+		usedPNGC := false
+		for _, pt := range perTerm {
+			if vol.nameGramUnionUsesExtra(pt.term) {
+				usedPNGC = true
+				break
+			}
+		}
+		if usedPNGC {
+			pq.Trace.FilenameDriver = "posting-intersection-pngc-multi"
+			pq.Trace.setSource("filename-pngc-multi-term", len(verified))
+		} else {
+			pq.Trace.FilenameDriver = "posting-intersection-pngr-multi"
+			pq.Trace.setSource("filename-pngr-multi-term", len(verified))
+		}
+		pq.Trace.FilenameRequiredGrams = len(driver.its)
+		pq.Trace.setComplete(true)
+	}
+	return verified, true
+}
+
 // completeFilenameCountPosting intersects the smallest complete gram in
 // record-ID order and probes the other grams with bounded membership checks.
 // It retains only one decoded posting block at a time.

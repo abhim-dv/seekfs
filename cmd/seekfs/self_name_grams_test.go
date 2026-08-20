@@ -203,7 +203,6 @@ func TestCompleteSelfNameGramSyntheticMeasurements(t *testing.T) {
 }
 
 func TestCompleteSelfNameGramSyntheticServiceBroadMatrix(t *testing.T) {
-	t.Setenv("SEEKFS_ENGINE_V9", "1")
 	idx := dottedPathBenchmarkIndex(50_000)
 	selective := buildSelectiveNameTrigramIndex(idx, 1)
 	extra := optionalSelfNameGramIndex(idx, selective)

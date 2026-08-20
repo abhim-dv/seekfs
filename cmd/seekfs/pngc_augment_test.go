@@ -15,7 +15,6 @@ import (
 )
 
 func TestPNGCAugmentPreservesSectionsAndQueryParity(t *testing.T) {
-	t.Setenv("SEEKFS_ENGINE_V9", "1")
 	t.Setenv("SEEKFS_LOW_MEMORY_TRIGRAM_MAX_POSTING", "1")
 	t.Setenv("SEEKFS_V9_SELF_NAME_GRAMS", "0")
 	dir := t.TempDir()
@@ -99,7 +98,6 @@ func TestPNGCAugmentPreservesSectionsAndQueryParity(t *testing.T) {
 }
 
 func TestPNGCAugmentRejectsCorruptionDuplicateAndCleansUp(t *testing.T) {
-	t.Setenv("SEEKFS_ENGINE_V9", "1")
 	t.Setenv("SEEKFS_LOW_MEMORY_TRIGRAM_MAX_POSTING", "1")
 	t.Setenv("SEEKFS_V9_SELF_NAME_GRAMS", "0")
 	dir := t.TempDir()
@@ -146,7 +144,6 @@ func TestPNGCAugmentRejectsCorruptionDuplicateAndCleansUp(t *testing.T) {
 }
 
 func TestPNGCAugmentFixtureMeasurement(t *testing.T) {
-	t.Setenv("SEEKFS_ENGINE_V9", "1")
 	t.Setenv("SEEKFS_LOW_MEMORY_TRIGRAM_MAX_POSTING", "1")
 	t.Setenv("SEEKFS_V9_SELF_NAME_GRAMS", "0")
 	for _, records := range []int{50_000, 200_000, 500_000} {
@@ -256,7 +253,6 @@ func TestPNGCAugmentStreamingRejectsSpoolCorruptionAndWriteFailure(t *testing.T)
 }
 
 func TestPNGCAugmentLegacyNoMetadataUsesBoundedDiscovery(t *testing.T) {
-	t.Setenv("SEEKFS_ENGINE_V9", "1")
 	t.Setenv("SEEKFS_LOW_MEMORY_TRIGRAM_MAX_POSTING", "1")
 	t.Setenv("SEEKFS_V9_SELF_NAME_GRAMS", "0")
 	dir := t.TempDir()

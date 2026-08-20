@@ -28,7 +28,6 @@ type r5OverlayGateState struct {
 }
 
 func TestR5ActiveOverlayOwnedInProcessGate(t *testing.T) {
-	t.Setenv("SEEKFS_ENGINE_V9", "1")
 	const seed = r5OverlayGateSeed
 	t.Logf("R5 active-overlay gate seed=%d real_usn=blocked-no-unwatched-disposable-volume", seed)
 

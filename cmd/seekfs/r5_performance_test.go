@@ -9,10 +9,9 @@ import (
 )
 
 func TestR5MappedScalarRangeCountUsesQualifyingInterval(t *testing.T) {
-	t.Setenv("SEEKFS_ENGINE_V9", "1")
 	const files = 4096
 	idx := &Index{
-		Version: indexVersion,
+		Version: indexVersionV9,
 		Source:  "usn",
 		Volume:  "C:",
 		Roots:   []string{`C:\`},
@@ -57,7 +56,6 @@ func TestR5MappedScalarRangeCountUsesQualifyingInterval(t *testing.T) {
 }
 
 func TestR5SyntheticSearchAndCountP95P99(t *testing.T) {
-	t.Setenv("SEEKFS_ENGINE_V9", "1")
 	t.Setenv("SEEKFS_MEMORY_MODE", "lowmem")
 
 	cIdx := dottedPathBenchmarkIndex(25_000)

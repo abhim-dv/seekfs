@@ -32,7 +32,7 @@ func buildOverlayLimitFixture(t *testing.T, matchCount int) *serviceVolumeIndex 
 		})
 	}
 	idx := &Index{
-		Version: indexVersion,
+		Version: indexVersionV9,
 		Roots:   []string{`F:\`},
 		Source:  "usn",
 		Volume:  "F:",
@@ -63,7 +63,6 @@ func buildOverlayLimitFixture(t *testing.T, matchCount int) *serviceVolumeIndex 
 // matches) rather than `limit - k`. Result set is compared against a fresh
 // rebuild oracle for both membership and order.
 func TestOverlayMergeUnderfillBackfillsFromLaterBaseMatches(t *testing.T) {
-	t.Setenv("SEEKFS_ENGINE_V9", "1")
 	const matchCount = 40
 	const limit = 25
 	const deleteCount = 10
@@ -137,7 +136,6 @@ func TestOverlayMergeUnderfillBackfillsFromLaterBaseMatches(t *testing.T) {
 // ranked position (first) in the limited response, not appended at the end
 // or dropped because the limit was already full.
 func TestOverlayMergeRanksNewCreateFirstWithinFilledLimit(t *testing.T) {
-	t.Setenv("SEEKFS_ENGINE_V9", "1")
 	const matchCount = 30
 	const limit = 25
 	vol := buildOverlayLimitFixture(t, matchCount)
@@ -177,7 +175,6 @@ func TestOverlayMergeRanksNewCreateFirstWithinFilledLimit(t *testing.T) {
 // search path and the overlay-aware fast count path must both match a fresh
 // rebuild oracle's count after deletes land only in the overlay.
 func TestOverlayMergeCountMatchesFreshOracleUnderTombstones(t *testing.T) {
-	t.Setenv("SEEKFS_ENGINE_V9", "1")
 	const matchCount = 30
 	const deleteCount = 10
 	vol := buildOverlayLimitFixture(t, matchCount)
@@ -247,9 +244,8 @@ func TestOverlayMergeCountMatchesFreshOracleUnderTombstones(t *testing.T) {
 // grandchild is expected to remain visible after the parent delete: this
 // documents a real, reproducible engine gap rather than a passing invariant.
 func TestOverlayDirectoryDeleteWithoutPerChildUSNLeavesOverlayOnlyChildVisible(t *testing.T) {
-	t.Setenv("SEEKFS_ENGINE_V9", "1")
 	idx := &Index{
-		Version: indexVersion,
+		Version: indexVersionV9,
 		Roots:   []string{`F:\`},
 		Source:  "usn",
 		Volume:  "F:",
@@ -319,7 +315,6 @@ func TestOverlayDirectoryDeleteWithoutPerChildUSNLeavesOverlayOnlyChildVisible(t
 // one directory in the same burst and asserts its overlay-only descendant
 // disappears, proving the guard still cascades for directories.
 func TestOverlayFileDeleteBurstMatchesFreshOracle(t *testing.T) {
-	t.Setenv("SEEKFS_ENGINE_V9", "1")
 	const baseFileCount = 300
 	const overlayFileCount = 300
 	const deleteBaseCount = 250
@@ -347,7 +342,7 @@ func TestOverlayFileDeleteBurstMatchesFreshOracle(t *testing.T) {
 	}
 
 	idx := &Index{
-		Version: indexVersion,
+		Version: indexVersionV9,
 		Roots:   []string{`F:\`},
 		Source:  "usn",
 		Volume:  "F:",

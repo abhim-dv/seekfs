@@ -25,30 +25,6 @@ func TestStandaloneServicePipeACLIsTestOnly(t *testing.T) {
 	}
 }
 
-func TestServiceVolumeIndexAfterPersistClearsRecentAndSearchCaches(t *testing.T) {
-	vol := syntheticServiceVolumeIndexForCacheTests()
-	vol.recentIDs = map[int]struct{}{1: {}, 2: {}}
-	vol.pathCache = map[int]string{1: "cached-path"}
-	vol.termCache = map[string]postingCacheEntry{"one": {ids: []int{1}, gen: 1}}
-	vol.pathTermCache = map[string]postingCacheEntry{"fixture": {ids: []int{1}, gen: 1}}
-	vol.extCache = map[string]postingCacheEntry{".txt": {ids: []int{1}, gen: 1}}
-
-	vol.afterPersist()
-
-	if vol.recentIDs != nil {
-		t.Fatalf("recentIDs = %#v, want nil", vol.recentIDs)
-	}
-	if len(vol.pathCache) != 0 {
-		t.Fatalf("pathCache len = %d, want 0", len(vol.pathCache))
-	}
-	if vol.termCache != nil || vol.pathTermCache != nil || vol.extCache != nil {
-		t.Fatalf("term caches were not cleared: term=%v pathTerm=%v ext=%v", vol.termCache, vol.pathTermCache, vol.extCache)
-	}
-	if vol.recentSeq != 1 {
-		t.Fatalf("recentSeq = %d, want 1", vol.recentSeq)
-	}
-}
-
 func TestCompactMMapEntryCountUsesMappedRecordCount(t *testing.T) {
 	idx := &Index{
 		Compact:     true,
@@ -61,7 +37,6 @@ func TestCompactMMapEntryCountUsesMappedRecordCount(t *testing.T) {
 }
 
 func TestServiceVolumeIndexTrimSearchCachesLockedClearsOversizedCaches(t *testing.T) {
-	t.Setenv("SEEKFS_ENGINE_V9", "0")
 	t.Setenv("SEEKFS_LOW_MEMORY", "0")
 	t.Setenv("SEEKFS_POSTING_CACHE_MB", "1")
 	vol := syntheticServiceVolumeIndexForCacheTests()
@@ -177,7 +152,7 @@ func TestCompactChildrenBuildNotNeededAfterVolumeConstruction(t *testing.T) {
 
 func TestServiceVolumesForQueryMatchesWalkRootVolume(t *testing.T) {
 	idx := &Index{
-		Version: indexVersion,
+		Version: indexVersionV9,
 		Roots:   []string{`F:\fixture-root\churn-soak`},
 		Source:  "walk",
 		Entries: []Entry{{

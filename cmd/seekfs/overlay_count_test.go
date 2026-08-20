@@ -15,7 +15,6 @@ import (
 // overlayAwareFastCount helper itself returns ok=true and the exact count,
 // so the fast route (not merely "some route") is exercised.
 func TestOverlayAwareFastCountExcludesTombstonesIncludesOverlayCreates(t *testing.T) {
-	t.Setenv("SEEKFS_ENGINE_V9", "1")
 	vol := engineV9OverlaySearchTestVolume(t)
 
 	logical := map[uint64]CompactRecord{
@@ -77,7 +76,6 @@ func TestOverlayAwareFastCountExcludesTombstonesIncludesOverlayCreates(t *testin
 // active (e.g. two renames of the same file). Only the latest slot for that
 // FRN may count as a live match, never once per overlay slot.
 func TestOverlayAwareFastCountDeduplicatesReModifiedFRN(t *testing.T) {
-	t.Setenv("SEEKFS_ENGINE_V9", "1")
 	vol := engineV9OverlaySearchTestVolume(t)
 
 	logical := map[uint64]CompactRecord{
@@ -140,7 +138,6 @@ func TestOverlayAwareFastCountDeduplicatesReModifiedFRN(t *testing.T) {
 // countServiceVolumes must still return the oracle-correct count via the
 // full search+merge fallback path.
 func TestOverlayAwareFastCountDeclinesForRegexDeclinesToFallback(t *testing.T) {
-	t.Setenv("SEEKFS_ENGINE_V9", "1")
 	vol := engineV9OverlaySearchTestVolume(t)
 
 	logical := map[uint64]CompactRecord{
@@ -193,7 +190,6 @@ func TestOverlayAwareFastCountDeclinesForRegexDeclinesToFallback(t *testing.T) {
 // oracle for several query shapes the fast route is expected to handle
 // (ext:, plain term, type:dir).
 func TestOverlayAwareFastCountMatchesFreshOracleAcrossSeededMutations(t *testing.T) {
-	t.Setenv("SEEKFS_ENGINE_V9", "1")
 	vol := engineV9OverlaySearchTestVolume(t)
 
 	logical := map[uint64]CompactRecord{
@@ -267,7 +263,6 @@ func TestOverlayAwareFastCountMatchesFreshOracleAcrossSeededMutations(t *testing
 }
 
 func BenchmarkOverlayAwareFastCountVsSearchFallback(b *testing.B) {
-	b.Setenv("SEEKFS_ENGINE_V9", "1")
 
 	const baseFiles = 200_000
 	const overlayCreates = 10_000
@@ -285,7 +280,7 @@ func BenchmarkOverlayAwareFastCountVsSearchFallback(b *testing.B) {
 		})
 	}
 	idx := &Index{
-		Version: indexVersion,
+		Version: indexVersionV9,
 		Roots:   []string{`F:\`},
 		BuiltAt: time.Unix(0, 123),
 		Source:  "usn",
