@@ -127,6 +127,7 @@ func cmdDefault(args []string) error {
 
 func (a *UIApp) startup(ctx context.Context) {
 	a.ctx = ctx
+	warmUpShellContextMenus()
 }
 
 func (a *UIApp) Status() UIStatus {
@@ -713,6 +714,46 @@ func (a *UIApp) DeleteToRecycleBin(paths []string) error {
 		}
 	}
 	return nil
+}
+
+// PrebuildShellContextMenu builds the native Explorer shell context menu for
+// the given paths in the background and caches it, so a subsequent
+// ShowShellContextMenu call on the same selection shows instantly. Called from
+// the frontend on row hover so the right-click is pre-warmed.
+func (a *UIApp) PrebuildShellContextMenu(paths []string) {
+	prebuildShellContextMenu(paths)
+}
+
+// ShowShellContextMenu shows the native Explorer shell context menu for the
+// given paths at the given client coordinates, using the shell menu when
+// available and falling back to the HTML menu (returned shown=false) otherwise.
+func (a *UIApp) ShowShellContextMenu(paths []string, clientX, clientY int) (bool, error) {
+	clean := make([]string, 0, len(paths))
+	for _, path := range paths {
+		if strings.TrimSpace(path) != "" {
+			clean = append(clean, path)
+		}
+	}
+	if len(clean) == 0 {
+		return false, nil
+	}
+	hwnd := foregroundWindowHandle()
+	screenX, screenY := shellMenuScreenPosition(hwnd, clientX, clientY)
+	uiDebugLogf("ShowShellContextMenu paths=%d hwnd=%d client=%d,%d screen=%d,%d", len(clean), hwnd, clientX, clientY, screenX, screenY)
+	shown, err := showShellContextMenu(hwnd, clean, screenX, screenY)
+	uiDebugLogf("ShowShellContextMenu result shown=%v err=%v", shown, err)
+	return shown, err
+}
+
+// uiDebugLogf appends a line to a temporary debug log so UI integration
+// problems can be diagnosed without attaching a console.
+func uiDebugLogf(format string, args ...interface{}) {
+	f, err := os.OpenFile(filepath.Join(os.TempDir(), "seekfs-ui-debug.log"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	_, _ = fmt.Fprintf(f, "%s %s\n", time.Now().Format(time.RFC3339Nano), fmt.Sprintf(format, args...))
 }
 
 func uiResultFromPathOnly(path string) UIResult {

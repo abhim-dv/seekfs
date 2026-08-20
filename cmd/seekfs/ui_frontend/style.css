@@ -54,11 +54,48 @@ input {
   overflow: auto;
 }
 
+/* Rubber-band selection box (the translucent rectangle Explorer draws while
+   you drag across empty space to select a range of rows). position:fixed so it
+   stays pinned to the viewport while the results list scrolls underneath. */
+.marquee {
+  position: fixed;
+  display: none;
+  pointer-events: none;
+  border: 1px solid #9ad4ff;
+  background: rgba(154, 212, 255, 0.15);
+  z-index: 5;
+}
+
 .results {
-  width: 100%;
+  /* Shrink-wrap: the table is exactly as wide as its columns, so narrower
+     columns leave empty space on the right (native Explorer behavior) and a
+     horizontal scrollbar appears only when columns spill past the window. */
+  width: auto;
   border-collapse: collapse;
   table-layout: fixed;
   font-size: 13px;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.col-name {
+  width: 300px;
+}
+
+.col-size {
+  width: 108px;
+}
+
+.col-date {
+  width: 190px;
+}
+
+.col-path {
+  width: 340px;
+}
+
+#results {
+  outline: none;
 }
 
 th {
@@ -73,6 +110,34 @@ th {
   border-bottom: 1px solid #353535;
   font-weight: 400;
   text-align: left;
+  user-select: none;
+  cursor: pointer;
+}
+
+.th-resizer {
+  position: absolute;
+  top: 0;
+  right: -4px;
+  width: 8px;
+  height: 100%;
+  cursor: col-resize;
+  z-index: 2;
+}
+
+.th-resizer:hover,
+.resizing .th-resizer.active {
+  background: #9ad4ff;
+  opacity: 0.5;
+}
+
+th.sorted {
+  color: #ffffff;
+  background: #242424;
+}
+
+th .sort-arrow {
+  font-size: 11px;
+  color: #9ad4ff;
 }
 
 td {
@@ -83,6 +148,18 @@ td {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.row-icon {
+  width: 16px;
+  height: 16px;
+  margin-right: 6px;
+  vertical-align: -3px;
+  display: inline-block;
+}
+
+td:hover {
+  cursor: default;
 }
 
 tbody tr {
@@ -99,17 +176,13 @@ tbody tr.selected {
   outline-offset: -2px;
 }
 
-.name-col {
-  width: 33%;
+tbody tr.focused {
+  outline: 1px dotted #dadada;
+  outline-offset: -2px;
 }
 
-.size-col {
-  width: 108px;
-  text-align: right;
-}
-
-.date-col {
-  width: 190px;
+tbody tr.focused td {
+  outline: none;
 }
 
 .size-cell {
@@ -184,4 +257,16 @@ tbody tr.selected {
   margin: 4px 0;
   border: 0;
   background: #3d3d3d;
+}
+
+.rename-input {
+  width: 100%;
+  height: 18px;
+  margin: 0;
+  padding: 0 2px;
+  color: #f6f6f6;
+  background: #000000;
+  border: 1px solid #4a4a4a;
+  outline: none;
+  font: inherit;
 }

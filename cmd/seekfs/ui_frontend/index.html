@@ -16,15 +16,21 @@
 
       <section class="results-wrap">
         <table class="results">
+          <colgroup>
+            <col class="col-name" />
+            <col class="col-path" />
+            <col class="col-size" />
+            <col class="col-date" />
+          </colgroup>
           <thead>
             <tr>
-              <th class="name-col">Name</th>
-              <th>Path</th>
-              <th class="size-col">Size</th>
-              <th class="date-col">Date Modified</th>
+              <th class="name-col" data-sort="name">Name</th>
+              <th data-sort="path">Path</th>
+              <th class="size-col" data-sort="size">Size</th>
+              <th class="date-col" data-sort="modified">Date Modified</th>
             </tr>
           </thead>
-          <tbody id="results"></tbody>
+          <tbody id="results" tabindex="-1"></tbody>
         </table>
         <div id="empty" class="empty">Type to search</div>
       </section>
