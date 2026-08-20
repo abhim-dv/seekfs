@@ -292,15 +292,33 @@ func TestDirectV9MFTAndUSNAdaptersAreElevationFree(t *testing.T) {
 	if err != nil || second.FRN != 20 || second.ParentFRN != 10 || second.Size != 7 {
 		t.Fatalf("MFT adapter second=%+v err=%v", second, err)
 	}
+}
+
+func TestDirectV9MFTSourceNormalizesRootSelfParent(t *testing.T) {
+	mft := newDirectV9MFTSource(map[uint64]mftEntry{
+		5:  {frn: 5, parentFRN: 5, name: "root", attr: fileAttributeDir, isDir: true},
+		10: {frn: 10, parentFRN: 5, name: "child.bin", size: 3},
+	})
+	root, err := mft.Next(context.Background())
+	if err != nil || root.FRN != 5 || root.ParentFRN != 0 {
+		t.Fatalf("MFT root self-parent not normalized: root=%+v err=%v", root, err)
+	}
+	child, err := mft.Next(context.Background())
+	if err != nil || child.FRN != 10 || child.ParentFRN != 5 {
+		t.Fatalf("MFT child=%+v err=%v", child, err)
+	}
+}
+
+func TestDirectV9USNAdapterIsElevationFree(t *testing.T) {
 	usn := newDirectV9USNSource(map[uint64]usnNode{
 		2: {frn: 2, parentFRN: 1, name: "child.bin"},
 		1: {frn: 1, name: "root", attr: fileAttributeDir},
 	})
-	first, err = usn.Next(context.Background())
+	first, err := usn.Next(context.Background())
 	if err != nil || first.FRN != 1 || first.Mode&uint32(os.ModeDir) == 0 {
 		t.Fatalf("USN adapter first=%+v err=%v", first, err)
 	}
-	second, err = usn.Next(context.Background())
+	second, err := usn.Next(context.Background())
 	if err != nil || second.FRN != 2 || second.ParentFRN != 1 {
 		t.Fatalf("USN adapter second=%+v err=%v", second, err)
 	}

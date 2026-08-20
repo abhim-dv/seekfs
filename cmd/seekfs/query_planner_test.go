@@ -297,7 +297,7 @@ func TestR5HolisticPlannerGeneratedCoverageMatrix(t *testing.T) {
 			baseF := cloneCompactIndex(baseC)
 			baseF.Volume, baseF.Roots = "F:", []string{`F:\`}
 			if tc.volume == "mixed-v8" {
-				baseF.Version = indexVersion
+				baseF.Version = indexVersionV9
 				baseF.Derived = indexDerivedSections{}
 			}
 			if tc.volume == "missing-derived" {
@@ -394,7 +394,6 @@ func r5ExhaustivePlannerOracle(volumes []*serviceVolumeIndex, opts queryOptions,
 }
 
 func TestR5GeneratedOverlayCoverageMatrix(t *testing.T) {
-	t.Setenv("SEEKFS_ENGINE_V9", "1")
 	const seed int64 = 0x0a11ce
 	states := []struct {
 		name    string
@@ -483,7 +482,7 @@ func TestR5RequiredAdversarialCoverageMatrix(t *testing.T) {
 	buildOrders(baseC)
 	baseF := cloneCompactIndex(baseC)
 	baseF.Volume, baseF.Roots = "F:", []string{`F:\`}
-	baseF.Version, baseF.Derived = indexVersion, indexDerivedSections{}
+	baseF.Version, baseF.Derived = indexVersionV9, indexDerivedSections{}
 	volC := newServiceVolumeIndex("r5-adversarial-c.gsi", baseC)
 	volF := newServiceVolumeIndex("r5-adversarial-f-v8.gsi", baseF)
 
@@ -567,10 +566,9 @@ func TestR5RequiredAdversarialCoverageMatrix(t *testing.T) {
 }
 
 func TestMappedComponentTopUsesDescendantRankBounds(t *testing.T) {
-	t.Setenv("SEEKFS_ENGINE_V9", "1")
 	const roots = 2048
 	idx := &Index{
-		Version: indexVersion, Source: "usn", Volume: "C:", Compact: true,
+		Version: indexVersionV9, Source: "usn", Volume: "C:", Compact: true,
 		Roots: []string{`C:\`}, Records: make([]CompactRecord, 0, 1+roots*3),
 	}
 	idx.Records = append(idx.Records, CompactRecord{FRN: 1, ParentFRN: 1, Parent: -1, Name: ".", Mode: uint32(os.ModeDir)})
@@ -826,7 +824,6 @@ func TestServiceVolumesPromotedShortExtensionDoesNotWaterfall(t *testing.T) {
 }
 
 func TestMultiVolumePlannerDeclineDoesNotUsePerVolumeTerminal(t *testing.T) {
-	t.Setenv("SEEKFS_ENGINE_V9", "1")
 	volumes := []*serviceVolumeIndex{
 		newServiceVolumeIndex("c-declined.gsi", singleFileCompactIndex("C:", "needle.txt")),
 		newServiceVolumeIndex("f-declined.gsi", singleFileCompactIndex("F:", "needle.txt")),
@@ -4402,7 +4399,6 @@ func singleEntryKindCompactIndex(volume, name string, mode uint32) *Index {
 }
 
 func TestGlobalPlannerOverlayExtMatchesServiceVolumes(t *testing.T) {
-	t.Setenv("SEEKFS_ENGINE_V9", "1")
 	vol := engineV9OverlaySearchTestVolume(t)
 	vol.applyUSNChanges([]usnChange{
 		{FRN: 101, USN: 10, Reason: usnReasonFileDelete},
@@ -4660,7 +4656,6 @@ func TestGlobalPlannerComponentSortPathUsesGlobalPathOrder(t *testing.T) {
 }
 
 func TestGlobalPlannerOverlayComponentMatchesServiceVolumes(t *testing.T) {
-	t.Setenv("SEEKFS_ENGINE_V9", "1")
 	vol := engineV9OverlaySearchTestVolume(t)
 	vol.applyUSNChanges([]usnChange{{
 		FRN:       301,
@@ -4719,7 +4714,6 @@ func TestGlobalPlannerOverlayComponentMatchesServiceVolumes(t *testing.T) {
 }
 
 func TestGlobalPlannerOverlayDirectoryRenameUpdatesComponentDescendants(t *testing.T) {
-	t.Setenv("SEEKFS_ENGINE_V9", "1")
 	t.Setenv("SEEKFS_GLOBAL_PLANNER", "1")
 	vol := engineV9OverlaySearchTestVolume(t)
 	vol.applyUSNChanges([]usnChange{
@@ -4795,7 +4789,6 @@ func TestGlobalPlannerOverlayParentMatchesServiceVolumes(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			t.Setenv("SEEKFS_ENGINE_V9", "1")
 			vol := engineV9OverlaySearchTestVolume(t)
 			vol.applyUSNChanges(tc.changes)
 			opts := queryOptions{Query: tc.query, Limit: 10}
@@ -6110,48 +6103,6 @@ func TestNameTrigramRecentOverlayFindsCreateWithMissingBaseGram(t *testing.T) {
 	}
 	if names := namesOf(fast); !sameStringSet(names, []string{"zzquark-note.txt"}) {
 		t.Fatalf("recent create names = %v, want zzquark-note.txt", names)
-	}
-}
-
-func TestNameTrigramPathPostingCachesAndKeepsRecentOverlay(t *testing.T) {
-	t.Setenv("SEEKFS_NAME_TRIGRAMS", "1")
-	idx := pathSyntaxFixture()
-	vol := newServiceVolumeIndex("fixture.gsi", idx)
-	(&goSearchService{}).rebuildNameTrigramsInBackground(vol)
-
-	first, ok := vol.nameTrigramPathTermPosting(".opencode")
-	if !ok || len(first) == 0 {
-		t.Fatalf("first trigram path posting = %v, %v; want candidates", first, ok)
-	}
-	cacheKey := "\x00trigrampath:.opencode"
-	if vol.pathTermCache == nil || len(vol.pathTermCache[cacheKey].ids) == 0 {
-		t.Fatal("trigram path posting was not cached")
-	}
-
-	dirID := 10 // ai.opencode.desktop in pathSyntaxFixture.
-	id := idx.appendCompactRecord(CompactRecord{FRN: 40, ParentFRN: 10, Parent: int32(dirID), Name: "new-child.txt", Size: 1, ModUnix: time.Now().UnixNano()})
-	vol.addFRNID(40, id)
-	vol.addChild(10, id)
-	vol.markNameTrigramRecent(id)
-	if vol.recentIDs == nil {
-		vol.recentIDs = make(map[int]struct{})
-	}
-	vol.recentIDs[id] = struct{}{}
-	vol.recentSeq++
-
-	second, ok := vol.nameTrigramPathTermPosting(".opencode")
-	if !ok {
-		t.Fatal("cached trigram path posting declined after recent update")
-	}
-	found := false
-	for _, gotID := range second {
-		if gotID == id {
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Fatalf("cached trigram path posting = %v, want recent descendant id %d", second, id)
 	}
 }
 

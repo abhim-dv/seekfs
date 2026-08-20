@@ -854,7 +854,6 @@ func TestAttribFilterUsesGlobalPlannerSource(t *testing.T) {
 }
 
 func TestAttribFilterUsesMappedLowmemSource(t *testing.T) {
-	t.Setenv("SEEKFS_ENGINE_V9", "1")
 	t.Setenv("SEEKFS_MEMORY_MODE", "lowmem")
 	t.Setenv("SEEKFS_GLOBAL_PLANNER", "1")
 	idx := attribSearchFixture()

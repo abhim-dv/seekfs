@@ -1515,10 +1515,14 @@ func countServiceVolumesGlobalOnly(volumes []*serviceVolumeIndex, opts queryOpti
 
 // globalBoundedScanBudgetOK reports whether the remaining query deadline can
 // plausibly cover a full per-volume record scan.  A full scan is linear in the
-// compact record count (roughly 300ms per million records observed on a
-// 27.6M-record two-volume service), so starting one when the remaining budget
-// is already tight would only block until the deadline and then cancel.  The
-// margin keeps the check generous so legitimate path queries still run.
+// compact record count (roughly 30-140ms per million records measured on a
+// 26.8M-record two-volume service: search-path candidate scans near 30ms/M,
+// count-path verification near 140ms/M), so a pessimistic 100ms/M is a safe
+// base.  Starting a scan when the remaining budget is too tight would only
+// block until the deadline and then cancel, so the margin keeps the check
+// generous while still avoiding clearly-doomed scans.  The scan itself remains
+// deadline-cancellable, so a slightly optimistic estimate only costs waiting
+// until the deadline rather than a wrong answer.
 func globalBoundedScanBudgetOK(volumes []*serviceVolumeIndex, pq parsedQuery, margin float64) bool {
 	if pq.DeadlineUnix <= 0 {
 		return true
@@ -1533,7 +1537,7 @@ func globalBoundedScanBudgetOK(volumes []*serviceVolumeIndex, pq parsedQuery, ma
 			records += int64(vol.index.compactRecordCount())
 		}
 	}
-	estimatedMS := float64(records) / 1e6 * 300
+	estimatedMS := float64(records) / 1e6 * 100
 	return float64(remaining.Milliseconds()) >= estimatedMS*margin
 }
 

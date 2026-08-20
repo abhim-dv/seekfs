@@ -74,7 +74,6 @@ func TestGlobalNamePlannerAppliesLimitAfterGlobalOrder(t *testing.T) {
 }
 
 func TestGlobalNamePlannerUsesOneOverlaySnapshot(t *testing.T) {
-	t.Setenv("SEEKFS_ENGINE_V9", "1")
 	volumes := globalNameTestVolumes(true)
 	volumes[0].applyUSNChanges([]usnChange{{FRN: 2, USN: 10, Reason: usnReasonFileDelete}})
 	volumes[1].applyUSNChanges([]usnChange{{FRN: 99, ParentFRN: 1, USN: 11, Reason: usnReasonFileCreate, Name: "000-overlay.nrrd"}})
@@ -272,6 +271,88 @@ func scopedNamePostingTestVolume(volume string, withPNGC bool) *serviceVolumeInd
 		idx.Derived.SelfNameTrigrams = decodeGramPostingIndex(encodeGramPostingSection(extra, nil), idx.compactRecordCount())
 	}
 	return newServiceVolumeIndex(strings.ToLower(strings.TrimSuffix(volume, ":"))+"-scoped-name.gsi", idx)
+}
+
+// TestMultiTermPNGCIntersection verifies that a multi-term name query whose
+// grams are all common (omitted from selective PNGR, present in PNGC) is
+// answered by the multi-term posting-intersection lane instead of falling to
+// the bounded scan.
+func TestMultiTermPNGCIntersection(t *testing.T) {
+	t.Setenv("SEEKFS_V9_SELF_NAME_GRAMS", "1")
+	t.Setenv("SEEKFS_LOW_MEMORY_TRIGRAM_MAX_POSTING", "1")
+	vol := scopedNamePostingTestVolume("C:", true)
+	// "a-scan" and "scan.raw" both share "scan"; "a-scan.nrrd" and "b-scan.nrrd"
+	// both contain "scan" AND "nrrd".  Query "scan nrrd" must return only the
+	// records whose names contain both substrings.
+	tests := []struct {
+		query string
+		want  []string
+	}{
+		{query: "scan nrrd", want: []string{`C:\a-scan.nrrd`, `C:\b-scan.nrrd`, `C:\backup-scan.nrrd`, `C:\c-scan.nrrd`}},
+		{query: "nrrd scan", want: []string{`C:\a-scan.nrrd`, `C:\b-scan.nrrd`, `C:\backup-scan.nrrd`, `C:\c-scan.nrrd`}},
+		{query: "scan raw", want: []string{`C:\scan.raw`}},
+		{query: "nrrd cache", want: []string{`C:\nrrd-cache`}},
+		{query: "nothing match", want: []string{}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.query, func(t *testing.T) {
+			trace := &searchTrace{}
+			got, err := searchServiceVolumes([]*serviceVolumeIndex{vol}, queryOptions{Query: tc.query, Limit: 20, Trace: trace}, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if gotPaths := pathsOf(got); !slices.Equal(gotPaths, tc.want) {
+				t.Fatalf("paths = %v, want %v", gotPaths, tc.want)
+			}
+			if trace.FilenameDriver != "posting-intersection-pngc-multi" && !(len(tc.want) == 0 && trace.FilenameDriver == "exact-empty") {
+				t.Fatalf("FilenameDriver = %q, want posting-intersection-pngc-multi (trace=%+v)", trace.FilenameDriver, trace)
+			}
+			if trace.PlannerMode != "global-name" || trace.Complete == nil || !*trace.Complete {
+				t.Fatalf("trace = %+v, want complete global-name", trace)
+			}
+			countTrace := &searchTrace{}
+			count, ok, err := countServiceVolumes([]*serviceVolumeIndex{vol}, queryOptions{Query: tc.query, Trace: countTrace})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !ok || count != len(tc.want) {
+				t.Fatalf("count = %d ok=%v, want %d true", count, ok, len(tc.want))
+			}
+		})
+	}
+}
+
+// TestMultiTermPNGCIntersectionBeatsBoundedScan verifies the trace declines do
+// NOT include the bounded-scan fallback and the result stays complete for the
+// real two-volume scenario with a common-gram query.
+func TestMultiTermPNGCIntersectionBeatsBoundedScan(t *testing.T) {
+	t.Setenv("SEEKFS_V9_SELF_NAME_GRAMS", "1")
+	t.Setenv("SEEKFS_LOW_MEMORY_TRIGRAM_MAX_POSTING", "1")
+	cVol := scopedNamePostingTestVolume("C:", true)
+	fVol := scopedNamePostingTestVolume("F:", true)
+	volumes := []*serviceVolumeIndex{cVol, fVol}
+	trace := &searchTrace{}
+	got, err := searchServiceVolumes(volumes, queryOptions{Query: "scan nrrd", Limit: 20, Trace: trace}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if trace.FilenameDriver != "posting-intersection-pngc-multi" {
+		t.Fatalf("FilenameDriver = %q, want posting-intersection-pngc-multi", trace.FilenameDriver)
+	}
+	if trace.PlannerMode != "global-name" {
+		t.Fatalf("PlannerMode = %q, want global-name", trace.PlannerMode)
+	}
+	for _, decline := range trace.Declines {
+		if decline.Source == "global-name" && decline.Reason == "no-selective-trigram" {
+			t.Fatalf("query declined global-name:no-selective-trigram: %+v", trace.Declines)
+		}
+	}
+	for _, entry := range got {
+		lower := strings.ToLower(entry.Name)
+		if !strings.Contains(lower, "scan") || !strings.Contains(lower, "nrrd") {
+			t.Fatalf("multi-term lane admitted non-matching result %q", entry.Path)
+		}
+	}
 }
 
 func globalNameTestVolumes(withTrigrams bool) []*serviceVolumeIndex {

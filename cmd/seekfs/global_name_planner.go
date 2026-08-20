@@ -220,6 +220,16 @@ func globalNameCandidateIDs(snapshot globalQuerySnapshot, pq parsedQuery, trace 
 			trace.addDeclineForVolume(reason, vol.volume)
 			return nil, false
 		}
+		if volumePQ.Trace != nil && volumePQ.Trace.FilenameDriver != "" {
+			trace.FilenameDriver = volumePQ.Trace.FilenameDriver
+			trace.FilenameRequiredGrams += volumePQ.Trace.FilenameRequiredGrams
+			trace.FilenameRecordsVerified += volumePQ.Trace.FilenameRecordsVerified
+			trace.BlocksDecoded += volumePQ.Trace.BlocksDecoded
+			trace.BlocksSkipped += volumePQ.Trace.BlocksSkipped
+			trace.PostingPrefetchBytes += volumePQ.Trace.PostingPrefetchBytes
+			trace.PostingPrefetchRanges += volumePQ.Trace.PostingPrefetchRanges
+			trace.PostingPrefetchPages += volumePQ.Trace.PostingPrefetchPages
+		}
 		if len(ids) == 0 && volumePQ.Trace != nil && volumePQ.Trace.Source == "exact-empty" && len(snapshot.volumes) == 1 {
 			trace.setSource("exact-empty", 0)
 		}
@@ -241,7 +251,11 @@ func setGlobalNameTrace(trace *searchTrace, pq parsedQuery, candidates int, coun
 	}
 	trace.setPlannerMode(mode)
 	if trace.Source != "exact-empty" {
-		trace.setSource("global:filename-trigram", candidates)
+		if trace.FilenameDriver != "" && strings.Contains(trace.FilenameDriver, "pngc") {
+			trace.setSource("global:filename-pngc", candidates)
+		} else {
+			trace.setSource("global:filename-trigram", candidates)
+		}
 	}
 	termSource := "global:filename-trigram"
 	if trace.FilenameDriver != "" && strings.Contains(trace.FilenameDriver, "pngc") {

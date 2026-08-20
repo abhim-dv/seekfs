@@ -115,7 +115,6 @@ func TestGlobalScalarVolumeAnchorKeepsMappedRangeAndCardinality(t *testing.T) {
 }
 
 func TestGlobalScalarFiltersIncludeOverlaySnapshot(t *testing.T) {
-	t.Setenv("SEEKFS_ENGINE_V9", "1")
 	volumes := globalScalarTestVolumes()
 	volumes[0].applyUSNChanges([]usnChange{{FRN: 3, USN: 10, Reason: usnReasonFileDelete}})
 	volumes[1].applyUSNChanges([]usnChange{{FRN: 99, ParentFRN: 1, USN: 11, Reason: usnReasonFileCreate, Name: "overlay.txt"}})
@@ -334,7 +333,6 @@ func TestGlobalScalarRangeRoutePreservesDefaultGlobalOrder(t *testing.T) {
 }
 
 func TestGlobalScalarRangeOverlayParity(t *testing.T) {
-	t.Setenv("SEEKFS_ENGINE_V9", "1")
 	vol := scalarRangeFixture()
 	installScalarOrders(vol)
 	vol.applyUSNChanges([]usnChange{
@@ -364,9 +362,8 @@ func TestGlobalScalarRangeOverlayParity(t *testing.T) {
 }
 
 func TestGlobalScalarRangeMappedResidentParity(t *testing.T) {
-	t.Setenv("SEEKFS_ENGINE_V9", "1")
 	idx := &Index{
-		Version: indexVersion,
+		Version: indexVersionV9,
 		Source:  "usn",
 		Volume:  "C:",
 		Roots:   []string{`C:\`},

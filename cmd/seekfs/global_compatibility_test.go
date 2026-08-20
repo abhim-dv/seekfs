@@ -7,15 +7,14 @@ import (
 	"testing"
 )
 
-func TestGlobalPlannerMixedV8V9MultiVolumeParityAndTrace(t *testing.T) {
+func TestGlobalPlannerMultiVolumeParityAndTrace(t *testing.T) {
 	cIndex := compatibilityIndexForVolume("C:")
 	fIndex := compatibilityIndexForVolume("F:")
-	v8 := roundTripCompatibilityIndex(t, cIndex, false, false)
-	v9 := roundTripCompatibilityIndex(t, fIndex, true, false)
-	t.Setenv("SEEKFS_ENGINE_V9", "")
+	v9c := roundTripCompatibilityIndex(t, cIndex, true, false)
+	v9f := roundTripCompatibilityIndex(t, fIndex, true, false)
 	volumes := []*serviceVolumeIndex{
-		newServiceVolumeIndex("mixed-v8.gsi", v8),
-		newServiceVolumeIndex("mixed-v9.gsi", v9),
+		newServiceVolumeIndex("mixed-v9-c.gsi", v9c),
+		newServiceVolumeIndex("mixed-v9-f.gsi", v9f),
 	}
 
 	for _, tc := range []struct {
@@ -28,7 +27,7 @@ func TestGlobalPlannerMixedV8V9MultiVolumeParityAndTrace(t *testing.T) {
 	} {
 		t.Run(tc.query, func(t *testing.T) {
 			opts := queryOptions{Query: tc.query, MatchPath: true, Limit: 20}
-			want, err := searchAll([]*Index{v8, v9}, opts, false)
+			want, err := searchAll([]*Index{v9c, v9f}, opts, false)
 			if err != nil {
 				t.Fatalf("oracle search: %v", err)
 			}
@@ -56,13 +55,17 @@ func TestGlobalPlannerMixedV8V9MultiVolumeParityAndTrace(t *testing.T) {
 	}
 }
 
-func TestGlobalPlannerMixedV8V9FallbackTrace(t *testing.T) {
-	v8 := roundTripCompatibilityIndex(t, compatibilityIndexForVolume("C:"), false, false)
-	v9 := roundTripCompatibilityIndex(t, compatibilityIndexForVolume("F:"), true, false)
-	t.Setenv("SEEKFS_ENGINE_V9", "")
+func TestGlobalPlannerFallbackTrace(t *testing.T) {
+	v9c := roundTripCompatibilityIndex(t, compatibilityIndexForVolume("C:"), true, false)
+	v9f := roundTripCompatibilityIndex(t, compatibilityIndexForVolume("F:"), true, false)
 	volumes := []*serviceVolumeIndex{
-		newServiceVolumeIndex("fallback-v8.gsi", v8),
-		newServiceVolumeIndex("fallback-v9.gsi", v9),
+		newServiceVolumeIndex("fallback-v9-c.gsi", v9c),
+		newServiceVolumeIndex("fallback-v9-f.gsi", v9f),
+	}
+	// Force the ext planner to decline for C: by removing every ext posting
+	// source so the bounded fallback must run.
+	if volumes[0].index.Derived.Postings != nil {
+		delete(volumes[0].index.Derived.Postings, indexSectionPEXT)
 	}
 	volumes[0].queryIndex.ext = nil
 
@@ -71,7 +74,7 @@ func TestGlobalPlannerMixedV8V9FallbackTrace(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want, err := searchAll([]*Index{v8, v9}, queryOptions{Query: "ext:txt", Limit: 20}, false)
+	want, err := searchAll([]*Index{v9c, v9f}, queryOptions{Query: "ext:txt", Limit: 20}, false)
 	if err != nil {
 		t.Fatal(err)
 	}

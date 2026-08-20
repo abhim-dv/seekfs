@@ -254,9 +254,13 @@ func (s *directV9MFTSource) Next(ctx context.Context) (directV9Record, error) {
 	}
 	e := s.entries[s.frns[s.pos]]
 	s.pos++
+	parentFRN := e.parentFRN
+	if parentFRN == e.frn {
+		parentFRN = 0
+	}
 	return directV9Record{
 		FRN:       e.frn,
-		ParentFRN: e.parentFRN,
+		ParentFRN: parentFRN,
 		Mode:      modeFromAttrs(e.attr),
 		Size:      e.size,
 		ModUnix:   e.modUnix,

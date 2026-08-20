@@ -35,7 +35,6 @@ import (
 	"golang.org/x/sys/windows/svc/mgr"
 )
 
-const indexVersion = 8
 const indexVersionV9 = 9
 const servicePathCacheLimit = 25_000
 const serviceStartupDefaultWorkers = 2
@@ -64,7 +63,6 @@ const (
 	nameTrigramStateReady
 )
 
-var indexMagic = [8]byte{'G', 'O', 'S', 'R', 'C', 'H', '0', '8'}
 var indexMagicV9 = [8]byte{'G', 'O', 'S', 'R', 'C', 'H', '0', '9'}
 var walMagicV1 = []byte{'S', 'W', 'A', 'L', '1'}
 
@@ -91,10 +89,6 @@ const (
 )
 
 const gramPostingUnionMetadataMagic uint32 = 0x47524d32 // "GRM2"
-
-func engineV9Enabled() bool {
-	return envBool("SEEKFS_ENGINE_V9")
-}
 
 func globalPlannerEnabled() bool {
 	return envBool("SEEKFS_GLOBAL_PLANNER")
@@ -130,6 +124,10 @@ const (
 	overlayCompactionMaxSlots   = 64 * 1024
 	overlayCompactionMaxWAL     = 64 * 1024 * 1024
 	overlayCompactionTombstoneP = 5
+	// serviceUSNReplayBatchMax bounds the number of USN changes applied in a
+	// single replay iteration.  A large backlog is drained across several
+	// iterations so search requests are never starved by one long apply.
+	serviceUSNReplayBatchMax = 10_000
 	compactDiskRecordBytes      = 43
 	compactWideDiskRecordBytes  = 45
 	compactDiskFlag             = 1
@@ -1113,13 +1111,14 @@ func cmdIndex(args []string) error {
 	}
 
 	start := time.Now()
-	idx := &Index{Version: indexVersion, Roots: roots, BuiltAt: time.Now(), Source: "walk"}
+	idx := &Index{Version: indexVersionV9, Roots: roots, BuiltAt: time.Now(), Source: "walk"}
 	for _, root := range roots {
 		if err := walkRoot(root, idx); err != nil {
 			fmt.Fprintf(os.Stderr, "warning: %s: %v\n", root, err)
 		}
 	}
 	buildOrders(idx)
+	ensureCompactIndexForService(idx)
 	if err := saveIndex(*db, idx); err != nil {
 		return err
 	}
@@ -1156,9 +1155,6 @@ func cmdUpgradeIndex(args []string) error {
 	if *db == "" {
 		return errors.New("upgrade-index requires -db")
 	}
-	if !engineV9Enabled() {
-		return errors.New("upgrade-index writes the gated v9 format only when SEEKFS_ENGINE_V9=1")
-	}
 	idx, err := loadIndex(*db)
 	if err != nil {
 		return err
@@ -1183,9 +1179,6 @@ func cmdCompactIndex(args []string) error {
 	}
 	if *db == "" {
 		return errors.New("compact-index requires -db")
-	}
-	if !engineV9Enabled() {
-		return errors.New("compact-index writes the gated v9 format only when SEEKFS_ENGINE_V9=1")
 	}
 	idx, err := loadIndexForService(*db)
 	if err != nil {
@@ -1259,10 +1252,8 @@ func newCompactionVolumeIndex(dbPath string, idx *Index) *serviceVolumeIndex {
 			}
 		}
 	}
-	if engineV9Enabled() {
-		vol.overlay = newOverlaySegment()
-		vol.publishSnapshot()
-	}
+	vol.overlay = newOverlaySegment()
+	vol.publishSnapshot()
 	return vol
 }
 
@@ -1382,7 +1373,7 @@ func indexUSNVolume(volume string) (*Index, error) {
 	}
 
 	idx := &Index{
-		Version:    indexVersion,
+		Version:    indexVersionV9,
 		Roots:      []string{vol + `\`},
 		BuiltAt:    time.Now(),
 		Source:     "usn",
@@ -2661,6 +2652,7 @@ type goSearchService struct {
 }
 
 type serviceVolumeIndex struct {
+	mu                sync.Mutex
 	dbPath            string
 	index             *Index
 	volume            string
@@ -3427,9 +3419,6 @@ func waitForDoctor(pipeName string, timeout time.Duration) doctorResponse {
 		if resp.OK || time.Now().After(deadline) {
 			return resp
 		}
-		if !engineV9Enabled() {
-			time.Sleep(500 * time.Millisecond)
-		}
 	}
 }
 
@@ -3657,6 +3646,7 @@ func (s *goSearchService) loadConfiguredIndexes() error {
 	s.loadErr = ""
 	s.indexMu.Unlock()
 	debug.FreeOSMemory()
+	s.sweepStaleIndexTempFiles()
 	s.startBackgroundNameOrderBuilds(volumes)
 	s.startBackgroundNameTrigramBuilds(volumes)
 	for _, vol := range volumes {
@@ -3755,7 +3745,7 @@ func loadConfiguredVolume(dbPath string) (*Index, *serviceVolumeIndex, error) {
 			}
 		}
 	}
-	if engineV9Enabled() && serviceLowMemoryMode() && idx.Compact && idx.MMapRecords == nil {
+	if serviceLowMemoryMode() && idx.Compact && idx.MMapRecords == nil {
 		if mmapIdx, mmapErr := loadIndexMMap(dbPath); mmapErr == nil {
 			idx = mmapIdx
 			vol = newServiceVolumeIndex(dbPath, idx)
@@ -3782,14 +3772,6 @@ func loadIndexForService(dbPath string) (*Index, error) {
 		ensureCompactIndexForService(idx)
 		return idx, nil
 	}
-	if !engineV9Enabled() {
-		idx, err := loadIndex(dbPath)
-		if err != nil {
-			return nil, err
-		}
-		ensureCompactIndexForService(idx)
-		return idx, nil
-	}
 	idx, err := loadIndexMMap(dbPath)
 	if err == nil {
 		ensureCompactIndexForService(idx)
@@ -3804,9 +3786,32 @@ func loadIndexForService(dbPath string) (*Index, error) {
 	return idx, nil
 }
 
+func depthOfPath(path string) int {
+	depth := 0
+	for _, c := range path {
+		if c == '\\' || c == '/' {
+			depth++
+		}
+	}
+	return depth
+}
+
 func ensureCompactIndexForService(idx *Index) {
 	if idx == nil || idx.Compact || len(idx.Entries) == 0 {
 		return
+	}
+	if len(idx.Roots) == 0 {
+		shallow := idx.Entries[0]
+		for _, entry := range idx.Entries {
+			if depthOfPath(entry.Path) < depthOfPath(shallow.Path) {
+				shallow = entry
+			}
+		}
+		if p := filepath.Dir(shallow.Path); p != "" && p != "." {
+			idx.Roots = []string{p}
+		} else {
+			idx.Roots = []string{shallow.Path}
+		}
 	}
 	records := make([]CompactRecord, 0, len(idx.Entries))
 	idByPath := make(map[string]int32, len(idx.Entries))
@@ -3923,10 +3928,8 @@ func newServiceVolumeIndex(dbPath string, idx *Index) *serviceVolumeIndex {
 			vol.buildCompactChildren()
 		}
 	}
-	if engineV9Enabled() {
-		vol.overlay = newOverlaySegment()
-		vol.publishSnapshot()
-	}
+	vol.overlay = newOverlaySegment()
+	vol.publishSnapshot()
 	return vol
 }
 
@@ -3975,7 +3978,7 @@ func (set *overlayBaseIDSet) len() int {
 }
 
 func (vol *serviceVolumeIndex) publishSnapshot() {
-	if vol == nil || !engineV9Enabled() {
+	if vol == nil {
 		return
 	}
 	gen := vol.snapshotGen.Add(1)
@@ -4136,32 +4139,17 @@ func catchUpServiceVolume(vol *serviceVolumeIndex) error {
 		if nextUSN <= vol.checkpoint {
 			break
 		}
-		if engineV9Enabled() {
-			if err := appendWAL(vol.dbPath, nextUSN, changes); err != nil {
-				vol.state = "stale"
-				vol.staleReason = err.Error()
-				return err
-			}
+		if err := appendWAL(vol.dbPath, nextUSN, changes); err != nil {
+			vol.state = "stale"
+			vol.staleReason = err.Error()
+			return err
 		}
 		vol.applyUSNChanges(changes)
 		vol.checkpoint = nextUSN
 		vol.index.Checkpoint = nextUSN
 	}
 	if vol.dbPath != "" {
-		if engineV9Enabled() {
-			vol.dirty = true
-		} else {
-			if err := saveIndex(vol.dbPath, vol.index); err != nil {
-				vol.state = "stale"
-				vol.staleReason = err.Error()
-				return err
-			}
-			vol.repackResidentRecordsIfBloated()
-			releaseServiceMemoryAfterSave()
-			if err := removeWAL(vol.dbPath); err != nil {
-				serviceLog("wal cleanup error volume=%s db=%s err=%v", vol.volume, vol.dbPath, err)
-			}
-		}
+		vol.dirty = true
 	}
 	vol.state = "ready"
 	vol.staleReason = ""
@@ -4250,36 +4238,43 @@ func (s *goSearchService) replayVolumeOnce(vol *serviceVolumeIndex, buffer []byt
 	var nextUSN int64
 	var changes []usnChange
 	err = nil
-	if engineV9Enabled() {
-		nextUSN, changes, err = readUSNChangesWait(handle, journalID, startUSN, buffer, 5*time.Second, 1)
-	} else {
-		nextUSN, changes, err = readUSNChanges(handle, journalID, startUSN, buffer)
-	}
+	nextUSN, changes, err = readUSNChangesWait(handle, journalID, startUSN, buffer, 5*time.Second, 1)
 	if err != nil {
 		return err
 	}
 	if nextUSN <= startUSN {
 		return nil
 	}
-	if err := appendWAL(vol.dbPath, nextUSN, changes); err != nil {
-		s.indexMu.Lock()
-		vol.state = "stale"
-		vol.staleReason = err.Error()
-		s.indexMu.Unlock()
-		return err
+	// Bound the per-iteration batch so a large USN backlog is applied across
+	// several iterations, yielding to search requests between batches instead
+	// of monopolizing the volume under one long apply.
+	if len(changes) > serviceUSNReplayBatchMax {
+		changes = changes[:serviceUSNReplayBatchMax]
 	}
-	s.indexMu.Lock()
+	// The checkpoint must advance only as far as the last applied change so
+	// the next iteration resumes from the truncated remainder.
+	appliedCheckpoint := nextUSN
+	if len(changes) > 0 {
+		appliedCheckpoint = changes[len(changes)-1].USN
+	}
+	vol.mu.Lock()
 	if vol.checkpoint != startUSN {
-		s.indexMu.Unlock()
+		vol.mu.Unlock()
 		return nil
 	}
+	if err := appendWAL(vol.dbPath, nextUSN, changes); err != nil {
+		vol.state = "stale"
+		vol.staleReason = err.Error()
+		vol.mu.Unlock()
+		return err
+	}
 	vol.applyUSNChanges(changes)
-	vol.checkpoint = nextUSN
-	vol.index.Checkpoint = nextUSN
+	vol.checkpoint = appliedCheckpoint
+	vol.index.Checkpoint = appliedCheckpoint
 	vol.state = "ready"
 	vol.staleReason = ""
 	vol.dirty = true
-	s.indexMu.Unlock()
+	vol.mu.Unlock()
 	return nil
 }
 
@@ -4309,55 +4304,89 @@ func (s *goSearchService) persistVolumeIfDue(vol *serviceVolumeIndex, force bool
 	dirty := vol.dirty
 	retryAfter := vol.persistRetryAfter
 	due := force || vol.compactionDue(now)
-	if !engineV9Enabled() {
-		due = force || (now.Sub(vol.lastPersist) >= persistDebounce && (retryAfter.IsZero() || !now.Before(retryAfter)))
-	} else if !retryAfter.IsZero() && now.Before(retryAfter) {
+	if !retryAfter.IsZero() && now.Before(retryAfter) {
 		due = false
 	}
 	s.indexMu.RUnlock()
 	if !dirty || !due {
 		return
 	}
-	s.indexMu.Lock()
-	now = time.Now()
-	due = force || vol.compactionDue(now)
-	if !engineV9Enabled() {
-		due = force || (now.Sub(vol.lastPersist) >= persistDebounce && (vol.persistRetryAfter.IsZero() || !now.Before(vol.persistRetryAfter)))
-	} else if !vol.persistRetryAfter.IsZero() && now.Before(vol.persistRetryAfter) {
-		due = false
+	// Serialize the persist against the per-volume replay/write path.  We do
+	// NOT hold the global service lock here: the overlay fold and the multi-GB
+	// v9 tmp write can take minutes, and taking indexMu.Lock() during that
+	// window would wedge every pipe request (info/search block at RLock).
+	// Holding vol.mu only briefly pauses this volume's replay loop; the USN
+	// journal retains any changes read but not yet applied, and the next
+	// replay iteration resumes from the persisted checkpoint.
+	vol.mu.Lock()
+	if !vol.dirty || vol.dbPath == "" {
+		vol.mu.Unlock()
+		return
 	}
-	if !vol.dirty || !due {
-		s.indexMu.Unlock()
+	now = time.Now()
+	if !vol.persistRetryAfter.IsZero() && now.Before(vol.persistRetryAfter) {
+		vol.mu.Unlock()
+		return
+	}
+	compacted := compactOverlayIndex(vol)
+	tmp, err := stageIndexFile(vol.dbPath, compacted)
+	if err != nil {
+		vol.notePersistFailureLocked(err, now)
+		vol.mu.Unlock()
+		serviceLog("background persist stage error volume=%s db=%s failures=%d retry_after=%s err=%v", vol.volume, vol.dbPath, vol.persistFailures, vol.persistRetryAfter.Format(time.RFC3339Nano), err)
 		return
 	}
 	saved := false
-	var err error
-	if engineV9Enabled() && vol.overlay != nil {
-		err = s.compactOverlayVolumeLocked(vol)
-	} else {
-		err = saveIndex(vol.dbPath, vol.index)
+	// The disk write is done and durable; only the fast swap-in remains.
+	// Take the global lock so no search is mid-flight against the mmap view
+	// we are about to close, unmap the old file, replace it, and reload.
+	s.indexMu.Lock()
+	if closeErr := closeIndexMMapRecords(vol.index); closeErr != nil {
+		vol.notePersistFailureLocked(closeErr, time.Now())
+		s.indexMu.Unlock()
+		_ = os.Remove(tmp)
+		serviceLog("background persist unmap error volume=%s db=%s err=%v", vol.volume, vol.dbPath, closeErr)
+		return
 	}
-	if err != nil {
-		vol.notePersistFailureLocked(err, now)
-		serviceLog("background persist error volume=%s db=%s failures=%d retry_after=%s err=%v", vol.volume, vol.dbPath, vol.persistFailures, vol.persistRetryAfter.Format(time.RFC3339Nano), err)
-	} else {
-		if !engineV9Enabled() {
-			vol.repackResidentRecordsIfBloated()
-		}
-		if err := removeWAL(vol.dbPath); err != nil {
-			serviceLog("wal cleanup error volume=%s db=%s err=%v", vol.volume, vol.dbPath, err)
-		}
-		vol.dirty = false
-		vol.lastPersist = time.Now()
-		vol.persistFailures = 0
-		vol.persistRetryAfter = time.Time{}
-		vol.lastPersistErr = ""
-		if !engineV9Enabled() {
-			vol.afterPersist()
-		}
-		saved = true
+	if commitErr := commitStageIndexFile(vol.dbPath, tmp); commitErr != nil {
+		vol.notePersistFailureLocked(commitErr, time.Now())
+		s.indexMu.Unlock()
+		serviceLog("background persist commit error volume=%s db=%s err=%v", vol.volume, vol.dbPath, commitErr)
+		return
 	}
+	loaded, loadErr := loadIndexForService(vol.dbPath)
+	if loadErr != nil {
+		vol.notePersistFailureLocked(loadErr, time.Now())
+		s.indexMu.Unlock()
+		serviceLog("background persist reload error volume=%s db=%s err=%v", vol.volume, vol.dbPath, loadErr)
+		return
+	}
+	replacement := newServiceVolumeIndex(vol.dbPath, loaded)
+	replacement.state = "ready"
+	replacement.staleReason = ""
+	replacement.dirty = false
+	replacement.lastPersist = time.Now()
+	replacement.persistFailures = 0
+	replacement.persistRetryAfter = time.Time{}
+	replacement.lastPersistErr = ""
+	replaceServiceVolumeContents(vol, replacement)
+	for i, existing := range s.volumes {
+		if existing == vol {
+			s.indexes[i] = vol.index
+			break
+		}
+	}
+	if err := removeWAL(vol.dbPath); err != nil {
+		serviceLog("wal cleanup error volume=%s db=%s err=%v", vol.volume, vol.dbPath, err)
+	}
+	vol.dirty = false
+	vol.lastPersist = time.Now()
+	vol.persistFailures = 0
+	vol.persistRetryAfter = time.Time{}
+	vol.lastPersistErr = ""
+	saved = true
 	s.indexMu.Unlock()
+	vol.mu.Unlock()
 	if saved {
 		releaseServiceMemoryAfterSave()
 		s.startBackgroundNameOrderBuilds([]*serviceVolumeIndex{vol})
@@ -4366,7 +4395,7 @@ func (s *goSearchService) persistVolumeIfDue(vol *serviceVolumeIndex, force bool
 }
 
 func (vol *serviceVolumeIndex) compactionDue(now time.Time) bool {
-	if vol == nil || !engineV9Enabled() {
+	if vol == nil {
 		return false
 	}
 	if vol.overlay != nil {
@@ -4399,42 +4428,6 @@ func (vol *serviceVolumeIndex) notePersistFailureLocked(err error, now time.Time
 	vol.lastPersistErr = err.Error()
 }
 
-func (s *goSearchService) compactOverlayVolumeLocked(vol *serviceVolumeIndex) error {
-	if vol == nil || vol.index == nil || vol.dbPath == "" {
-		return nil
-	}
-	if err := vol.compactOverlayLocked(); err != nil {
-		return err
-	}
-	for i, existing := range s.volumes {
-		if existing == vol {
-			s.indexes[i] = vol.index
-			break
-		}
-	}
-	return nil
-}
-
-func (vol *serviceVolumeIndex) compactOverlayLocked() error {
-	if vol == nil || vol.index == nil || vol.dbPath == "" {
-		return nil
-	}
-	if err := compactOverlayToDisk(vol); err != nil {
-		return err
-	}
-	loaded, err := loadIndexForService(vol.dbPath)
-	if err != nil {
-		return err
-	}
-	replacement := newServiceVolumeIndex(vol.dbPath, loaded)
-	replacement.state = "ready"
-	replacement.staleReason = ""
-	replacement.dirty = false
-	replacement.lastPersist = time.Now()
-	replaceServiceVolumeContents(vol, replacement)
-	return nil
-}
-
 func compactOverlayToDisk(vol *serviceVolumeIndex) error {
 	if vol == nil || vol.index == nil || vol.dbPath == "" {
 		return nil
@@ -4460,7 +4453,7 @@ func closeIndexMMapRecords(idx *Index) error {
 func compactOverlayIndex(vol *serviceVolumeIndex) *Index {
 	base := vol.index
 	out := &Index{
-		Version:      indexVersion,
+		Version:    indexVersionV9,
 		Roots:        append([]string(nil), base.Roots...),
 		BuiltAt:      time.Now(),
 		Source:       base.Source,
@@ -4470,9 +4463,6 @@ func compactOverlayIndex(vol *serviceVolumeIndex) *Index {
 		ContentHash:  base.ContentHash,
 		Compact:      true,
 		CompactAttrs: base.CompactAttrs,
-	}
-	if engineV9Enabled() {
-		out.Version = indexVersionV9
 	}
 	if out.Volume == "" {
 		out.Volume = vol.volume
@@ -4553,34 +4543,6 @@ func releaseServiceMemoryAfterSave() {
 	debug.FreeOSMemory()
 }
 
-func (vol *serviceVolumeIndex) afterPersist() {
-	vol.queryIndex = buildResidentQueryIndex(vol)
-	vol.resetNameOrderBuild()
-	vol.resetNameTrigrams()
-	if vol.needsCompactChildrenBuild() {
-		vol.buildCompactChildren()
-	}
-	vol.recentIDs = nil
-	vol.recentSeq++
-	vol.clearSearchCachesLocked()
-	debug.FreeOSMemory()
-}
-
-func (vol *serviceVolumeIndex) repackResidentRecordsIfBloated() {
-	if vol == nil || vol.index == nil || !vol.index.packedNameBlobLooksBloated() {
-		return
-	}
-	before := len(vol.index.PackedRecords.NameBlob)
-	start := time.Now()
-	vol.index.repackCompactRecords()
-	debug.FreeOSMemory()
-	after := 0
-	if vol.index.PackedRecords != nil {
-		after = len(vol.index.PackedRecords.NameBlob)
-	}
-	serviceLog("repacked resident name blob volume=%s before=%d after=%d elapsed=%s", vol.volume, before, after, time.Since(start).Round(time.Millisecond))
-}
-
 func queryUSNJournal(handle windows.Handle) (usnJournalDataV0, error) {
 	var journal usnJournalDataV0
 	var bytesReturned uint32
@@ -4653,7 +4615,11 @@ func rebuildServiceVolumeIndex(vol *serviceVolumeIndex) (*serviceVolumeIndex, er
 	if err := removeWAL(vol.dbPath); err != nil {
 		serviceLog("wal cleanup error volume=%s db=%s err=%v", vol.volume, vol.dbPath, err)
 	}
-	rebuilt := newServiceVolumeIndex(vol.dbPath, idx)
+	loaded, err := loadIndexForService(vol.dbPath)
+	if err != nil {
+		return nil, err
+	}
+	rebuilt := newServiceVolumeIndex(vol.dbPath, loaded)
 	rebuilt.state = "ready"
 	rebuilt.staleReason = ""
 	return rebuilt, nil
@@ -4670,7 +4636,7 @@ func rebuildWalkIndex(vol *serviceVolumeIndex) (*Index, error) {
 		Source:  "walk",
 	}
 	if idx.Version == 0 {
-		idx.Version = indexVersion
+		idx.Version = indexVersionV9
 	}
 	for _, root := range idx.Roots {
 		if err := walkRoot(root, idx); err != nil {
@@ -4678,6 +4644,7 @@ func rebuildWalkIndex(vol *serviceVolumeIndex) (*Index, error) {
 		}
 	}
 	buildOrders(idx)
+	ensureCompactIndexForService(idx)
 	return idx, nil
 }
 
@@ -4691,12 +4658,17 @@ func (s *goSearchService) rebuildWalkVolumeInPlace(vol *serviceVolumeIndex, reas
 	if err != nil {
 		return err
 	}
+	tmp, err := stageIndexFile(vol.dbPath, idx)
+	if err != nil {
+		return err
+	}
 	s.indexMu.Lock()
 	if err := closeIndexMMapRecords(vol.index); err != nil {
 		s.indexMu.Unlock()
+		_ = os.Remove(tmp)
 		return err
 	}
-	if err := saveIndex(vol.dbPath, idx); err != nil {
+	if err := commitStageIndexFile(vol.dbPath, tmp); err != nil {
 		s.indexMu.Unlock()
 		return err
 	}
@@ -4732,19 +4704,29 @@ func (s *goSearchService) rebuildVolumeInPlace(vol *serviceVolumeIndex) error {
 	}
 	buildOrders(idx)
 
+	tmp, err := stageIndexFile(vol.dbPath, idx)
+	if err != nil {
+		return err
+	}
 	s.indexMu.Lock()
 	if err := closeIndexMMapRecords(vol.index); err != nil {
 		s.indexMu.Unlock()
+		_ = os.Remove(tmp)
 		return err
 	}
-	if err := saveIndex(vol.dbPath, idx); err != nil {
+	if err := commitStageIndexFile(vol.dbPath, tmp); err != nil {
 		s.indexMu.Unlock()
 		return err
 	}
 	if err := removeWAL(vol.dbPath); err != nil {
 		serviceLog("wal cleanup error volume=%s db=%s err=%v", vol.volume, vol.dbPath, err)
 	}
-	rebuilt := newServiceVolumeIndex(vol.dbPath, idx)
+	loaded, loadErr := loadIndexForService(vol.dbPath)
+	if loadErr != nil {
+		s.indexMu.Unlock()
+		return loadErr
+	}
+	rebuilt := newServiceVolumeIndex(vol.dbPath, loaded)
 	rebuilt.state = "ready"
 	rebuilt.staleReason = ""
 	replaceServiceVolumeContents(vol, rebuilt)
@@ -4845,85 +4827,22 @@ func openDirectoryForChanges(root string) (windows.Handle, error) {
 }
 
 func (vol *serviceVolumeIndex) applyUSNChanges(changes []usnChange) {
-	if engineV9Enabled() {
-		for _, change := range changes {
-			if change.FRN == 0 {
-				continue
-			}
-			vol.recordOverlayChange(change)
-			if change.USN > vol.checkpoint {
-				vol.checkpoint = change.USN
-			}
-		}
-		vol.index.Checkpoint = vol.checkpoint
-		vol.dirty = true
-		vol.publishSnapshot()
-		return
-	}
 	for _, change := range changes {
 		if change.FRN == 0 {
 			continue
 		}
 		vol.recordOverlayChange(change)
-		if change.Reason&usnReasonRenameOld != 0 && change.Reason&usnReasonRenameNew == 0 {
-			continue
-		}
-		if change.Reason&usnReasonFileDelete != 0 {
-			if id, ok := vol.idForFRN(change.FRN); ok {
-				vol.markNameTrigramRecent(id)
-				vol.removeExactName(id)
-				vol.markDeleted(id)
-			}
-			if change.USN > vol.checkpoint {
-				vol.checkpoint = change.USN
-			}
-			continue
-		}
-		id, ok := vol.idForFRN(change.FRN)
-		if !ok {
-			id = vol.index.appendCompactRecord(CompactRecord{FRN: change.FRN})
-			vol.addFRNID(change.FRN, id)
-		}
-		if vol.recentIDs == nil {
-			vol.recentIDs = make(map[int]struct{})
-		}
-		vol.recentIDs[id] = struct{}{}
-		vol.markNameTrigramRecent(id)
-		vol.recentSeq++
-		rec := vol.index.compactRecord(id)
-		if rec.ParentFRN != 0 && rec.ParentFRN != change.ParentFRN {
-			vol.removeChild(rec.ParentFRN, id)
-		}
-		vol.removeExactName(id)
-		rec.FRN = change.FRN
-		rec.ParentFRN = change.ParentFRN
-		rec.Parent = -1
-		if parentID, ok := vol.idForFRN(change.ParentFRN); ok && parentID != id {
-			rec.Parent = int32(parentID)
-		}
-		if change.ParentFRN != 0 && change.ParentFRN != change.FRN {
-			vol.addChild(change.ParentFRN, id)
-		}
-		vol.repairChildren(change.FRN, id)
-		if change.Name != "" {
-			rec.Name = change.Name
-		}
-		rec.Mode = modeFromAttrs(change.Attr)
-		vol.index.CompactAttrs = true
-		rec.Deleted = false
-		vol.index.setCompactRecord(id, rec)
-		vol.addExactName(id)
 		if change.USN > vol.checkpoint {
 			vol.checkpoint = change.USN
 		}
 	}
 	vol.index.Checkpoint = vol.checkpoint
-	vol.pathCache = make(map[int]string)
+	vol.dirty = true
 	vol.publishSnapshot()
 }
 
 func (vol *serviceVolumeIndex) recordOverlayChange(change usnChange) {
-	if vol == nil || !engineV9Enabled() {
+	if vol == nil {
 		return
 	}
 	if vol.overlay == nil {
@@ -5034,7 +4953,7 @@ func (vol *serviceVolumeIndex) tombstoneBaseSubtree(rootID int) {
 // no overlay slot of their own that got tombstoned by the delete branch
 // above (only deletedFRN's own slot did), and overlayRecordPath falls
 // back to the base index for any ancestor FRN without a live overlay
-// slot — which does not consult vol.overlay.tombstone. So without this
+// slot â€” which does not consult vol.overlay.tombstone. So without this
 // cascade an overlay-only child parented (directly or transitively)
 // under a deleted base directory stays visible forever.
 //
@@ -5252,13 +5171,7 @@ func appendWAL(dbPath string, nextUSN int64, changes []usnChange) error {
 	if err != nil {
 		return err
 	}
-	err = nil
-	if engineV9Enabled() {
-		err = appendBinaryWALFrame(f, nextUSN, changes)
-	} else {
-		enc := json.NewEncoder(f)
-		err = enc.Encode(walBatch{NextUSN: nextUSN, Changes: changes})
-	}
+	err = appendBinaryWALFrame(f, nextUSN, changes)
 	if syncErr := f.Sync(); err == nil {
 		err = syncErr
 	}
@@ -7350,18 +7263,13 @@ func handleServiceConn(conn *os.File, s *goSearchService) {
 		var err error
 		searchStart := time.Now()
 		if len(s.volumes) == len(s.indexes) {
-			volumes := s.volumes
-			unlockedForSearch := false
-			if engineV9Enabled() {
-				volumes = snapshotServiceVolumesForSearch(s.volumes)
-				s.indexMu.RUnlock()
-				unlockedForSearch = true
-			}
+			volumes := snapshotServiceVolumesForSearch(s.volumes)
+			// Hold the read lock through the whole query: a background persist
+			// swaps the memory-mapped index under indexMu.Lock(), and an
+			// in-flight search must not touch an un-mapped view.
 			if req.CountOnly {
 				if count, ok, countErr := countServiceVolumes(volumes, opts); ok {
-					if !unlockedForSearch {
-						s.indexMu.RUnlock()
-					}
+					s.indexMu.RUnlock()
 					searchMS := float64(time.Since(searchStart).Nanoseconds()) / 1_000_000
 					if countErr != nil {
 						_ = json.NewEncoder(conn).Encode(serviceResponse{OK: false, Message: countErr.Error()})
@@ -7373,9 +7281,7 @@ func handleServiceConn(conn *os.File, s *goSearchService) {
 				}
 			}
 			matches, err = searchServiceVolumes(volumes, opts, req.CountOnly)
-			if !unlockedForSearch {
-				s.indexMu.RUnlock()
-			}
+			s.indexMu.RUnlock()
 		} else {
 			matches, err = searchAll(s.indexes, opts, req.CountOnly)
 			s.indexMu.RUnlock()
@@ -7385,6 +7291,7 @@ func handleServiceConn(conn *os.File, s *goSearchService) {
 			_ = json.NewEncoder(conn).Encode(serviceResponse{OK: false, Message: err.Error()})
 			return
 		}
+		serviceLog("search query=%q ms=%.1f planner=%s source=%s decline=%s filename_driver=%s candidates=%d results=%d", req.Query, searchMS, trace.PlannerMode, trace.Source, trace.Decline, trace.FilenameDriver, trace.Candidates, len(matches))
 		resp := serviceResponse{OK: true, Count: len(matches), SearchMS: searchMS, Source: trace.Source, Decline: trace.Decline, Candidates: trace.Candidates, PlannerMode: trace.PlannerMode, EligibleVolumes: trace.EligibleVolumes, BlocksDecoded: trace.BlocksDecoded, BlocksSkipped: trace.BlocksSkipped, ScalarDriver: trace.ScalarDriver, ScalarInterval: trace.ScalarInterval, RecordsVerified: trace.ScalarRecordsVerified, ComponentDriver: trace.ComponentDriver, ComponentRoots: trace.ComponentRoots, ComponentIntervals: trace.ComponentIntervals, ComponentCardinality: trace.ComponentCardinality, ComponentSelfHits: trace.ComponentSelfHits, ComponentBounds: trace.ComponentBounds, ComponentRecordsVerified: trace.ComponentRecordsVerified, FilenameDriver: trace.FilenameDriver, FilenameRequiredGrams: trace.FilenameRequiredGrams, FilenamePostingHint: trace.FilenamePostingHint, FilenameRecordsVerified: trace.FilenameRecordsVerified, OverlayBaseWindow: trace.OverlayBaseWindow, PostingPrefetchBytes: trace.PostingPrefetchBytes, PostingPrefetchRanges: trace.PostingPrefetchRanges, PostingPrefetchPages: trace.PostingPrefetchPages, Terms: trace.Terms, Declines: trace.Declines, Fallback: trace.Fallback, Complete: trace.completePtr()}
 		if !req.CountOnly {
 			resp.Results = make([]string, len(matches))
@@ -7405,8 +7312,27 @@ func handleServiceConn(conn *os.File, s *goSearchService) {
 		serviceLog("index-usn built volume=%s entries=%d", req.Volume, idx.entryCount())
 		buildOrders(idx)
 		serviceLog("index-usn orders volume=%s", req.Volume)
+		// Stage the multi-GB v9 write outside the global lock so pipe
+		// requests keep serving while it runs; only the fast swap-in below
+		// takes indexMu.Lock().
+		tmp, stageErr := stageIndexFile(req.DB, idx)
+		if stageErr != nil {
+			serviceLog("index-usn stage error volume=%s err=%v", req.Volume, stageErr)
+			_ = json.NewEncoder(conn).Encode(serviceResponse{OK: false, Message: stageErr.Error()})
+			return
+		}
 		s.indexMu.Lock()
-		if err := saveIndex(req.DB, idx); err != nil {
+		// The low-memory mmap pins the target file open, so unmap any existing
+		// volume for this DB before the temp-file rename replaces the file.
+		for _, existing := range s.volumes {
+			if existing != nil && samePath(existing.dbPath, req.DB) {
+				if err := closeIndexMMapRecords(existing.index); err != nil {
+					serviceLog("index-usn close mmap volume=%s err=%v", req.Volume, err)
+				}
+				break
+			}
+		}
+		if err := commitStageIndexFile(req.DB, tmp); err != nil {
 			s.indexMu.Unlock()
 			serviceLog("index-usn save error volume=%s err=%v", req.Volume, err)
 			_ = json.NewEncoder(conn).Encode(serviceResponse{OK: false, Message: err.Error()})
@@ -7415,7 +7341,19 @@ func handleServiceConn(conn *os.File, s *goSearchService) {
 		if err := removeWAL(req.DB); err != nil {
 			serviceLog("wal cleanup error volume=%s db=%s err=%v", req.Volume, req.DB, err)
 		}
-		vol := s.replaceLoadedVolumeLocked(req.DB, idx)
+		// Reload from disk so the swapped-in volume carries the persisted
+		// derived sections (RANK/PNGR/PNGC etc.).  The in-memory idx built by
+		// indexUSNVolume never populates Derived; using it here would leave
+		// the volume without SelfNameTrigrams and force every multi-term name
+		// query onto the slow bounded-scan path.
+		loaded, loadErr := loadIndexForService(req.DB)
+		if loadErr != nil {
+			s.indexMu.Unlock()
+			serviceLog("index-usn reload error volume=%s err=%v", req.Volume, loadErr)
+			_ = json.NewEncoder(conn).Encode(serviceResponse{OK: false, Message: loadErr.Error()})
+			return
+		}
+		vol := s.replaceLoadedVolumeLocked(req.DB, loaded)
 		s.indexMu.Unlock()
 		releaseServiceMemoryAfterSave()
 		s.startBackgroundNameOrderBuilds([]*serviceVolumeIndex{vol})
@@ -8120,7 +8058,7 @@ func queryTermPromotedToExtension(term string, exts []string) bool {
 }
 
 func (vol *serviceVolumeIndex) mergeOverlayMatches(base []Entry, opts queryOptions, countOnly bool, pathCache map[int]string) []Entry {
-	if vol == nil || !engineV9Enabled() {
+	if vol == nil {
 		return base
 	}
 	snap := vol.snap.Load()
@@ -8208,7 +8146,7 @@ func (vol *serviceVolumeIndex) overlayRankedMatches(snap *volumeSnapshot, pq par
 }
 
 func (vol *serviceVolumeIndex) snapshotHiddenBaseIDs() hiddenBaseIDs {
-	if vol == nil || !engineV9Enabled() {
+	if vol == nil {
 		return hiddenBaseIDs{}
 	}
 	snap := vol.snap.Load()
@@ -8220,7 +8158,7 @@ func (vol *serviceVolumeIndex) snapshotHiddenBaseIDs() hiddenBaseIDs {
 
 // overlayLiveMatchCount counts live (non-deleted, latest-slot-per-FRN) overlay
 // records matching pq, reading only through the given snapshot's records
-// slice up to watermark — the same walk mergeOverlayMatches performs for a
+// slice up to watermark â€” the same walk mergeOverlayMatches performs for a
 // full search, but without allocating/ranking Entry results since callers
 // only need len(). It reuses latestOverlaySlotsByFRN/overlayEntry/
 // entryMatches so overlay entry construction and match semantics never
@@ -8774,28 +8712,8 @@ func lockVolumeSearch(vol *serviceVolumeIndex, opts queryOptions) (bool, bool) {
 	if vol == nil {
 		return false, false
 	}
-	if engineV9Enabled() {
-		pq := parsedQuery{DeadlineUnix: opts.DeadlineUnix, Cancel: opts.Cancel}
-		return false, !queryCanceled(pq)
-	}
-	if opts.Cancel == nil && opts.DeadlineUnix == 0 {
-		vol.searchMu.Lock()
-		return true, true
-	}
 	pq := parsedQuery{DeadlineUnix: opts.DeadlineUnix, Cancel: opts.Cancel}
-	for {
-		if queryCanceled(pq) {
-			return false, false
-		}
-		if vol.searchMu.TryLock() {
-			if queryCanceled(pq) {
-				vol.searchMu.Unlock()
-				return false, false
-			}
-			return true, true
-		}
-		time.Sleep(2 * time.Millisecond)
-	}
+	return false, !queryCanceled(pq)
 }
 
 func filterImplicitUnderExisting(matches []Entry, opts queryOptions, countOnly bool) []Entry {
@@ -8966,15 +8884,7 @@ func countServiceVolumes(volumes []*serviceVolumeIndex, opts queryOptions) (int,
 		matches = vol.mergeOverlayMatches(matches, opts, true, pathCache)
 		return len(matches), true, nil
 	}
-	locked := false
-	if !engineV9Enabled() {
-		vol.searchMu.Lock()
-		locked = true
-	}
 	count, ok := vol.fastPostingCount(pq)
-	if locked {
-		vol.searchMu.Unlock()
-	}
 	if !ok {
 		return 0, false, nil
 	}
@@ -8989,7 +8899,7 @@ func countServiceVolumes(volumes []*serviceVolumeIndex, opts queryOptions) (int,
 //	+ (linear count of live overlay records matching pq)
 //
 // It reads the volume's snapshot exactly once and only touches snapshot
-// slices (records[:watermark], tombstoneIDs, shadowedIDs) — never
+// slices (records[:watermark], tombstoneIDs, shadowedIDs) â€” never
 // vol.overlay's live maps, which the apply goroutine mutates concurrently
 // (review G6). If the base fast-count route cannot evaluate pq (same decline
 // conditions as fastPostingCount today), this declines too (ok=false) rather
@@ -9017,7 +8927,7 @@ func (vol *serviceVolumeIndex) overlayAwareFastCount(pq parsedQuery) (int, bool)
 }
 
 func (vol *serviceVolumeIndex) hasActiveOverlay() bool {
-	if !engineV9Enabled() || vol == nil {
+	if vol == nil {
 		return false
 	}
 	if snap := vol.snap.Load(); snap != nil {
@@ -10652,6 +10562,17 @@ func (vol *serviceVolumeIndex) filenameNgramCandidates(pq parsedQuery, trigrams 
 	if trigrams == nil {
 		return nil, false
 	}
+	// Multi-term queries: the selective single-best-term lane verifies only
+	// the best term, admitting false positives for the other terms.  When the
+	// companion PNGC section is present, answer exactly by intersecting
+	// postings across every term.  This is also the only exact lane for
+	// common-gram queries whose grams are omitted from PNGR.
+	if len(pq.Terms) >= 2 && vol.index != nil && vol.index.Derived.SelfNameTrigrams != nil &&
+		vol.index.Derived.SelfNameTrigrams.mappedGrams != nil {
+		if candidates, ok := vol.completeMultiTermNameGramCandidates(pq.Terms, maxIDs, pq); ok {
+			return candidates, true
+		}
+	}
 	bestTerm := ""
 	bestCount := maxIDs + 1
 	exactEmpty := false
@@ -11113,6 +11034,60 @@ func (vol *serviceVolumeIndex) verifyNameTrigramCandidateIDs(ids []int, term str
 		out = append(out, part...)
 	}
 	return out
+}
+
+// verifyMultiTermCandidateIDs runs the multi-term substring check over a
+// candidate set in parallel, mirroring verifyNameTrigramCandidateIDs.
+func (vol *serviceVolumeIndex) verifyMultiTermCandidateIDs(ids []int, matches func(int) bool) []int {
+	if len(ids) == 0 || vol == nil || vol.index == nil {
+		return nil
+	}
+	if len(ids) < serviceTrigramParallelVerifyMinIDs {
+		out := make([]int, 0, len(ids))
+		for _, id := range ids {
+			if matches(id) {
+				out = append(out, id)
+			}
+		}
+		return uniqueSortedInts(out)
+	}
+	workers := min(runtime.GOMAXPROCS(0), max(1, len(ids)/serviceTrigramParallelVerifyMinIDs))
+	if workers <= 1 {
+		out := make([]int, 0, len(ids))
+		for _, id := range ids {
+			if matches(id) {
+				out = append(out, id)
+			}
+		}
+		return uniqueSortedInts(out)
+	}
+	parts := make([][]int, workers)
+	var wg sync.WaitGroup
+	for worker := 0; worker < workers; worker++ {
+		start := worker * len(ids) / workers
+		end := (worker + 1) * len(ids) / workers
+		wg.Add(1)
+		go func(worker, start, end int) {
+			defer wg.Done()
+			local := make([]int, 0, end-start)
+			for _, id := range ids[start:end] {
+				if matches(id) {
+					local = append(local, id)
+				}
+			}
+			parts[worker] = local
+		}(worker, start, end)
+	}
+	wg.Wait()
+	total := 0
+	for _, part := range parts {
+		total += len(part)
+	}
+	out := make([]int, 0, total)
+	for _, part := range parts {
+		out = append(out, part...)
+	}
+	return uniqueSortedInts(out)
 }
 
 func (vol *serviceVolumeIndex) nameTrigramCandidateMatches(id int, term string) bool {
@@ -14829,48 +14804,21 @@ func (vol *serviceVolumeIndex) withRecentCandidates(base []int, seq uint64, keep
 	if vol == nil {
 		return base
 	}
-	if engineV9Enabled() {
-		if seq == 0 || seq == vol.cacheGeneration() {
-			return base
-		}
-		return base
-	}
-	if len(vol.recentIDs) == 0 || seq == vol.recentSeq {
-		return base
-	}
-	out := append([]int(nil), base...)
-	seen := make(map[int]struct{}, len(out))
-	for _, id := range out {
-		seen[id] = struct{}{}
-	}
-	for id := range vol.recentIDs {
-		if _, ok := seen[id]; ok || id < 0 || id >= vol.index.compactRecordCount() {
-			continue
-		}
-		rec := vol.index.compactRecord(id)
-		if !rec.Deleted && keep(rec) {
-			out = append(out, id)
-		}
-	}
-	sort.Ints(out)
-	return out
+	return base
 }
 
 func (vol *serviceVolumeIndex) cacheGeneration() uint64 {
 	if vol == nil {
 		return 0
 	}
-	if engineV9Enabled() {
-		if snap := vol.snap.Load(); snap != nil {
-			return snap.gen
-		}
-		return vol.snapshotGen.Load()
+	if snap := vol.snap.Load(); snap != nil {
+		return snap.gen
 	}
-	return vol.recentSeq
+	return vol.snapshotGen.Load()
 }
 
 func (vol *serviceVolumeIndex) cacheStampValid(stamp uint64) bool {
-	if vol == nil || !engineV9Enabled() {
+	if vol == nil {
 		return true
 	}
 	return stamp == vol.cacheGeneration()
@@ -15971,13 +15919,17 @@ func (idx *Index) reconstructCompactPathCached(i int, cache map[int]string) stri
 		cur = int(rec.Parent)
 	}
 	root := idx.Volume
-	if root == "" && len(idx.Roots) > 0 {
+	rootName := ""
+	if len(idx.Roots) > 0 {
 		root = strings.TrimRight(idx.Roots[0], `\`)
+		rootName = filepath.Base(root)
 	}
 	path := root
 	for p := len(parts) - 1; p >= 0; p-- {
 		if path == "" {
 			path = parts[p]
+		} else if rootName != "" && p == len(parts)-1 && parts[p] == rootName && len(parts) > 1 {
+			continue
 		} else {
 			path += `\` + parts[p]
 		}
@@ -16047,137 +15999,6 @@ type diskHeader struct {
 	TokenCount  uint64
 }
 
-func writeIndex(w io.Writer, idx *Index) error {
-	var nameOffs []uint32
-	var nameLens []uint16
-	var nameIDForRecord []uint32
-	recordCount := idx.compactRecordCount()
-	header := diskHeader{
-		Magic:      indexMagic,
-		Version:    indexVersion,
-		EntryCount: uint64(len(idx.Entries)),
-		RootCount:  uint64(len(idx.Roots)),
-		BuiltUnix:  idx.BuiltAt.UnixNano(),
-		JournalID:  idx.JournalID,
-		Checkpoint: idx.Checkpoint,
-	}
-	if idx.Compact {
-		header.EntryCount = uint64(recordCount)
-		nameIDs := make(map[string]uint32, recordCount/2)
-		nameBlob := make([]byte, 0, recordCount*16)
-		nameOffs = make([]uint32, 0, recordCount)
-		nameLens = make([]uint16, 0, recordCount)
-		nameIDForRecord = make([]uint32, recordCount)
-		for i := 0; i < recordCount; i++ {
-			rec := idx.compactRecord(i)
-			if len(rec.Name) > int(^uint16(0)) {
-				return errors.New("compact name too large")
-			}
-			id, ok := nameIDs[rec.Name]
-			if !ok {
-				id = uint32(len(nameOffs))
-				nameIDs[rec.Name] = id
-				nameOffs = append(nameOffs, uint32(len(nameBlob)))
-				nameLens = append(nameLens, uint16(len(rec.Name)))
-				nameBlob = append(nameBlob, rec.Name...)
-			}
-			nameIDForRecord[i] = id
-		}
-		idx.NameBlob = nameBlob
-		header.NameBlobLen = uint64(len(nameBlob))
-		header.TokenCount = uint64(len(nameOffs))
-		header.Compact = compactDiskFlag
-		if compactNeedsWideDiskRecords(recordCount, len(nameOffs)) {
-			header.Compact |= compactDiskWideRefsFlag
-		}
-		if idx.CompactAttrs {
-			header.Compact |= compactDiskAttrsFlag
-		}
-	}
-	if err := binary.Write(w, binary.LittleEndian, header); err != nil {
-		return err
-	}
-	for _, s := range []string{idx.Source, idx.Volume, idx.ContentHash} {
-		if err := writeString(w, s); err != nil {
-			return err
-		}
-	}
-	for _, root := range idx.Roots {
-		if err := writeString(w, root); err != nil {
-			return err
-		}
-	}
-	if idx.Compact {
-		wideRefs := header.Compact&compactDiskWideRefsFlag != 0
-		if _, err := w.Write(idx.NameBlob); err != nil {
-			return err
-		}
-		for i := range nameOffs {
-			if err := binary.Write(w, binary.LittleEndian, nameOffs[i]); err != nil {
-				return err
-			}
-			if err := binary.Write(w, binary.LittleEndian, nameLens[i]); err != nil {
-				return err
-			}
-		}
-		for i := 0; i < recordCount; i++ {
-			rec := idx.compactRecord(i)
-			rec.NameOff = nameIDForRecord[i]
-			parent := uint32(compactNarrowParentSentinel)
-			if wideRefs {
-				parent = compactWideParentSentinel
-			}
-			if rec.Parent >= 0 {
-				if !wideRefs && uint32(rec.Parent) >= compactNarrowParentSentinel {
-					return errors.New("compact index too large for packed record format")
-				}
-				parent = uint32(rec.Parent)
-			}
-			if err := binary.Write(w, binary.LittleEndian, rec.FRN); err != nil {
-				return err
-			}
-			if err := binary.Write(w, binary.LittleEndian, rec.ParentFRN); err != nil {
-				return err
-			}
-			if err := writeCompactRecordRefs(w, parent, rec.NameOff, wideRefs); err != nil {
-				return err
-			}
-			if err := binary.Write(w, binary.LittleEndian, rec.Mode); err != nil {
-				return err
-			}
-			if err := binary.Write(w, binary.LittleEndian, rec.Size); err != nil {
-				return err
-			}
-			if err := binary.Write(w, binary.LittleEndian, rec.ModUnix); err != nil {
-				return err
-			}
-			deleted := uint8(0)
-			if rec.Deleted {
-				deleted = 1
-			}
-			if err := binary.Write(w, binary.LittleEndian, deleted); err != nil {
-				return err
-			}
-		}
-		return nil
-	}
-	for _, entry := range idx.Entries {
-		for _, s := range []string{entry.Path, entry.Name, entry.LowerPath, entry.LowerName} {
-			if err := writeString(w, s); err != nil {
-				return err
-			}
-		}
-		for _, v := range []any{entry.Size, entry.Mode, entry.ModUnix} {
-			if err := binary.Write(w, binary.LittleEndian, v); err != nil {
-				return err
-			}
-		}
-	}
-	if err := writeUint32Slice(w, idx.NameOrder); err != nil {
-		return err
-	}
-	return writeUint32Slice(w, idx.PathOrder)
-}
 
 func readIndex(r io.Reader) (*Index, error) {
 	return readIndexWithReaderAt(r, nil, 0)
@@ -16189,15 +16010,14 @@ func readIndexWithReaderAt(r io.Reader, ra io.ReaderAt, size int64) (*Index, err
 		return nil, err
 	}
 	sectionTableOffset := uint64(0)
-	if header.Magic == indexMagicV9 {
-		if err := binary.Read(r, binary.LittleEndian, &sectionTableOffset); err != nil {
-			return nil, err
-		}
-	} else if header.Magic != indexMagic {
-		return nil, errors.New("unsupported index format")
+	if header.Magic != indexMagicV9 {
+		return nil, errors.New("unsupported index format: only the v9 index format is supported")
 	}
-	if header.Version != indexVersion && header.Version != indexVersionV9 {
-		return nil, fmt.Errorf("unsupported index version %d", header.Version)
+	if err := binary.Read(r, binary.LittleEndian, &sectionTableOffset); err != nil {
+		return nil, err
+	}
+	if header.Version != indexVersionV9 {
+		return nil, fmt.Errorf("unsupported index version %d: only v9 indexes are supported", header.Version)
 	}
 	if header.EntryCount > uint64(^uint(0)>>1) || header.RootCount > uint64(^uint(0)>>1) {
 		return nil, errors.New("index too large")
@@ -16464,51 +16284,134 @@ func blobString(blob []byte, off uint64, length uint32) (string, error) {
 }
 
 func saveIndex(path string, idx *Index) error {
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return err
-	}
-	f, err := os.CreateTemp(dir, filepath.Base(path)+".*.tmp")
+	tmp, err := stageIndexFile(path, idx)
 	if err != nil {
 		return err
 	}
-	tmp := f.Name()
-	if engineV9Enabled() && idx.Compact {
-		err = writeIndexV9File(f, idx)
-	} else {
-		bw := bufio.NewWriterSize(f, 16*1024*1024)
-		err = writeIndex(bw, idx)
-		if flushErr := bw.Flush(); err == nil {
-			err = flushErr
+	return commitStageIndexFile(path, tmp)
+}
+
+// sweepStaleIndexTempFiles removes leftover stageIndexFile temporaries for the
+// configured databases.  These accumulate when a persist is interrupted (the
+// process exits mid-write), and each one can be many GB; they are never
+// reaped otherwise.  Only files older than an hour and not currently growing
+// are removed, so a live persist is never disturbed.
+func (s *goSearchService) sweepStaleIndexTempFiles() {
+	for _, db := range s.dbs {
+		dir := filepath.Dir(db)
+		base := filepath.Base(db)
+		matches, err := filepath.Glob(filepath.Join(dir, base+".*.tmp"))
+		if err != nil {
+			continue
+		}
+		cutoff := time.Now().Add(-time.Hour)
+		for _, match := range matches {
+			info, err := os.Stat(match)
+			if err != nil {
+				continue
+			}
+			if info.ModTime().Before(cutoff) {
+				if rmErr := os.Remove(match); rmErr == nil {
+					serviceLog("swept stale index temp %s", match)
+				}
+			}
 		}
 	}
+}
+
+// stageIndexFile writes idx to a fresh temporary file next to path and returns
+// the temporary file name.  The caller may do expensive work between staging
+// and committing; commitStageIndexFile performs the atomic rename.  This lets
+// the service write a multi-GB v9 index while holding only the per-volume
+// lock, so the global service lock is not blocked for the whole disk write.
+func stageIndexFile(path string, idx *Index) (string, error) {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	f, err := os.CreateTemp(dir, filepath.Base(path)+".*.tmp")
+	if err != nil {
+		return "", err
+	}
+	tmp := f.Name()
+	if !idx.Compact {
+		ensureCompactIndexForService(idx)
+		buildOrders(idx)
+	}
+	err = writeIndexV9File(f, idx)
 	syncErr := f.Sync()
 	closeErr := f.Close()
 	if err != nil {
 		_ = os.Remove(tmp)
-		return err
+		return "", err
 	}
 	if syncErr != nil {
 		_ = os.Remove(tmp)
-		return syncErr
+		return "", syncErr
 	}
 	if closeErr != nil {
 		_ = os.Remove(tmp)
-		return closeErr
+		return "", closeErr
 	}
+	return tmp, nil
+}
+
+// commitStageIndexFile atomically replaces path with the staged temporary file
+// produced by stageIndexFile.
+func commitStageIndexFile(path, tmp string) error {
 	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		// In low-memory mode the live index is memory-mapped, so the OS
+		// refuses to delete the target file.  Fall back to an in-place
+		// truncate-and-rewrite: the mmap view stays valid (same file),
+		// readers see a coherent file only after the rename of the tmp file
+		// would have taken place, and the file is fully fsynced before the
+		// old mapping is invalidated by future loads.
+		if !serviceLowMemoryMode() {
+			_ = os.Remove(tmp)
+			return err
+		}
+		if inPlaceErr := replaceIndexFileInPlace(path, tmp); inPlaceErr != nil {
+			_ = os.Remove(tmp)
+			return fmt.Errorf("remove %s: %v; in-place fallback: %w", path, err, inPlaceErr)
+		}
 		_ = os.Remove(tmp)
-		return err
+		return nil
 	}
 	if err := os.Rename(tmp, path); err != nil {
 		_ = os.Remove(tmp)
 		return err
 	}
-	if dir, err := os.Open(dir); err == nil {
+	if dir, err := os.Open(filepath.Dir(path)); err == nil {
 		_ = dir.Sync()
 		_ = dir.Close()
 	}
 	return nil
+}
+
+// replaceIndexFileInPlace rewrites an existing (possibly memory-mapped) index
+// file with the freshly written temporary file's contents.  It truncates the
+// target and copies the tmp payload so the mapped view remains backed by the
+// same file.  On Windows this is required in low-memory mode because the mmap
+// pins the file open and remove/rename fails with ERROR_SHARING_VIOLATION.
+func replaceIndexFileInPlace(path, tmp string) error {
+	in, err := os.Open(tmp)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(path, os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		_ = out.Close()
+		return err
+	}
+	if err := out.Sync(); err != nil {
+		_ = out.Close()
+		return err
+	}
+	return out.Close()
 }
 
 type countingWriter struct {
@@ -16905,77 +16808,6 @@ func populatePersistenceFRNs(vol *serviceVolumeIndex, idx *Index) {
 	sortFRNIndexEntries(vol.frns, vol.frnRecordIDs)
 }
 
-func prepareDerivedSectionVolume(idx *Index) *serviceVolumeIndex {
-	if idx == nil || !idx.Compact {
-		return nil
-	}
-	// The writer needs query postings and rank metadata, but not the resident
-	// service wrapper, FRN maps, or packed record copy.  Keeping this view
-	// separate prevents v8->v9 compaction from materializing the same large
-	// index twice.
-	vol := newDerivedSectionVolumeIndex(idx)
-	populatePersistenceFRNs(vol, idx)
-	if vol.queryIndex == nil {
-		vol.queryIndex = buildResidentQueryIndexForPersistence(vol)
-	}
-	v9PersistTrace("resident-prepared")
-	if len(vol.queryIndex.nameOrder) == 0 || len(vol.queryIndex.nameRank) == 0 {
-		vol.queryIndex.nameOrder, vol.queryIndex.nameRank = buildCompactNameOrderRank(idx)
-	}
-	v9PersistTrace("name-rank-ready")
-	if idx.compactHasSize() && (len(vol.queryIndex.sizeOrder) == 0 || len(vol.queryIndex.sizeRank) == 0) {
-		vol.queryIndex.sizeOrder, vol.queryIndex.sizeRank = buildCompactSizeOrderRank(idx)
-	}
-	v9PersistTrace("size-rank-ready")
-	if idx.compactHasModTime() && (len(vol.queryIndex.modOrder) == 0 || len(vol.queryIndex.modRank) == 0) {
-		vol.queryIndex.modOrder, vol.queryIndex.modRank = buildCompactModifiedOrderRank(idx)
-	}
-	v9PersistTrace("modified-rank-ready")
-	if len(vol.queryIndex.extOrder) == 0 || len(vol.queryIndex.extRank) == 0 {
-		vol.queryIndex.extOrder, vol.queryIndex.extRank = buildCompactExtensionOrderRank(idx)
-	}
-	v9PersistTrace("extension-rank-ready")
-	if len(vol.queryIndex.typeOrder) == 0 || len(vol.queryIndex.typeRank) == 0 {
-		vol.queryIndex.typeOrder, vol.queryIndex.typeRank = buildCompactTypeOrderRank(idx)
-	}
-	v9PersistTrace("type-rank-ready")
-	if len(vol.queryIndex.pathOrder) == 0 || len(vol.queryIndex.pathRank) == 0 {
-		vol.queryIndex.pathOrder, vol.queryIndex.pathRank = buildCompactPathOrderRank(idx)
-	}
-	v9PersistTrace("path-rank-ready")
-	if len(vol.childOffsets) == 0 || len(vol.childIDs) == 0 {
-		vol.buildCompactChildren()
-	}
-	v9PersistTrace("children-ready")
-	// Persisted v9 generation must not inherit the low-memory serving toggle:
-	// SUBT is the source of truth for mapped component bounds and subtree
-	// execution after restart. The serving path may still decline to build this
-	// metadata when it is absent, but a writer should include it whenever the
-	// child graph is available.
-	if len(vol.subtreeOrder) == 0 && len(vol.childOffsets) > 0 {
-		vol.buildSubtreeRanges()
-	}
-	v9PersistTrace("subtree-ready")
-	// Size/modification rank sections are legitimately omitted when a compact
-	// index has no non-zero values. Bounds still need a safe rank for every
-	// persisted sort column; the default name rank is the same fallback used by
-	// rankForQuery for those absent columns.
-	sizeRank := vol.queryIndex.sizeRank
-	if len(sizeRank) == 0 {
-		sizeRank = vol.queryIndex.nameRank
-	}
-	modRank := vol.queryIndex.modRank
-	if len(modRank) == 0 {
-		modRank = vol.queryIndex.nameRank
-	}
-	vol.subtreeSizeRank = vol.buildSubtreeMinRanks(sizeRank)
-	vol.subtreeModRank = vol.buildSubtreeMinRanks(modRank)
-	vol.subtreeExtRank = vol.buildSubtreeMinRanks(vol.queryIndex.extRank)
-	vol.subtreeTypeRank = vol.buildSubtreeMinRanks(vol.queryIndex.typeRank)
-	vol.subtreePathRank = vol.buildSubtreeMinRanks(vol.queryIndex.pathRank)
-	v9PersistTrace("derived-prepared")
-	return vol
-}
 
 func buildDerivedSectionBlobs(idx *Index, nameTokens []string) []indexSectionBlob {
 	out := make([]indexSectionBlob, 0, 16)
@@ -17183,105 +17015,6 @@ func forEachDerivedSection(idx *Index, nameTokens []string, emit func(indexSecti
 	return nil
 }
 
-func forEachDerivedSectionLegacy(idx *Index, nameTokens []string, emit func(indexSectionBlob) error) error {
-	vol := prepareDerivedSectionVolume(idx)
-	if vol == nil {
-		return nil
-	}
-	// These serving-only structures are not needed by the v9 writer.  Drop
-	// them before encoding large persisted postings to shorten their lifetime.
-	vol.queryIndex.dirs = nil
-	vol.queryIndex.pathGrams = nil
-	vol.queryIndex.extTop = nil
-	sizeRank := vol.queryIndex.sizeRank
-	if len(sizeRank) == 0 {
-		sizeRank = vol.queryIndex.nameRank
-	}
-	modRank := vol.queryIndex.modRank
-	if len(modRank) == 0 {
-		modRank = vol.queryIndex.nameRank
-	}
-	if err := emit(indexSectionBlob{tag: indexSectionRANK, data: encodeUint32Section(vol.queryIndex.nameOrder, vol.queryIndex.nameRank)}); err != nil {
-		return err
-	}
-	if len(vol.queryIndex.sizeOrder) > 0 && len(vol.queryIndex.sizeRank) > 0 {
-		if err := emit(indexSectionBlob{tag: indexSectionSRNK, data: encodeUint32Section(vol.queryIndex.sizeOrder, vol.queryIndex.sizeRank)}); err != nil {
-			return err
-		}
-	}
-	if len(vol.queryIndex.modOrder) > 0 && len(vol.queryIndex.modRank) > 0 {
-		if err := emit(indexSectionBlob{tag: indexSectionMRNK, data: encodeUint32Section(vol.queryIndex.modOrder, vol.queryIndex.modRank)}); err != nil {
-			return err
-		}
-	}
-	if len(vol.queryIndex.extOrder) > 0 && len(vol.queryIndex.extRank) > 0 {
-		if err := emit(indexSectionBlob{tag: indexSectionERNK, data: encodeUint32Section(vol.queryIndex.extOrder, vol.queryIndex.extRank)}); err != nil {
-			return err
-		}
-	}
-	if len(vol.queryIndex.typeOrder) > 0 && len(vol.queryIndex.typeRank) > 0 {
-		if err := emit(indexSectionBlob{tag: indexSectionTRNK, data: encodeUint32Section(vol.queryIndex.typeOrder, vol.queryIndex.typeRank)}); err != nil {
-			return err
-		}
-	}
-	if len(vol.queryIndex.pathOrder) > 0 && len(vol.queryIndex.pathRank) > 0 {
-		if err := emit(indexSectionBlob{tag: indexSectionPRNK, data: encodeUint32Section(vol.queryIndex.pathOrder, vol.queryIndex.pathRank)}); err != nil {
-			return err
-		}
-	}
-	if err := emit(indexSectionBlob{tag: indexSectionCHLD, data: encodeUint32Section(vol.childOffsets, vol.childIDs, vol.rootIDs)}); err != nil {
-		return err
-	}
-	if err := emit(indexSectionBlob{tag: indexSectionSUBT, data: encodeUint32Section(
-		vol.subtreeStart, vol.subtreeEnd, vol.subtreeOrder,
-		vol.subtreeSizeRank, vol.subtreeModRank, vol.subtreeExtRank,
-		vol.subtreeTypeRank, vol.subtreePathRank,
-	)}); err != nil {
-		return err
-	}
-	if err := emit(indexSectionBlob{tag: indexSectionFRNS, data: encodeFRNSection(vol.frns, vol.frnRecordIDs)}); err != nil {
-		return err
-	}
-	vol.frns = nil
-	vol.frnRecordIDs = nil
-	if err := emit(indexSectionBlob{tag: indexSectionLOWR, data: encodeLowerSection(nameTokens)}); err != nil {
-		return err
-	}
-	if err := emit(indexSectionBlob{tag: indexSectionPATR, data: encodeAttrPostingSection(vol.queryIndex.attrBits)}); err != nil {
-		return err
-	}
-	vol.queryIndex.attrBits = nil
-	if err := emit(indexSectionBlob{tag: indexSectionPEXT, data: encodeStringPostingSection(vol.queryIndex.ext, vol.queryIndex.nameRank)}); err != nil {
-		return err
-	}
-	if err := emit(indexSectionBlob{tag: indexSectionPXRB, data: encodePostingRankBounds(buildStringPostingRankBounds(vol.queryIndex.ext, vol.queryIndex.nameRank, sizeRank, modRank, vol.queryIndex.extRank, vol.queryIndex.typeRank, vol.queryIndex.pathRank))}); err != nil {
-		return err
-	}
-	vol.queryIndex.ext = nil
-	releaseV9PersistStage()
-	if err := emit(indexSectionBlob{tag: indexSectionPCMP, data: encodeStringPostingSection(vol.queryIndex.components, vol.queryIndex.nameRank)}); err != nil {
-		return err
-	}
-	if err := emit(indexSectionBlob{tag: indexSectionPXRC, data: encodePostingRankBounds(buildComponentPostingRankBounds(vol.queryIndex.components, vol))}); err != nil {
-		return err
-	}
-	vol.queryIndex.components = nil
-	releaseV9PersistStage()
-	vol.childOffsets = nil
-	vol.childIDs = nil
-	vol.rootIDs = nil
-	vol.subtreeStart = nil
-	vol.subtreeEnd = nil
-	vol.subtreeOrder = nil
-	vol.subtreeSizeRank = nil
-	vol.subtreeModRank = nil
-	vol.subtreeExtRank = nil
-	vol.subtreeTypeRank = nil
-	vol.subtreePathRank = nil
-	nameGrams := buildSelectiveNameTrigramIndex(idx, serviceLowMemoryTrigramStoredPostingMax())
-	return emit(indexSectionBlob{tag: indexSectionPNGR, data: encodeGramPostingSection(nameGrams, vol.queryIndex.nameRank)})
-}
-
 func writeDerivedSectionStream(cw *countingWriter, idx *Index, nameTokens []string) ([]indexSectionTableEntry, error) {
 	return writeDerivedSectionStreamObserved(cw, idx, nameTokens, nil)
 }
@@ -17382,6 +17115,7 @@ func derivedSectionInfo(derived indexDerivedSections) ([]string, int) {
 		{indexSectionPXRC, "PXRC"},
 		{indexSectionPCMP, "PCMP"},
 		{indexSectionPNGR, "PNGR"},
+		{indexSectionPNGC, "PNGC"},
 	} {
 		if item.tag == indexSectionPATR {
 			if len(derived.AttrBits) > 0 {
@@ -17993,17 +17727,16 @@ func readIndexMMap(mapped *mappedIndexFile) (*Index, error) {
 		TokenCount:  binary.LittleEndian.Uint64(data[64:]),
 	}
 	sectionTableOffset := uint64(0)
-	if header.Magic == indexMagicV9 {
-		if len(data) < headerSize+8 {
-			return nil, errors.New("invalid mapped v9 index")
-		}
-		sectionTableOffset = binary.LittleEndian.Uint64(data[headerSize:])
-		headerSize += 8
-	} else if header.Magic != indexMagic {
-		return nil, errors.New("unsupported index format")
+	if header.Magic != indexMagicV9 {
+		return nil, errors.New("unsupported index format: only the v9 index format is supported")
 	}
-	if header.Version != indexVersion && header.Version != indexVersionV9 {
-		return nil, fmt.Errorf("unsupported index version %d", header.Version)
+	if len(data) < headerSize+8 {
+		return nil, errors.New("invalid mapped v9 index")
+	}
+	sectionTableOffset = binary.LittleEndian.Uint64(data[headerSize:])
+	headerSize += 8
+	if header.Version != indexVersionV9 {
+		return nil, fmt.Errorf("unsupported index version %d: only v9 indexes are supported", header.Version)
 	}
 	if header.Compact == 0 {
 		return nil, errors.New("mmap low-memory mode requires compact index")
