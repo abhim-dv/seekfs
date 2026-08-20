@@ -1882,6 +1882,10 @@ func cmdSearch(args []string, countOnly bool) error {
 	if err != nil {
 		return err
 	}
+	// Track whether the user pinned concrete indexes with -db. A config file
+	// that merely lists DBs must not force a cold local index load on every
+	// invocation when the resident service already has those indexes resident.
+	explicitDBs := len(dbs) > 0
 	if len(dbs) == 0 && len(cfg.DBs) > 0 {
 		dbs = append(dbs, cfg.DBs...)
 	}
@@ -1894,9 +1898,10 @@ func cmdSearch(args []string, countOnly bool) error {
 	if *limit == 100 && cfg.DefaultLimit > 0 {
 		*limit = cfg.DefaultLimit
 	}
-	if len(dbs) == 0 && !*forceLocal {
-		*useService = true
-	}
+	// Prefer the resident service unless the user explicitly asked for a local
+	// search (--local) or pinned concrete -db indexes. This keeps the CLI as
+	// fast as the UI instead of re-loading the whole index for every query.
+	autoService := !*forceLocal && !explicitDBs
 	queryArgs := append([]string(nil), fs.Args()...)
 	if *matchPath && *under == "" {
 		queryArgs, *under = extractUnderPathArg(queryArgs)
@@ -1923,8 +1928,15 @@ func cmdSearch(args []string, countOnly bool) error {
 		}
 		opts.CWDBias = cwd
 	}
-	if *useService {
-		return searchService(*pipeName, opts, countOnly, *jsonOut)
+	if *useService || autoService {
+		if err := searchService(*pipeName, opts, countOnly, *jsonOut); err == nil {
+			return nil
+		}
+		if *useService || len(dbs) == 0 {
+			return err
+		}
+		// Auto-service failed but configured DBs exist: fall back to a direct
+		// local search so the CLI still works without a running service.
 	}
 	if len(dbs) == 0 {
 		dbs = append(dbs, defaultDB())
