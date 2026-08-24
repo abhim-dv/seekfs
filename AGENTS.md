@@ -11,10 +11,11 @@
   `F:\git\seekfs\seekfs.exe`.
 - Seekfs searches indexed file names and paths only. It does not search file
   contents, symbols, import references, or line matches; use `rg` for those.
-- For repo-local file discovery, constrain global results with `--under` and a
-  selective filename/path query; quote multi-term queries. Prefer putting flags
-  before the query for compatibility with older seekfs binaries:
-  `seekfs search --under F:\git\seekfs "main.go"` or
+- For file discovery, use a plain indexed filename/path term (do not add shell
+  wildcards such as `*`); constrain results with `--under` and quote multi-term
+  queries. Prefer putting flags before the query for compatibility with older
+  seekfs binaries, e.g. `seekfs search --under C:\Users\...\Temp vanth-controller-race`
+  (which matches `vanth-controller-race-8q3f8sxj`), or
   `seekfs search -path --under F:\git\seekfs "ext:go dir:cmd main"`.
 - Avoid `seekfs search -path <directory-only-query>` when the intent is to list
   a tree. Add a file term/filter or use `--under <repo>` with a filename query.
