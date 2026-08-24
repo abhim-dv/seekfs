@@ -25,11 +25,12 @@
 - Stale-result verification with `--exists`.
 - Recency filters with `--recent 24h` or `--modified-after 2026-05-22`.
 - Ranking bias with `--cwd-bias` or `--root-bias <path>`.
-- Fuzzy matching with `term~` or the `--fuzzy` flag: when exact results fill
-  fewer than the requested limit, close matches (Damerau-Levenshtein distance,
-  accent/fullwidth-folded) are appended below exact results, ranked by edit
-  distance, then prefix alignment, then normal rank. Single-term name queries
-  only; terms shorter than 3 characters are not fuzzed.
+- Fuzzy matching: when a single-term query returns fewer than 10 results,
+  close matches (Damerau-Levenshtein distance, accent/fullwidth-folded) are
+  appended below the exact results and ranked by edit distance, then prefix
+  alignment, then normal rank. `term~` or `--fuzzy` opts in explicitly,
+  regardless of how many exact results were found. Terms shorter than 3
+  characters are not fuzzed.
 
 ## Examples
 

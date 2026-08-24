@@ -18,6 +18,11 @@ const (
 	fuzzyMaxDistance   = 2
 	fuzzyCandidateCap  = serviceNameTrigramCandidateMaxIDs
 	fuzzyCollectFactor = 16
+	// Auto-fuzzy fires when exact search returns fewer than this many
+	// results: zero hits are the strongest typo signal, but a handful of
+	// incidental substring hits (e.g. "reprot" inside "coreproto") can also
+	// mask the intended match, so a small threshold catches those too.
+	fuzzyAutoResultThreshold = 10
 )
 
 // fuzzyThresholdForTerm picks the allowed Damerau-Levenshtein distance for a
@@ -231,7 +236,15 @@ func appendFuzzyServiceMatches(volumes []*serviceVolumeIndex, opts queryOptions,
 		return matches, false
 	}
 	pq, err := parseQuery(opts)
-	if err != nil || !pq.Fuzzy || pq.CaseSensitive || pq.MatchPath || len(pq.Terms) != 1 || len(pq.OrGroups) > 0 || len(pq.Regexps) > 0 || len(pq.Globs) > 0 {
+	if err != nil || pq.CaseSensitive || pq.MatchPath || len(pq.Terms) != 1 || len(pq.OrGroups) > 0 || len(pq.Regexps) > 0 || len(pq.Globs) > 0 {
+		return matches, false
+	}
+	// Auto-fuzzy: a query that matched nothing is the strongest typo signal,
+	// so the fallback tier fires without needing the explicit ~ marker or
+	// --fuzzy flag. Explicit markers additionally allow topping up partially
+	// filled result sets.
+	autoFuzzy := len(matches) < fuzzyAutoResultThreshold
+	if !autoFuzzy && !pq.Fuzzy {
 		return matches, false
 	}
 	term := foldFuzzyText(strings.ToLower(pq.Terms[0]))

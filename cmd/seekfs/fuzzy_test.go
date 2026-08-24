@@ -167,14 +167,46 @@ func TestAppendFuzzyServiceMatchesGoldenRanking(t *testing.T) {
 	}
 }
 
-func TestAppendFuzzyServiceMatchesDeclinesNonFuzzyAndMultiTerm(t *testing.T) {
+func TestAppendFuzzyServiceMatchesAutoFiresOnZeroResults(t *testing.T) {
 	vol := buildFuzzyTestVolume(t)
 
-	// Without the ~ marker or --fuzzy the stage must decline.
+	// A zero-result exact query auto-triggers fuzzy without any marker.
 	opts := queryOptions{Query: "tonics", Limit: 10}
-	if _, added := appendFuzzyServiceMatches([]*serviceVolumeIndex{vol}, opts, nil); added {
-		t.Fatal("non-fuzzy query must not produce fuzzy results")
+	matches, added := appendFuzzyServiceMatches([]*serviceVolumeIndex{vol}, opts, nil)
+	if !added || len(matches) == 0 {
+		t.Fatal("zero-result query should auto-trigger the fuzzy tier")
 	}
+	if matches[0].Name != "tonic.txt" && matches[0].Name != "tonicwater.txt" {
+		t.Fatalf("top fuzzy result = %q, want a tonic* file", matches[0].Name)
+	}
+}
+
+func TestAppendFuzzyServiceMatchesKeepsExactResultsFirst(t *testing.T) {
+	vol := buildFuzzyTestVolume(t)
+
+	// Simulate a partial exact result set (below the auto-fuzzy threshold):
+	// fuzzy entries must be appended strictly after every exact entry.
+	exact := []Entry{{Path: `Q:\exact-tonic.txt`, Name: "exact-tonic.txt"}}
+	opts := queryOptions{Query: "tonics", Limit: 10}
+	matches, added := appendFuzzyServiceMatches([]*serviceVolumeIndex{vol}, opts, exact)
+	if !added {
+		t.Fatal("partial result set below threshold should trigger the fuzzy tier")
+	}
+	for i, m := range matches {
+		if i < len(exact) {
+			continue
+		}
+		if m.Path == exact[0].Path {
+			t.Fatalf("exact entry %q reappeared inside the fuzzy section at %d", m.Path, i)
+		}
+	}
+	if matches[0].Path != exact[0].Path {
+		t.Fatalf("first result = %q; exact results must always lead", matches[0].Path)
+	}
+}
+
+func TestAppendFuzzyServiceMatchesDeclinesMultiTermAndShortTerms(t *testing.T) {
+	vol := buildFuzzyTestVolume(t)
 
 	// Multi-term queries are out of scope for the fallback tier in v1.
 	optsMulti := queryOptions{Query: "tonic~ water", Limit: 10}
@@ -186,6 +218,12 @@ func TestAppendFuzzyServiceMatchesDeclinesNonFuzzyAndMultiTerm(t *testing.T) {
 	optsShort := queryOptions{Query: "to~", Limit: 10}
 	if _, added := appendFuzzyServiceMatches([]*serviceVolumeIndex{vol}, optsShort, nil); added {
 		t.Fatal("sub-minimum terms must be declined")
+	}
+
+	// Case-sensitive queries are declined (fuzzy compares folded text).
+	optsCase := queryOptions{Query: "tonics~", CaseSensitive: true, Limit: 10}
+	if _, added := appendFuzzyServiceMatches([]*serviceVolumeIndex{vol}, optsCase, nil); added {
+		t.Fatal("case-sensitive fuzzy queries must be declined")
 	}
 }
 
