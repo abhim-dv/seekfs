@@ -280,7 +280,7 @@ func (vol *serviceVolumeIndex) completeFilenameRankedPosting(term string, limit 
 // "aker log" whose grams are all common (>25k) and thus live in PNGC instead
 // of the selective PNGR section.
 func (vol *serviceVolumeIndex) completeMultiTermNameGramCandidates(terms []string, maxIDs int, pq parsedQuery) ([]int, bool) {
-	if vol == nil || vol.index == nil || len(terms) < 2 || maxIDs <= 0 {
+	if vol == nil || vol.index == nil || len(terms) < 1 || maxIDs <= 0 {
 		return nil, false
 	}
 	// Collect complete gram iterators for every term.  A term is complete
@@ -299,6 +299,9 @@ func (vol *serviceVolumeIndex) completeMultiTermNameGramCandidates(terms []strin
 		}
 		its, counts, exactZero, complete := completeSelfNameGramIterators(vol.index, term)
 		if !complete {
+			if pq.Trace != nil {
+				pq.Trace.setDecline("name-trigram:incomplete-self-gram-union")
+			}
 			return nil, false
 		}
 		if exactZero {
@@ -306,6 +309,9 @@ func (vol *serviceVolumeIndex) completeMultiTermNameGramCandidates(terms []strin
 			continue
 		}
 		if len(its) == 0 || len(counts) != len(its) || counts[0] <= 0 {
+			if pq.Trace != nil {
+				pq.Trace.setDecline("name-trigram:empty-gram-iterators")
+			}
 			return nil, false
 		}
 		perTerm = append(perTerm, termIters{term: term, its: its, counts: counts})
@@ -327,8 +333,20 @@ func (vol *serviceVolumeIndex) completeMultiTermNameGramCandidates(terms []strin
 	// here.
 	sort.Slice(perTerm, func(i, j int) bool { return perTerm[i].counts[0] < perTerm[j].counts[0] })
 	driver := perTerm[0]
+	// Single-term rescue: without companion terms to shrink the set, a very
+	// common driver gram would be materialized in full only to intersect
+	// against itself.  Leave those to the bounded-scan fallback.
+	if len(terms) == 1 && driver.counts[0] > serviceSingleTermPNGCDriverMaxIDs {
+		if pq.Trace != nil {
+			pq.Trace.setDecline("name-trigram:single-term-driver-too-large")
+		}
+		return nil, false
+	}
 	ids := materializePostingBlockIterator(driver.its[0], driver.counts[0])
 	if ids == nil {
+		if pq.Trace != nil {
+			pq.Trace.setDecline("name-trigram:driver-materialize-failed")
+		}
 		return nil, false
 	}
 	// Intersect the driver's remaining grams for its own term.

@@ -20,7 +20,7 @@ func searchServiceVolumesGlobalNameSnapshot(snapshot globalQuerySnapshot, opts q
 	if !globalNameQuerySupported(pq) {
 		return nil, false, nil
 	}
-	if !countOnly && countNonVolumeTerms(pq.Terms) == 1 && pq.Limit > 0 && !globalSnapshotsHaveHidden(snapshot.overlays) {
+	if !countOnly && countNonVolumeTerms(pq.Terms) == 1 && pq.Limit > 0 {
 		if ranked, ok, err := globalNameTopRanked(snapshot, pq, opts.Trace); ok {
 			if err != nil {
 				return nil, true, err
