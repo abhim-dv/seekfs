@@ -201,6 +201,7 @@ type jsonSearchResponse struct {
 	PostingPrefetchRanges    int            `json:"posting_prefetch_ranges,omitempty"`
 	PostingPrefetchPages     int            `json:"posting_prefetch_pages,omitempty"`
 	PlannerMode              string         `json:"planner_mode,omitempty"`
+	Fuzzy                    bool           `json:"fuzzy,omitempty"`
 	EligibleVolumes          []string       `json:"eligible_volumes,omitempty"`
 	Terms                    []traceTerm    `json:"terms,omitempty"`
 	Declines                 []traceDecline `json:"declines,omitempty"`
@@ -410,6 +411,7 @@ type queryOptions struct {
 	Recent        string       `json:"recent,omitempty"`
 	ModifiedAfter string       `json:"modified_after,omitempty"`
 	CaseSensitive bool         `json:"case_sensitive,omitempty"`
+	Fuzzy         bool         `json:"fuzzy,omitempty"`
 	DeadlineUnix  int64        `json:"deadline_unix,omitempty"`
 	RequestSeq    int64        `json:"request_seq,omitempty"`
 	Cancel        func() bool  `json:"-"`
@@ -419,6 +421,7 @@ type queryOptions struct {
 type parsedQuery struct {
 	Raw               string
 	Terms             []string
+	Fuzzy             bool
 	ImplicitPathTerms []string
 	Impossible        bool
 	MatchPath         bool
@@ -1876,6 +1879,7 @@ func cmdSearch(args []string, countOnly bool) error {
 	recent := fs.String("recent", "", "only return results modified within this duration, for example 24h")
 	modifiedAfter := fs.String("modified-after", "", "only return results modified after RFC3339 time or YYYY-MM-DD")
 	caseSensitive := fs.Bool("case", false, "case-sensitive query matching")
+	fuzzy := fs.Bool("fuzzy", false, "append close matches (edit distance) below exact results")
 	if err := fs.Parse(normalizeSearchArgs(args)); err != nil {
 		return err
 	}
@@ -1921,6 +1925,7 @@ func cmdSearch(args []string, countOnly bool) error {
 		Recent:        *recent,
 		ModifiedAfter: *modifiedAfter,
 		CaseSensitive: *caseSensitive,
+		Fuzzy:         *fuzzy,
 	}
 	if *cwdBias {
 		cwd, err := os.Getwd()
@@ -2488,6 +2493,7 @@ type serviceRequest struct {
 	Recent        string `json:"recent,omitempty"`
 	ModifiedAfter string `json:"modified_after,omitempty"`
 	CaseSensitive bool   `json:"case_sensitive,omitempty"`
+	Fuzzy         bool   `json:"fuzzy,omitempty"`
 	DeadlineUnix  int64  `json:"deadline_unix,omitempty"`
 	RequestSeq    int64  `json:"request_seq,omitempty"`
 }
@@ -2495,6 +2501,7 @@ type serviceRequest struct {
 type serviceResponse struct {
 	OK                       bool               `json:"ok"`
 	Message                  string             `json:"message,omitempty"`
+	Fuzzy                    bool               `json:"fuzzy,omitempty"`
 	PID                      int                `json:"pid,omitempty"`
 	Executable               string             `json:"executable,omitempty"`
 	ExecutableHash           string             `json:"executable_hash,omitempty"`
@@ -7417,6 +7424,7 @@ func handleServiceConn(conn *os.File, s *goSearchService) {
 		}
 		var matches []Entry
 		var err error
+		var fuzzyApplied bool
 		searchStart := time.Now()
 		if len(s.volumes) == len(s.indexes) {
 			volumes := snapshotServiceVolumesForSearch(s.volumes)
@@ -7437,7 +7445,20 @@ func handleServiceConn(conn *os.File, s *goSearchService) {
 				}
 			}
 			matches, err = searchServiceVolumes(volumes, opts, req.CountOnly)
+			fuzzied := false
+			if err == nil && !req.CountOnly {
+				// Fuzzy only runs when the exact tier underfilled the limit,
+				// and must stay under the read lock: it reads compact records
+				// that a background persist may unmap.
+				if limit := normalizedLimit(opts.Limit, false); len(matches) < limit {
+					matches, fuzzied = appendFuzzyServiceMatches(volumes, opts, matches)
+				}
+			}
 			s.indexMu.RUnlock()
+			if fuzzied {
+				opts.Trace.setPlannerMode("fuzzy-trigram")
+			}
+			fuzzyApplied = fuzzied
 		} else {
 			matches, err = searchAll(s.indexes, opts, req.CountOnly)
 			s.indexMu.RUnlock()
@@ -7448,7 +7469,7 @@ func handleServiceConn(conn *os.File, s *goSearchService) {
 			return
 		}
 		serviceLog("search query=%q ms=%.1f planner=%s source=%s decline=%s filename_driver=%s candidates=%d results=%d", req.Query, searchMS, trace.PlannerMode, trace.Source, trace.Decline, trace.FilenameDriver, trace.Candidates, len(matches))
-		resp := serviceResponse{OK: true, Count: len(matches), SearchMS: searchMS, Source: trace.Source, Decline: trace.Decline, Candidates: trace.Candidates, PlannerMode: trace.PlannerMode, EligibleVolumes: trace.EligibleVolumes, BlocksDecoded: trace.BlocksDecoded, BlocksSkipped: trace.BlocksSkipped, ScalarDriver: trace.ScalarDriver, ScalarInterval: trace.ScalarInterval, RecordsVerified: trace.ScalarRecordsVerified, ComponentDriver: trace.ComponentDriver, ComponentRoots: trace.ComponentRoots, ComponentIntervals: trace.ComponentIntervals, ComponentCardinality: trace.ComponentCardinality, ComponentSelfHits: trace.ComponentSelfHits, ComponentBounds: trace.ComponentBounds, ComponentRecordsVerified: trace.ComponentRecordsVerified, FilenameDriver: trace.FilenameDriver, FilenameRequiredGrams: trace.FilenameRequiredGrams, FilenamePostingHint: trace.FilenamePostingHint, FilenameRecordsVerified: trace.FilenameRecordsVerified, OverlayBaseWindow: trace.OverlayBaseWindow, PostingPrefetchBytes: trace.PostingPrefetchBytes, PostingPrefetchRanges: trace.PostingPrefetchRanges, PostingPrefetchPages: trace.PostingPrefetchPages, Terms: trace.Terms, Declines: trace.Declines, Fallback: trace.Fallback, Complete: trace.completePtr()}
+		resp := serviceResponse{OK: true, Count: len(matches), SearchMS: searchMS, Fuzzy: fuzzyApplied, Source: trace.Source, Decline: trace.Decline, Candidates: trace.Candidates, PlannerMode: trace.PlannerMode, EligibleVolumes: trace.EligibleVolumes, BlocksDecoded: trace.BlocksDecoded, BlocksSkipped: trace.BlocksSkipped, ScalarDriver: trace.ScalarDriver, ScalarInterval: trace.ScalarInterval, RecordsVerified: trace.ScalarRecordsVerified, ComponentDriver: trace.ComponentDriver, ComponentRoots: trace.ComponentRoots, ComponentIntervals: trace.ComponentIntervals, ComponentCardinality: trace.ComponentCardinality, ComponentSelfHits: trace.ComponentSelfHits, ComponentBounds: trace.ComponentBounds, ComponentRecordsVerified: trace.ComponentRecordsVerified, FilenameDriver: trace.FilenameDriver, FilenameRequiredGrams: trace.FilenameRequiredGrams, FilenamePostingHint: trace.FilenamePostingHint, FilenameRecordsVerified: trace.FilenameRecordsVerified, OverlayBaseWindow: trace.OverlayBaseWindow, PostingPrefetchBytes: trace.PostingPrefetchBytes, PostingPrefetchRanges: trace.PostingPrefetchRanges, PostingPrefetchPages: trace.PostingPrefetchPages, Terms: trace.Terms, Declines: trace.Declines, Fallback: trace.Fallback, Complete: trace.completePtr()}
 		if !req.CountOnly {
 			resp.Results = make([]string, len(matches))
 			for i, entry := range matches {
@@ -7733,6 +7754,7 @@ func searchService(pipeName string, opts queryOptions, countOnly bool, jsonOut b
 			PostingPrefetchRanges:    resp.PostingPrefetchRanges,
 			PostingPrefetchPages:     resp.PostingPrefetchPages,
 			PlannerMode:              resp.PlannerMode,
+			Fuzzy:                    resp.Fuzzy,
 			EligibleVolumes:          resp.EligibleVolumes,
 			Terms:                    resp.Terms,
 			Declines:                 resp.Declines,
@@ -7753,6 +7775,9 @@ func searchService(pipeName string, opts queryOptions, countOnly bool, jsonOut b
 		return nil
 	}
 	w := bufio.NewWriter(os.Stdout)
+	if resp.Fuzzy {
+		fmt.Fprintf(w, "(showing close matches for %q)\n", opts.Query)
+	}
 	for _, result := range resp.Results {
 		fmt.Fprintln(w, result)
 	}
@@ -7773,6 +7798,7 @@ func serviceRequestFromOptions(opts queryOptions, countOnly bool) serviceRequest
 		Recent:        opts.Recent,
 		ModifiedAfter: opts.ModifiedAfter,
 		CaseSensitive: opts.CaseSensitive,
+		Fuzzy:         opts.Fuzzy,
 		DeadlineUnix:  opts.DeadlineUnix,
 		RequestSeq:    opts.RequestSeq,
 	}
@@ -7790,6 +7816,7 @@ func requestToOptionsFromService(req serviceRequest) queryOptions {
 		Recent:        req.Recent,
 		ModifiedAfter: req.ModifiedAfter,
 		CaseSensitive: req.CaseSensitive,
+		Fuzzy:         req.Fuzzy,
 		DeadlineUnix:  req.DeadlineUnix,
 		RequestSeq:    req.RequestSeq,
 	}
@@ -15145,6 +15172,7 @@ func parseQuery(opts queryOptions) (parsedQuery, error) {
 		Raw:           opts.Query,
 		MatchPath:     opts.MatchPath || queryLooksPathScoped(opts.Query),
 		CaseSensitive: opts.CaseSensitive,
+		Fuzzy:         opts.Fuzzy,
 		Under:         normalizeFilterPath(opts.Under),
 		Exists:        opts.Exists,
 		CWDBias:       normalizeFilterPath(opts.CWDBias),
@@ -15463,9 +15491,17 @@ func applyQueryToken(pq *parsedQuery, raw string) error {
 	case looksLikeImplicitFilenameGlob(raw):
 		pq.Globs = append(pq.Globs, normalizeCase(raw, pq.CaseSensitive))
 	default:
-		for _, term := range queryPlainTerms(raw, pq.CaseSensitive, pq.MatchPath) {
-			pq.Terms = append(pq.Terms, term)
+		fuzzyMarked := false
+		trimmed := raw
+		if strings.HasSuffix(trimmed, "~") && len(trimmed) > 1 {
+			trimmed = strings.TrimSuffix(trimmed, "~")
+			fuzzyMarked = trimmed != ""
 		}
+		terms := queryPlainTerms(trimmed, pq.CaseSensitive, pq.MatchPath)
+		if fuzzyMarked && len(terms) == 1 {
+			pq.Fuzzy = true
+		}
+		pq.Terms = append(pq.Terms, terms...)
 	}
 	return nil
 }

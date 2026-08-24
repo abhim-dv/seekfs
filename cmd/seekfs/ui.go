@@ -228,12 +228,17 @@ func (a *UIApp) search(req UISearchRequest, seq int64) UISearchResponse {
 		return UISearchResponse{OK: false, Seq: seq, Query: query, ElapsedMS: elapsed, Message: resp.Message}
 	}
 	results := uiResultsFromServiceResponse(resp)
+	message := ""
+	if resp.Fuzzy {
+		message = "showing close matches"
+	}
 	return UISearchResponse{
 		OK:        true,
 		Seq:       seq,
 		Query:     query,
 		Count:     len(results),
 		ElapsedMS: elapsed,
+		Message:   message,
 		Results:   results,
 	}
 }
