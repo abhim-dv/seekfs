@@ -55,6 +55,7 @@ const serviceRankParallelMinIDs = 500_000
 const serviceNameTrigramDefaultMaxRecords = 20_000_000
 const filesystemFallbackMaxVisited = 100_000
 const filesystemFallbackMaxDuration = 2 * time.Second
+const defaultIdleMemoryRelease = 15 * time.Minute
 
 const (
 	nameTrigramStateDisabled int32 = iota
@@ -2540,6 +2541,50 @@ type serviceResponse struct {
 	Rows                     []jsonResult       `json:"rows,omitempty"`
 	DBs                      []dbInfo           `json:"dbs,omitempty"`
 	Runtime                  *runtimeMemoryInfo `json:"runtime,omitempty"`
+	Health                   string             `json:"health,omitempty"`
+	HealthMessage            string             `json:"health_message,omitempty"`
+}
+
+// Service health values reported via the info response and surfaced in the UI
+// as the bottom-right status dot.
+const (
+	serviceHealthOK       = "ok"
+	serviceHealthDegraded = "degraded"
+	serviceHealthError    = "error"
+)
+
+// classifyServiceHealth derives the overall service health from the per-db
+// snapshots.  Precedence: error (a volume is stale or errored) > degraded
+// (catching up, loading, or persist trouble) > ok.  The returned message
+// names the first problem found so the UI can show why the dot is not green.
+func classifyServiceHealth(loading bool, loadErr string, infos []dbInfo) (string, string) {
+	for i := range infos {
+		info := infos[i]
+		switch info.State {
+		case "stale", "error":
+			reason := firstNonEmpty(info.StaleReason, "volume "+info.Volume+" is "+info.State)
+			return serviceHealthError, reason
+		}
+	}
+	if loadErr != "" {
+		return serviceHealthError, loadErr
+	}
+	for i := range infos {
+		info := infos[i]
+		if info.PersistFailures > 0 || info.LastPersistError != "" {
+			return serviceHealthDegraded, firstNonEmpty(info.LastPersistError, "persist failing on volume "+info.Volume)
+		}
+		if info.State == "replaying" {
+			return serviceHealthDegraded, "catching up volume " + info.Volume
+		}
+	}
+	if loading {
+		return serviceHealthDegraded, "loading indexes"
+	}
+	if len(infos) == 0 {
+		return serviceHealthDegraded, "no indexes loaded"
+	}
+	return serviceHealthOK, ""
 }
 
 func serviceInfoResponse(resp serviceResponse) serviceResponse {
@@ -2647,6 +2692,7 @@ type runtimeMemoryInfo struct {
 	SysBytes          uint64  `json:"sys_bytes"`
 	NumGC             uint32  `json:"num_gc"`
 	GCCPUFraction     float64 `json:"gc_cpu_fraction,omitempty"`
+	GoMemLimitBytes   int64   `json:"go_mem_limit_bytes,omitempty"`
 }
 
 type goSearchService struct {
@@ -3580,6 +3626,7 @@ func (s *goSearchService) Execute(args []string, r <-chan svc.ChangeRequest, cha
 	if s.processMode == "" {
 		s.processMode = "windows-service"
 	}
+	applyServiceRuntimeMemoryTuning()
 	changes <- svc.Status{State: svc.StartPending}
 	done := make(chan struct{})
 	go func() {
@@ -3615,6 +3662,7 @@ func (s *goSearchService) runStandalone() error {
 	if s.processMode == "" {
 		s.processMode = "standalone"
 	}
+	applyServiceRuntimeMemoryTuning()
 	fmt.Fprintf(os.Stderr, "seekfs privileged service listening on %s\n", s.pipeName)
 	go func() {
 		defer func() {
@@ -3667,6 +3715,12 @@ func (s *goSearchService) loadConfiguredIndexes() error {
 			go s.persistVolumeLoop(vol)
 		} else if vol.state == "ready" && vol.index.Source == "walk" {
 			s.startWalkWatchers(vol)
+		} else if vol.state == "stale" && vol.index != nil && vol.index.Compact && vol.index.Source == "usn" {
+			// A volume that started stale (failed startup rebuild, journal
+			// anomaly, transient open failure) must not stay broken until
+			// restart: keep retrying the rebuild in the background with
+			// backoff until it recovers.
+			go s.staleRecoveryLoop(vol)
 		}
 	}
 	serviceLog("loaded %d dbs entries=%d elapsed=%s", len(indexes), total, time.Since(start).Round(time.Millisecond))
@@ -4201,6 +4255,14 @@ func (vol *serviceVolumeIndex) frnRecordCount() int {
 	return len(vol.frns) + len(vol.frnToID)
 }
 
+// Loop pacing delays are package variables so tests can shorten them.
+var (
+	replayIdleDelay     = 500 * time.Millisecond
+	replayErrorDelay    = 5 * time.Second
+	staleRecoveryDelay  = 30 * time.Second
+	staleRecoveryMax    = 5 * time.Minute
+)
+
 func (s *goSearchService) replayVolumeLoop(vol *serviceVolumeIndex) {
 	buffer := make([]byte, 4*1024*1024)
 	for {
@@ -4214,7 +4276,7 @@ func (s *goSearchService) replayVolumeLoop(vol *serviceVolumeIndex) {
 			if shouldRebuildStaleIndex(err) {
 				rebuildErr := s.rebuildVolumeInPlace(vol)
 				if rebuildErr == nil {
-					time.Sleep(500 * time.Millisecond)
+					time.Sleep(replayIdleDelay)
 					continue
 				}
 				serviceLog("background stale rebuild failed volume=%s db=%s err=%v", vol.volume, vol.dbPath, rebuildErr)
@@ -4223,10 +4285,43 @@ func (s *goSearchService) replayVolumeLoop(vol *serviceVolumeIndex) {
 			vol.state = "stale"
 			vol.staleReason = err.Error()
 			s.indexMu.Unlock()
-			time.Sleep(5 * time.Second)
+			time.Sleep(replayErrorDelay)
 			continue
 		}
-		time.Sleep(500 * time.Millisecond)
+		time.Sleep(replayIdleDelay)
+	}
+}
+
+// staleRecoveryLoop retries a volume that started stale until its index is
+// rebuilt, with exponential backoff between attempts.  On success it swaps
+// the rebuilt volume in and starts the normal replay/persist loops.  If some
+// other path recovers the volume first, the loop exits.
+func (s *goSearchService) staleRecoveryLoop(vol *serviceVolumeIndex) {
+	delay := staleRecoveryDelay
+	for {
+		select {
+		case <-s.stop:
+			return
+		case <-time.After(delay):
+		}
+		s.indexMu.RLock()
+		state := vol.state
+		s.indexMu.RUnlock()
+		if state != "stale" {
+			return
+		}
+		if err := s.rebuildVolumeInPlace(vol); err != nil {
+			serviceLog("stale recovery rebuild failed volume=%s db=%s retry_after=%s err=%v", vol.volume, vol.dbPath, delay, err)
+			delay *= 2
+			if delay > staleRecoveryMax {
+				delay = staleRecoveryMax
+			}
+			continue
+		}
+		go s.replayVolumeLoop(vol)
+		go s.persistVolumeLoop(vol)
+		serviceLog("stale recovery complete volume=%s db=%s entries=%d", vol.volume, vol.dbPath, vol.index.entryCount())
+		return
 	}
 }
 
@@ -6321,6 +6416,7 @@ func (vol *serviceVolumeIndex) residentMemoryInfo() *residentMemoryInfo {
 func runtimeMemorySnapshot() *runtimeMemoryInfo {
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
+	limit := debug.SetMemoryLimit(-1)
 	return &runtimeMemoryInfo{
 		HeapAllocBytes:    m.HeapAlloc,
 		HeapInuseBytes:    m.HeapInuse,
@@ -6331,6 +6427,52 @@ func runtimeMemorySnapshot() *runtimeMemoryInfo {
 		SysBytes:          m.Sys,
 		NumGC:             m.NumGC,
 		GCCPUFraction:     m.GCCPUFraction,
+		GoMemLimitBytes:   limit,
+	}
+}
+
+var serviceLastQueryUnixNano atomic.Int64
+var serviceRuntimeTuningOnce sync.Once
+
+func serviceNoteQueryActivity() {
+	serviceLastQueryUnixNano.Store(time.Now().UnixNano())
+}
+
+func applyServiceRuntimeMemoryTuning() {
+	serviceRuntimeTuningOnce.Do(func() {
+		if raw := strings.TrimSpace(os.Getenv("SEEKFS_GO_MEM_LIMIT_MB")); raw != "" {
+			if mb, err := strconv.ParseInt(raw, 10, 64); err == nil && mb > 0 {
+				prev := debug.SetMemoryLimit(int64(mb) << 20)
+				serviceLog("go memory limit set to %d MiB (previous %d bytes)", mb, prev)
+			}
+		}
+		idle := defaultIdleMemoryRelease
+		if raw := strings.TrimSpace(os.Getenv("SEEKFS_IDLE_RELEASE_SECONDS")); raw != "" {
+			if secs, err := strconv.Atoi(raw); err == nil {
+				idle = time.Duration(secs) * time.Second
+			}
+		}
+		if idle > 0 {
+			go serviceIdleMemoryReleaseLoop(idle)
+		}
+	})
+}
+
+func serviceIdleMemoryReleaseLoop(idle time.Duration) {
+	var lastRelease time.Time
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+	for range ticker.C {
+		last := serviceLastQueryUnixNano.Load()
+		if last != 0 && time.Since(time.Unix(0, last)) < idle {
+			continue
+		}
+		if !lastRelease.IsZero() && time.Since(lastRelease) < idle {
+			continue
+		}
+		debug.FreeOSMemory()
+		lastRelease = time.Now()
+		serviceLog("idle memory release ran (threshold %s)", idle)
 	}
 }
 
@@ -7238,8 +7380,10 @@ func handleServiceConn(conn *os.File, s *goSearchService) {
 		} else if loadErr != "" {
 			message = loadErr
 		}
-		_ = json.NewEncoder(conn).Encode(serviceInfoResponseFor(serviceResponse{OK: loadErr == "", Message: message, Entries: total, Loading: loading, DBs: infos, Runtime: runtimeMemorySnapshot()}, s.pipeName, s.processMode))
+		health, healthMessage := classifyServiceHealth(loading, loadErr, infos)
+		_ = json.NewEncoder(conn).Encode(serviceInfoResponseFor(serviceResponse{OK: loadErr == "", Message: message, Entries: total, Loading: loading, DBs: infos, Runtime: runtimeMemorySnapshot(), Health: health, HealthMessage: healthMessage}, s.pipeName, s.processMode))
 	case "search":
+		serviceNoteQueryActivity()
 		s.indexMu.RLock()
 		if len(s.indexes) == 0 {
 			loading := s.loading

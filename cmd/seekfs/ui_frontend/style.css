@@ -207,7 +207,7 @@ tbody tr.focused td {
 
 .footer {
   display: grid;
-  grid-template-columns: 1fr auto;
+  grid-template-columns: 1fr auto auto;
   align-items: center;
   gap: 12px;
   padding: 0 8px;
@@ -215,6 +215,37 @@ tbody tr.focused td {
   background: #171717;
   border-top: 1px solid #303030;
   font-size: 12px;
+}
+
+.health {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 12px;
+  justify-self: end;
+}
+
+.health-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  display: inline-block;
+}
+
+.health-ok {
+  background: #3fb950;
+}
+
+.health-degraded {
+  background: #d29922;
+}
+
+.health-error {
+  background: #f85149;
+}
+
+#health-text {
+  color: #b0b0b0;
 }
 
 .context-menu {

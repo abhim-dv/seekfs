@@ -16,6 +16,9 @@ const els = {
   selected: document.getElementById("selected"),
   menu: document.getElementById("menu"),
   headers: Array.from(document.querySelectorAll("th")),
+  healthDot: document.getElementById("health-dot"),
+  healthText: document.getElementById("health-text"),
+  health: document.getElementById("health"),
 };
 
 function api() {
@@ -549,9 +552,21 @@ function activeIndex() {
   return state.rows.length ? 0 : -1;
 }
 
+function updateHealthDot(health, message) {
+  if (!els.healthDot) return;
+  const level = ["ok", "degraded", "error"].includes(health) ? health : "error";
+  els.healthDot.classList.remove("health-ok", "health-degraded", "health-error");
+  els.healthDot.classList.add(`health-${level}`);
+  els.healthText.textContent = message || "";
+  if (els.health) {
+    els.health.title = message || `Index health: ${level}`;
+  }
+}
+
 async function refreshStatus() {
   try {
     const status = await call("Status");
+    updateHealthDot(status.health, status.health_message);
     if (!status.ok) {
       els.summary.textContent = status.message || "Service unavailable";
       return;
@@ -561,6 +576,7 @@ async function refreshStatus() {
       els.summary.textContent = `${status.entries.toLocaleString()} items${loading}`;
     }
   } catch (err) {
+    updateHealthDot("error", err.message);
     els.summary.textContent = err.message;
   }
 }

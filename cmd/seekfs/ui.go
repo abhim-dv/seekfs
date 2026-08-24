@@ -73,11 +73,13 @@ type UIResult struct {
 }
 
 type UIStatus struct {
-	OK      bool     `json:"ok"`
-	Message string   `json:"message,omitempty"`
-	Entries int      `json:"entries,omitempty"`
-	Loading bool     `json:"loading,omitempty"`
-	DBs     []dbInfo `json:"dbs,omitempty"`
+	OK            bool     `json:"ok"`
+	Message       string   `json:"message,omitempty"`
+	Entries       int      `json:"entries,omitempty"`
+	Loading       bool     `json:"loading,omitempty"`
+	DBs           []dbInfo `json:"dbs,omitempty"`
+	Health        string   `json:"health,omitempty"`
+	HealthMessage string   `json:"health_message,omitempty"`
 }
 
 func cmdUI(args []string) error {
@@ -151,13 +153,34 @@ func (a *UIApp) Status() UIStatus {
 		a.ready = false
 		a.readyMessage = firstNonEmpty(resp.Message, "service has no search indexes loaded")
 	}
+	health, healthMessage := serviceHealthFromStatus(a.ready, a.readyMessage, resp)
 	return UIStatus{
-		OK:      a.ready,
-		Message: firstNonEmpty(a.readyMessage, resp.Message),
-		Entries: resp.Entries,
-		Loading: resp.Loading,
-		DBs:     resp.DBs,
+		OK:            a.ready,
+		Message:       firstNonEmpty(a.readyMessage, resp.Message),
+		Entries:       resp.Entries,
+		Loading:       resp.Loading,
+		DBs:           resp.DBs,
+		Health:        health,
+		HealthMessage: healthMessage,
 	}
+}
+
+// serviceHealthFromStatus maps the service info response onto the UI health
+// dot: green (ok), yellow (degraded/catching up), red (stale or error).  When
+// the UI itself could not reach the service the dot is red with the transport
+// error.
+func serviceHealthFromStatus(ready bool, readyMessage string, resp serviceResponse) (string, string) {
+	if !ready {
+		if resp.Health == serviceHealthError || resp.Health == serviceHealthDegraded {
+			return resp.Health, firstNonEmpty(resp.HealthMessage, resp.Message, readyMessage)
+		}
+		return "error", firstNonEmpty(resp.Message, readyMessage, "service is not ready")
+	}
+	switch resp.Health {
+	case serviceHealthOK, serviceHealthDegraded, serviceHealthError:
+		return resp.Health, resp.HealthMessage
+	}
+	return serviceHealthOK, ""
 }
 
 func (a *UIApp) Search(req UISearchRequest) (UISearchResponse, error) {
