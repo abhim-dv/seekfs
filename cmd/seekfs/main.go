@@ -46,6 +46,11 @@ const serviceStartupWALRebuildBytes = 512 * 1024 * 1024
 const defaultQueryPostingPrefetchBytes = 32 * 1024 * 1024
 const serviceNameTrigramCandidateMaxIDs = 25_000
 const servicePathNameTrigramCandidateMaxIDs = 250_000
+// serviceSingleTermPNGCDriverMaxIDs bounds the driver posting a single-term
+// query may materialize when the selective trigram lane declines (every gram
+// over cap or omitted-common) and the complete PNGC intersection lane rescues
+// it instead of falling to a global bounded scan.
+const serviceSingleTermPNGCDriverMaxIDs = 2_000_000
 const serviceComponentTrigramCandidateMaxIDs = 10_000
 const serviceComponentTrigramExpansionMaxIDs = 25_000
 const serviceComponentMultiTermScanMaxIDs = 500_000
@@ -10824,17 +10829,39 @@ func (vol *serviceVolumeIndex) filenameNgramCandidates(pq parsedQuery, trigrams 
 				break
 			}
 		}
+		// Selective lane declined (every gram over cap or omitted-common).
+		if rescued, ok := vol.rescueWithCompleteGramLane(pq, maxIDs); ok {
+			return rescued, true
+		}
 		return nil, false
 	}
 	candidates, ok := vol.nameNgramNameTermPosting(bestTerm, trigrams, maxIDs)
 	if !ok {
 		pq.Trace.setDecline("name-trigram:" + trigrams.lookupState(bestTerm))
+		if rescued, rescuedOK := vol.rescueWithCompleteGramLane(pq, maxIDs); rescuedOK {
+			return rescued, true
+		}
 		return nil, false
 	}
 	if len(candidates) > maxIDs {
+		if rescued, rescuedOK := vol.rescueWithCompleteGramLane(pq, maxIDs); rescuedOK {
+			return rescued, true
+		}
 		return nil, false
 	}
 	return candidates, true
+}
+
+// rescueWithCompleteGramLane retries a declined selective-trigram query
+// through the complete PNGC intersection lane, which answers broad terms
+// exactly instead of falling to the bounded scan.
+func (vol *serviceVolumeIndex) rescueWithCompleteGramLane(pq parsedQuery, maxIDs int) ([]int, bool) {
+	if vol == nil || vol.index == nil || vol.index.Derived.SelfNameTrigrams == nil ||
+		vol.index.Derived.SelfNameTrigrams.mappedGrams == nil {
+		return nil, false
+	}
+	out, ok := vol.completeMultiTermNameGramCandidates(pq.Terms, maxIDs, pq)
+	return out, ok
 }
 
 func (vol *serviceVolumeIndex) componentTrigramCandidates(pq parsedQuery) ([]int, bool) {

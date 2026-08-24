@@ -118,29 +118,41 @@ func TestGlobalNamePlannerMissingTrigramFallsBackGlobally(t *testing.T) {
 	}
 }
 
-func TestGlobalNamePlannerBroadTrigramFallsBackGlobally(t *testing.T) {
+func TestGlobalNamePlannerBroadTrigramRescuedByCompleteLane(t *testing.T) {
+	t.Setenv("SEEKFS_V9_SELF_NAME_GRAMS", "1")
+	t.Setenv("SEEKFS_LOW_MEMORY_TRIGRAM_MAX_POSTING", "1")
 	makeVolume := func(volume string) *serviceVolumeIndex {
-		idx := &Index{Source: "usn", Volume: volume, Compact: true, Records: make([]CompactRecord, 0, serviceNameTrigramCandidateMaxIDs+2)}
-		idx.Records = append(idx.Records, CompactRecord{FRN: 1, ParentFRN: 1, Parent: -1, Name: ".", Mode: uint32(os.ModeDir)})
-		for i := 0; i <= serviceNameTrigramCandidateMaxIDs; i++ {
-			idx.Records = append(idx.Records, CompactRecord{FRN: uint64(i + 2), ParentFRN: 1, Parent: 0, Name: fmt.Sprintf("plain-%05d.txt", i)})
+		records := []CompactRecord{
+			{FRN: 1, ParentFRN: 1, Parent: -1, Name: ".", Mode: uint32(os.ModeDir)},
 		}
+		for i := 0; i < 8; i++ {
+			records = append(records, CompactRecord{FRN: uint64(i + 2), ParentFRN: 1, Parent: 0, Name: fmt.Sprintf("plain-%02d.txt", i)})
+		}
+		records = append(records, CompactRecord{FRN: 20, ParentFRN: 1, Parent: 0, Name: "unrelated.bin"})
+		idx := &Index{Source: "usn", Volume: volume, Roots: []string{volume + `\`}, Compact: true, Records: records}
 		buildOrders(idx)
-		vol := newServiceVolumeIndex(volume+"-broad-name.gsi", idx)
-		vol.rebuildNameTrigramsLocked()
-		return vol
+		selective := buildSelectiveNameTrigramIndex(idx, 1)
+		idx.Derived.NameTrigrams = decodeGramPostingIndex(encodeGramPostingSection(selective, nil), idx.compactRecordCount())
+		extra := optionalSelfNameGramIndex(idx, selective)
+		idx.Derived.SelfNameTrigrams = decodeGramPostingIndex(encodeGramPostingSection(extra, nil), idx.compactRecordCount())
+		return newServiceVolumeIndex(strings.ToLower(strings.TrimSuffix(volume, ":"))+"-broad-name.gsi", idx)
 	}
 	volumes := []*serviceVolumeIndex{makeVolume("C:"), makeVolume("F:")}
 	trace := &searchTrace{}
-	got, err := searchServiceVolumes(volumes, queryOptions{Query: "plain", Limit: 1, Trace: trace}, false)
+	got, err := searchServiceVolumes(volumes, queryOptions{Query: "plain", Limit: 3, Trace: trace}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 1 || trace.PlannerMode != "global-bounded-scan" || trace.Fallback != "global-bounded-scan" {
-		t.Fatalf("results=%v trace=%+v, want bounded global fallback", pathsOf(got), trace)
+	if len(got) != 3 {
+		t.Fatalf("results=%v, want 3 exact plain* results via the complete lane", pathsOf(got))
 	}
-	if !traceHasDecline(trace.Declines, "global-name", "no-selective-trigram") {
-		t.Fatalf("declines = %+v, want no-selective-trigram", trace.Declines)
+	for _, entry := range got {
+		if !strings.Contains(entry.Name, "plain") {
+			t.Fatalf("rescued results leaked non-matching name %q", entry.Name)
+		}
+	}
+	if trace.PlannerMode != "global-name" || trace.Fallback != "" {
+		t.Fatalf("trace = %+v, want global-name complete-lane rescue without fallback", trace)
 	}
 }
 
