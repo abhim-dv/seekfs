@@ -28,7 +28,10 @@
 - Fuzzy matching: when a single-term query returns fewer than 10 results,
   close matches (Damerau-Levenshtein distance, accent/fullwidth-folded) are
   appended below the exact results and ranked by edit distance, then prefix
-  alignment, then normal rank. `term~` or `--fuzzy` opts in explicitly,
+  alignment, then normal rank. For multi-term queries, terms that match
+  nothing on their own are replaced by their single best close-match variant
+  and the query is re-run once (`reprot pdf` finds `report.pdf`); terms that
+  match stay as hard constraints. `term~` or `--fuzzy` opts in explicitly,
   regardless of how many exact results were found. Terms shorter than 3
   characters are not fuzzed.
 

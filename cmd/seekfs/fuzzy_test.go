@@ -134,6 +134,149 @@ func buildFuzzyTestVolume(t *testing.T) *serviceVolumeIndex {
 	return vol
 }
 
+func buildMultiTermFuzzyTestVolume(t *testing.T) *serviceVolumeIndex {
+	t.Helper()
+	idx := &Index{Source: "usn", Volume: "R:", Compact: true, DBPath: ""}
+	add := func(name string) {
+		idx.Records = append(idx.Records, CompactRecord{
+			FRN:       uint64(len(idx.Records) + 10),
+			ParentFRN: uint64(10),
+			Parent:    0,
+			Name:      name,
+		})
+	}
+	for _, name := range []string{
+		".", // root record
+		"report.pdf",
+		"annual-report-2024.pdf",
+		"report.docx",
+		"q4-report-notes.pdf",
+		"unrelated-image.png",
+	} {
+		add(name)
+	}
+	buildOrders(idx)
+	vol := newServiceVolumeIndex("", idx)
+	vol.volume = "R:"
+	vol.rebuildNameTrigramsLocked()
+	return vol
+}
+
+func TestMultiTermFuzzyRewriteTrialsFixBrokenTermFirst(t *testing.T) {
+	vol := buildMultiTermFuzzyTestVolume(t)
+	volumes := []*serviceVolumeIndex{vol}
+	opts := queryOptions{Query: "reprot pdf", Limit: 10}
+	pq, err := parseQuery(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	trials := multiTermFuzzyRewriteTrials(volumes, opts, pq)
+	if len(trials) == 0 {
+		t.Fatal("expected at least one rewrite trial")
+	}
+	if trials[0].Sub.From != "reprot" {
+		t.Fatalf("first trial term = %q, want reprot", trials[0].Sub.From)
+	}
+	// The winning variant must produce results whose names contain both the
+	// fixed term and the untouched term.
+	found := false
+	for _, trial := range trials {
+		if trial.Sub.From != "reprot" || !strings.Contains(trial.Sub.To, "repor") {
+			continue
+		}
+		rewritten, err := searchServiceVolumes(volumes, trial.Opts, false)
+		if err != nil || len(rewritten) == 0 {
+			t.Fatalf("trial %q -> %d results err=%v, want matches", trial.Opts.Query, len(rewritten), err)
+		}
+		for _, entry := range rewritten {
+			name := strings.ToLower(entry.Name)
+			if !strings.Contains(name, "report") || !strings.Contains(name, "pdf") {
+				t.Fatalf("result %q does not contain both report and pdf", entry.Name)
+			}
+		}
+		found = true
+		break
+	}
+	if !found {
+		t.Fatalf("no viable reprot->report* trial among %+v", trials)
+	}
+}
+
+func TestTryMultiTermFuzzyRewriteMaskedSubstringStillFires(t *testing.T) {
+	vol := buildMultiTermFuzzyTestVolume(t)
+	// A name containing the typo as a literal substring makes the broken term
+	// look healthy to a solo check; the masked-term trial must still fire.
+	vol.applyUSNChanges([]usnChange{{FRN: 900, ParentFRN: 10, USN: 12, Reason: usnReasonFileCreate, Name: "coreproto.txt"}})
+
+	volumes := []*serviceVolumeIndex{vol}
+	opts := queryOptions{Query: "reprot pdf", Limit: 10}
+	matches, err := searchServiceVolumes(volumes, opts, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fuzzied := false
+	handled := tryMultiTermFuzzyRewrite(volumes, &opts, &matches, &fuzzied)
+	if !handled || !fuzzied {
+		t.Fatalf("handled=%v fuzzied=%v, want masked-substring rewrite to fire", handled, fuzzied)
+	}
+	if len(matches) == 0 {
+		t.Fatal("expected rewritten-query results")
+	}
+}
+
+func TestTryMultiTermFuzzyRewriteHealthyQueryNoop(t *testing.T) {
+	vol := buildMultiTermFuzzyTestVolume(t)
+	volumes := []*serviceVolumeIndex{vol}
+	// Both terms exist on their own and neither has a variant with matches
+	// that could help; no trial should produce results or flip the flag.
+	opts := queryOptions{Query: "report png", Limit: 10}
+	matches, err := searchServiceVolumes(volumes, opts, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fuzzied := false
+	handled := tryMultiTermFuzzyRewrite(volumes, &opts, &matches, &fuzzied)
+	if !handled {
+		t.Fatal("multi-term case must always be handled once terms >= 2")
+	}
+	if fuzzied {
+		t.Fatalf("fuzzied=true with no viable substitution (matches=%d)", len(matches))
+	}
+}
+
+func TestTryMultiTermFuzzyRewriteNoVariantNoResults(t *testing.T) {
+	vol := buildMultiTermFuzzyTestVolume(t)
+	volumes := []*serviceVolumeIndex{vol}
+	opts := queryOptions{Query: "zzzzzzz pdf", Limit: 10}
+	matches, err := searchServiceVolumes(volumes, opts, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fuzzied := false
+	handled := tryMultiTermFuzzyRewrite(volumes, &opts, &matches, &fuzzied)
+	if !handled || fuzzied {
+		t.Fatalf("handled=%v fuzzied=%v, want handled without bogus results", handled, fuzzied)
+	}
+}
+
+func TestTryMultiTermFuzzyRewriteEndToEnd(t *testing.T) {
+	vol := buildMultiTermFuzzyTestVolume(t)
+	volumes := []*serviceVolumeIndex{vol}
+	opts := queryOptions{Query: "reprot pdf", Limit: 10}
+	matches, err := searchServiceVolumes(volumes, opts, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fuzzied := false
+	handled := tryMultiTermFuzzyRewrite(volumes, &opts, &matches, &fuzzied)
+	if !handled || !fuzzied {
+		t.Fatalf("handled=%v fuzzied=%v, want handled rewrite with results", handled, fuzzied)
+	}
+	if len(matches) == 0 {
+		t.Fatal("expected rewritten-query results")
+	}
+}
+
 func TestAppendFuzzyServiceMatchesGoldenRanking(t *testing.T) {
 	vol := buildFuzzyTestVolume(t)
 	opts := queryOptions{Query: "tonics~", Limit: 10}

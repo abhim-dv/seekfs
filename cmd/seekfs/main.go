@@ -7456,7 +7456,9 @@ func handleServiceConn(conn *os.File, s *goSearchService) {
 				// and must stay under the read lock: it reads compact records
 				// that a background persist may unmap.
 				if limit := normalizedLimit(opts.Limit, false); len(matches) < limit {
-					matches, fuzzied = appendFuzzyServiceMatches(volumes, opts, matches)
+					if !tryMultiTermFuzzyRewrite(volumes, &opts, &matches, &fuzzied) {
+						matches, fuzzied = appendFuzzyServiceMatches(volumes, opts, matches)
+					}
 				}
 			}
 			s.indexMu.RUnlock()
