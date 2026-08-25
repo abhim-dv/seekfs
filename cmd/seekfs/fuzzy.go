@@ -519,9 +519,8 @@ func multiTermFuzzyRewriteTrials(volumes []*serviceVolumeIndex, opts queryOption
 		return nil
 	}
 	const (
-		maxTrials        = 4
-		variantsPerTerm  = 2
-		maskedSoloCutoff = 50
+		maxTrials       = 4
+		variantsPerTerm = 2
 	)
 	fields := strings.Fields(opts.Query)
 	broken := make([]fuzzyRewriteTrial, 0, 2)
@@ -531,21 +530,17 @@ func multiTermFuzzyRewriteTrials(volumes []*serviceVolumeIndex, opts queryOption
 		if utf8.RuneCountInString(low) < fuzzyMinTermRunes || strings.ContainsAny(low, `\/*?[]:`) {
 			continue // ineligible terms stay exact; they never block the rewrite
 		}
-		soloCount, soloOK := fuzzySoloMatchCount(volumes, low, maskedSoloCutoff)
-		if !soloOK {
-			// No volume could evaluate this term, which means its postings
-			// are too popular for the bounded lanes — i.e. a very common
-			// term. Common terms do not need fuzzy help, and guessing a
-			// substitution for them risks corrupting healthy queries.
-			continue
+		// Solo health cannot be the gate here: typos like "llog" are real
+		// substrings with dozens of unrelated matches, and popular terms'
+		// lookups decline outright. In a zero-result query every eligible
+		// term is a rewrite candidate; the ordered trials plus the exact
+		// re-search decide what wins. Zero-match terms rank first.
+		soloCount, soloOK := fuzzySoloMatchCount(volumes, low, 1)
+		variantBudget := variantsPerTerm
+		if soloOK && soloCount > 0 {
+			variantBudget = 1
 		}
-		if soloCount >= maskedSoloCutoff {
-			continue // genuinely common term; substituting it would be wrong
-		}
-		// Both zero-match and low-match terms get multiple candidates: the
-		// plausibility heuristic is noisy, and the trial's exact re-search
-		// is the real judge.
-		variants := fuzzyTopTermVariants(volumes, low, variantsPerTerm)
+		variants := fuzzyTopTermVariants(volumes, low, variantBudget)
 		for _, variant := range variants {
 			out := make([]string, len(fields))
 			replaced := false
@@ -566,7 +561,7 @@ func multiTermFuzzyRewriteTrials(volumes []*serviceVolumeIndex, opts queryOption
 			// open the explicit fuzzy tier on top of it.
 			newOpts.Fuzzy = false
 			trial := fuzzyRewriteTrial{Opts: newOpts, Sub: fuzzyTermSubstitution{From: term, To: variant}}
-			if soloCount == 0 {
+			if soloOK && soloCount == 0 {
 				broken = append(broken, trial)
 			} else {
 				masked = append(masked, trial)
@@ -591,8 +586,12 @@ func tryMultiTermFuzzyRewrite(volumes []*serviceVolumeIndex, opts *queryOptions,
 	if err != nil || len(pq.Terms) < 2 {
 		return false
 	}
-	if len(*matches) >= fuzzyAutoResultThreshold && !pq.Fuzzy {
-		return true // below-threshold rule decided: enough exact results already
+	if len(*matches) > 0 && !pq.Fuzzy {
+		// Query rewrites are invasive: unlike the single-term tier, which
+		// only appends below exact results, chaining fires on total misses
+		// (or with an explicit marker). A query that already matched anything
+		// is left alone.
+		return true
 	}
 	for _, trial := range multiTermFuzzyRewriteTrials(volumes, *opts, pq) {
 		rewritten, err := searchServiceVolumes(volumes, trial.Opts, false)
