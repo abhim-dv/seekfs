@@ -536,11 +536,7 @@ func multiTermFuzzyRewriteTrials(volumes []*serviceVolumeIndex, opts queryOption
 		// term is a rewrite candidate; the ordered trials plus the exact
 		// re-search decide what wins. Zero-match terms rank first.
 		soloCount, soloOK := fuzzySoloMatchCount(volumes, low, 1)
-		variantBudget := variantsPerTerm
-		if soloOK && soloCount > 0 {
-			variantBudget = 1
-		}
-		variants := fuzzyTopTermVariants(volumes, low, variantBudget)
+		variants := fuzzyTopTermVariants(volumes, low, variantsPerTerm)
 		for _, variant := range variants {
 			out := make([]string, len(fields))
 			replaced := false
