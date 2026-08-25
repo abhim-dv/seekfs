@@ -355,3 +355,257 @@ func appendFuzzyServiceMatches(volumes []*serviceVolumeIndex, opts queryOptions,
 	}
 	return append(matches, appended...), true
 }
+
+type fuzzyTermSubstitution struct {
+	From string
+	To   string
+}
+
+// fuzzySoloMatchCount counts visible names containing termLower as a substring
+// across all volumes, stopping once stopAt matches are found. It returns
+// (count, true) when at least one volume could evaluate the term and
+// (0, false) when every lookup declined, so callers never mistake an
+// unevaluated term for a healthy or broken one.
+func fuzzySoloMatchCount(volumes []*serviceVolumeIndex, termLower string, stopAt int) (int, bool) {
+	if utf8.RuneCountInString(termLower) < fuzzyMinTermRunes || strings.ContainsAny(termLower, `\/*?[]:`) {
+		return stopAt, true
+	}
+	count := 0
+	evaluated := false
+	for _, vol := range volumes {
+		if vol == nil || vol.index == nil || vol.nameTrigramIndex() == nil {
+			continue
+		}
+		pq := parsedQuery{Terms: []string{termLower}, Limit: stopAt}
+		ids, ok := vol.nameTrigramCandidates(pq)
+		if !ok {
+			continue
+		}
+		evaluated = true
+		for _, id := range ids {
+			if !vol.nameTrigramCandidateMatches(id, termLower) {
+				continue
+			}
+			count++
+			if count >= stopAt {
+				return count, true
+			}
+		}
+	}
+	return count, evaluated
+}
+
+// fuzzyTermMinGramCount scores how plausible a term is as a real filename
+// substring using posting-count metadata only: the smallest (bottleneck) gram
+// posting count across the term's grams, maximized across volumes. No posting
+// blocks are decoded. ok is false when completeness metadata cannot judge
+// (missing sections); a proven empty gram returns (0, true).
+func fuzzyTermMinGramCount(vol *serviceVolumeIndex, termLower string) (int, bool) {
+	if vol == nil || vol.index == nil {
+		return 0, false
+	}
+	trigrams := vol.nameTrigramIndex()
+	extraTrigrams := vol.index.Derived.SelfNameTrigrams
+	if trigrams == nil && extraTrigrams == nil {
+		return 0, false
+	}
+	minCount := -1
+	for _, gram := range uniqueFixedGramKeysFoldASCII(strings.ToLower(termLower), 3) {
+		_, count, _, state, exactEmpty := vol.nameGramPosting(gram)
+		if exactEmpty {
+			return 0, true
+		}
+		if state == "missing-section" {
+			return 0, false
+		}
+		if count < 0 {
+			count = 0
+		}
+		if minCount < 0 || count < minCount {
+			minCount = count
+		}
+	}
+	if minCount < 0 {
+		return 0, false
+	}
+	return minCount, true
+}
+
+// fuzzyTopTermVariants returns up to n close-match variants of termLower
+// ordered by plausibility: lowest edit distance first, then strongest
+// gram-selectivity score (a stand-in for match count that stays cheap on
+// popular terms whose posting lanes decline), then lexicographic order for
+// determinism. Variants that are themselves too short to be fuzzed, or whose
+// grams prove they cannot appear in any name, are skipped.
+func fuzzyTopTermVariants(volumes []*serviceVolumeIndex, termLower string, n int) []string {
+	if n <= 0 {
+		return nil
+	}
+	tau := fuzzyThresholdForTerm(termLower)
+	type scored struct {
+		variant string
+		dist    int
+		score   int
+	}
+	var out []scored
+	variants := fuzzyDeletionVariants(termLower, tau)
+	sort.Strings(variants)
+	for _, variant := range variants {
+		if variant == termLower {
+			continue
+		}
+		if utf8.RuneCountInString(variant) < fuzzyMinTermRunes {
+			continue
+		}
+		dist := damerauLevenshteinBounded([]rune(variant), []rune(termLower), tau)
+		if dist <= 0 || dist > tau {
+			continue
+		}
+		score := 0
+		proven := false
+		for _, vol := range volumes {
+			s, ok := fuzzyTermMinGramCount(vol, variant)
+			if !ok {
+				continue // this volume cannot judge; other volumes may
+			}
+			if s > 0 {
+				proven = true
+				if s > score {
+					score = s
+				}
+			}
+		}
+		if !proven || score <= 0 {
+			continue
+		}
+		out = append(out, scored{variant: variant, dist: dist, score: score})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].dist != out[j].dist {
+			return out[i].dist < out[j].dist
+		}
+		if out[i].score != out[j].score {
+			return out[i].score > out[j].score
+		}
+		return out[i].variant < out[j].variant
+	})
+	result := make([]string, 0, n)
+	for _, s := range out {
+		result = append(result, s.variant)
+		if len(result) >= n {
+			break
+		}
+	}
+	return result
+}
+
+
+// fuzzyRewriteTrial is one candidate query rewrite: a single term swapped for
+// its best close-match variant, every other byte of the query untouched.
+type fuzzyRewriteTrial struct {
+	Opts queryOptions
+	Sub  fuzzyTermSubstitution
+}
+
+// multiTermFuzzyRewriteTrials builds substitution candidates for an
+// underfilled multi-term query. Terms with zero solo matches come first
+// (strongest typo signal); terms that do match on their own still get a trial
+// because incidental substrings (e.g. "reprot" inside "coreproto") can mask a
+// typo. Trials are capped; callers execute them cheapest-first and keep the
+// first that yields results.
+func multiTermFuzzyRewriteTrials(volumes []*serviceVolumeIndex, opts queryOptions, pq parsedQuery) []fuzzyRewriteTrial {
+	if len(pq.Terms) < 2 || pq.CaseSensitive || pq.MatchPath ||
+		len(pq.OrGroups) > 0 || len(pq.Regexps) > 0 || len(pq.Globs) > 0 {
+		return nil
+	}
+	const (
+		maxTrials        = 4
+		variantsPerTerm  = 2
+		maskedSoloCutoff = 50
+	)
+	fields := strings.Fields(opts.Query)
+	broken := make([]fuzzyRewriteTrial, 0, 2)
+	masked := make([]fuzzyRewriteTrial, 0, 2)
+	for _, term := range pq.Terms {
+		low := foldFuzzyText(strings.ToLower(term))
+		if utf8.RuneCountInString(low) < fuzzyMinTermRunes || strings.ContainsAny(low, `\/*?[]:`) {
+			continue // ineligible terms stay exact; they never block the rewrite
+		}
+		soloCount, soloOK := fuzzySoloMatchCount(volumes, low, maskedSoloCutoff)
+		if !soloOK {
+			// No volume could evaluate this term, which means its postings
+			// are too popular for the bounded lanes — i.e. a very common
+			// term. Common terms do not need fuzzy help, and guessing a
+			// substitution for them risks corrupting healthy queries.
+			continue
+		}
+		if soloCount >= maskedSoloCutoff {
+			continue // genuinely common term; substituting it would be wrong
+		}
+		// Both zero-match and low-match terms get multiple candidates: the
+		// plausibility heuristic is noisy, and the trial's exact re-search
+		// is the real judge.
+		variants := fuzzyTopTermVariants(volumes, low, variantsPerTerm)
+		for _, variant := range variants {
+			out := make([]string, len(fields))
+			replaced := false
+			for i, field := range fields {
+				if !replaced && strings.ToLower(field) == strings.ToLower(term) {
+					out[i] = variant
+					replaced = true
+				} else {
+					out[i] = field
+				}
+			}
+			if !replaced {
+				continue
+			}
+			newOpts := opts
+			newOpts.Query = strings.Join(out, " ")
+			// The rewritten query is exact; do not let the recursive pass
+			// open the explicit fuzzy tier on top of it.
+			newOpts.Fuzzy = false
+			trial := fuzzyRewriteTrial{Opts: newOpts, Sub: fuzzyTermSubstitution{From: term, To: variant}}
+			if soloCount == 0 {
+				broken = append(broken, trial)
+			} else {
+				masked = append(masked, trial)
+			}
+			if len(broken)+len(masked) >= maxTrials {
+				break
+			}
+		}
+		if len(broken)+len(masked) >= maxTrials {
+			break
+		}
+	}
+	return append(broken, masked...)
+}
+
+// tryMultiTermFuzzyRewrite runs the multi-term fuzzy chain against an
+// underfilled result set. It reports whether the multi-term case was handled
+// (including deciding there was nothing to do), so callers can skip the
+// single-term fallback, which declines multi-term queries anyway.
+func tryMultiTermFuzzyRewrite(volumes []*serviceVolumeIndex, opts *queryOptions, matches *[]Entry, fuzzied *bool) bool {
+	pq, err := parseQuery(*opts)
+	if err != nil || len(pq.Terms) < 2 {
+		return false
+	}
+	if len(*matches) >= fuzzyAutoResultThreshold && !pq.Fuzzy {
+		return true // below-threshold rule decided: enough exact results already
+	}
+	for _, trial := range multiTermFuzzyRewriteTrials(volumes, *opts, pq) {
+		rewritten, err := searchServiceVolumes(volumes, trial.Opts, false)
+		if err != nil {
+			continue
+		}
+		if len(rewritten) == 0 {
+			continue
+		}
+		serviceLog("fuzzymulti rewrote q=%q %q->%q results=%d", opts.Query, trial.Sub.From, trial.Sub.To, len(rewritten))
+		*matches = rewritten
+		*fuzzied = true
+		return true
+	}
+	return true // multi-term case decided; keep the original (underfilled) results
+}
