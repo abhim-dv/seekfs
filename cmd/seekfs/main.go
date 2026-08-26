@@ -833,6 +833,8 @@ func run(args []string) error {
 		return cmdSearch(args[1:], false)
 	case "count":
 		return cmdSearch(args[1:], true)
+	case "watch":
+		return runWatch(args[1:])
 	case "version":
 		fmt.Printf("seekfs %s commit=%s date=%s\n", version, commit, date)
 		return nil
@@ -883,6 +885,7 @@ func normalizeSearchArgs(args []string) []string {
 		"-config": true, "--config": true, "-pipe": true, "--pipe": true,
 		"-root-bias": true, "--root-bias": true, "-recent": true, "--recent": true,
 		"-modified-after": true, "--modified-after": true,
+		"-interval": true, "--interval": true,
 	}
 	boolFlags := map[string]bool{
 		"-path": true, "--path": true, "--json": true, "-json": true,
@@ -940,6 +943,7 @@ func printUsage(w io.Writer) {
   seekfs agent
   seekfs search [-db seekfs.db...] [--json] [-n 100] [-path] <query>
   seekfs count [-db seekfs.db...] [--json] [-path] <query>
+  seekfs watch "<query>" [-interval 2s] [-n 10000] [-pipe \\.\pipe\seekfs-service]
   seekfs version
 
 Agent use:
