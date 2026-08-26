@@ -10738,7 +10738,7 @@ func (vol *serviceVolumeIndex) filenameTrigramCandidates(pq parsedQuery) ([]int,
 	trigrams := vol.nameTrigramIndex()
 	if vol == nil || vol.index == nil || (trigrams == nil && vol.index.Derived.SelfNameTrigrams == nil) || pq.CaseSensitive ||
 		pq.MatchPath || len(pq.Terms) == 0 || pq.Under != "" || pq.Type != "" ||
-		len(pq.Exts) > 0 || len(pq.Globs) > 0 || len(pq.Dirs) > 0 || len(pq.Regexps) > 0 ||
+		len(pq.Globs) > 0 || len(pq.Dirs) > 0 || len(pq.Regexps) > 0 ||
 		len(pq.OrGroups) > 0 || len(pq.NotGroups) > 0 || pq.HasModAfter || pq.Exists ||
 		pq.CWDBias != "" || pq.RootBias != "" {
 		return nil, false

@@ -61,8 +61,14 @@ func (vol *serviceVolumeIndex) nameGramUnionUsesExtra(term string) bool {
 // checks, so a common gram never becomes a full ID slice.  The final folded
 // name check keeps the posting source conservative.
 func (vol *serviceVolumeIndex) completeFilenameTopPosting(term string, limit int, pq parsedQuery) ([]int, bool) {
-	if vol == nil || vol.index == nil || limit <= 0 || pq.CountOnly || len(vol.recentIDs) > 0 {
+	if vol == nil || vol.index == nil || limit <= 0 || pq.CountOnly || len(vol.recentIDs) > 0 ||
+		len(pq.Dirs) > 0 || len(pq.Globs) > 0 || len(pq.Regexps) > 0 {
 		return nil, false
+	}
+	if len(pq.Exts) == 1 {
+		if out, ok := vol.completeExtTermTopPosting(term, limit, pq); ok {
+			return out, true
+		}
 	}
 	if pq.SortColumn == "" {
 		if out, ok := vol.completeFilenameRankedPosting(term, limit, pq); ok {
@@ -129,7 +135,8 @@ func (vol *serviceVolumeIndex) completeFilenameTopPosting(term string, limit int
 			continue
 		}
 		verified++
-		if !vol.nameTrigramCandidateMatches(id, term) {
+		rec := vol.index.compactRecord(id)
+		if !vol.recordMatchesNonPath(id, rec, pq) {
 			continue
 		}
 		out = append(out, id)
@@ -148,6 +155,91 @@ func (vol *serviceVolumeIndex) completeFilenameTopPosting(term string, limit int
 		pq.Trace.FilenameRequiredGrams = len(its)
 		pq.Trace.FilenameRecordsVerified = verified
 		pq.Trace.addPostingBlocks(decoded, 0)
+		pq.Trace.setComplete(true)
+	}
+	return out, true
+}
+
+// completeExtTermTopPosting drives a single-term query with exactly one
+// ext: filter from the extension posting instead of the term's gram posting.
+// Walking the term posting in rank order for a common term can scan millions
+// of records that fail the extension check (the block-skip heap never fills,
+// so no early stop fires).  The extension posting is typically far smaller,
+// and walking it with per-record term verification bounds the work to the
+// extension's own population.
+func (vol *serviceVolumeIndex) completeExtTermTopPosting(term string, limit int, pq parsedQuery) ([]int, bool) {
+	if vol == nil || vol.index == nil || limit <= 0 || len(vol.recentIDs) > 0 || pq.SortColumn != "" ||
+		len(pq.Exts) != 1 || pq.CountOnly {
+		return nil, false
+	}
+	candidate, ok := vol.extPostingCountCandidate(pq.Exts[0])
+	if !ok || !candidate.mapped || candidate.len() == 0 {
+		return nil, false
+	}
+	ranks := vol.rankForQuery(pq)
+	blocks, canSkipByBlockRank := candidate.it.rankOrderedBlockRefsForSort("")
+	if len(blocks) == 0 {
+		return nil, false
+	}
+	h := make(extRankMaxHeap, 0, limit)
+	recordCount := vol.index.compactRecordCount()
+	decoded, skipped, verified := 0, 0, 0
+	prefetchBytes, prefetchRanges, prefetchPages, prefetchStopped := prefetchPostingBlockRefs(candidate.it, blocks, queryPostingPrefetchBytes(), func() bool { return queryCanceled(pq) })
+	if prefetchStopped {
+		return nil, false
+	}
+	if pq.Trace != nil {
+		pq.Trace.PostingPrefetchBytes += prefetchBytes
+		pq.Trace.PostingPrefetchRanges += prefetchRanges
+		pq.Trace.PostingPrefetchPages += prefetchPages
+	}
+	add := func(id32 uint32) {
+		item := extRankItem{id: id32, rank: extRankOf(id32, ranks)}
+		if len(h) < limit {
+			heap.Push(&h, item)
+		} else if extRankLess(item, h[0]) {
+			h[0] = item
+			heap.Fix(&h, 0)
+		}
+	}
+	for blockPos, ref := range blocks {
+		if canSkipByBlockRank && len(h) >= limit && ref.meta.minRank > h[0].rank {
+			skipped = len(blocks) - blockPos
+			break
+		}
+		ids, _, ok := candidate.it.blockAt(ref.index)
+		if !ok {
+			return nil, false
+		}
+		decoded++
+		for _, id32 := range ids {
+			id := int(id32)
+			if id < 0 || id >= recordCount {
+				continue
+			}
+			rec := vol.index.compactRecord(id)
+			if rec.Deleted {
+				continue
+			}
+			verified++
+			if !vol.nameTrigramCandidateMatches(id, term) {
+				continue
+			}
+			add(id32)
+		}
+	}
+	out := make([]int, len(h))
+	for i := range h {
+		out[i] = int(h[i].id)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return extRankLess(extRankItem{id: uint32(out[i]), rank: extRankOf(uint32(out[i]), ranks)}, extRankItem{id: uint32(out[j]), rank: extRankOf(uint32(out[j]), ranks)})
+	})
+	if pq.Trace != nil {
+		pq.Trace.FilenameDriver = "ext-posting-pngr"
+		pq.Trace.setSource("filename-pngc-ext-driven", len(out))
+		pq.Trace.FilenameRecordsVerified = verified
+		pq.Trace.addPostingBlocks(decoded, skipped)
 		pq.Trace.setComplete(true)
 	}
 	return out, true

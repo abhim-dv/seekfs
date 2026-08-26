@@ -5,7 +5,7 @@ import "strings"
 func globalNameQuerySupported(pq parsedQuery) bool {
 	return !pq.CaseSensitive && !pq.MatchPath && len(nonVolumeTerms(pq.Terms)) > 0 &&
 		pq.Type == "" && pq.Under == "" && !pq.Exists && !pq.HasModAfter &&
-		len(pq.Exts) == 0 && len(pq.Dirs) == 0 && len(pq.Globs) == 0 &&
+		len(pq.Dirs) == 0 && len(pq.Globs) == 0 &&
 		len(pq.Regexps) == 0 && len(pq.RegexTerms) == 0 && len(pq.Parents) == 0 &&
 		len(pq.SizeFilters) == 0 && len(pq.DateFilters) == 0 && len(pq.AttrFilters) == 0 &&
 		len(pq.OrGroups) == 0 && len(pq.NotGroups) == 0 && pq.CWDBias == "" && pq.RootBias == ""
