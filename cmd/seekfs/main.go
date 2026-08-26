@@ -8424,12 +8424,13 @@ func (vol *serviceVolumeIndex) snapshotHiddenBaseIDs() hiddenBaseIDs {
 }
 
 // serviceWatchDelta returns the file-change events for a watch client since
-// each volume's overlay watermark. It reads the published snapshot's overlay
-// records (append-only within a persist epoch) and emits, per FRN touched
-// after that volume's cursor, the transition between the state at the cursor
-// boundary and the state now, filtered through the watch query. This lets a
-// watch client pay only for changed records instead of re-running the full
-// query every tick.
+// each volume's overlay watermark. It reads each volume's published snapshot
+// (base + overlay records + watermark published atomically together) and
+// emits, per FRN touched after that volume's cursor, the transition between
+// the state at the cursor boundary and the state now, filtered through the
+// watch query. This lets a watch client pay only for changed records instead
+// of re-running the full query every tick, and it never takes vol.mu (which a
+// background persist can hold for minutes during the multi-GB compaction).
 //
 // The cursor is the overlay watermark (len of overlay.records at snapshot
 // time). On background persist the overlay is rebuilt and the watermark
