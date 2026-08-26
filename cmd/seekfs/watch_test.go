@@ -1,7 +1,10 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -139,5 +142,209 @@ func TestDiffWatchSnapshotsDeterminism(t *testing.T) {
 		if first[i-1] >= first[i] {
 			t.Fatalf("created not sorted: %v", first)
 		}
+	}
+}
+
+func watchDeltaFixture(t *testing.T) *serviceVolumeIndex {
+	t.Helper()
+	idx := &Index{
+		Source:  "usn",
+		Volume:  "F:",
+		Compact: true,
+		Records: []CompactRecord{
+			{FRN: 100, ParentFRN: 100, Parent: -1, Name: ".", Mode: uint32(os.ModeDir)},
+			{FRN: 200, ParentFRN: 100, Parent: 0, Name: "existing.txt", Size: 5, ModUnix: 1000},
+		},
+	}
+	buildOrders(idx)
+	vol := newServiceVolumeIndex(`F:\state.gsi`, idx)
+	return vol
+}
+
+func TestServiceWatchDeltaCreatesModifiesDeletes(t *testing.T) {
+	vol := watchDeltaFixture(t)
+	// Baseline cursor: no changes yet.
+	cursors, events, err := serviceWatchDelta([]*serviceVolumeIndex{vol}, []watchVolumeCursor{{Volume: "F:", Seq: 0}}, parsedQuery{}, &searchTrace{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 0 || len(cursors) != 1 || cursors[0].Seq != 0 {
+		t.Fatalf("baseline delta = (%+v, %v)", cursors, events)
+	}
+	// Create a file.
+	vol.applyUSNChanges([]usnChange{{FRN: 301, ParentFRN: 100, USN: 10, Reason: usnReasonFileCreate, Name: "alpha.txt"}})
+	cursors, events, err = serviceWatchDelta([]*serviceVolumeIndex{vol}, []watchVolumeCursor{{Volume: "F:", Seq: 0}}, parsedQuery{}, &searchTrace{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cursors) != 1 || cursors[0].Seq != 1 {
+		t.Fatalf("after create cursors = %+v, want seq 1", cursors)
+	}
+	if len(events) != 1 || events[0].Event != "created" || events[0].Path != `F:\alpha.txt` {
+		t.Fatalf("after create events = %+v, want created F:\\alpha.txt", events)
+	}
+	// Delta from cursor 1: nothing new.
+	_, events, err = serviceWatchDelta([]*serviceVolumeIndex{vol}, []watchVolumeCursor{{Volume: "F:", Seq: 1}}, parsedQuery{}, &searchTrace{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 0 {
+		t.Fatalf("delta from cursor 1 = %+v, want none", events)
+	}
+	// Modify the created file (size change).
+	vol.applyUSNChanges([]usnChange{{FRN: 301, ParentFRN: 100, USN: 11, Reason: usnReasonFileCreate, Name: "alpha.txt"}})
+	vol.overlay.records[1].Size = 42
+	_, events, err = serviceWatchDelta([]*serviceVolumeIndex{vol}, []watchVolumeCursor{{Volume: "F:", Seq: 1}}, parsedQuery{}, &searchTrace{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 || events[0].Event != "modified" || events[0].Path != `F:\alpha.txt` {
+		t.Fatalf("after modify events = %+v, want modified F:\\alpha.txt", events)
+	}
+	// Delete the file.
+	vol.applyUSNChanges([]usnChange{{FRN: 301, USN: 12, Reason: usnReasonFileDelete}})
+	_, events, err = serviceWatchDelta([]*serviceVolumeIndex{vol}, []watchVolumeCursor{{Volume: "F:", Seq: 2}}, parsedQuery{}, &searchTrace{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 || events[0].Event != "deleted" || events[0].Path != `F:\alpha.txt` {
+		t.Fatalf("after delete events = %+v, want deleted F:\\alpha.txt", events)
+	}
+}
+
+func TestServiceWatchDeltaResetOnCursorBeyondWatermark(t *testing.T) {
+	vol := watchDeltaFixture(t)
+	cursors, _, err := serviceWatchDelta([]*serviceVolumeIndex{vol}, []watchVolumeCursor{{Volume: "F:", Seq: 9999}}, parsedQuery{}, &searchTrace{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cursors) != 1 || !cursors[0].Reset {
+		t.Fatal("cursor beyond watermark did not signal reset")
+	}
+}
+
+func TestServiceWatchDeltaFiltersByQuery(t *testing.T) {
+	vol := watchDeltaFixture(t)
+	vol.applyUSNChanges([]usnChange{{FRN: 301, ParentFRN: 100, USN: 10, Reason: usnReasonFileCreate, Name: "alpha.txt"}})
+	vol.applyUSNChanges([]usnChange{{FRN: 302, ParentFRN: 100, USN: 11, Reason: usnReasonFileCreate, Name: "beta.log"}})
+	pq, err := parseQuery(queryOptions{Query: "alpha"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, events, err := serviceWatchDelta([]*serviceVolumeIndex{vol}, []watchVolumeCursor{{Volume: "F:", Seq: 0}}, pq, &searchTrace{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 || events[0].Event != "created" || events[0].Path != `F:\alpha.txt` {
+		t.Fatalf("query-filtered events = %+v, want only alpha.txt", events)
+	}
+	// ext:txt filter also isolates alpha.
+	pq2, err := parseQuery(queryOptions{Query: "ext:txt"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, events, err = serviceWatchDelta([]*serviceVolumeIndex{vol}, []watchVolumeCursor{{Volume: "F:", Seq: 0}}, pq2, &searchTrace{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 || events[0].Event != "created" || events[0].Path != `F:\alpha.txt` {
+		t.Fatalf("ext-filtered events = %+v, want only alpha.txt", events)
+	}
+}
+
+func TestServiceWatchDeltaRenameEmitsDeletedAndCreated(t *testing.T) {
+	vol := watchDeltaFixture(t)
+	vol.applyUSNChanges([]usnChange{{FRN: 301, ParentFRN: 100, USN: 10, Reason: usnReasonFileCreate, Name: "oldname.txt"}})
+	// Baseline established at cursor 1: oldname.txt exists.
+	cursors, _, err := serviceWatchDelta([]*serviceVolumeIndex{vol}, []watchVolumeCursor{{Volume: "F:", Seq: 0}}, parsedQuery{}, &searchTrace{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Rename after the baseline.
+	vol.applyUSNChanges([]usnChange{{FRN: 301, ParentFRN: 100, USN: 11, Reason: usnReasonRenameNew, Name: "newname.txt"}})
+	_, events, err := serviceWatchDelta([]*serviceVolumeIndex{vol}, cursors, parsedQuery{}, &searchTrace{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("rename events = %+v, want deleted+created pair", events)
+	}
+	// Poll-diff emits created, then deleted (both sorted by path); the delta
+	// must match that ordering.
+	if events[0].Event != "created" || events[0].Path != `F:\newname.txt` ||
+		events[1].Event != "deleted" || events[1].Path != `F:\oldname.txt` {
+		t.Fatalf("rename events = %+v, want created newname + deleted oldname", events)
+	}
+}
+
+func TestServiceWatchDeltaCreatedThenDeletedInWindowIsSilent(t *testing.T) {
+	vol := watchDeltaFixture(t)
+	vol.applyUSNChanges([]usnChange{{FRN: 301, ParentFRN: 100, USN: 10, Reason: usnReasonFileCreate, Name: "alpha.txt"}})
+	vol.applyUSNChanges([]usnChange{{FRN: 301, USN: 11, Reason: usnReasonFileDelete}})
+	_, events, err := serviceWatchDelta([]*serviceVolumeIndex{vol}, []watchVolumeCursor{{Volume: "F:", Seq: 0}}, parsedQuery{}, &searchTrace{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 0 {
+		t.Fatalf("created-then-deleted window events = %+v, want none", events)
+	}
+}
+
+func TestServiceWatchDeltaMultiVolume(t *testing.T) {
+	volA := watchDeltaFixture(t)
+	idxB := &Index{
+		Source:  "usn",
+		Volume:  "C:",
+		Compact: true,
+		Records: []CompactRecord{{FRN: 100, ParentFRN: 100, Parent: -1, Name: ".", Mode: uint32(os.ModeDir)}},
+	}
+	buildOrders(idxB)
+	volB := newServiceVolumeIndex(`C:\state.gsi`, idxB)
+	volA.applyUSNChanges([]usnChange{{FRN: 301, ParentFRN: 100, USN: 10, Reason: usnReasonFileCreate, Name: "onA.txt"}})
+	volB.applyUSNChanges([]usnChange{{FRN: 401, ParentFRN: 100, USN: 20, Reason: usnReasonFileCreate, Name: "onB.txt"}})
+	cursors, events, err := serviceWatchDelta([]*serviceVolumeIndex{volA, volB}, []watchVolumeCursor{{Volume: "F:", Seq: 0}, {Volume: "C:", Seq: 0}}, parsedQuery{}, &searchTrace{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("multi-volume events = %+v, want 2", events)
+	}
+	byVol := map[string]int{}
+	for _, e := range events {
+		byVol[e.Volume+`|`+e.Path]++
+	}
+	if _, ok := byVol["F:"+`|`+`F:\onA.txt`]; !ok {
+		t.Fatalf("missing volume A event: %+v", events)
+	}
+	if _, ok := byVol["C:"+`|`+`C:\onB.txt`]; !ok {
+		t.Fatalf("missing volume B event: %+v", events)
+	}
+	if len(cursors) != 2 {
+		t.Fatalf("multi-volume cursors = %+v, want 2", cursors)
+	}
+}
+
+func TestRunWatchExecSubstitution(t *testing.T) {
+	dir := t.TempDir()
+	log := filepath.Join(dir, "log.txt")
+	script := filepath.Join(dir, "w.ps1")
+	os.WriteFile(script, []byte("param($p) Add-Content -Path $env:OUTLOG -Value $p\n"), 0o644)
+	os.Setenv("OUTLOG", log)
+	runWatchExec("powershell -NoProfile -File "+script+" {}", filepath.Join(dir, "delta1.txt"), false)
+	deadline := time.Now().Add(5 * time.Second)
+	var b []byte
+	var err error
+	for time.Now().Before(deadline) {
+		b, err = os.ReadFile(log)
+		if err == nil && len(b) > 0 {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if err != nil || len(b) == 0 {
+		t.Fatalf("exec log not written: %v (content=%q)", err, b)
+	}
+	if !strings.Contains(string(b), "delta1.txt") {
+		t.Fatalf("exec log = %q, want delta1.txt", b)
 	}
 }

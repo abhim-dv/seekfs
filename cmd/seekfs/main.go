@@ -886,12 +886,13 @@ func normalizeSearchArgs(args []string) []string {
 		"-root-bias": true, "--root-bias": true, "-recent": true, "--recent": true,
 		"-modified-after": true, "--modified-after": true,
 		"-interval": true, "--interval": true,
+		"-exec": true, "--exec": true, "-exec-on": true, "--exec-on": true,
 	}
 	boolFlags := map[string]bool{
 		"-path": true, "--path": true, "--json": true, "-json": true,
 		"-service": true, "--service": true, "-local": true, "--local": true,
 		"--exists": true, "-exists": true, "--cwd-bias": true, "-cwd-bias": true,
-		"-case": true, "--case": true,
+		"-case": true, "--case": true, "-exec-shell": true, "--exec-shell": true,
 	}
 	flags := make([]string, 0, len(args))
 	query := make([]string, 0, len(args))
@@ -943,7 +944,7 @@ func printUsage(w io.Writer) {
   seekfs agent
   seekfs search [-db seekfs.db...] [--json] [-n 100] [-path] <query>
   seekfs count [-db seekfs.db...] [--json] [-path] <query>
-  seekfs watch "<query>" [-interval 2s] [-n 10000] [-pipe \\.\pipe\seekfs-service]
+  seekfs watch "<query>" [-interval 2s] [-n 10000] [-under PATH] [-exec CMD] [-pipe \\.\pipe\seekfs-service]
   seekfs version
 
 Agent use:
@@ -2503,8 +2504,10 @@ type serviceRequest struct {
 	ModifiedAfter string `json:"modified_after,omitempty"`
 	CaseSensitive bool   `json:"case_sensitive,omitempty"`
 	Fuzzy         bool   `json:"fuzzy,omitempty"`
-	DeadlineUnix  int64  `json:"deadline_unix,omitempty"`
-	RequestSeq    int64  `json:"request_seq,omitempty"`
+	DeadlineUnix  int64               `json:"deadline_unix,omitempty"`
+	RequestSeq    int64               `json:"request_seq,omitempty"`
+	SinceVolumes  []watchVolumeCursor `json:"since_volumes,omitempty"`
+	Baseline      bool                `json:"baseline,omitempty"`
 }
 
 type serviceResponse struct {
@@ -2549,6 +2552,8 @@ type serviceResponse struct {
 	PostingPrefetchBytes     int                `json:"posting_prefetch_bytes,omitempty"`
 	PostingPrefetchRanges    int                `json:"posting_prefetch_ranges,omitempty"`
 	PostingPrefetchPages     int                `json:"posting_prefetch_pages,omitempty"`
+	WatchVolumes             []watchVolumeCursor `json:"watch_volumes,omitempty"`
+	WatchEvents              []watchDeltaEvent  `json:"watch_events,omitempty"`
 	Terms                    []traceTerm        `json:"terms,omitempty"`
 	Declines                 []traceDecline     `json:"declines,omitempty"`
 	Fallback                 string             `json:"fallback,omitempty"`
@@ -7489,6 +7494,74 @@ func handleServiceConn(conn *os.File, s *goSearchService) {
 			resp.Rows = entriesToJSON(matches)
 		}
 		_ = json.NewEncoder(conn).Encode(resp)
+	case "watch-delta":
+		serviceNoteQueryActivity()
+		s.indexMu.RLock()
+		if len(s.indexes) == 0 {
+			loading := s.loading
+			loadErr := s.loadErr
+			s.indexMu.RUnlock()
+			message := "service has no search indexes loaded"
+			if loading {
+				message = "loading indexes"
+			} else if loadErr != "" {
+				message = loadErr
+			}
+			_ = json.NewEncoder(conn).Encode(serviceResponse{OK: false, Message: message, Loading: loading})
+			return
+		}
+		opts := requestToOptionsFromService(req)
+		if opts.DeadlineUnix == 0 {
+			opts.DeadlineUnix = time.Now().Add(serviceQueryTimeout - 250*time.Millisecond).UnixNano()
+		}
+		trace := &searchTrace{}
+		opts.Trace = trace
+		if req.RequestSeq > 0 {
+			for {
+				current := s.requestSeq.Load()
+				if req.RequestSeq <= current || s.requestSeq.CompareAndSwap(current, req.RequestSeq) {
+					break
+				}
+			}
+			opts.Cancel = func() bool {
+				return req.RequestSeq < s.requestSeq.Load()
+			}
+		}
+		pq, parseErr := parseQuery(opts)
+		if parseErr != nil {
+			s.indexMu.RUnlock()
+			_ = json.NewEncoder(conn).Encode(serviceResponse{OK: false, Message: parseErr.Error()})
+			return
+		}
+		volumes := append([]*serviceVolumeIndex(nil), s.volumes...)
+		var sinceCursors []watchVolumeCursor
+		if req.Baseline || len(req.SinceVolumes) == 0 {
+			// Silent baseline: establish the current watermark for every
+			// volume so the next delta request only sees changes made after
+			// watch started.
+			for _, vol := range volumes {
+				if vol == nil || vol.index == nil {
+					continue
+				}
+				wm := uint64(0)
+				if snap := vol.snap.Load(); snap != nil {
+					wm = uint64(snap.watermark)
+				}
+				sinceCursors = append(sinceCursors, watchVolumeCursor{Volume: vol.volume, Seq: wm})
+			}
+			s.indexMu.RUnlock()
+			_ = json.NewEncoder(conn).Encode(serviceResponse{OK: true, WatchVolumes: sinceCursors})
+			return
+		}
+		sinceCursors = req.SinceVolumes
+		nextCursors, events, err := serviceWatchDelta(volumes, sinceCursors, pq, trace)
+		s.indexMu.RUnlock()
+		if err != nil {
+			_ = json.NewEncoder(conn).Encode(serviceResponse{OK: false, Message: err.Error()})
+			return
+		}
+		serviceLog("watch-delta query=%q volumes=%d events=%d", req.Query, len(nextCursors), len(events))
+		_ = json.NewEncoder(conn).Encode(serviceResponse{OK: true, WatchVolumes: nextCursors, WatchEvents: events, Source: trace.Source, Decline: trace.Decline})
 	case "index-usn":
 		serviceLog("index-usn start volume=%s db=%s", req.Volume, req.DB)
 		idx, err := indexUSNVolume(req.Volume)
@@ -8350,6 +8423,206 @@ func (vol *serviceVolumeIndex) snapshotHiddenBaseIDs() hiddenBaseIDs {
 	return hiddenBaseIDs{tombstone: snap.tombstoneIDs, shadowed: snap.shadowedIDs}
 }
 
+// serviceWatchDelta returns the file-change events for a watch client since
+// each volume's overlay watermark. It reads the published snapshot's overlay
+// records (append-only within a persist epoch) and emits, per FRN touched
+// after that volume's cursor, the transition between the state at the cursor
+// boundary and the state now, filtered through the watch query. This lets a
+// watch client pay only for changed records instead of re-running the full
+// query every tick.
+//
+// The cursor is the overlay watermark (len of overlay.records at snapshot
+// time). On background persist the overlay is rebuilt and the watermark
+// resets to 0; a requested cursor beyond the current watermark means that
+// volume's cursor is stale, and the caller must re-baseline that volume.
+func serviceWatchDelta(volumes []*serviceVolumeIndex, since []watchVolumeCursor, pq parsedQuery, trace *searchTrace) ([]watchVolumeCursor, []watchDeltaEvent, error) {
+	if len(volumes) == 0 {
+		return since, nil, nil
+	}
+	sinceMap := make(map[string]uint64, len(since))
+	for _, c := range since {
+		sinceMap[c.Volume] = c.Seq
+	}
+	out := make([]watchDeltaEvent, 0, 32)
+	cursors := make([]watchVolumeCursor, 0, len(volumes))
+	for _, vol := range volumes {
+		if vol == nil || vol.index == nil {
+			continue
+		}
+		snap := vol.snap.Load()
+		watermark := uint64(0)
+		records := []CompactRecord(nil)
+		if snap != nil {
+			watermark = uint64(snap.watermark)
+			records = snap.records
+			if watermark > uint64(len(records)) {
+				watermark = uint64(len(records))
+			}
+		}
+		sinceSeq, known := sinceMap[vol.volume]
+		if !known {
+			// New volume: baseline it silently at its current watermark.
+			cursors = append(cursors, watchVolumeCursor{Volume: vol.volume, Seq: watermark})
+			continue
+		}
+		if sinceSeq > watermark {
+			// Overlay rebuilt (persist) after this volume's cursor. Signal
+			// reset; the client re-baselines this volume.
+			cursors = append(cursors, watchVolumeCursor{Volume: vol.volume, Seq: watermark, Reset: true})
+			continue
+		}
+		cursors = append(cursors, watchVolumeCursor{Volume: vol.volume, Seq: watermark})
+		if sinceSeq >= watermark {
+			continue
+		}
+		out = append(out, vol.overlayDelta(records, watermark, sinceSeq, pq, trace)...)
+	}
+	return cursors, out, nil
+}
+
+// overlayDelta emits the changed-overlay events for slots [since, watermark).
+// It compares each FRN's state at the cursor boundary against its state now
+// so created/modified/deleted exactly match a poll-and-diff against the
+// previous snapshot, while only walking changed slots.
+func (vol *serviceVolumeIndex) overlayDelta(records []CompactRecord, watermark, since uint64, pq parsedQuery, trace *searchTrace) []watchDeltaEvent {
+	if vol == nil || len(records) == 0 || since >= watermark {
+		return nil
+	}
+	if int(since) >= len(records) {
+		return nil
+	}
+	window := records[since:watermark]
+	if len(window) == 0 {
+		return nil
+	}
+	latest := latestOverlaySlotsByFRN(records)
+	// prevSlots: last slot per FRN at or before the cursor boundary.
+	prevSlots := make(map[uint64]int32)
+	for i := int(since) - 1; i >= 0; i-- {
+		frn := records[i].FRN
+		if frn == 0 {
+			continue
+		}
+		if _, exists := prevSlots[frn]; !exists {
+			prevSlots[frn] = int32(i)
+		}
+	}
+	// curSlots: last slot per FRN in the window (touched since cursor).
+	curSlots := make(map[uint64]int32, len(window))
+	for i := 0; i < len(window); i++ {
+		if frn := window[i].FRN; frn != 0 {
+			curSlots[frn] = int32(i)
+		}
+	}
+	pathCache := make(map[int]string)
+	out := make([]watchDeltaEvent, 0, len(curSlots))
+	for frn, curOffset := range curSlots {
+		curSlot := int(curOffset) + int(since)
+		curRec := records[curSlot]
+		curEntry, curOK := vol.overlaySlotEntry(records, latest, curSlot, make(map[int32]struct{}), pathCache)
+		prevSlot, hadPrev := prevSlots[frn]
+		var prevEntry Entry
+		prevOK := false
+		if hadPrev {
+			prevEntry, prevOK = vol.overlaySlotEntry(records, latest, int(prevSlot), make(map[int32]struct{}), pathCache)
+		}
+		if !prevOK && !curOK && curRec.Deleted {
+			// Created and deleted entirely within the window: nothing to
+			// report, matching poll-and-diff (absent both before and after).
+			continue
+		}
+		var ev *watchDeltaEvent
+		switch {
+		case prevOK && !curOK:
+			if entryMatches(prevEntry, pq, pq.MatchPath) {
+				ev = &watchDeltaEvent{Volume: vol.volume, Event: "deleted", Path: prevEntry.Path}
+			}
+		case !prevOK && curOK:
+			if entryMatches(curEntry, pq, pq.MatchPath) {
+				ev = &watchDeltaEvent{Volume: vol.volume, Event: "created", Path: curEntry.Path}
+			}
+		case prevOK && curOK:
+			if prevEntry.Path != curEntry.Path {
+				// Rename: emit deleted(old)+created(new), matching poll-diff.
+				if entryMatches(prevEntry, pq, pq.MatchPath) {
+					out = append(out, watchDeltaEvent{Volume: vol.volume, Event: "deleted", Path: prevEntry.Path})
+				}
+				if entryMatches(curEntry, pq, pq.MatchPath) {
+					ev = &watchDeltaEvent{Volume: vol.volume, Event: "created", Path: curEntry.Path}
+				}
+			} else if entryMatches(curEntry, pq, pq.MatchPath) && (prevEntry.Size != curEntry.Size || prevEntry.ModUnix != curEntry.ModUnix) {
+				ev = &watchDeltaEvent{Volume: vol.volume, Event: "modified", Path: curEntry.Path}
+			}
+		}
+		if ev == nil {
+			continue
+		}
+		entry := curEntry
+		if ev.Event == "deleted" {
+			entry = prevEntry
+		}
+		if entry.Size != 0 {
+			ev.Size = entry.Size
+		}
+		if entry.ModUnix != 0 {
+			ev.Mtime = time.Unix(0, entry.ModUnix).UTC().Format(time.RFC3339)
+		}
+		out = append(out, *ev)
+	}
+	var created, modified, deleted []watchDeltaEvent
+	for _, ev := range out {
+		switch ev.Event {
+		case "created":
+			created = append(created, ev)
+		case "modified":
+			modified = append(modified, ev)
+		default:
+			deleted = append(deleted, ev)
+		}
+	}
+	sortEvents := func(list []watchDeltaEvent) {
+		sort.Slice(list, func(i, j int) bool { return list[i].Path < list[j].Path })
+	}
+	sortEvents(created)
+	sortEvents(modified)
+	sortEvents(deleted)
+	ordered := make([]watchDeltaEvent, 0, len(out))
+	ordered = append(ordered, created...)
+	ordered = append(ordered, modified...)
+	ordered = append(ordered, deleted...)
+	return ordered
+}
+
+// overlaySlotEntry builds an Entry from a specific overlay slot without
+// requiring the slot to be the FRN's latest state (unlike overlayEntry).
+// Used by the watch-delta path to materialize states at a cursor boundary.
+func (vol *serviceVolumeIndex) overlaySlotEntry(records []CompactRecord, latest map[uint64]int32, slot int, seen map[int32]struct{}, pathCache map[int]string) (Entry, bool) {
+	if vol == nil || slot < 0 || slot >= len(records) {
+		return Entry{}, false
+	}
+	if _, ok := seen[int32(slot)]; ok {
+		return Entry{}, false
+	}
+	seen[int32(slot)] = struct{}{}
+	rec := records[slot]
+	if rec.Deleted {
+		return Entry{}, false
+	}
+	path := vol.overlayRecordPath(records, latest, slot, seen, pathCache)
+	if path == "" {
+		return Entry{}, false
+	}
+	return Entry{
+		Path:        path,
+		Name:        rec.Name,
+		LowerName:   strings.ToLower(rec.Name),
+		LowerPath:   strings.ToLower(path),
+		Mode:        rec.Mode,
+		Size:        rec.Size,
+		ModUnix:     rec.ModUnix,
+		IndexSource: vol.index.Source,
+	}, true
+}
 // overlayLiveMatchCount counts live (non-deleted, latest-slot-per-FRN) overlay
 // records matching pq, reading only through the given snapshot's records
 // slice up to watermark â€” the same walk mergeOverlayMatches performs for a
