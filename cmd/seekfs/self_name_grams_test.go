@@ -12,8 +12,7 @@ import (
 	"time"
 )
 
-func TestOptionalSelfNameGramRoundTripLegacyUnknownAndCorruption(t *testing.T) {
-	idx := dottedPathBenchmarkIndex(2_000)
+func TestOptionalSelfNameGramRoundTripLegacyUnknownAndCorruption(t *testing.T) {	idx := dottedPathBenchmarkIndex(2_000)
 	selective := buildSelectiveNameTrigramIndex(idx, 1)
 	if len(selective.omitted) == 0 {
 		t.Fatal("fixture did not produce an omitted common gram")
@@ -287,5 +286,57 @@ func BenchmarkCompleteSelfNameGramSource(b *testing.B) {
 		data := encodeGramPostingSection(extra, nil)
 		b.ReportMetric(float64(len(data)), "section_bytes")
 		b.ReportMetric(float64(time.Since(start).Microseconds()), "build_us")
+	}
+}
+
+// TestShortCompanionTermRidesGramIntersection covers the 2-rune companion
+// fix: a query like "acme lg" must drive candidate generation from the
+// long term's gram intersection and enforce the short term via the final
+// substring fold, instead of declining to the bounded scan.
+func TestShortCompanionTermRidesGramIntersection(t *testing.T) {
+	idx := dottedPathBenchmarkIndex(50_000)
+	selective := buildSelectiveNameTrigramIndex(idx, 1)
+	extra := optionalSelfNameGramIndex(idx, selective)
+	if extra == nil {
+		t.Fatal("fixture did not produce a complete common-gram companion")
+	}
+	base := decodeGramPostingIndex(encodeGramPostingSection(selective, nil), idx.compactRecordCount())
+	companion := decodeGramPostingIndex(encodeGramPostingSection(extra, nil), idx.compactRecordCount())
+	idx.Derived.NameTrigrams = base
+	idx.Derived.SelfNameTrigrams = companion
+	vol := newServiceVolumeIndex("self-gram.gsi", idx)
+
+	trace := &searchTrace{}
+	pq := parsedQuery{Trace: trace}
+	terms := []string{"nrrd", "x1"}
+	out, ok := vol.completeMultiTermNameGramCandidates(terms, serviceNameTrigramCandidateMaxIDs, pq)
+	if !ok {
+		t.Fatalf("multi-term lane declined short companion: declines=%v", trace.Declines)
+	}
+	want := 0
+	for id := 0; id < idx.compactRecordCount(); id++ {
+		if vol.nameTrigramCandidateMatches(id, "nrrd") && vol.nameTrigramCandidateMatches(id, "x1") {
+			want++
+		}
+	}
+	if len(out) != want {
+		t.Fatalf("short-companion result=%d oracle=%d", len(out), want)
+	}
+	if trace.FilenameDriver == "" {
+		t.Fatal("expected posting-intersection driver in trace")
+	}
+
+	// All-short term lists must decline (no gram driver) rather than
+	// advertise a complete empty or complete result.
+	allShortTrace := &searchTrace{}
+	if out, ok := vol.completeMultiTermNameGramCandidates([]string{"x1", "ab"}, serviceNameTrigramCandidateMaxIDs, parsedQuery{Trace: allShortTrace}); ok {
+		t.Fatalf("all-short terms should decline, got %d results", len(out))
+	}
+
+	// A short companion with an exactly-empty gram term stays exactly empty.
+	emptyTrace := &searchTrace{}
+	out, ok = vol.completeMultiTermNameGramCandidates([]string{"zzzz-no-hit", "x1"}, serviceNameTrigramCandidateMaxIDs, parsedQuery{Trace: emptyTrace})
+	if !ok || len(out) != 0 || emptyTrace.Source != "exact-empty" {
+		t.Fatalf("short companion + empty gram term: ok=%v out=%d source=%q", ok, len(out), emptyTrace.Source)
 	}
 }

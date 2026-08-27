@@ -377,18 +377,36 @@ func (vol *serviceVolumeIndex) completeMultiTermNameGramCandidates(terms []strin
 	}
 	// Collect complete gram iterators for every term.  A term is complete
 	// only when each required gram is stored in PNGR or PNGC, or the
-	// completeness metadata proves an exact empty.
+	// completeness metadata proves an exact empty.  Terms shorter than a
+	// gram (1-2 runes) cannot drive candidate generation, but the final
+	// fold verifies every term as a plain substring, so they ride along as
+	// verify-only terms: the gram intersection from the longer terms
+	// narrows the pool and the fold enforces the short terms exactly.
+	gramTerms := make([]string, 0, len(terms))
+	shortTerms := make([]string, 0, len(terms))
+	for _, term := range terms {
+		if len(term) < 3 {
+			shortTerms = append(shortTerms, term)
+			continue
+		}
+		gramTerms = append(gramTerms, term)
+	}
+	if len(gramTerms) == 0 {
+		if len(shortTerms) > 0 {
+			if pq.Trace != nil {
+				pq.Trace.setDecline("name-trigram:no-gram-driver-term")
+			}
+		}
+		return nil, false
+	}
 	type termIters struct {
 		term   string
 		its    []postingBlockIterator
 		counts []int
 	}
-	perTerm := make([]termIters, 0, len(terms))
+	perTerm := make([]termIters, 0, len(gramTerms))
 	exactEmpty := false
-	for _, term := range terms {
-		if len(term) < 3 {
-			return nil, false
-		}
+	for _, term := range gramTerms {
 		its, counts, exactZero, complete := completeSelfNameGramIterators(vol.index, term)
 		if !complete {
 			if pq.Trace != nil {
@@ -410,6 +428,8 @@ func (vol *serviceVolumeIndex) completeMultiTermNameGramCandidates(terms []strin
 	}
 	if len(perTerm) == 0 {
 		if exactEmpty {
+			// Every gram term is exactly empty, so no record can match the
+			// full query regardless of the short terms.
 			if pq.Trace != nil {
 				pq.Trace.FilenameDriver = "exact-empty"
 				pq.Trace.setSource("exact-empty", 0)
@@ -427,7 +447,9 @@ func (vol *serviceVolumeIndex) completeMultiTermNameGramCandidates(terms []strin
 	driver := perTerm[0]
 	// Single-term rescue: without companion terms to shrink the set, a very
 	// common driver gram would be materialized in full only to intersect
-	// against itself.  Leave those to the bounded-scan fallback.
+	// against itself.  A short companion term changes that trade: its
+	// substring fold shrinks the driver's result set, so allow a somewhat
+	// larger driver when one is present.
 	if len(terms) == 1 && driver.counts[0] > serviceSingleTermPNGCDriverMaxIDs {
 		if pq.Trace != nil {
 			pq.Trace.setDecline("name-trigram:single-term-driver-too-large")
@@ -481,7 +503,8 @@ func (vol *serviceVolumeIndex) completeMultiTermNameGramCandidates(terms []strin
 		sortUint32s(ids)
 	}
 	// Final fold: each candidate must contain every query term as a
-	// substring of its name.
+	// substring of its name, including the 1-2 rune terms that could not
+	// contribute grams.
 	ints := uint32sToInts(ids)
 	if len(ints) < serviceTrigramParallelVerifyMinIDs {
 		out := make([]int, 0, len(ints))
