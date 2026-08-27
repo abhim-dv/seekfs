@@ -151,6 +151,7 @@ func buildMultiTermFuzzyTestVolume(t *testing.T) *serviceVolumeIndex {
 		"annual-report-2024.pdf",
 		"report.docx",
 		"q4-report-notes.pdf",
+		"build-log.txt",
 		"unrelated-image.png",
 	} {
 		add(name)
@@ -202,8 +203,59 @@ func TestMultiTermFuzzyRewriteTrialsFixBrokenTermFirst(t *testing.T) {
 	}
 }
 
-func TestTryMultiTermFuzzyRewriteMaskedSubstringStillFires(t *testing.T) {
+// TestShortTermFuzzyInsertionRewrite covers the 2-rune companion path:
+// "lg" cannot enter the deletion-variant machinery, so insertion variants
+// must propose a proven real word ("log") and the rewritten query must hit.
+func TestShortTermFuzzyInsertionRewrite(t *testing.T) {
 	vol := buildMultiTermFuzzyTestVolume(t)
+	volumes := []*serviceVolumeIndex{vol}
+	opts := queryOptions{Query: "build lg", Limit: 10}
+	pq, err := parseQuery(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	trials := multiTermFuzzyRewriteTrials(volumes, opts, pq)
+	if len(trials) == 0 {
+		t.Fatal("expected insertion-variant rewrite trials for lg")
+	}
+	found := false
+	for _, trial := range trials {
+		if trial.Sub.From != "lg" {
+			continue
+		}
+		if !strings.Contains(trial.Sub.To, "log") {
+			continue
+		}
+		rewritten, err := searchServiceVolumes(volumes, trial.Opts, false)
+		if err != nil || len(rewritten) == 0 {
+			t.Fatalf("trial lg->%q gave %d results err=%v", trial.Sub.To, len(rewritten), err)
+		}
+		for _, entry := range rewritten {
+			name := strings.ToLower(entry.Name)
+			if !strings.Contains(name, "build") || !strings.Contains(name, "log") {
+				t.Fatalf("result %q lacks build+log", entry.Name)
+			}
+		}
+		found = true
+		break
+	}
+	if !found {
+		t.Fatalf("no viable lg->*log* trial among %+v", trials)
+	}
+
+	// End to end: zero exact results, then the fuzzy chain rewrites lg->log.
+	matches, err := searchServiceVolumes(volumes, opts, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fuzzied := false
+	handled := tryMultiTermFuzzyRewrite(volumes, &opts, &matches, &fuzzied)
+	if !handled || !fuzzied || len(matches) == 0 {
+		t.Fatalf("handled=%v fuzzied=%v results=%d; want lg->log rewrite to produce results", handled, fuzzied, len(matches))
+	}
+}
+
+func TestTryMultiTermFuzzyRewriteMaskedSubstringStillFires(t *testing.T) {	vol := buildMultiTermFuzzyTestVolume(t)
 	// A name containing the typo as a literal substring makes the broken term
 	// look healthy to a solo check; the masked-term trial must still fire.
 	vol.applyUSNChanges([]usnChange{{FRN: 900, ParentFRN: 10, USN: 12, Reason: usnReasonFileCreate, Name: "coreproto.txt"}})

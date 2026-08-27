@@ -370,6 +370,13 @@ func fuzzySoloMatchCount(volumes []*serviceVolumeIndex, termLower string, stopAt
 	if utf8.RuneCountInString(termLower) < fuzzyMinTermRunes || strings.ContainsAny(termLower, `\/*?[]:`) {
 		return stopAt, true
 	}
+	return fuzzySoloMatchCountAllowShort(volumes, termLower, stopAt)
+}
+
+// fuzzySoloMatchCountAllowShort is fuzzySoloMatchCount without the rune
+// length gate, used by the short-term insertion path whose variants are
+// full-length but whose metadata may be unavailable.
+func fuzzySoloMatchCountAllowShort(volumes []*serviceVolumeIndex, termLower string, stopAt int) (int, bool) {
 	count := 0
 	evaluated := false
 	for _, vol := range volumes {
@@ -525,10 +532,33 @@ func multiTermFuzzyRewriteTrials(volumes []*serviceVolumeIndex, opts queryOption
 	fields := strings.Fields(opts.Query)
 	broken := make([]fuzzyRewriteTrial, 0, 2)
 	masked := make([]fuzzyRewriteTrial, 0, 2)
+	shortFirst := make([]fuzzyRewriteTrial, 0, 2)
 	for _, term := range pq.Terms {
 		low := foldFuzzyText(strings.ToLower(term))
-		if utf8.RuneCountInString(low) < fuzzyMinTermRunes || strings.ContainsAny(low, `\/*?[]:`) {
+		if strings.ContainsAny(low, `\/*?[]:`) {
 			continue // ineligible terms stay exact; they never block the rewrite
+		}
+		if utf8.RuneCountInString(low) < fuzzyMinTermRunes {
+			// A 1-2 rune term has no deletion neighborhood (the correct
+			// spelling is longer, not shorter) and no gram posting of its
+			// own.  Its plausible corrections are insertion variants:
+			// "lg" -> "log" adds a rune.  Score insertion candidates with
+			// gram-count metadata and rewrite the best proven one.  These
+			// trials always rank first: a short term in a zero-result query
+			// is the strongest possible typo signal.
+			for _, trial := range fuzzyShortTermInsertionTrials(volumes, opts, term, low) {
+				if trial.Sub.To == low {
+					continue
+				}
+				if trial.Opts.Query == opts.Query {
+					continue
+				}
+				shortFirst = append(shortFirst, trial)
+				if len(shortFirst) >= 2 {
+					break
+				}
+			}
+			continue
 		}
 		// Solo health cannot be the gate here: typos like "llog" are real
 		// substrings with dozens of unrelated matches, and popular terms'
@@ -570,7 +600,105 @@ func multiTermFuzzyRewriteTrials(volumes []*serviceVolumeIndex, opts queryOption
 			break
 		}
 	}
-	return append(broken, masked...)
+	all := append(shortFirst, broken...)
+	all = append(all, masked...)
+	if len(all) > maxTrials {
+		all = all[:maxTrials]
+	}
+	return all
+}
+
+// fuzzyShortTermInsertionTrials builds rewrite trials for a 1-2 rune term by
+// inserting one ASCII letter in every position (2-rune) or appending/prepending
+// one letter (1-rune), keeping candidates whose gram-count metadata proves a
+// real filename substring presence.  Trials are ordered best-first: higher
+// bottleneck gram count and (tie) alphabetically stable.  The rewritten query
+// keeps every other option (limit, under, recent, ...) from the original.
+func fuzzyShortTermInsertionTrials(volumes []*serviceVolumeIndex, opts queryOptions, origTerm, low string) []fuzzyRewriteTrial {
+	runes := []rune(low)
+	if len(runes) >= fuzzyMinTermRunes || len(runes) == 0 {
+		return nil
+	}
+	var candidates []string
+	if len(runes) == 2 {
+		for c := 'a'; c <= 'z'; c++ {
+			candidates = append(candidates, string(c)+low, string(runes[0])+string(c)+string(runes[1]), low+string(c))
+		}
+	} else {
+		for c := 'a'; c <= 'z'; c++ {
+			candidates = append(candidates, string(c)+low, low+string(c))
+		}
+	}
+	type scored struct {
+		variant string
+		score   int
+	}
+	var out []scored
+	for _, variant := range candidates {
+		score := 0
+		proven := false
+		for _, vol := range volumes {
+			s, ok := fuzzyTermMinGramCount(vol, variant)
+			if !ok {
+				continue
+			}
+			proven = true
+			if s > score {
+				score = s
+			}
+		}
+	if !proven {
+		// No volume's metadata could judge; fall back to a cheap
+		// stop-at-first-match solo probe per variant.  The rune-length gate
+		// inside fuzzySoloMatchCount is bypassed: the whole point of the
+		// insertion path is 1-2 rune source terms, and the variants are
+		// full-length words.
+		if count, evaluated := fuzzySoloMatchCountAllowShort(volumes, variant, 1); evaluated && count > 0 {
+			out = append(out, scored{variant: variant, score: 1})
+		}
+		continue
+	}
+		if score <= 0 {
+			continue
+		}
+		out = append(out, scored{variant: variant, score: score})
+	}
+	// Deterministic order: score desc, then variant asc.
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].score != out[j].score {
+			return out[i].score > out[j].score
+		}
+		return out[i].variant < out[j].variant
+	})
+	trials := make([]fuzzyRewriteTrial, 0, 2)
+	for _, s := range out {
+		if len(trials) >= 2 {
+			break
+		}
+		if s.variant == low {
+			continue
+		}
+		fields := strings.Fields(opts.Query)
+		replaced := make([]string, len(fields))
+		done := false
+		for i, field := range fields {
+			if !done && strings.ToLower(field) == origTerm {
+				replaced[i] = s.variant
+				done = true
+			} else {
+				replaced[i] = field
+			}
+		}
+		if !done {
+			continue
+		}
+		newOpts := opts
+		newOpts.Query = strings.Join(replaced, " ")
+		// The rewritten query is exact; the explicit fuzzy tier stays off.
+		newOpts.Fuzzy = false
+		trials = append(trials, fuzzyRewriteTrial{Opts: newOpts, Sub: fuzzyTermSubstitution{From: origTerm, To: s.variant}})
+	}
+	return trials
 }
 
 // tryMultiTermFuzzyRewrite runs the multi-term fuzzy chain against an
