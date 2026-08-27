@@ -2675,6 +2675,9 @@ type dbInfo struct {
 	PersistFailures   int                 `json:"persist_failures,omitempty"`
 	PersistRetryAfter string              `json:"persist_retry_after,omitempty"`
 	LastPersistError  string              `json:"last_persist_error,omitempty"`
+	LastReplayAt      string              `json:"last_replay_at,omitempty"`
+	LastReplayError   string              `json:"last_replay_error,omitempty"`
+	LastReplayNext    int64               `json:"last_replay_next,omitempty"`
 	QueryExtKeys      int                 `json:"query_ext_keys,omitempty"`
 	QueryDirs         int                 `json:"query_dirs,omitempty"`
 	NameOrderState    string              `json:"name_order_state,omitempty"`
@@ -2772,6 +2775,8 @@ type serviceVolumeIndex struct {
 	recentIDs         map[int]struct{}
 	nameTrigramRecent map[int]struct{}
 	recentSeq         uint64
+	replayGen         atomic.Uint64
+	persistGen        atomic.Uint64
 	underCache        map[int]postingCacheEntry
 	underRootCache    map[string]postingCacheEntry
 	dirty             bool
@@ -2779,6 +2784,13 @@ type serviceVolumeIndex struct {
 	persistFailures   int
 	persistRetryAfter time.Time
 	lastPersistErr    string
+	lastReplayAt      time.Time
+	lastReplayErr     string
+	lastReplayNext    int64
+	replayStrikes     int
+	stallObservedCp   int64
+	stallObservedAt   time.Time
+	recovering        atomic.Bool
 	searchCount       uint64
 	overlay           *overlaySegment
 	snap              atomic.Pointer[volumeSnapshot]
@@ -3029,6 +3041,25 @@ func cmdLaunch(args []string) error {
 		return nil
 	}
 	fmt.Printf("installed: %t\nrunning: %t\npipe_reachable: %t\nentries: %d\nquery_ok: %t\n", resp.Installed, resp.Running, resp.PipeReachable, resp.Entries, resp.QueryOK)
+	for _, db := range resp.DBs {
+		fresh := db.State == "ready" && db.LastReplayError == ""
+		state := db.State
+		if state == "ready" && db.LastReplayError != "" {
+			state = "replay-error"
+		}
+		line := fmt.Sprintf("  volume %s: state=%s entries=%d", db.Volume, state, db.Entries)
+		if !fresh {
+			reason := db.StaleReason
+			if reason == "" {
+				reason = db.LastReplayError
+			}
+			if reason == "" {
+				reason = "unknown"
+			}
+			line += " [" + reason + "]"
+		}
+		fmt.Println(line)
+	}
 	if !resp.OK {
 		return errors.New(resp.Message)
 	}
@@ -3264,6 +3295,25 @@ func cmdDoctor(args []string) error {
 		return nil
 	}
 	fmt.Printf("installed: %t\nrunning: %t\npipe_reachable: %t\nentries: %d\nquery_ok: %t\n", resp.Installed, resp.Running, resp.PipeReachable, resp.Entries, resp.QueryOK)
+	for _, db := range resp.DBs {
+		fresh := db.State == "ready" && db.LastReplayError == ""
+		state := db.State
+		if state == "ready" && db.LastReplayError != "" {
+			state = "replay-error"
+		}
+		line := fmt.Sprintf("  volume %s: state=%s entries=%d", db.Volume, state, db.Entries)
+		if !fresh {
+			reason := db.StaleReason
+			if reason == "" {
+				reason = db.LastReplayError
+			}
+			if reason == "" {
+				reason = "unknown"
+			}
+			line += " [" + reason + "]"
+		}
+		fmt.Println(line)
+	}
 	if !resp.OK {
 		return errors.New(resp.Message)
 	}
@@ -3744,6 +3794,7 @@ func (s *goSearchService) loadConfiguredIndexes() error {
 			go s.staleRecoveryLoop(vol)
 		}
 	}
+	go s.replayStallWatchdog()
 	serviceLog("loaded %d dbs entries=%d elapsed=%s", len(indexes), total, time.Since(start).Round(time.Millisecond))
 	return nil
 }
@@ -4282,21 +4333,36 @@ var (
 	replayErrorDelay    = 5 * time.Second
 	staleRecoveryDelay  = 30 * time.Second
 	staleRecoveryMax    = 5 * time.Minute
+	replayStallCheck          = 15 * time.Second
+	replayStallWindow         = 2 * time.Minute
+	replayStallRebuildStrikes = 3
 )
 
 func (s *goSearchService) replayVolumeLoop(vol *serviceVolumeIndex) {
 	buffer := make([]byte, 4*1024*1024)
+	gen := vol.replayGen.Load()
 	for {
+		if cur := vol.replayGen.Load(); cur != gen {
+			// A watchdog restart or rebuild took ownership; retire quietly.
+			return
+		}
 		select {
 		case <-s.stop:
 			return
 		default:
 		}
+		vol.mu.Lock()
+		vol.lastReplayAt = time.Now()
+		vol.mu.Unlock()
 		if err := s.replayVolumeOnce(vol, buffer); err != nil {
 			serviceLog("background replay error volume=%s db=%s err=%v", vol.volume, vol.dbPath, err)
+			vol.mu.Lock()
+			vol.lastReplayErr = err.Error()
+			vol.mu.Unlock()
 			if shouldRebuildStaleIndex(err) {
 				rebuildErr := s.rebuildVolumeInPlace(vol)
 				if rebuildErr == nil {
+					gen = vol.replayGen.Load()
 					time.Sleep(replayIdleDelay)
 					continue
 				}
@@ -4313,11 +4379,118 @@ func (s *goSearchService) replayVolumeLoop(vol *serviceVolumeIndex) {
 	}
 }
 
+// replayStallWatchdog is the trust-pack safety net for the live USN replay
+// loop. A healthy volume advances its checkpoint whenever the journal has
+// data ahead; a volume whose checkpoint stops moving for replayStallWindow
+// while the journal still reports data past it is silently broken (the
+// replay goroutine may be wedged in a blocked read, or the OS journal read
+// is returning EOF early). The watchdog marks such a volume stale so the
+// stale-recovery path rebuilds it instead of quietly missing every change.
+func (s *goSearchService) replayStallWatchdog() {
+	ticker := time.NewTicker(replayStallCheck)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.stop:
+			return
+		case <-ticker.C:
+			s.indexMu.RLock()
+			volumes := append([]*serviceVolumeIndex(nil), s.volumes...)
+			s.indexMu.RUnlock()
+			for _, vol := range volumes {
+				if vol == nil || vol.index == nil || vol.volume == "" || vol.dbPath == "" {
+					continue
+				}
+				s.checkReplayStall(vol)
+			}
+		}
+	}
+}
+
+func (s *goSearchService) checkReplayStall(vol *serviceVolumeIndex) {
+	vol.mu.Lock()
+	if vol.state != "ready" || vol.recovering.Load() {
+		vol.mu.Unlock()
+		return
+	}
+	lastReplay := vol.lastReplayAt
+	cp := vol.checkpoint
+	vol.mu.Unlock()
+	if lastReplay.IsZero() {
+		// Replay loop never stamped progress: give it a full window first.
+		return
+	}
+	// Note: the loop heartbeat (lastReplayAt) is deliberately NOT used as a
+	// gate here. A loop that spins without consuming (the observed C: failure
+	// mode) keeps stamping it, so only checkpoint progress is ground truth.
+	handle, err := openVolume(vol.volume)
+	if err != nil {
+		return
+	}
+	defer windows.CloseHandle(handle)
+	journal, err := queryUSNJournal(handle)
+	if err != nil {
+		return
+	}
+	s.observeReplayStall(vol, cp, journal.NextUsn)
+}
+
+// observeReplayStall applies the graduated stall policy given the volume's
+// checkpoint and the live journal position: observation first, replay-loop
+// restart second, index rebuild last. Called with the journal confirmed to
+// hold data past cp.
+func (s *goSearchService) observeReplayStall(vol *serviceVolumeIndex, cp, journalNext int64) {
+	vol.mu.Lock()
+	// Require the checkpoint to be frozen across two consecutive
+	// observations so a slow-but-moving replay (large backlog batches) is
+	// not misclassified.
+	if vol.stallObservedCp != cp || vol.stallObservedAt.IsZero() {
+		vol.stallObservedCp = cp
+		vol.stallObservedAt = time.Now()
+		vol.mu.Unlock()
+		return
+	}
+	if time.Since(vol.stallObservedAt) < replayStallWindow {
+		vol.mu.Unlock()
+		return
+	}
+
+	vol.stallObservedCp = 0
+	vol.stallObservedAt = time.Time{}
+	vol.replayStrikes++
+	strikes := vol.replayStrikes
+	vol.mu.Unlock()
+	// First response is cheap: restart only the replay loop. The index is
+	// healthy, so a full rebuild is avoided unless restarts fail repeatedly.
+	if strikes < replayStallRebuildStrikes {
+		reason := fmt.Sprintf("replay stall: checkpoint %d frozen while journal next is %d; restarting replay loop (strike %d/%d)", cp, journalNext, strikes, replayStallRebuildStrikes)
+		serviceLog("replay stall detected volume=%s reason=%s", vol.volume, reason)
+		vol.mu.Lock()
+		vol.lastReplayErr = reason
+		vol.mu.Unlock()
+		vol.replayGen.Add(1) // retires the wedged loop at its next apply
+		go s.replayVolumeLoop(vol)
+		return
+	}
+	reason := fmt.Sprintf("replay stall: checkpoint %d frozen while journal next is %d; %d restarts did not help, rebuilding", cp, journalNext, strikes)
+	serviceLog("replay stall detected volume=%s reason=%s", vol.volume, reason)
+	s.indexMu.Lock()
+	vol.state = "stale"
+	vol.staleReason = reason
+	vol.lastReplayErr = "replay stall watchdog"
+	s.indexMu.Unlock()
+	// Kick the stale recovery path so the volume is rebuilt rather than
+	// waiting for the wedged replay goroutine.
+	go s.staleRecoveryLoop(vol)
+}
+
 // staleRecoveryLoop retries a volume that started stale until its index is
 // rebuilt, with exponential backoff between attempts.  On success it swaps
 // the rebuilt volume in and starts the normal replay/persist loops.  If some
 // other path recovers the volume first, the loop exits.
 func (s *goSearchService) staleRecoveryLoop(vol *serviceVolumeIndex) {
+	vol.recovering.Store(true)
+	defer vol.recovering.Store(false)
 	delay := staleRecoveryDelay
 	for {
 		select {
@@ -4341,12 +4514,16 @@ func (s *goSearchService) staleRecoveryLoop(vol *serviceVolumeIndex) {
 		}
 		go s.replayVolumeLoop(vol)
 		go s.persistVolumeLoop(vol)
+		vol.mu.Lock()
+		vol.replayStrikes = 0
+		vol.mu.Unlock()
 		serviceLog("stale recovery complete volume=%s db=%s entries=%d", vol.volume, vol.dbPath, vol.index.entryCount())
 		return
 	}
 }
 
 func (s *goSearchService) replayVolumeOnce(vol *serviceVolumeIndex, buffer []byte) error {
+	gen := vol.replayGen.Load()
 	handle, err := openVolume(vol.volume)
 	if err != nil {
 		return err
@@ -4386,7 +4563,9 @@ func (s *goSearchService) replayVolumeOnce(vol *serviceVolumeIndex, buffer []byt
 		appliedCheckpoint = changes[len(changes)-1].USN
 	}
 	vol.mu.Lock()
-	if vol.checkpoint != startUSN {
+	if vol.checkpoint != startUSN || vol.replayGen.Load() != gen {
+		// Another path (stale rebuild) replaced the index while this read was
+		// in flight; its replay owns the volume now. Drop this batch.
 		vol.mu.Unlock()
 		return nil
 	}
@@ -4401,6 +4580,12 @@ func (s *goSearchService) replayVolumeOnce(vol *serviceVolumeIndex, buffer []byt
 	vol.index.Checkpoint = appliedCheckpoint
 	vol.state = "ready"
 	vol.staleReason = ""
+	vol.lastReplayAt = time.Now()
+	vol.lastReplayNext = nextUSN
+	vol.lastReplayErr = ""
+	vol.replayStrikes = 0
+	vol.stallObservedCp = 0
+	vol.stallObservedAt = time.Time{}
 	vol.dirty = true
 	vol.mu.Unlock()
 	return nil
@@ -4409,7 +4594,12 @@ func (s *goSearchService) replayVolumeOnce(vol *serviceVolumeIndex, buffer []byt
 func (s *goSearchService) persistVolumeLoop(vol *serviceVolumeIndex) {
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
+	gen := vol.persistGen.Load()
 	for {
+		if cur := vol.persistGen.Load(); cur != gen {
+			// A replacement persist loop took ownership; retire quietly.
+			return
+		}
 		select {
 		case <-s.stop:
 			s.persistVolumeIfDue(vol, true)
@@ -4808,6 +4998,8 @@ func (s *goSearchService) rebuildWalkVolumeInPlace(vol *serviceVolumeIndex, reas
 	rebuilt := newServiceVolumeIndex(vol.dbPath, loaded)
 	rebuilt.state = "ready"
 	rebuilt.staleReason = ""
+	vol.replayGen.Add(1)
+	vol.persistGen.Add(1)
 	replaceServiceVolumeContents(vol, rebuilt)
 	for i, existing := range s.volumes {
 		if existing == vol {
@@ -4857,6 +5049,8 @@ func (s *goSearchService) rebuildVolumeInPlace(vol *serviceVolumeIndex) error {
 	rebuilt := newServiceVolumeIndex(vol.dbPath, loaded)
 	rebuilt.state = "ready"
 	rebuilt.staleReason = ""
+	vol.replayGen.Add(1)
+	vol.persistGen.Add(1)
 	replaceServiceVolumeContents(vol, rebuilt)
 	for i, existing := range s.volumes {
 		if existing == vol {
@@ -7373,9 +7567,14 @@ func handleServiceConn(conn *os.File, s *goSearchService) {
 				Dirty:            vol.dirty,
 				PersistFailures:  vol.persistFailures,
 				LastPersistError: vol.lastPersistErr,
+				LastReplayError:  vol.lastReplayErr,
+				LastReplayNext:   vol.lastReplayNext,
 			}
 			if !vol.lastPersist.IsZero() {
 				info.LastPersist = vol.lastPersist.Format(time.RFC3339Nano)
+			}
+			if !vol.lastReplayAt.IsZero() {
+				info.LastReplayAt = vol.lastReplayAt.Format(time.RFC3339Nano)
 			}
 			if !vol.persistRetryAfter.IsZero() {
 				info.PersistRetryAfter = vol.persistRetryAfter.Format(time.RFC3339Nano)
