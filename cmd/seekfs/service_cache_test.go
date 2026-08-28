@@ -595,6 +595,22 @@ func TestNormalizeSearchArgsMovesFlagsBeforeQuery(t *testing.T) {
 	}
 }
 
+func TestNormalizeSearchArgsKeepsFuzzyFlagOutOfQuery(t *testing.T) {
+	for _, flag := range []string{"-fuzzy", "--fuzzy"} {
+		got := normalizeSearchArgs([]string{"acme", "lg", flag})
+		if len(got) != 3 {
+			t.Fatalf("%s: normalized args = %v, want 3 elements", flag, got)
+		}
+		if got[0] != flag {
+			t.Fatalf("%s: flag should be moved before query terms, got %v", flag, got)
+		}
+		joined := strings.Join(got, " ")
+		if strings.Contains(joined, "fuzzy") && !strings.HasPrefix(joined, flag) {
+			t.Fatalf("%s: -fuzzy leaked into query text: %v", flag, got)
+		}
+	}
+}
+
 func TestServiceVolumeIndexFastPostingCountIncludesRecentAndDeleted(t *testing.T) {
 	vol := syntheticServiceVolumeIndexForCacheTests()
 	vol.recentIDs = map[int]struct{}{1: {}, 3: {}}

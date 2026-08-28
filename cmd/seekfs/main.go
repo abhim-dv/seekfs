@@ -51,6 +51,10 @@ const servicePathNameTrigramCandidateMaxIDs = 250_000
 // over cap or omitted-common) and the complete PNGC intersection lane rescues
 // it instead of falling to a global bounded scan.
 const serviceSingleTermPNGCDriverMaxIDs = 2_000_000
+// serviceShortFoldMaxIDs bounds the posting intersection a 1-2 rune
+// companion term may fold: the fold is a per-record substring check, so it
+// must not run over an unbounded driver result.
+const serviceShortFoldMaxIDs = 4_000_000
 const serviceComponentTrigramCandidateMaxIDs = 10_000
 const serviceComponentTrigramExpansionMaxIDs = 25_000
 const serviceComponentMultiTermScanMaxIDs = 500_000
@@ -893,6 +897,7 @@ func normalizeSearchArgs(args []string) []string {
 		"-service": true, "--service": true, "-local": true, "--local": true,
 		"--exists": true, "-exists": true, "--cwd-bias": true, "-cwd-bias": true,
 		"-case": true, "--case": true, "-exec-shell": true, "--exec-shell": true,
+		"-fuzzy": true, "--fuzzy": true,
 	}
 	flags := make([]string, 0, len(args))
 	query := make([]string, 0, len(args))
