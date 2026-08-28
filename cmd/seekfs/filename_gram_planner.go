@@ -477,6 +477,32 @@ func (vol *serviceVolumeIndex) completeMultiTermNameGramCandidates(terms []strin
 	if len(ids) == 0 {
 		return []int{}, true
 	}
+	// A short companion cannot narrow the posting intersection (it has no
+	// grams), but its substring fold is exactly what shrinks a broad
+	// driver's result.  Fold it before the maxIDs gate: "acme lg"
+	// intersects to millions of acme-name records, and the two-rune fold
+	// cuts that to the handful that also contain "lg".  The pre-fold cap
+	// keeps a pathological driver from paying an unbounded fold.
+	if len(shortTerms) > 0 && len(ids) > serviceShortFoldMaxIDs {
+		if pq.Trace != nil {
+			pq.Trace.setDecline("name-trigram:short-fold-driver-too-large")
+		}
+		return nil, false
+	}
+	for _, short := range shortTerms {
+		if len(ids) == 0 {
+			break
+		}
+		kept := make([]uint32, 0, len(ids)/16+1)
+		for _, id := range ids {
+			if vol.nameTrigramCandidateMatches(int(id), short) {
+				kept = append(kept, id)
+			}
+		}
+		ids = kept
+	}
+	// Empty after the short fold falls through to the final fold below so
+	// the trace still records the posting-intersection driver.
 	// The intersected result must fit within maxIDs; intermediate posting
 	// counts for common PNGC grams are expected to exceed it.
 	if len(ids) > maxIDs {
