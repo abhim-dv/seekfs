@@ -34,3 +34,12 @@ bin/
 .tools/
 seekfs.toml
 AGENTS.local.md
+# Planning/research docs stay local and are never committed.
+docs/*_PLAN.md
+docs/HANDOFF_*.md
+docs/UNIFIED_ENGINE_*.md
+docs/ARCHITECTURE_REVIEW.md
+docs/USER_RESEARCH_*.md
+docs/WATCH_COMMAND_DESIGN.md
+docs/R5_EXHAUSTIVE_IMPLEMENTATION_PLAN.md
+docs/RESEARCH_*.md
