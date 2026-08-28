@@ -104,6 +104,41 @@ func TestParseQueryFuzzyMarker(t *testing.T) {
 	}
 }
 
+func TestParseQueryDropsBarePathSeparatorTokens(t *testing.T) {
+	pq, err := parseQuery(queryOptions{Query: "AGENTS.md / pyproject.toml / ext:py", Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(pq.Terms, "|")
+	if strings.Contains(joined, "/") || strings.Contains(joined, `\`) {
+		t.Fatalf("bare path separators leaked into terms: %v", pq.Terms)
+	}
+	if len(pq.Terms) != 2 || pq.Terms[0] != "agents.md" || pq.Terms[1] != "pyproject.toml" {
+		t.Fatalf("terms = %v, want [agents.md pyproject.toml]", pq.Terms)
+	}
+	if len(pq.Exts) != 1 || pq.Exts[0] != "py" {
+		t.Fatalf("exts = %v, want [py]", pq.Exts)
+	}
+
+	// A real path token with a drive still splits into its components.
+	pqPath, err := parseQuery(queryOptions{Query: "C:/work/src/main.go", Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pathJoined := strings.Join(pqPath.Terms, "|")
+	if strings.Contains(pathJoined, "/") || strings.Contains(pathJoined, `\`) {
+		t.Fatalf("path separators leaked in path-like term: %v", pqPath.Terms)
+	}
+	if len(pqPath.Terms) == 0 {
+		t.Fatal("path-like term should still produce components")
+	}
+
+	// Lone separator with no other terms must not empty the query.
+	if _, err := parseQuery(queryOptions{Query: "/", Limit: 10}); err == nil {
+		t.Fatal("a query of only '/' should error as empty (no searchable terms)")
+	}
+}
+
 // buildFuzzyTestVolume creates a compact service volume whose names exercise
 // distance ranking, prefix preference, and exact-tier separation.
 func buildFuzzyTestVolume(t *testing.T) *serviceVolumeIndex {

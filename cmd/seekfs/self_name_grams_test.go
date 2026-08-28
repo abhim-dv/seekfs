@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/binary"
 	"os"
+	"path/filepath"
 	"runtime"
 	"slices"
 	"sort"
@@ -338,5 +339,99 @@ func TestShortCompanionTermRidesGramIntersection(t *testing.T) {
 	out, ok = vol.completeMultiTermNameGramCandidates([]string{"zzzz-no-hit", "x1"}, serviceNameTrigramCandidateMaxIDs, parsedQuery{Trace: emptyTrace})
 	if !ok || len(out) != 0 || emptyTrace.Source != "exact-empty" {
 		t.Fatalf("short companion + empty gram term: ok=%v out=%d source=%q", ok, len(out), emptyTrace.Source)
+	}
+}
+
+func TestGlobLiteralDrivesGramLane(t *testing.T) {
+	idx := dottedPathBenchmarkIndex(50_000)
+	selective := buildSelectiveNameTrigramIndex(idx, 1)
+	extra := optionalSelfNameGramIndex(idx, selective)
+	if extra == nil {
+		t.Fatal("fixture did not produce a complete common-gram companion")
+	}
+	base := decodeGramPostingIndex(encodeGramPostingSection(selective, nil), idx.compactRecordCount())
+	companion := decodeGramPostingIndex(encodeGramPostingSection(extra, nil), idx.compactRecordCount())
+	idx.Derived.NameTrigrams = base
+	idx.Derived.SelfNameTrigrams = companion
+	vol := newServiceVolumeIndex("self-gram.gsi", idx)
+
+	// A selective literal inside a glob (rare enough to stay under the
+	// candidate cap) must drive the gram lane and land in the result.
+	trace := &searchTrace{}
+	pq := parsedQuery{Trace: trace, Globs: []string{"*backup-000477*"}}
+	if !pqGramsCouldDriveGlobs(pq) {
+		t.Fatal("expected glob literal to be driveable")
+	}
+	out, ok := vol.filenameTrigramCandidates(pq)
+	if !ok {
+		t.Fatalf("filename lane declined glob literal query: declines=%v", trace.Declines)
+	}
+	want := 0
+	for id := 0; id < idx.compactRecordCount(); id++ {
+		name := strings.ToLower(idx.compactRecord(id).Name)
+		ok, _ := filepath.Match("*backup-000477*", name)
+		if ok {
+			want++
+		}
+	}
+	if want == 0 {
+		t.Fatal("fixture must contain a backup-000477 record for the oracle")
+	}
+	if len(out) != want {
+		t.Fatalf("glob-literal candidate=%d oracle=%d", len(out), want)
+	}
+
+	// Character-class globs cannot be reduced to a literal.
+	if pqGramsCouldDriveGlobs(parsedQuery{Globs: []string{"*[ab]x*"}}) {
+		t.Fatal("character-class glob should not be driveable")
+	}
+	if pqGramsCouldDriveGlobs(parsedQuery{Globs: []string{"*a?"}}) {
+		t.Fatal("single-char wildcard glob should not be driveable")
+	}
+}
+
+
+func TestGlobalNameSupportedGlob(t *testing.T) {
+	pq, err := parseQuery(queryOptions{Query: "glob:*acme*", Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("terms=%v globs=%v", pq.Terms, pq.Globs)
+	if !pqGramsCouldDriveGlobs(pq) {
+		t.Fatalf("pqGramsCouldDriveGlobs=false for %v", pq.Globs)
+	}
+	if !globalNameQuerySupported(pq) {
+		t.Fatalf("globalNameQuerySupported=false for glob query; terms=%v globs=%v", pq.Terms, pq.Globs)
+	}
+}
+
+func TestGlobQueryViaGlobalNamePlanner(t *testing.T) {
+	idx := dottedPathBenchmarkIndex(50_000)
+	selective := buildSelectiveNameTrigramIndex(idx, 1)
+	extra := optionalSelfNameGramIndex(idx, selective)
+	base := decodeGramPostingIndex(encodeGramPostingSection(selective, nil), idx.compactRecordCount())
+	companion := decodeGramPostingIndex(encodeGramPostingSection(extra, nil), idx.compactRecordCount())
+	idx.Derived.NameTrigrams = base
+	idx.Derived.SelfNameTrigrams = companion
+	vol := newServiceVolumeIndex("self-gram.gsi", idx)
+	vol.volume = "R:"
+	snapshot := newGlobalQuerySnapshot([]*serviceVolumeIndex{vol}, &searchTrace{})
+
+	opts := queryOptions{Query: "glob:*backup-000477*", Limit: 10}
+	entries, handled, err := searchServiceVolumesGlobalNameSnapshot(snapshot, opts, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !handled {
+		t.Fatal("global name planner declined glob query")
+	}
+	if len(entries) == 0 {
+		t.Fatal("glob query returned no entries via name planner")
+	}
+	for _, e := range entries {
+		ok, _ := filepath.Match("*backup-000477*", strings.ToLower(e.Name))
+		if !ok {
+			t.Fatalf("entry %q does not match glob", e.Name)
+		}
 	}
 }

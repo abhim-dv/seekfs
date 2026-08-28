@@ -3,9 +3,14 @@ package main
 import "strings"
 
 func globalNameQuerySupported(pq parsedQuery) bool {
-	return !pq.CaseSensitive && !pq.MatchPath && len(nonVolumeTerms(pq.Terms)) > 0 &&
+	hasGlobs := len(pq.Globs) > 0
+	if hasGlobs && !pqGramsCouldDriveGlobs(pq) {
+		return false
+	}
+	hasTerms := len(nonVolumeTerms(pq.Terms)) > 0 || (hasGlobs && len(globLiteralTerms(pq.Globs, pq.CaseSensitive)) > 0)
+	return !pq.CaseSensitive && !pq.MatchPath && hasTerms &&
 		pq.Type == "" && pq.Under == "" && !pq.Exists && !pq.HasModAfter &&
-		len(pq.Dirs) == 0 && len(pq.Globs) == 0 &&
+		len(pq.Dirs) == 0 &&
 		len(pq.Regexps) == 0 && len(pq.RegexTerms) == 0 && len(pq.Parents) == 0 &&
 		len(pq.SizeFilters) == 0 && len(pq.DateFilters) == 0 && len(pq.AttrFilters) == 0 &&
 		len(pq.OrGroups) == 0 && len(pq.NotGroups) == 0 && pq.CWDBias == "" && pq.RootBias == ""

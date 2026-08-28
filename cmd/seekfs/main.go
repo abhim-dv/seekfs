@@ -955,8 +955,17 @@ func printUsage(w io.Writer) {
 Agent use:
   seekfs is for indexed file-name and path discovery, preferably through the
   resident service. It is not a content/symbol search tool; use rg for text
-  matches. Use --under <repo> for repo-scoped file discovery and run
-  seekfs agent for automation guidance.
+  matches.
+
+  If you are an agent (LLM, script, or automation), run "seekfs agent" first:
+  it explains how to query fast, what works well, and what to avoid so you
+  do not fall into a slow full-volume scan.
+
+  Quick start for agents:
+    seekfs agent                -> agent-focused guidance (read this first)
+    seekfs search --under <repo> "query"   -> repo-scoped discovery
+    seekfs count --under <repo> "query"    -> count matching entries
+    seekfs loaded --json        -> what volumes are indexed & fresh
 
 Agent starting points:
   seekfs agent
@@ -1097,11 +1106,73 @@ Agent usage rules:
   If seekfs is not on PATH, try the installed/repo binary directly:
     F:\git\seekfs\seekfs.exe search "gh.exe"
 
+How to query well (learned from real agent usage):
+  Prefer filename terms over path terms. Name-only search is the fastest,
+  most reliable lane. Add -path only when the directory structure matters.
+  Scope with --under whenever you know the workspace:
+    seekfs search --under F:\git\seekfs "ext:go main"
+  Use count first to probe scale before pulling results:
+    seekfs count --under F:\git\seekfs "ext:go"
+  Combine terms to narrow: the engine intersects filename terms, so
+  "main.go router" finds files whose names contain both. The intersection
+  shrinks the candidate pool and keeps the search fast.
+  Use ext: to bound by type instead of adding a glob:
+    seekfs search --under F:\git\seekfs "main ext:go"     (fast)
+    seekfs search --under F:\git\seekfs "glob:*.go main"  (usually fine)
+  When you need a file you know the approximate name of, a plain substring
+  term beats a glob: "report" finds report.pdf, reports/, reporting.md.
+
+Pitfalls that force the slow full-volume scan:
+  - Leading wildcards with a rare literal: glob:*acme* has no indexed
+    gram for the middle run, so it scans the whole index. Use a plain term
+    ("acme") instead, or scope with --under.
+  - Character-class globs (glob:*[ab]* or glob:*a?) cannot be reduced to a
+    literal; they always scan. Prefer a plain term or regex.
+  - Regex searches always scan the full path space. Prefer plain terms +
+    ext:/dir: filters, and add --under.
+  - Extremely common single terms with no other constraint (e.g. "log" alone
+    across the whole disk) are broad; add a second term, an ext:, or --under.
+  - Remember: seekfs is not a content search. Do not query for words inside
+    files; that is rg's job.
+
 Performance guidance:
   Start with filename-only search for exact names and executables:
     seekfs search "gh.exe"
   Add -path only for path-aware queries:
     seekfs search -path "ext:go dir:cmd main"
+
+Fast-path tips (avoid the slow full-volume scan):
+  - Bare "/" separators are ignored, but do not add them as query noise:
+      good:  seekfs search "AGENTS.md pyproject.toml ext:py"
+      slow:  seekfs search "AGENTS.md / pyproject.toml / ext:py"
+  - For repo-local discovery always scope with --under; broad un-scoped
+    multi-term queries can fall to a slow bounded scan:
+      seekfs search --under F:\git\seekfs "ext:go dir:cmd main"
+  - A filename glob is a substring match and is fast when its literal run
+    is indexed:
+      good:  seekfs search "glob:*report*"      (fast)
+             seekfs search "glob:*notes.txt*"   (fast)
+      slow:  seekfs search "glob:*acme*"        (rare word, grams not in
+             the index -> falls back to a full scan)
+    Prefer a plain filename term over a leading-* glob when you only need
+    the middle of a name. If a rare-word glob is slow, run it once with a
+    bounded result set (-n) or scope it with --under, or fall back to rg.
+  - A query that yields zero results is often the fastest signal: the fast
+    lane can prove "no match" in ms, while a slow path means the query
+    could not be answered from the index (rare/odd grams, character-class
+    globs, regex).
+
+Working with results:
+  Use --json for machine-readable output. The default human format is fine
+  for eyeballing. Set default_limit so a broad query does not flood:
+    seekfs config set default_limit 20
+  If a file is not found, check the index is current first:
+    seekfs loaded --json   -> volumes, states, checkpoint freshness
+    seekfs doctor          -> per-volume health and replay state
+  A missing file that rg finds is usually one of: it is newer than the last
+  index build, it lives in an unindexed location (e.g. the seekfs dir itself
+  is never indexed), or the name never matched. Check loaded/doctor before
+  assuming a bug.
 
 Config:
   seekfs reads seekfs.toml from the current directory, the user config dir, or
@@ -11215,13 +11286,41 @@ func (vol *serviceVolumeIndex) nameTrigramCandidates(pq parsedQuery) ([]int, boo
 func (vol *serviceVolumeIndex) filenameTrigramCandidates(pq parsedQuery) ([]int, bool) {
 	trigrams := vol.nameTrigramIndex()
 	if vol == nil || vol.index == nil || (trigrams == nil && vol.index.Derived.SelfNameTrigrams == nil) || pq.CaseSensitive ||
-		pq.MatchPath || len(pq.Terms) == 0 || pq.Under != "" || pq.Type != "" ||
-		len(pq.Globs) > 0 || len(pq.Dirs) > 0 || len(pq.Regexps) > 0 ||
+		pq.MatchPath || pq.Under != "" || pq.Type != "" ||
+		len(pq.Dirs) > 0 || len(pq.Regexps) > 0 ||
 		len(pq.OrGroups) > 0 || len(pq.NotGroups) > 0 || pq.HasModAfter || pq.Exists ||
 		pq.CWDBias != "" || pq.RootBias != "" {
 		return nil, false
 	}
+	// Glob literals can supply the driving terms when the query has no plain
+	// terms of its own (glob:*acme*), or join them.  Without this a
+	// glob-only query is all-orphan and drops to the bounded scan.
+	if len(pq.Terms) == 0 && len(pq.Globs) > 0 && !pqGramsCouldDriveGlobs(pq) {
+		return nil, false
+	}
 	return vol.filenameNgramCandidates(pq, trigrams, serviceNameTrigramCandidateMaxIDs)
+}
+
+// pqGramsCouldDriveGlobs reports whether the query's globs can be driven by
+// gram candidate generation: every glob must yield a literal run of at least
+// three runes so a substring of it can select candidates, and the globs must
+// be verifiable on the record name in the final fold.  A leading wildcard
+// glob like "glob:*acme*" is a substring match, which the trigram lane
+// answers exactly; the blanket "no globs in the fast lane" rule is what made
+// it fall to a 22s bounded scan.
+func pqGramsCouldDriveGlobs(pq parsedQuery) bool {
+	literals := globLiteralTerms(pq.Globs, pq.CaseSensitive)
+	if len(literals) == 0 {
+		return false
+	}
+	for _, glob := range pq.Globs {
+		if strings.ContainsAny(glob, `[]`) || strings.Contains(glob, "?") {
+			// Character classes and single-char wildcards cannot be reduced
+			// to a plain substring literal.
+			return false
+		}
+	}
+	return true
 }
 
 func (vol *serviceVolumeIndex) filenameNgramCandidates(pq parsedQuery, trigrams *compressedTrigramIndex, maxIDs int) ([]int, bool) {
@@ -11233,6 +11332,26 @@ func (vol *serviceVolumeIndex) filenameNgramCandidates(pq parsedQuery, trigrams 
 	}
 	if trigrams == nil {
 		return nil, false
+	}
+	// Glob literals ride into the driving term set when the glob is a plain
+	// substring pattern (glob:*acme*).  pq.Globs stays intact for the
+	// final fold, so this only widens candidate selection, never weakens the
+	// verification.  Without it, any query carrying a glob was forced to the
+	// bounded scan even though a literal run inside it is exactly the kind of
+	// substring the gram lane answers.
+	if len(pq.Globs) > 0 && pqGramsCouldDriveGlobs(pq) {
+		combined := append([]string(nil), pq.Terms...)
+		seen := make(map[string]struct{}, len(combined))
+		for _, t := range combined {
+			seen[t] = struct{}{}
+		}
+		for _, gl := range globLiteralTerms(pq.Globs, pq.CaseSensitive) {
+			if _, ok := seen[gl]; !ok {
+				combined = append(combined, gl)
+				seen[gl] = struct{}{}
+			}
+		}
+		pq.Terms = combined
 	}
 	// Multi-term queries: the selective single-best-term lane verifies only
 	// the best term, admitting false positives for the other terms.  When the
@@ -15866,6 +15985,15 @@ func applyQueryToken(pq *parsedQuery, raw string) error {
 		return nil
 	}
 
+	// Bare path-separator tokens ("/", "\", "\\") are noise from shell
+	// typing: a query like "AGENTS.md / pyproject.toml / ext:py" uses
+	// slashes as visual separators. They carry no search intent and, kept
+	// as terms, would gate the fast lanes (a "/" term cannot drive gram
+	// candidates) and force the slow bounded scan. Drop them.
+	if isBarePathSeparatorToken(raw) {
+		return nil
+	}
+
 	// Negation: !term or -term excludes records matching the inner token.
 	if (strings.HasPrefix(raw, "!") || strings.HasPrefix(raw, "-")) && len(raw) > 1 {
 		inner := raw[1:]
@@ -16100,6 +16228,21 @@ func queryPlainTerms(raw string, caseSensitive, matchPath bool) []string {
 		return []string{normalizeCase(raw, caseSensitive)}
 	}
 	return out
+}
+
+// isBarePathSeparatorToken reports whether raw consists only of path
+// separators (or a drive-less trailing separator), e.g. "/", "\", "\\".
+// Such tokens are visual noise from shell typing, not search intent.
+func isBarePathSeparatorToken(raw string) bool {
+	if raw == "" {
+		return false
+	}
+	for _, r := range raw {
+		if r != '\\' && r != '/' {
+			return false
+		}
+	}
+	return true
 }
 
 func looksLikeImplicitFilenameGlob(raw string) bool {
