@@ -33,3 +33,4 @@ bin/
 .agents/
 .tools/
 seekfs.toml
+AGENTS.local.md
