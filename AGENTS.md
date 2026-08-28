@@ -23,3 +23,9 @@
   one-line JSON object to `.seekfs-agent-findings.jsonl` with the query, command,
   elapsed_ms if known, expected behavior, and fallback used. Do not commit this
   log file.
+- Never put private or identifying terms in commit messages, release notes,
+  changelog entries, docs, or code: no real company names, client names, project
+  codenames, customer paths (e.g. `client_testing`, `dvt4327`), or sample queries
+  built from real files. Use generic placeholders (`acme`, `project-name`,
+  `client-name`, `job-NNNN`) instead, including in perf examples and test
+  fixtures.
