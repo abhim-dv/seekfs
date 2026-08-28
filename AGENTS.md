@@ -1,11 +1,5 @@
 # Repository Instructions
 
-This file is public. Keep it generic: it may contain no private or
-identifying terms, no local machine paths, and no project-internal
-conventions. It exists only to give third-party agents guidance that is
-not already in the README. If a change to this file is needed, ask the
-repository owner first.
-
 ## Using seekfs in this repository
 
 - seekfs searches indexed file names and paths, not file contents. For
