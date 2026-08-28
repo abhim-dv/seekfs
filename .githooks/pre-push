@@ -1,10 +1,17 @@
 #!/bin/sh
 # pre-push: block pushes that would publish blocked/sensitive terms.
-# Delegates to the shared pre-commit script with --check-push, scanning
-# the range origin/<branch>..HEAD for blocked terms in commit subjects.
+# 1) grep block-list over outgoing commit subjects (fast, always on)
+# 2) optional AI review via opencode (off unless SEEKFS_AGENT_REVIEW=1)
 #
 # Install:  git config core.hooksPath .githooks
 
 DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 "$DIR/pre-commit" --check-push "$@"
+GREP_STATUS=$?
+
+if [ "$GREP_STATUS" -ne 0 ]; then
+    exit $GREP_STATUS
+fi
+
+"$DIR/pre-push-agent"
 exit $?

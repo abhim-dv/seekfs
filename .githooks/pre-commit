@@ -9,7 +9,7 @@
 # Install:  git config core.hooksPath .githooks
 # (The pre-push hook reuses this script via --check-push.)
 
-BLOCKED="coterra|acme|reaper|darkformer|macbeth|wolfcamp|cenovus|dvpass|dev-ff"
+BLOCKED="coterra|hades|reaper|darkformer|macbeth|wolfcamp|cenovus|dvpass|dev-ff"
 
 # The block-list itself lives in this hook; never scan .githooks/ (it must
 # mention the terms by design).

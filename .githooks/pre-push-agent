@@ -1,0 +1,63 @@
+#!/bin/sh
+# pre-push-agent: optional AI review of outgoing commits for sensitive/private
+# content that the grep blocklist in pre-commit may miss (unknown client names,
+# internal paths, company-specific identifiers, real usernames).
+#
+# This is SLOW (an LLM call). It is OFF by default. Enable per-push with:
+#     SEEKFS_AGENT_REVIEW=1 git push
+#
+# Delegates to opencode run --agent build (primary agent) in the repo dir.
+# The agent is told exactly what to look for and to reply with a JSON verdict.
+
+if [ "${SEEKFS_AGENT_REVIEW:-0}" != "1" ]; then
+    exit 0
+fi
+
+BRANCH=$(git symbolic-ref --short HEAD 2>/dev/null)
+[ -z "$BRANCH" ] && exit 0
+RANGE="origin/${BRANCH}..HEAD"
+if ! git rev-parse --verify "origin/${BRANCH}" >/dev/null 2>&1; then
+    RANGE="HEAD"
+fi
+
+# Capture the diff + subjects of the range being pushed.
+DIFF_FILE=$(mktemp)
+git log --format='COMMIT %h %s' "$RANGE" > "$DIFF_FILE"
+echo "---" >> "$DIFF_FILE"
+git diff "origin/${BRANCH}..HEAD" >> "$DIFF_FILE" 2>/dev/null
+
+PROMPT="You are reviewing a git diff for sensitive or private information before it is pushed to a public GitHub repository.
+
+Review the commit list and full diff below. Flag anything that appears to be:
+- real company, client, project, or product names (not generic placeholders like acme/acmepy/client)
+- internal/private directory paths or volume layouts (like a real drive root or internal share)
+- employee usernames, email addresses, or personal data
+- private API keys, tokens, secrets, or connection strings
+- internal tooling names or codenames that are not public
+- real dataset, filename, or naming conventions tied to an identifiable organization
+
+Do NOT flag generic placeholders (acme, notes.txt, report, volume-###, fixtureproj, client_...). Do NOT flag standard library or public-tech terms (NTFS, mmap, trigram, etc).
+
+Reply with EXACTLY one line of JSON:
+{\"verdict\":\"ok\"} if nothing sensitive, or
+{\"verdict\":\"block\",\"reasons\":[\"...\",\"...\"]} listing each flagged item with a short reason.
+
+Do not output anything else.
+
+<BEGIN DIFF>
+$(cat "$DIFF_FILE")
+<END DIFF>"
+
+RESULT=$(opencode run --agent build "$PROMPT" 2>/dev/null | tail -1)
+rm -f "$DIFF_FILE"
+
+VERDICT=$(printf '%s' "$RESULT" | grep -o '"verdict":"[a-z]*"' | head -1 | sed 's/.*://;s/"//g')
+if [ "$VERDICT" = "block" ]; then
+    echo "ERROR: AI review found potentially sensitive content in outgoing commits:" 1>&2
+    printf '%s\n' "$RESULT" 1>&2
+    echo "Re-run with SEEKFS_AGENT_REVIEW=0 to force-skip (not recommended)." 1>&2
+    exit 1
+fi
+
+echo "AI review passed."
+exit 0
