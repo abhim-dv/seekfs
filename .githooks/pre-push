@@ -1,0 +1,10 @@
+#!/bin/sh
+# pre-push: block pushes that would publish blocked/sensitive terms.
+# Delegates to the shared pre-commit script with --check-push, scanning
+# the range origin/<branch>..HEAD for blocked terms in commit subjects.
+#
+# Install:  git config core.hooksPath .githooks
+
+DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+"$DIR/pre-commit" --check-push "$@"
+exit $?

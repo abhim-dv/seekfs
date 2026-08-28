@@ -1,0 +1,61 @@
+#!/bin/sh
+# pre-commit: block commits that introduce sensitive/private terms.
+#
+# Fails the commit if the staged diff or the commit message contains any
+# blocked term (case-insensitive substring match). Substring matching
+# catches composite variants (acmepy, client_base_new_workspaces,
+# tables.dvpass, fixtureproj-dev, ...).
+#
+# Install:  git config core.hooksPath .githooks
+# (The pre-push hook reuses this script via --check-push.)
+
+BLOCKED="coterra|acme|reaper|darkformer|macbeth|wolfcamp|cenovus|dvpass|dev-ff"
+
+# The block-list itself lives in this hook; never scan .githooks/ (it must
+# mention the terms by design).
+SELF=".githooks/"
+
+usage() {
+    echo "usage: $0 [--check-push]" 1>&2
+    exit 2
+}
+
+if [ "$1" = "--check-push" ]; then
+    # Check the range being pushed: origin/<branch>..HEAD
+    BRANCH=$(git symbolic-ref --short HEAD 2>/dev/null)
+    [ -z "$BRANCH" ] && exit 0
+    RANGE="origin/${BRANCH}..HEAD"
+    if ! git rev-parse --verify "origin/${BRANCH}" >/dev/null 2>&1; then
+        RANGE="HEAD"   # no upstream yet: check full pushed head
+    fi
+    echo "pre-push: scanning $RANGE for blocked terms"
+    HITS=$(git log --format='%H %s' "$RANGE" 2>/dev/null | grep -inE "$BLOCKED")
+    if [ -n "$HITS" ]; then
+        echo "ERROR: blocked term(s) in commits to be pushed:" 1>&2
+        echo "$HITS" 1>&2
+        echo "Run the full-history scrub or amend the commits before pushing." 1>&2
+        exit 1
+    fi
+    exit 0
+fi
+
+if [ "$1" != "" ]; then
+    usage
+fi
+
+# 1) staged changes (tracked + added), skipping .githooks/ (self)
+for f in $(git diff --cached --name-only 2>/dev/null); do
+    case "$f" in
+        "$SELF"*) continue ;;
+    esac
+    [ -f "$f" ] || continue
+    HITS=$(grep -inE "$BLOCKED" "$f")
+    if [ -n "$HITS" ]; then
+        echo "ERROR: blocked term(s) in staged file '$f':" 1>&2
+        echo "$HITS" 1>&2
+        echo "Remove/rename the offending terms and stage again." 1>&2
+        exit 1
+    fi
+done
+
+exit 0
