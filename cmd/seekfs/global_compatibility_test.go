@@ -168,6 +168,61 @@ func assertCompleteGlobalTrace(t *testing.T, trace *searchTrace, mode string) {
 	}
 }
 
+// TestGlobalBoundedScanPrefilterParity covers the global bounded-scan fallback
+// pre-filters added for broad path queries with a cheap posting source: an
+// ext:/glob-ext: membership filter and a bounded type:dir subtree filter.  Both
+// must return exactly the same paths (and count) as the full scan, in the same
+// order, because the bounded-scan order is the ground-truth top-N.
+func TestGlobalBoundedScanPrefilterParity(t *testing.T) {
+	cIdx := dottedPathBenchmarkIndex(4_000)
+	fIdx := dottedPathBenchmarkIndex(4_000)
+	fIdx.Volume = "F:"
+	volumes := []*serviceVolumeIndex{
+		newServiceVolumeIndex("pf-c.gsi", cIdx),
+		newServiceVolumeIndex("pf-f.gsi", fIdx),
+	}
+	for _, vol := range volumes {
+		vol.rebuildNameTrigramsLocked()
+	}
+	queries := []string{
+		"test ext:py",
+		"F raw",
+		"nrrd raw",
+		"type:dir docs",
+		"type:dir workspace",
+		"F: nrrd",
+		"Downloads raw",
+	}
+	for _, query := range queries {
+		opts := queryOptions{Query: query, MatchPath: true, Limit: 50}
+		want, err := searchAll([]*Index{cIdx, fIdx}, opts, false)
+		if err != nil {
+			t.Fatalf("query %q oracle search: %v", query, err)
+		}
+		trace := &searchTrace{}
+		opts.Trace = trace
+		got, err := searchServiceVolumes(volumes, opts, false)
+		if err != nil {
+			t.Fatalf("query %q service search: %v", query, err)
+		}
+		if !sameOrderedStrings(pathsOf(got), pathsOf(want)) {
+			t.Fatalf("query %q service paths = %v, full paths = %v", query, pathsOf(got), pathsOf(want))
+		}
+		// Count must equal the full number of matches, not the capped top-N.
+		allOpts := queryOptions{Query: query, MatchPath: true, Limit: 0}
+		wantAll, err := searchAll([]*Index{cIdx, fIdx}, allOpts, true)
+		if err != nil {
+			t.Fatalf("query %q oracle count: %v", query, err)
+		}
+		countOpts := opts
+		countOpts.Limit = 0
+		count, ok, err := countServiceVolumes(volumes, countOpts)
+		if err != nil || !ok || count != len(wantAll) {
+			t.Fatalf("query %q count = %d handled=%v err=%v, want %d", query, count, ok, err, len(wantAll))
+		}
+	}
+}
+
 func globalTraceModeSuffix(mode string) string {
 	if mode == "global-ext" {
 		return "ext"

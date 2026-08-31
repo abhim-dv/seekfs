@@ -1486,7 +1486,18 @@ func searchServiceVolumesGlobalBoundedFallbackSnapshot(snapshot globalQuerySnaps
 			if volumeIndex < len(snapshots) && snapshots[volumeIndex] != nil {
 				hidden = hiddenBaseIDs{tombstone: snapshots[volumeIndex].tombstoneIDs, shadowed: snapshots[volumeIndex].shadowedIDs}
 			}
-			localIDs, ok = vol.boundedScanCandidatesHiddenTop(volumePQ, hidden, limit)
+			// Pre-filter the name/id-order scan with a cheap exact posting
+			// (ext:, glob-ext:, or a bounded type:dir subtree) when present, so
+			// broad queries like "test ext:py" or "type:dir docs" skip
+			// non-matching records instead of verifying every record.  The scan
+			// order is unchanged, preserving the bounded scan's top-N semantics.
+			var filter *boundedScanMembershipFilter
+			if source, hasSource := vol.planExtFilterSource(volumePQ); hasSource {
+				filter = &boundedScanMembershipFilter{source: source}
+			} else if dirFilter, hasDirFilter := vol.planDirSubtreeFilter(volumePQ); hasDirFilter {
+				filter = dirFilter
+			}
+			localIDs, ok = vol.boundedScanCandidatesHiddenTopFiltered(volumePQ, hidden, limit, filter)
 		}
 		if !ok {
 			opts.Trace.replaceDecline("global-bounded-scan:canceled")
@@ -4692,6 +4703,149 @@ func (vol *serviceVolumeIndex) boundedScanCandidatesHiddenTop(pq parsedQuery, hi
 		}
 	}
 	return out, true
+}
+
+// boundedScanMembershipFilter pre-filters the bounded name/id-order scan to a
+// selective ext/glob-ext posting so broad queries with a cheap extension filter
+// do not walk every record.  The scan order is unchanged (id order when the
+// resident name order is absent, name order otherwise), so the top-N semantics
+// of boundedScanCandidatesHiddenTop are preserved exactly.
+type boundedScanMembershipFilter struct {
+	source  candidatePlanSource
+	members map[int]struct{}
+}
+
+func (f *boundedScanMembershipFilter) contains(id int) bool {
+	if f == nil || f.members == nil {
+		return true
+	}
+	_, ok := f.members[id]
+	return ok
+}
+
+// boundedScanCandidatesHiddenTopFiltered is boundedScanCandidatesHiddenTop with
+// an optional cheap posting membership pre-filter.  Records outside the filter
+// are skipped without verifying the full entry, so a query like "test ext:py"
+// scans only the .py subset of the volume while preserving the exact id/name
+// order of the unfiltered bounded scan.
+func (vol *serviceVolumeIndex) boundedScanCandidatesHiddenTopFiltered(pq parsedQuery, hidden hiddenBaseIDs, limit int, filter *boundedScanMembershipFilter) ([]int, bool) {
+	if vol == nil || vol.index == nil || limit <= 0 {
+		return nil, false
+	}
+	if filter != nil && filter.members == nil && filter.source.hasPosting {
+		ids := filter.source.posting.materialize()
+		filter.members = make(map[int]struct{}, len(ids))
+		for _, id := range ids {
+			filter.members[int(id)] = struct{}{}
+		}
+	}
+	recordCount := vol.index.compactRecordCount()
+	order := vol.orderForQuery(pq)
+	out := make([]int, 0, min(limit, 1024))
+	cache := make(map[int]string)
+	for pos := 0; pos < compactUint32OrderLen(order, recordCount); pos++ {
+		if pos&1023 == 0 && queryCanceled(pq) {
+			return nil, false
+		}
+		id := compactUint32OrderAt(order, pos)
+		if filter != nil && !filter.contains(id) {
+			continue
+		}
+		if !hidden.empty() && hidden.contains(id) {
+			continue
+		}
+		if _, ok := compactCandidateEntryIfMatch(vol.index, pq, id, cache, true, false); !ok {
+			continue
+		}
+		out = append(out, id)
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out, true
+}
+
+// planExtFilterSource returns a candidatePlanSource whose posting is a cheap,
+// exact superset pre-filter (ext: or glob-ext:) for the query, when one exists.
+func (vol *serviceVolumeIndex) planExtFilterSource(pq parsedQuery) (candidatePlanSource, bool) {
+	if vol == nil || vol.index == nil || pq.CaseSensitive {
+		return candidatePlanSource{}, false
+	}
+	for _, ext := range pq.Exts {
+		if candidate, ok := vol.extPostingCountCandidate(ext); ok {
+			return candidatePlanSource{posting: candidate, hasPosting: true}, true
+		}
+	}
+	if globExts, ok := simpleGlobExts(pq.Globs); ok && len(globExts) == 1 {
+		if candidate, ok := vol.extPostingCountCandidate(globExts[0]); ok {
+			return candidatePlanSource{posting: candidate, hasPosting: true}, true
+		}
+	}
+	return candidatePlanSource{}, false
+}
+
+// planDirSubtreeFilter builds a membership pre-filter for `type:dir <term>`
+// path queries: every matching directory is either a `term`-named directory or
+// a descendant of one, so the union of each term root's descendant interval is
+// an exact superset of the match set.  The filter is only built when the total
+// descendant count is bounded, so a huge `term` subtree (e.g. a root directory)
+// falls back to the unfiltered scan rather than materializing millions of ids.
+// The scan order is unchanged, preserving bounded-scan top-N semantics.
+func (vol *serviceVolumeIndex) planDirSubtreeFilter(pq parsedQuery) (*boundedScanMembershipFilter, bool) {
+	if vol == nil || vol.index == nil || pq.CaseSensitive || pq.Type != "dir" ||
+		len(pq.Terms) != 1 || len(pq.Exts) != 0 || len(pq.Globs) != 0 ||
+		len(pq.Dirs) != 0 || len(pq.Regexps) != 0 || len(pq.OrGroups) != 0 || len(pq.NotGroups) != 0 ||
+		len(pq.SizeFilters) != 0 || len(pq.DateFilters) != 0 || len(pq.AttrFilters) != 0 ||
+		pq.Under != "" || pq.HasModAfter || pq.Exists {
+		return nil, false
+	}
+	term := ""
+	for _, candidate := range pq.Terms {
+		if !isVolumeQueryTerm(candidate) {
+			term = candidate
+			break
+		}
+	}
+	if len(term) < 3 || strings.ContainsAny(term, `\/*?[]:`) {
+		return nil, false
+	}
+	roots := vol.pathTermRootIDs(term)
+	if len(roots) == 0 {
+		return nil, false
+	}
+	if len(vol.subtreeOrder) == 0 {
+		return nil, false
+	}
+	total := 0
+	for _, root := range roots {
+		if root < 0 || root >= len(vol.subtreeStart) || root >= len(vol.subtreeEnd) {
+			continue
+		}
+		start, end := vol.subtreeStart[root], vol.subtreeEnd[root]
+		if start != ^uint32(0) && start <= end {
+			total += int(end - start)
+			if total > serviceComponentTrigramExpansionMaxIDs {
+				return nil, false
+			}
+		}
+	}
+	if total == 0 {
+		return nil, false
+	}
+	members := make(map[int]struct{}, total)
+	for _, root := range roots {
+		if root < 0 || root >= len(vol.subtreeStart) || root >= len(vol.subtreeEnd) {
+			continue
+		}
+		start, end := vol.subtreeStart[root], vol.subtreeEnd[root]
+		if start == ^uint32(0) || start > end || int(end) > len(vol.subtreeOrder) {
+			continue
+		}
+		for _, id32 := range vol.subtreeOrder[start:end] {
+			members[int(id32)] = struct{}{}
+		}
+	}
+	return &boundedScanMembershipFilter{members: members}, true
 }
 
 func compactUint32OrderLen(order []uint32, recordCount int) int {
