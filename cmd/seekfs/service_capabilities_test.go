@@ -10,7 +10,7 @@ func TestClassifyServiceCommand(t *testing.T) {
 		{"search", serviceCommandReadOnly},
 		{"info", serviceCommandReadOnly},
 		{"status", serviceCommandReadOnly},
-		{"watch-delta", serviceCommandReadOnly},
+		{"watch-delta", serviceCommandLocalOnly},
 		{"index-usn", serviceCommandMutate},
 		{"index-volumes", serviceCommandUnknown},
 		{"service-index-usn", serviceCommandUnknown},

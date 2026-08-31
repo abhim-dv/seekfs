@@ -408,6 +408,7 @@ type appConfig struct {
 	DefaultLimit int
 	OutputFormat string
 	SeekFSDir    string
+	RemoteAddr   string
 }
 
 type queryOptions struct {
@@ -2967,6 +2968,11 @@ type goSearchService struct {
 	loadErr     string
 	indexMu     sync.RWMutex
 	requestSeq  atomic.Int64
+	// remoteAddr, when non-empty, is a loopback address (Mode L) that this
+	// service also listens on with the versioned JSON frame transport.  It is
+	// empty (disabled) by default.
+	remoteAddr string
+	remoteSrv  *remoteLoopbackServer
 }
 
 // signalServiceStop closes the stop channel exactly once.  It is safe to call
@@ -3115,6 +3121,7 @@ func cmdService(args []string) error {
 	sddl := fs.String("sddl", defaultServiceSDDL, "pipe security descriptor SDDL")
 	lowMemory := fs.Bool("lowmem", false, "run service in low-memory mmap mode")
 	skipStartupSync := fs.Bool("skip-startup-sync", false, "deprecated no-op; startup replay and catch-up always run")
+	remoteAddr := fs.String("remote-addr", "", "loopback address for the Mode L transport (e.g. 127.0.0.1:0); empty disables it (default)")
 	fs.Var(&dbs, "db", "index database path to load for service search; repeatable")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -3126,6 +3133,9 @@ func cmdService(args []string) error {
 	cfg, err := loadConfig(*configPath)
 	if err != nil {
 		return err
+	}
+	if *remoteAddr == "" && cfg.RemoteAddr != "" {
+		*remoteAddr = cfg.RemoteAddr
 	}
 	if len(dbs) == 0 && len(cfg.DBs) > 0 {
 		dbs = append(dbs, cfg.DBs...)
@@ -3141,7 +3151,7 @@ func cmdService(args []string) error {
 	if isService {
 		processMode = "windows-service"
 	}
-	handler := &goSearchService{pipeName: *pipeName, sddl: *sddl, processMode: processMode, stop: make(chan struct{}), dbs: dbs}
+	handler := &goSearchService{pipeName: *pipeName, sddl: *sddl, processMode: processMode, stop: make(chan struct{}), dbs: dbs, remoteAddr: *remoteAddr}
 	if isService {
 		return svc.Run(serviceName, handler)
 	}
@@ -5521,7 +5531,7 @@ func (vol *serviceVolumeIndex) tombstoneBaseSubtree(rootID int) {
 // no overlay slot of their own that got tombstoned by the delete branch
 // above (only deletedFRN's own slot did), and overlayRecordPath falls
 // back to the base index for any ancestor FRN without a live overlay
-// slot â€” which does not consult vol.overlay.tombstone. So without this
+// slot Ã¢â‚¬â€ which does not consult vol.overlay.tombstone. So without this
 // cascade an overlay-only child parented (directly or transitively)
 // under a deleted base directory stays visible forever.
 //
@@ -7695,7 +7705,21 @@ func (s *goSearchService) servePrivileged() {
 			s.servePipeListener()
 		}()
 	}
+	if s.remoteAddr != "" {
+		rs := newRemoteLoopbackServer(s, s.remoteAddr)
+		s.remoteSrv = rs
+		if err := rs.start(); err != nil {
+			serviceLog("remote loopback listener disabled: %v", err)
+			s.remoteSrv = nil
+		} else {
+			serviceLog("remote loopback (Mode L) listening on %s", s.remoteAddr)
+		}
+	}
 	<-s.stop
+	if s.remoteSrv != nil {
+		s.remoteSrv.close()
+		s.remoteSrv = nil
+	}
 	wg.Wait()
 }
 
@@ -7796,6 +7820,7 @@ type serviceCommandClass int
 const (
 	serviceCommandReadOnly serviceCommandClass = iota
 	serviceCommandMutate
+	serviceCommandLocalOnly
 	serviceCommandUnknown
 )
 
@@ -7805,8 +7830,12 @@ const (
 // callers, and are otherwise denied by default.
 func classifyServiceCommand(command string) serviceCommandClass {
 	switch command {
-	case "search", "info", "status", "watch-delta":
+	case "search", "info", "status":
 		return serviceCommandReadOnly
+	case "watch-delta":
+		// watch-delta is a read-only local operation but is deferred remotely
+		// until Phase 7: it exposes cursor semantics that need scoped identity.
+		return serviceCommandLocalOnly
 	case "index-usn":
 		return serviceCommandMutate
 	default:
@@ -7823,6 +7852,8 @@ func serviceCommandAllowed(command string, caps serviceCapabilities) bool {
 		return caps.ReadOnly
 	case serviceCommandMutate:
 		return caps.Mutate
+	case serviceCommandLocalOnly:
+		return caps.ReadOnly && !caps.Remote
 	default:
 		return false
 	}
@@ -7833,13 +7864,13 @@ func serviceCommandAllowed(command string, caps serviceCapabilities) bool {
 // capabilities gate commands.  Later phases reuse this dispatch from
 // the broker/remote transport with a remote principal and a strict read-only
 // capability set.
-func (s *goSearchService) handleServiceCommand(conn *os.File, principal servicePrincipal, caps serviceCapabilities, req *serviceRequest) {
+func (s *goSearchService) handleServiceCommand(w io.Writer, principal servicePrincipal, caps serviceCapabilities, req *serviceRequest) {
 	if !serviceCommandAllowed(req.Command, caps) {
 		message := "command not permitted for this caller"
 		if classifyServiceCommand(req.Command) == serviceCommandMutate {
 			message = "this command requires elevation; rerun it from an elevated prompt"
 		}
-		_ = json.NewEncoder(conn).Encode(serviceResponse{OK: false, Message: message})
+		_ = json.NewEncoder(w).Encode(serviceResponse{OK: false, Message: message})
 		return
 	}
 	switch req.Command {
@@ -7908,7 +7939,7 @@ func (s *goSearchService) handleServiceCommand(conn *os.File, principal serviceP
 			message = loadErr
 		}
 		health, healthMessage := classifyServiceHealth(loading, loadErr, infos)
-		_ = json.NewEncoder(conn).Encode(serviceInfoResponseFor(serviceResponse{OK: loadErr == "", Message: message, Entries: total, Loading: loading, DBs: infos, Runtime: runtimeMemorySnapshot(), Health: health, HealthMessage: healthMessage}, s.pipeName, s.processMode))
+		_ = json.NewEncoder(w).Encode(serviceInfoResponseFor(serviceResponse{OK: loadErr == "", Message: message, Entries: total, Loading: loading, DBs: infos, Runtime: runtimeMemorySnapshot(), Health: health, HealthMessage: healthMessage}, s.pipeName, s.processMode))
 	case "search":
 		serviceNoteQueryActivity()
 		s.indexMu.RLock()
@@ -7922,7 +7953,7 @@ func (s *goSearchService) handleServiceCommand(conn *os.File, principal serviceP
 			} else if loadErr != "" {
 				message = loadErr
 			}
-			_ = json.NewEncoder(conn).Encode(serviceResponse{OK: false, Message: message, Loading: loading})
+			_ = json.NewEncoder(w).Encode(serviceResponse{OK: false, Message: message, Loading: loading})
 			return
 		}
 		opts := requestToOptionsFromService(*req)
@@ -7956,10 +7987,10 @@ func (s *goSearchService) handleServiceCommand(conn *os.File, principal serviceP
 					s.indexMu.RUnlock()
 					searchMS := float64(time.Since(searchStart).Nanoseconds()) / 1_000_000
 					if countErr != nil {
-						_ = json.NewEncoder(conn).Encode(serviceResponse{OK: false, Message: countErr.Error()})
+						_ = json.NewEncoder(w).Encode(serviceResponse{OK: false, Message: countErr.Error()})
 					} else {
 						trace.setSource("count-fast-posting", count)
-						_ = json.NewEncoder(conn).Encode(serviceResponse{OK: true, Count: count, SearchMS: searchMS, Source: trace.Source, Decline: trace.Decline, Candidates: trace.Candidates, PlannerMode: trace.PlannerMode, EligibleVolumes: trace.EligibleVolumes, BlocksDecoded: trace.BlocksDecoded, BlocksSkipped: trace.BlocksSkipped, ScalarDriver: trace.ScalarDriver, ScalarInterval: trace.ScalarInterval, RecordsVerified: trace.ScalarRecordsVerified, ComponentDriver: trace.ComponentDriver, ComponentRoots: trace.ComponentRoots, ComponentIntervals: trace.ComponentIntervals, ComponentCardinality: trace.ComponentCardinality, ComponentSelfHits: trace.ComponentSelfHits, ComponentBounds: trace.ComponentBounds, ComponentRecordsVerified: trace.ComponentRecordsVerified, FilenameDriver: trace.FilenameDriver, FilenameRequiredGrams: trace.FilenameRequiredGrams, FilenamePostingHint: trace.FilenamePostingHint, FilenameRecordsVerified: trace.FilenameRecordsVerified, OverlayBaseWindow: trace.OverlayBaseWindow, PostingPrefetchBytes: trace.PostingPrefetchBytes, PostingPrefetchRanges: trace.PostingPrefetchRanges, PostingPrefetchPages: trace.PostingPrefetchPages, Terms: trace.Terms, Declines: trace.Declines, Fallback: trace.Fallback, Complete: trace.completePtr()})
+						_ = json.NewEncoder(w).Encode(serviceResponse{OK: true, Count: count, SearchMS: searchMS, Source: trace.Source, Decline: trace.Decline, Candidates: trace.Candidates, PlannerMode: trace.PlannerMode, EligibleVolumes: trace.EligibleVolumes, BlocksDecoded: trace.BlocksDecoded, BlocksSkipped: trace.BlocksSkipped, ScalarDriver: trace.ScalarDriver, ScalarInterval: trace.ScalarInterval, RecordsVerified: trace.ScalarRecordsVerified, ComponentDriver: trace.ComponentDriver, ComponentRoots: trace.ComponentRoots, ComponentIntervals: trace.ComponentIntervals, ComponentCardinality: trace.ComponentCardinality, ComponentSelfHits: trace.ComponentSelfHits, ComponentBounds: trace.ComponentBounds, ComponentRecordsVerified: trace.ComponentRecordsVerified, FilenameDriver: trace.FilenameDriver, FilenameRequiredGrams: trace.FilenameRequiredGrams, FilenamePostingHint: trace.FilenamePostingHint, FilenameRecordsVerified: trace.FilenameRecordsVerified, OverlayBaseWindow: trace.OverlayBaseWindow, PostingPrefetchBytes: trace.PostingPrefetchBytes, PostingPrefetchRanges: trace.PostingPrefetchRanges, PostingPrefetchPages: trace.PostingPrefetchPages, Terms: trace.Terms, Declines: trace.Declines, Fallback: trace.Fallback, Complete: trace.completePtr()})
 					}
 					return
 				}
@@ -7987,7 +8018,7 @@ func (s *goSearchService) handleServiceCommand(conn *os.File, principal serviceP
 		}
 		searchMS := float64(time.Since(searchStart).Nanoseconds()) / 1_000_000
 		if err != nil {
-			_ = json.NewEncoder(conn).Encode(serviceResponse{OK: false, Message: err.Error()})
+			_ = json.NewEncoder(w).Encode(serviceResponse{OK: false, Message: err.Error()})
 			return
 		}
 		serviceLog("search query=%q ms=%.1f planner=%s source=%s decline=%s filename_driver=%s candidates=%d results=%d", req.Query, searchMS, trace.PlannerMode, trace.Source, trace.Decline, trace.FilenameDriver, trace.Candidates, len(matches))
@@ -7999,7 +8030,7 @@ func (s *goSearchService) handleServiceCommand(conn *os.File, principal serviceP
 			}
 			resp.Rows = entriesToJSON(matches)
 		}
-		_ = json.NewEncoder(conn).Encode(resp)
+		_ = json.NewEncoder(w).Encode(resp)
 	case "watch-delta":
 		serviceNoteQueryActivity()
 		s.indexMu.RLock()
@@ -8013,7 +8044,7 @@ func (s *goSearchService) handleServiceCommand(conn *os.File, principal serviceP
 			} else if loadErr != "" {
 				message = loadErr
 			}
-			_ = json.NewEncoder(conn).Encode(serviceResponse{OK: false, Message: message, Loading: loading})
+			_ = json.NewEncoder(w).Encode(serviceResponse{OK: false, Message: message, Loading: loading})
 			return
 		}
 		opts := requestToOptionsFromService(*req)
@@ -8036,7 +8067,7 @@ func (s *goSearchService) handleServiceCommand(conn *os.File, principal serviceP
 		pq, parseErr := parseQuery(opts)
 		if parseErr != nil {
 			s.indexMu.RUnlock()
-			_ = json.NewEncoder(conn).Encode(serviceResponse{OK: false, Message: parseErr.Error()})
+			_ = json.NewEncoder(w).Encode(serviceResponse{OK: false, Message: parseErr.Error()})
 			return
 		}
 		volumes := append([]*serviceVolumeIndex(nil), s.volumes...)
@@ -8056,24 +8087,24 @@ func (s *goSearchService) handleServiceCommand(conn *os.File, principal serviceP
 				sinceCursors = append(sinceCursors, watchVolumeCursor{Volume: vol.volume, Seq: wm})
 			}
 			s.indexMu.RUnlock()
-			_ = json.NewEncoder(conn).Encode(serviceResponse{OK: true, WatchVolumes: sinceCursors})
+			_ = json.NewEncoder(w).Encode(serviceResponse{OK: true, WatchVolumes: sinceCursors})
 			return
 		}
 		sinceCursors = req.SinceVolumes
 		nextCursors, events, err := serviceWatchDelta(volumes, sinceCursors, pq, trace)
 		s.indexMu.RUnlock()
 		if err != nil {
-			_ = json.NewEncoder(conn).Encode(serviceResponse{OK: false, Message: err.Error()})
+			_ = json.NewEncoder(w).Encode(serviceResponse{OK: false, Message: err.Error()})
 			return
 		}
 		serviceLog("watch-delta query=%q volumes=%d events=%d", req.Query, len(nextCursors), len(events))
-		_ = json.NewEncoder(conn).Encode(serviceResponse{OK: true, WatchVolumes: nextCursors, WatchEvents: events, Source: trace.Source, Decline: trace.Decline})
+		_ = json.NewEncoder(w).Encode(serviceResponse{OK: true, WatchVolumes: nextCursors, WatchEvents: events, Source: trace.Source, Decline: trace.Decline})
 	case "index-usn":
 		serviceLog("index-usn start volume=%s db=%s", req.Volume, req.DB)
 		idx, err := indexUSNVolume(req.Volume)
 		if err != nil {
 			serviceLog("index-usn error volume=%s err=%v", req.Volume, err)
-			_ = json.NewEncoder(conn).Encode(serviceResponse{OK: false, Message: err.Error()})
+			_ = json.NewEncoder(w).Encode(serviceResponse{OK: false, Message: err.Error()})
 			return
 		}
 		serviceLog("index-usn built volume=%s entries=%d", req.Volume, idx.entryCount())
@@ -8085,7 +8116,7 @@ func (s *goSearchService) handleServiceCommand(conn *os.File, principal serviceP
 		tmp, stageErr := stageIndexFile(req.DB, idx)
 		if stageErr != nil {
 			serviceLog("index-usn stage error volume=%s err=%v", req.Volume, stageErr)
-			_ = json.NewEncoder(conn).Encode(serviceResponse{OK: false, Message: stageErr.Error()})
+			_ = json.NewEncoder(w).Encode(serviceResponse{OK: false, Message: stageErr.Error()})
 			return
 		}
 		s.indexMu.Lock()
@@ -8102,7 +8133,7 @@ func (s *goSearchService) handleServiceCommand(conn *os.File, principal serviceP
 		if err := commitStageIndexFile(req.DB, tmp); err != nil {
 			s.indexMu.Unlock()
 			serviceLog("index-usn save error volume=%s err=%v", req.Volume, err)
-			_ = json.NewEncoder(conn).Encode(serviceResponse{OK: false, Message: err.Error()})
+			_ = json.NewEncoder(w).Encode(serviceResponse{OK: false, Message: err.Error()})
 			return
 		}
 		if err := removeWAL(req.DB); err != nil {
@@ -8117,7 +8148,7 @@ func (s *goSearchService) handleServiceCommand(conn *os.File, principal serviceP
 		if loadErr != nil {
 			s.indexMu.Unlock()
 			serviceLog("index-usn reload error volume=%s err=%v", req.Volume, loadErr)
-			_ = json.NewEncoder(conn).Encode(serviceResponse{OK: false, Message: loadErr.Error()})
+			_ = json.NewEncoder(w).Encode(serviceResponse{OK: false, Message: loadErr.Error()})
 			return
 		}
 		vol := s.replaceLoadedVolumeLocked(req.DB, loaded)
@@ -8126,11 +8157,11 @@ func (s *goSearchService) handleServiceCommand(conn *os.File, principal serviceP
 		s.startBackgroundNameOrderBuilds([]*serviceVolumeIndex{vol})
 		s.startBackgroundNameTrigramBuilds([]*serviceVolumeIndex{vol})
 		serviceLog("index-usn complete volume=%s entries=%d", req.Volume, idx.entryCount())
-		_ = json.NewEncoder(conn).Encode(serviceResponse{OK: true, Message: "indexed", Entries: idx.entryCount()})
+		_ = json.NewEncoder(w).Encode(serviceResponse{OK: true, Message: "indexed", Entries: idx.entryCount()})
 	case "status":
-		_ = json.NewEncoder(conn).Encode(serviceInfoResponseFor(serviceResponse{OK: true, Message: "service running"}, s.pipeName, s.processMode))
+		_ = json.NewEncoder(w).Encode(serviceInfoResponseFor(serviceResponse{OK: true, Message: "service running"}, s.pipeName, s.processMode))
 	default:
-		_ = json.NewEncoder(conn).Encode(serviceResponse{OK: false, Message: "unknown command"})
+		_ = json.NewEncoder(w).Encode(serviceResponse{OK: false, Message: "unknown command"})
 	}
 }
 
@@ -9132,7 +9163,7 @@ func (vol *serviceVolumeIndex) overlaySlotEntry(records []CompactRecord, latest 
 }
 // overlayLiveMatchCount counts live (non-deleted, latest-slot-per-FRN) overlay
 // records matching pq, reading only through the given snapshot's records
-// slice up to watermark â€” the same walk mergeOverlayMatches performs for a
+// slice up to watermark Ã¢â‚¬â€ the same walk mergeOverlayMatches performs for a
 // full search, but without allocating/ranking Entry results since callers
 // only need len(). It reuses latestOverlaySlotsByFRN/overlayEntry/
 // entryMatches so overlay entry construction and match semantics never
@@ -9873,7 +9904,7 @@ func countServiceVolumes(volumes []*serviceVolumeIndex, opts queryOptions) (int,
 //	+ (linear count of live overlay records matching pq)
 //
 // It reads the volume's snapshot exactly once and only touches snapshot
-// slices (records[:watermark], tombstoneIDs, shadowedIDs) â€” never
+// slices (records[:watermark], tombstoneIDs, shadowedIDs) Ã¢â‚¬â€ never
 // vol.overlay's live maps, which the apply goroutine mutates concurrently
 // (review G6). If the base fast-count route cannot evaluate pq (same decline
 // conditions as fastPostingCount today), this declines too (ok=false) rather
@@ -19912,6 +19943,8 @@ func loadConfig(path string) (appConfig, error) {
 			}
 		case "seekfs_dir":
 			cfg.SeekFSDir = parseTOMLString(value)
+		case "remote_addr":
+			cfg.RemoteAddr = parseTOMLString(value)
 		}
 	}
 	return cfg, nil
