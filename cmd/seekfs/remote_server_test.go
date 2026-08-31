@@ -39,6 +39,10 @@ func TestRemoteResponseAllowlist(t *testing.T) {
 		Candidates:      5,
 		Decline:         "missing-posting",
 		Fallback:        "bounded-scan",
+		Entries:         42,
+		Loading:         false,
+		Fuzzy:           true,
+		Complete:        boolPtr(false),
 		Health:          "ok",
 		HealthMessage:   "volume C: stale: journal replay failed",
 		DBs:             []dbInfo{{Path: "C:\\ProgramData\\seekfs\\indexes\\seekfs_c.gsi", Entries: 100, Volume: "C:", State: "ready", JournalID: 123, Checkpoint: 456, Memory: &residentMemoryInfo{Records: 100}, LastPersistError: "boom", Source: "usn", BuiltAt: "2026-01-01T00:00:00Z", FRNRecords: 100}},
@@ -56,7 +60,7 @@ func TestRemoteResponseAllowlist(t *testing.T) {
 	if err := json.Unmarshal(b, &raw); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	for _, forbidden := range []string{"pid", "executable", "executable_hash", "pipe_name", "process_mode", "runtime", "journal_id", "checkpoint", "component_bounds", "blocks_decoded", "memory"} {
+	for _, forbidden := range []string{"pid", "executable", "executable_hash", "pipe_name", "process_mode", "runtime", "journal_id", "checkpoint", "component_bounds", "blocks_decoded", "memory", "planner_mode", "candidates", "decline", "fallback"} {
 		if _, ok := raw[forbidden]; ok {
 			t.Errorf("remote response leaks forbidden field %q", forbidden)
 		}
@@ -71,6 +75,18 @@ func TestRemoteResponseAllowlist(t *testing.T) {
 	}
 	if out.Version != "1.6.0" || out.Commit != "abc" {
 		t.Errorf("version/commit should be preserved: %+v", out)
+	}
+	// Public response semantics retained: info totals, fuzzy flag, and the
+	// completeness signal so partial fallback results are not mistaken for
+	// exhaustive results.
+	if out.Entries != 42 {
+		t.Errorf("entries lost: %+v", out)
+	}
+	if !out.Fuzzy {
+		t.Errorf("fuzzy flag lost: %+v", out)
+	}
+	if out.Complete == nil || *out.Complete {
+		t.Errorf("complete signal lost: %+v", out)
 	}
 	if len(out.DBs) != 1 {
 		t.Fatalf("DBs count = %d, want 1", len(out.DBs))
@@ -250,59 +266,50 @@ func TestRemoteWatchDeltaDenied(t *testing.T) {
 }
 
 func TestRemoteDuplicateRequestID(t *testing.T) {
-	// Two concurrent requests with the same id: one may complete, but the
-	// duplicate must be rejected with an error frame, not silently accepted.
-	// We exercise handleRequest directly with a nil service (dispatch panics
-	// and recovers) to force overlap deterministically.
+	// Duplicate request ids are rejected deterministically: pre-seed an
+	// in-flight state for id 7, then a second request with the same id must be
+	// rejected without relying on goroutine scheduling.
 	rs := newRemoteLoopbackServer(nil, "127.0.0.1:0")
 	a, b := net.Pipe()
 	rc := &remoteConn{rs: rs, conn: a, inFlight: make(map[int64]*remoteRequestState)}
+	rc.inFlight[7] = &remoteRequestState{done: make(chan struct{})}
 
-	// Read frames in the background: writes to net.Pipe block until read.
-	frames := make(chan remoteFrame, 4)
+	// Read the rejection frame in the background: writes to net.Pipe block
+	// until read.
+	frames := make(chan remoteFrame, 1)
 	errs := make(chan error, 1)
 	go func() {
 		br := bufio.NewReader(b)
-		for i := 0; i < 2; i++ {
-			payload, err := readRemoteFramePayload(br)
-			if err != nil {
-				errs <- err
-				return
-			}
-			var f remoteFrame
-			if err := json.Unmarshal(payload, &f); err != nil {
-				errs <- err
-				return
-			}
-			frames <- f
+		payload, err := readRemoteFramePayload(br)
+		if err != nil {
+			errs <- err
+			return
 		}
-		close(frames)
+		var f remoteFrame
+		if err := json.Unmarshal(payload, &f); err != nil {
+			errs <- err
+			return
+		}
+		frames <- f
 	}()
 
 	payload := mustJSON(serviceRequest{Command: "search"})
 	rc.handleRequest(7, payload)
-	rc.handleRequest(7, payload)
 
-	gotDup := false
-	for i := 0; i < 2; i++ {
-		select {
-		case f, ok := <-frames:
-			if !ok {
-				t.Fatal("frame channel closed early")
-			}
-			var out remoteResponse
-			_ = json.Unmarshal(f.Payload, &out)
-			if out.Message == "duplicate request id" {
-				gotDup = true
-			}
-		case err := <-errs:
-			t.Fatalf("read frame: %v", err)
-		case <-time.After(5 * time.Second):
-			t.Fatal("timed out waiting for frames")
+	select {
+	case f, ok := <-frames:
+		if !ok {
+			t.Fatal("frame channel closed early")
 		}
-	}
-	if !gotDup {
-		t.Error("expected a duplicate request id rejection frame")
+		var out remoteResponse
+		_ = json.Unmarshal(f.Payload, &out)
+		if out.Message != "duplicate request id" {
+			t.Errorf("expected duplicate rejection, got %q", out.Message)
+		}
+	case err := <-errs:
+		t.Fatalf("read frame: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for duplicate rejection frame")
 	}
 }
 
@@ -326,13 +333,79 @@ func TestRemoteShutdownCancelsInFlight(t *testing.T) {
 
 func TestRemoteCancellation(t *testing.T) {
 	st := &remoteRequestState{done: make(chan struct{})}
-	st.cancelHook = func() {}
 	if st.requestCancelFunc()() {
 		t.Error("cancel flag should be false initially")
 	}
 	st.cancel()
 	if !st.requestCancelFunc()() {
 		t.Error("cancel flag should be true after cancel")
+	}
+}
+
+func TestRemoteClosedRejectsNewRequests(t *testing.T) {
+	// Once shutdown begins, a request that was already read (and not yet
+	// admitted) must be rejected, so close cannot miss newly admitted work.
+	rs := newRemoteLoopbackServer(nil, "127.0.0.1:0")
+	a, b := net.Pipe()
+	rc := &remoteConn{rs: rs, conn: a, inFlight: make(map[int64]*remoteRequestState)}
+	rc.closed.Store(true)
+
+	frames := make(chan remoteFrame, 1)
+	errs := make(chan error, 1)
+	go func() {
+		br := bufio.NewReader(b)
+		payload, err := readRemoteFramePayload(br)
+		if err != nil {
+			errs <- err
+			return
+		}
+		var f remoteFrame
+		if err := json.Unmarshal(payload, &f); err != nil {
+			errs <- err
+			return
+		}
+		frames <- f
+	}()
+
+	rc.handleRequest(9, mustJSON(serviceRequest{Command: "search"}))
+
+	select {
+	case f, ok := <-frames:
+		if !ok {
+			t.Fatal("frame channel closed early")
+		}
+		var out remoteResponse
+		_ = json.Unmarshal(f.Payload, &out)
+		if out.Message != "connection closed" {
+			t.Errorf("expected connection-closed rejection, got %q", out.Message)
+		}
+	case err := <-errs:
+		t.Fatalf("read frame: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for connection-closed rejection frame")
+	}
+}
+
+func TestRemoteLimitClampedBeforeDispatch(t *testing.T) {
+	// The remote limit must be clamped server-side before the engine sees it.
+	big := serviceRequest{Command: "search", Limit: 1 << 20}
+	clampRemoteLimit(&big)
+	if big.Limit > remoteMaxResultLimit {
+		t.Errorf("clampRemoteLimit did not clamp: got %d, want <= %d", big.Limit, remoteMaxResultLimit)
+	}
+	// Negative/zero limits are normalized to the max (they would otherwise be
+	// treated as the engine default of 100, which is fine, but the bound must
+	// still hold).
+	neg := serviceRequest{Command: "search", Limit: -5}
+	clampRemoteLimit(&neg)
+	if neg.Limit != remoteMaxResultLimit {
+		t.Errorf("clampRemoteLimit(-5) = %d, want %d", neg.Limit, remoteMaxResultLimit)
+	}
+	// Count-only requests do not materialize rows; leave the limit untouched.
+	co := serviceRequest{Command: "search", CountOnly: true, Limit: 1 << 20}
+	clampRemoteLimit(&co)
+	if co.Limit != 1<<20 {
+		t.Errorf("count-only limit should be untouched, got %d", co.Limit)
 	}
 }
 

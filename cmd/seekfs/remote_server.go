@@ -19,7 +19,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -35,6 +34,17 @@ const remoteMaxFrameBytes = 16 * 1024 * 1024
 // remoteMaxResultBytes bounds a single encoded response payload before it is
 // written, so an oversized result cannot stall the client with no response.
 const remoteMaxResultBytes = 8 * 1024 * 1024
+
+// remoteMaxResultLimit bounds the number of result rows a remote caller may
+// request.  It is enforced before dispatch so an unauthenticated loopback caller
+// cannot force the engine to allocate large result sets (the encoded-response
+// bound alone runs too late).  The exact budget is an implementation choice.
+const remoteMaxResultLimit = 50_000
+
+// remoteWriteTimeout bounds a single socket write so a client that stops reading
+// cannot block cancellation, request cleanup, or new admission behind a slow
+// writer.
+const remoteWriteTimeout = 15 * time.Second
 
 // remoteConnMaxInFlight bounds outstanding requests per remote connection.
 const remoteConnMaxInFlight = 32
@@ -96,17 +106,17 @@ type remoteResponse struct {
 	Count           int                 `json:"count,omitempty"`
 	SearchMS        float64             `json:"search_ms,omitempty"`
 	Source          string              `json:"source,omitempty"`
-	PlannerMode     string              `json:"planner_mode,omitempty"`
 	EligibleVolumes []string            `json:"eligible_volumes,omitempty"`
-	Candidates      int                 `json:"candidates,omitempty"`
-	Decline         string              `json:"decline,omitempty"`
-	Fallback        string              `json:"fallback,omitempty"`
 	Health          string              `json:"health,omitempty"`
 	HealthMessage   string              `json:"health_message,omitempty"`
 	Version         string              `json:"version,omitempty"`
 	Commit          string              `json:"commit,omitempty"`
 	Date            string              `json:"date,omitempty"`
 	BuildFlavor     string              `json:"build_flavor,omitempty"`
+	Entries         int                 `json:"entries,omitempty"`
+	Loading         bool                `json:"loading,omitempty"`
+	Fuzzy           bool                `json:"fuzzy,omitempty"`
+	Complete        *bool               `json:"complete,omitempty"`
 	Results         []string            `json:"results,omitempty"`
 	Rows            []remoteResultRow   `json:"rows,omitempty"`
 	DBs             []remoteDBSummary   `json:"dbs,omitempty"`
@@ -220,7 +230,6 @@ func (rs *remoteLoopbackServer) close() {
 // cancellation.
 type remoteRequestState struct {
 	cancelFlag atomic.Bool
-	cancelHook func()
 	done       chan struct{}
 }
 
@@ -229,21 +238,20 @@ func (st *remoteRequestState) requestCancelFunc() func() bool {
 	return func() bool { return st.cancelFlag.Load() }
 }
 
-// cancel marks the request cancelled and invokes the wired engine cancel hook if
-// present.
+// cancel marks the request cancelled.  The engine cancel predicate observes the
+// flag on its next poll, so no additional hook is needed.
 func (st *remoteRequestState) cancel() {
 	st.cancelFlag.Store(true)
-	if st.cancelHook != nil {
-		st.cancelHook()
-	}
 }
 
 // remoteConn is a single client connection on the Mode L transport.
 type remoteConn struct {
 	rs        *remoteLoopbackServer
 	conn      net.Conn
-	mu        sync.Mutex // serializes writes and guards inFlight
+	stateMu   sync.Mutex // guards inFlight and closed admission
+	writeMu   sync.Mutex // serializes socket writes
 	inFlight  map[int64]*remoteRequestState
+	closed    atomic.Bool // set once shutdown begins; rejects new requests
 	closeOnce sync.Once
 }
 
@@ -260,31 +268,33 @@ func (rc *remoteConn) close() {
 	})
 }
 
-// shutdown closes the socket and cancels in-flight work WITHOUT waiting for it.
-// It is safe to call from within an in-flight request (e.g. a failed response
-// write) because it never blocks on the caller's own done channel.
+// shutdown marks the connection closed, closes the socket, and cancels
+// in-flight work WITHOUT waiting for it.  It is safe to call from within an
+// in-flight request (e.g. a failed response write) because it never blocks on
+// the caller's own done channel.
 func (rc *remoteConn) shutdown() {
+	rc.closed.Store(true)
 	rc.conn.Close()
-	rc.mu.Lock()
+	rc.stateMu.Lock()
 	inFlight := make([]*remoteRequestState, 0, len(rc.inFlight))
 	for _, st := range rc.inFlight {
 		inFlight = append(inFlight, st)
 	}
-	rc.mu.Unlock()
+	rc.stateMu.Unlock()
 	for _, st := range inFlight {
 		st.cancel()
 	}
 }
 
 // waitInFlight blocks until all in-flight requests have finished.  Callers must
-// not hold rc.mu.
+// not hold stateMu.
 func (rc *remoteConn) waitInFlight() {
-	rc.mu.Lock()
+	rc.stateMu.Lock()
 	inFlight := make([]*remoteRequestState, 0, len(rc.inFlight))
 	for _, st := range rc.inFlight {
 		inFlight = append(inFlight, st)
 	}
-	rc.mu.Unlock()
+	rc.stateMu.Unlock()
 	for _, st := range inFlight {
 		<-st.done
 	}
@@ -293,7 +303,8 @@ func (rc *remoteConn) waitInFlight() {
 // writeFrame serializes a frame to the connection under the write lock and
 // shuts down the connection on any write failure so the client never waits on a
 // desynchronized stream.  It never waits for in-flight requests (a failed
-// response write can originate from inside one).
+// response write can originate from inside one).  Writes are bounded by a
+// deadline so a client that stops reading cannot stall the server indefinitely.
 func (rc *remoteConn) writeFrame(f remoteFrame) error {
 	payload, err := json.Marshal(f)
 	if err != nil {
@@ -306,18 +317,18 @@ func (rc *remoteConn) writeFrame(f remoteFrame) error {
 	}
 	var buf [4]byte
 	binary.BigEndian.PutUint32(buf[:], uint32(len(payload)))
-	rc.mu.Lock()
+	rc.writeMu.Lock()
+	defer rc.writeMu.Unlock()
+	rc.conn.SetWriteDeadline(time.Now().Add(remoteWriteTimeout))
+	defer rc.conn.SetWriteDeadline(time.Time{})
 	if _, err := rc.conn.Write(buf[:]); err != nil {
-		rc.mu.Unlock()
 		rc.shutdown()
 		return err
 	}
 	if _, err := rc.conn.Write(payload); err != nil {
-		rc.mu.Unlock()
 		rc.shutdown()
 		return err
 	}
-	rc.mu.Unlock()
 	return nil
 }
 
@@ -380,7 +391,9 @@ func (rc *remoteConn) handleHello(id int64) {
 }
 
 // handleRequest dispatches a remote request asynchronously.  The request id is
-// connection-scoped; a duplicate id while one is in flight is rejected.
+// connection-scoped; a duplicate id while one is in flight is rejected.  Once
+// shutdown has begun, no new request is admitted so close cannot miss work it
+// has already decided not to wait for.
 func (rc *remoteConn) handleRequest(id int64, payload json.RawMessage) {
 	var req serviceRequest
 	if err := json.Unmarshal(payload, &req); err != nil {
@@ -388,21 +401,27 @@ func (rc *remoteConn) handleRequest(id int64, payload json.RawMessage) {
 		return
 	}
 
-	// Bound in-flight work per connection and reject duplicate ids.
-	rc.mu.Lock()
+	// Bound in-flight work per connection, reject duplicate ids, and refuse new
+	// work once shutdown has begun.
+	rc.stateMu.Lock()
+	if rc.closed.Load() {
+		rc.stateMu.Unlock()
+		_ = rc.writeFrame(remoteFrame{Type: remoteFrameResponse, V: remoteProtocolVersion, ID: id, Payload: mustJSON(remoteResponse{OK: false, Message: "connection closed"})})
+		return
+	}
 	if len(rc.inFlight) >= remoteConnMaxInFlight {
-		rc.mu.Unlock()
+		rc.stateMu.Unlock()
 		_ = rc.writeFrame(remoteFrame{Type: remoteFrameResponse, V: remoteProtocolVersion, ID: id, Payload: mustJSON(remoteResponse{OK: false, Message: "busy: too many in-flight requests"})})
 		return
 	}
 	if _, exists := rc.inFlight[id]; exists {
-		rc.mu.Unlock()
+		rc.stateMu.Unlock()
 		_ = rc.writeFrame(remoteFrame{Type: remoteFrameResponse, V: remoteProtocolVersion, ID: id, Payload: mustJSON(remoteResponse{OK: false, Message: "duplicate request id"})})
 		return
 	}
 	st := &remoteRequestState{done: make(chan struct{})}
 	rc.inFlight[id] = st
-	rc.mu.Unlock()
+	rc.stateMu.Unlock()
 
 	rc.rs.wg.Add(1)
 	go func() {
@@ -413,12 +432,16 @@ func (rc *remoteConn) handleRequest(id int64, payload json.RawMessage) {
 }
 
 // executeRequest runs one remote request inside a recovery boundary.  It wires
-// the connection-scoped cancel into the engine, dispatches through the shared
-// handler, and emits only the allowlisted remote projection.
+// the connection-scoped cancel into the engine, clamps caller-controlled
+// resource bounds, dispatches through the shared handler, and emits only the
+// allowlisted remote projection.
 func (rc *remoteConn) executeRequest(id int64, st *remoteRequestState, req *serviceRequest) {
 	defer func() {
 		if r := recover(); r != nil {
-			serviceLog("remote request panic (id=%d): %v\n%s", id, r, string(debug.Stack()))
+			// Do not leak the panic value or stack to the log: they may embed
+			// query terms or filesystem paths, bypassing the remote log
+			// redaction policy.  Keep the entry generic and keyed by request id.
+			serviceLog("remote request panic (id=%d) recovered", id)
 			// Do not leak panic text to the caller; emit a generic failure.
 			// Guard the write: the connection may itself be broken, and a
 			// failure here must not panic again.
@@ -426,9 +449,9 @@ func (rc *remoteConn) executeRequest(id int64, st *remoteRequestState, req *serv
 			_ = rc.writeFrame(remoteFrame{Type: remoteFrameResponse, V: remoteProtocolVersion, ID: id, Payload: mustJSON(remoteResponse{OK: false, Message: "internal error"})})
 		}
 		// Ensure in-flight cleanup even on the panic path.
-		rc.mu.Lock()
+		rc.stateMu.Lock()
 		delete(rc.inFlight, id)
-		rc.mu.Unlock()
+		rc.stateMu.Unlock()
 	}()
 
 	// Remote callers are read-only.  watch-delta is deferred remotely until
@@ -440,12 +463,16 @@ func (rc *remoteConn) executeRequest(id int64, st *remoteRequestState, req *serv
 	// query by supplying a large deadline_unix.
 	req.DeadlineUnix = clampRemoteDeadline(req.DeadlineUnix)
 
+	// Server-owned result-limit clamp: enforce the bound before dispatch so an
+	// unauthenticated loopback caller cannot force large result allocations in
+	// the engine (the encoded-response check alone runs too late).
+	clampRemoteLimit(req)
+
 	// The request_seq field drives the service-global cancellation counter and
 	// must not be trusted from a remote caller (it could cancel another
 	// client's or the local GUI's in-flight query).  Remote cancellation is
 	// connection-scoped via the frame id.
 	req.RequestSeq = 0
-	st.cancelHook = func() {}
 	req.CancelOverride = st.requestCancelFunc()
 
 	resp := rc.dispatch(caps, principal, req)
@@ -455,7 +482,7 @@ func (rc *remoteConn) executeRequest(id int64, st *remoteRequestState, req *serv
 		return
 	}
 	if err := rc.writeRemoteResponse(id, resp); err != nil {
-		serviceLog("remote response write failed (id=%d): %v", id, err)
+		serviceLog("remote response write failed (id=%d)", id)
 	}
 }
 
@@ -488,8 +515,10 @@ func (rc *remoteConn) writeFrameNoClose(f remoteFrame) error {
 	}
 	var buf [4]byte
 	binary.BigEndian.PutUint32(buf[:], uint32(len(b)))
-	rc.mu.Lock()
-	defer rc.mu.Unlock()
+	rc.writeMu.Lock()
+	defer rc.writeMu.Unlock()
+	rc.conn.SetWriteDeadline(time.Now().Add(remoteWriteTimeout))
+	defer rc.conn.SetWriteDeadline(time.Time{})
 	if _, err := rc.conn.Write(buf[:]); err != nil {
 		return err
 	}
@@ -512,9 +541,9 @@ func (rc *remoteConn) dispatch(caps serviceCapabilities, principal servicePrinci
 // handleCancel cancels the in-flight request with the matching connection-scoped
 // id (if any).
 func (rc *remoteConn) handleCancel(id int64) {
-	rc.mu.Lock()
+	rc.stateMu.Lock()
 	st, ok := rc.inFlight[id]
-	rc.mu.Unlock()
+	rc.stateMu.Unlock()
 	if ok && st != nil {
 		st.cancel()
 	}
@@ -547,7 +576,8 @@ func readRemoteFramePayload(r *bufio.Reader) ([]byte, error) {
 
 // remoteResponseFromService builds the allowlist-based remote projection from an
 // internal serviceResponse.  Only explicitly public fields are copied; all
-// internal diagnostics stay private by default.
+// internal diagnostics (planner detail, candidate counts, decline/fallback
+// reasons) stay private by default.
 func remoteResponseFromService(resp serviceResponse) remoteResponse {
 	out := remoteResponse{
 		OK:          resp.OK,
@@ -555,15 +585,15 @@ func remoteResponseFromService(resp serviceResponse) remoteResponse {
 		Count:       resp.Count,
 		SearchMS:    resp.SearchMS,
 		Source:      resp.Source,
-		PlannerMode: resp.PlannerMode,
-		Candidates:  resp.Candidates,
-		Decline:     resp.Decline,
-		Fallback:    resp.Fallback,
 		Health:      resp.Health,
 		Version:     resp.Version,
 		Commit:      resp.Commit,
 		Date:        resp.Date,
 		BuildFlavor: resp.BuildFlavor,
+		Entries:     resp.Entries,
+		Loading:     resp.Loading,
+		Fuzzy:       resp.Fuzzy,
+		Complete:    resp.Complete,
 		Results:     resp.Results,
 	}
 	// EligibleVolumes are public volume labels (C:, F:), safe to expose.
@@ -646,4 +676,17 @@ func clampRemoteDeadline(deadlineUnix int64) int64 {
 		return maxDeadline
 	}
 	return deadlineUnix
+}
+
+// clampRemoteLimit enforces the server-owned result-limit bound before dispatch
+// so an unauthenticated loopback caller cannot force large result allocations
+// in the engine.  Count-only requests never materialize result rows, so their
+// limit is left to the engine (which ignores it for counting).
+func clampRemoteLimit(req *serviceRequest) {
+	if req.CountOnly {
+		return
+	}
+	if req.Limit <= 0 || req.Limit > remoteMaxResultLimit {
+		req.Limit = remoteMaxResultLimit
+	}
 }
