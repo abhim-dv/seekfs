@@ -53,6 +53,13 @@ func TestServiceCommandAllowed(t *testing.T) {
 		{"watch-delta", serviceCapabilities{ReadOnly: true, Remote: true}, false},
 		{"index-usn", serviceCapabilities{ReadOnly: true, Remote: true}, false},
 		{"reindex", serviceCapabilities{ReadOnly: true, Remote: true}, false},
+		// The remote allowlist is applied BEFORE capability-class dispatch: a
+		// remote principal with Mutate enabled still cannot reach mutation
+		// commands (or any command outside the search/info wire contract).
+		{"search", serviceCapabilities{ReadOnly: true, Mutate: true, Remote: true}, true},
+		{"info", serviceCapabilities{ReadOnly: true, Mutate: true, Remote: true}, true},
+		{"index-usn", serviceCapabilities{ReadOnly: true, Mutate: true, Remote: true}, false},
+		{"status", serviceCapabilities{ReadOnly: true, Mutate: true, Remote: true}, false},
 	}
 	for _, tt := range tests {
 		if got := serviceCommandAllowed(tt.command, tt.caps); got != tt.want {

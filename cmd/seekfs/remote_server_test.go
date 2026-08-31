@@ -48,7 +48,7 @@ func TestRemoteResponseAllowlist(t *testing.T) {
 		DBs:             []dbInfo{{Path: "C:\\ProgramData\\seekfs\\indexes\\seekfs_c.gsi", Entries: 100, Volume: "C:", State: "ready", JournalID: 123, Checkpoint: 456, Memory: &residentMemoryInfo{Records: 100}, LastPersistError: "boom", Source: "usn", BuiltAt: "2026-01-01T00:00:00Z", FRNRecords: 100}},
 	}
 
-	out := remoteResponseFromService(resp)
+	out := remoteResponseFromService(resp, false)
 
 	// The projection type has no fields for physical internals; verify the
 	// marshaled JSON contains none of them.
@@ -427,28 +427,41 @@ func TestRemoteLimitClampedBeforeDispatch(t *testing.T) {
 func TestRemoteSearchSourceCoarse(t *testing.T) {
 	// Detailed planner route names must collapse to stable public categories.
 	// Fuzzy behavior is conveyed by the separate Fuzzy field, not the source.
-	tests := []struct{ in, want string }{
-		{"global:filename-pngc", "indexed"},
-		{"global:filename-pngr", "indexed"},
-		{"global:filename-trigram", "indexed"},
-		{"planned:ext-top", "indexed"},
-		{"planned:boolean", "indexed"},
-		{"planned", "indexed"},
-		{"compact-name-order-scan", "bounded-scan"},
-		{"bounded-scan", "bounded-scan"},
-		{"filesystem-under-fallback", "bounded-scan"},
-		{"legacy-planner", "bounded-scan"},
-		{"count-fast-posting", "count"},
-		{"count-fast-pngc", "count"},
-		{"count-fast-pngr", "count"},
-		{"name-trigram", "indexed"},
-		{"component-trigram", "indexed"},
-		{"exact-name", "indexed"},
-		{"path-component-trigram", "indexed"},
+	tests := []struct {
+		in        string
+		countOnly bool
+		want      string
+	}{
+		{"", false, ""},
+		{"", true, ""},
+		{"global:filename-pngc", false, "indexed"},
+		{"global:filename-pngr", false, "indexed"},
+		{"global:filename-trigram", false, "indexed"},
+		{"planned:ext-top", false, "indexed"},
+		{"planned:boolean", false, "indexed"},
+		{"planned", false, "indexed"},
+		{"compact-name-order-scan", false, "bounded-scan"},
+		{"bounded-scan", false, "bounded-scan"},
+		{"global:bounded-scan", false, "bounded-scan"},
+		{"filesystem-under-fallback", false, "bounded-scan"},
+		{"legacy-planner", false, "bounded-scan"},
+		{"count-fast-posting", false, "count"},
+		{"count-fast-pngc", false, "count"},
+		{"count-fast-pngr", false, "count"},
+		{"parallel-name-count", false, "count"},
+		{"global:boolean-persisted-count", false, "count"},
+		{"planned:or-group-lazy-count", false, "count"},
+		// Any count-only request is a count, regardless of internal route.
+		{"global:bounded-scan", true, "count"},
+		{"planned:or-group-lazy-top", true, "count"},
+		{"name-trigram", false, "indexed"},
+		{"component-trigram", false, "indexed"},
+		{"exact-name", false, "indexed"},
+		{"path-component-trigram", false, "indexed"},
 	}
 	for _, tt := range tests {
-		if got := remoteSearchSource(tt.in); got != tt.want {
-			t.Errorf("remoteSearchSource(%q) = %q, want %q", tt.in, got, tt.want)
+		if got := remoteSearchSource(tt.in, tt.countOnly); got != tt.want {
+			t.Errorf("remoteSearchSource(%q, countOnly=%v) = %q, want %q", tt.in, tt.countOnly, got, tt.want)
 		}
 	}
 }

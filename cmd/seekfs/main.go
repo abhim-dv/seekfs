@@ -7863,11 +7863,17 @@ func remoteServiceCommandAllowed(command string) bool {
 
 // serviceCommandAllowed reports whether a caller with the given capabilities may
 // issue a command.  Deny-by-default: unknown commands and any command exceeding
-// the caller's capabilities are rejected.
+// the caller's capabilities are rejected.  Remote callers are held to the
+// canonical search/info-only wire allowlist FIRST, before capability-class
+// dispatch, so a remote principal can never reach a mutation branch even with
+// Mutate enabled.
 func serviceCommandAllowed(command string, caps serviceCapabilities) bool {
+	if caps.Remote && !remoteServiceCommandAllowed(command) {
+		return false
+	}
 	switch classifyServiceCommand(command) {
 	case serviceCommandReadOnly:
-		return caps.ReadOnly && (!caps.Remote || remoteServiceCommandAllowed(command))
+		return caps.ReadOnly
 	case serviceCommandMutate:
 		return caps.Mutate
 	case serviceCommandLocalOnly:
@@ -8043,7 +8049,10 @@ func (s *goSearchService) handleServiceCommand(w io.Writer, principal servicePri
 			return
 		}
 		if caps.Remote {
-			serviceLog("search remote ms=%.1f planner=%s source=%s decline=%s candidates=%d results=%d", searchMS, trace.PlannerMode, trace.Source, trace.Decline, trace.Candidates, len(matches))
+			// Remote logs use only the coarse public source category and omit
+			// planner/decline detail: internal sources can embed query-derived
+			// extension or path terms, which must not reach the log.
+			serviceLog("search remote ms=%.1f source=%s results=%d", searchMS, remoteSearchSource(trace.Source, req.CountOnly), len(matches))
 		} else {
 			serviceLog("search query=%q ms=%.1f planner=%s source=%s decline=%s filename_driver=%s candidates=%d results=%d", req.Query, searchMS, trace.PlannerMode, trace.Source, trace.Decline, trace.FilenameDriver, trace.Candidates, len(matches))
 		}

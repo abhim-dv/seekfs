@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -481,7 +482,7 @@ func (rc *remoteConn) executeRequest(id int64, st *remoteRequestState, req *serv
 		// The request was cancelled; the client may not expect a response.
 		return
 	}
-	if err := rc.writeRemoteResponse(id, resp); err != nil {
+	if err := rc.writeRemoteResponse(id, resp, req.CountOnly); err != nil {
 		serviceLog("remote response write failed (id=%d)", id)
 	}
 }
@@ -489,8 +490,8 @@ func (rc *remoteConn) executeRequest(id int64, st *remoteRequestState, req *serv
 // writeRemoteResponse converts an internal response to the allowlisted remote
 // projection, bounds its encoded size, and writes it (closing the connection on
 // failure).
-func (rc *remoteConn) writeRemoteResponse(id int64, resp serviceResponse) error {
-	out := remoteResponseFromService(resp)
+func (rc *remoteConn) writeRemoteResponse(id int64, resp serviceResponse, countOnly bool) error {
+	out := remoteResponseFromService(resp, countOnly)
 	b, err := json.Marshal(out)
 	if err != nil {
 		rc.shutdown()
@@ -578,13 +579,13 @@ func readRemoteFramePayload(r *bufio.Reader) ([]byte, error) {
 // internal serviceResponse.  Only explicitly public fields are copied; all
 // internal diagnostics (planner detail, candidate counts, decline/fallback
 // reasons) stay private by default.
-func remoteResponseFromService(resp serviceResponse) remoteResponse {
+func remoteResponseFromService(resp serviceResponse, countOnly bool) remoteResponse {
 	out := remoteResponse{
 		OK:          resp.OK,
 		Message:     genericRemoteMessage(resp.Message),
 		Count:       resp.Count,
 		SearchMS:    resp.SearchMS,
-		Source:      remoteSearchSource(resp.Source),
+		Source:      remoteSearchSource(resp.Source, countOnly),
 		Health:      resp.Health,
 		Version:     resp.Version,
 		Commit:      resp.Commit,
@@ -631,13 +632,22 @@ func remoteResponseFromService(resp serviceResponse) remoteResponse {
 // category.  Internal sources are detailed planner names (e.g.
 // "global:filename-pngc", "planned:ext-top", "compact-name-order-scan") that
 // must not become wire API; remote callers get one of the stable route
-// categories: "count", "bounded-scan", or "indexed".  Fuzzy behavior is
-// conveyed by the separate Fuzzy field, not by the source route.
-func remoteSearchSource(source string) string {
-	switch {
-	case source == "count-fast-posting" || source == "count-fast-pngc" || source == "count-fast-pngr":
+// categories: "count", "bounded-scan", or "indexed".  An empty source is
+// preserved (it appears on info and error responses and must not acquire a
+// false route).  Fuzzy behavior is conveyed by the separate Fuzzy field, not by
+// the source route.
+func remoteSearchSource(source string, countOnly bool) string {
+	if source == "" {
+		return ""
+	}
+	if countOnly {
 		return "count"
-	case source == "bounded-scan" || source == "broad-scan" || source == "filesystem-under-fallback" || source == "compact-name-order-scan" || source == "legacy-planner":
+	}
+	switch {
+	case source == "count-fast-posting" || source == "count-fast-pngc" || source == "count-fast-pngr" ||
+		source == "parallel-name-count" || source == "global:boolean-persisted-count" || source == "planned:or-group-lazy-count" || strings.HasSuffix(source, "-count"):
+		return "count"
+	case strings.Contains(source, "bounded-scan") || source == "broad-scan" || source == "filesystem-under-fallback" || source == "compact-name-order-scan" || source == "legacy-planner":
 		return "bounded-scan"
 	default:
 		return "indexed"
