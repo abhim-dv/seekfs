@@ -192,6 +192,9 @@ func TestGlobalBoundedScanPrefilterParity(t *testing.T) {
 		"type:dir workspace",
 		"F: nrrd",
 		"Downloads raw",
+		"regex:.*volume.*",
+		`regex:.*\.json$`,
+		"regex:.*filtered-volume.*",
 	}
 	for _, query := range queries {
 		opts := queryOptions{Query: query, MatchPath: true, Limit: 50}

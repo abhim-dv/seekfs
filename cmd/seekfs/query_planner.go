@@ -1330,7 +1330,7 @@ func searchServiceVolumesGlobalComponentsOnlySnapshot(snapshot globalQuerySnapsh
 	if !globalEnabled && !globalComponentDefaultSupported(pq, terms) {
 		return nil, false, nil
 	}
-	if !globalComponentQuerySupported(pq, terms) {
+	if !globalComponentQuerySupportedMulti(pq, terms, len(volumes) > 1) {
 		opts.Trace.replaceDecline("global-components:unsupported-query")
 		return nil, false, nil
 	}
@@ -1402,6 +1402,28 @@ func searchServiceVolumesGlobalComponentsOnlySnapshot(snapshot globalQuerySnapsh
 				opts.Trace.replaceDecline("global-components:missing-source")
 			}
 			return nil, false, nil
+		}
+		if !countOnly && limit > 0 {
+			// Stream the iterator and verify on the fly, keeping only the
+			// top-N in a bounded heap.  The old path materialized every
+			// candidate id (potentially millions, e.g. a broad regex-literal
+			// query) and then re-verified them in a second pass.  Streaming
+			// keeps memory O(limit) and runs one verification pass, which is
+			// the difference between 28s and tens of ms for regex-literal
+			// queries.
+			base, verified, err := collectGlobalVerifiedTopN(componentIt, volumes, snapshots, pq, limit)
+			if err != nil {
+				return nil, true, err
+			}
+			if opts.Trace != nil {
+				opts.Trace.ComponentRecordsVerified += verified
+			}
+			results := globalRankedEntriesToEntries(mergeGlobalOverlayEntries(volumes, snapshots, base, pq, limit))
+			opts.Trace.setPlannerMode("global-components")
+			addGlobalComponentTraceTerms(opts.Trace, pq, len(base))
+			opts.Trace.setSource("global:components", len(base))
+			opts.Trace.setComplete(true)
+			return results, true, nil
 		}
 		canceled := false
 		if globalSnapshotsHaveHidden(snapshots) {
@@ -1487,17 +1509,21 @@ func searchServiceVolumesGlobalBoundedFallbackSnapshot(snapshot globalQuerySnaps
 				hidden = hiddenBaseIDs{tombstone: snapshots[volumeIndex].tombstoneIDs, shadowed: snapshots[volumeIndex].shadowedIDs}
 			}
 			// Pre-filter the name/id-order scan with a cheap exact posting
-			// (ext:, glob-ext:, or a bounded type:dir subtree) when present, so
-			// broad queries like "test ext:py" or "type:dir docs" skip
-			// non-matching records instead of verifying every record.  The scan
-			// order is unchanged, preserving the bounded scan's top-N semantics.
+			// (ext:, glob-ext:, a bounded type:dir subtree, or a required regex
+			// literal run) when present, so broad queries like "test ext:py",
+			// "type:dir docs", or "regex:README\.(md|txt)$" skip non-matching
+			// records instead of verifying every record.  The scan order is
+			// unchanged, preserving the bounded scan's top-N semantics.
 			var filter *boundedScanMembershipFilter
-			if source, hasSource := vol.planExtFilterSource(volumePQ); hasSource {
-				filter = &boundedScanMembershipFilter{source: source}
-			} else if dirFilter, hasDirFilter := vol.planDirSubtreeFilter(volumePQ); hasDirFilter {
-				filter = dirFilter
+			exactEmpty, filterOK := vol.boundedScanPrefilter(volumePQ, &filter)
+			if !exactEmpty && filterOK {
+				localIDs, ok = vol.boundedScanCandidatesHiddenTopFiltered(volumePQ, hidden, limit, filter)
+			} else if exactEmpty {
+				localIDs = []int{}
+				ok = true
+			} else {
+				localIDs, ok = vol.boundedScanCandidatesHiddenTop(volumePQ, hidden, limit)
 			}
-			localIDs, ok = vol.boundedScanCandidatesHiddenTopFiltered(volumePQ, hidden, limit, filter)
 		}
 		if !ok {
 			opts.Trace.replaceDecline("global-bounded-scan:canceled")
@@ -1846,7 +1872,7 @@ func countServiceVolumesGlobalOnlySnapshot(snapshot globalQuerySnapshot, opts qu
 	if !globalEnabled && !globalComponentDefaultSupported(pq, terms) {
 		return 0, false, nil
 	}
-	if !globalComponentQuerySupported(pq, terms) {
+	if !globalComponentQuerySupportedMulti(pq, terms, len(volumes) > 1) {
 		opts.Trace.replaceDecline("global-count:unsupported-query")
 		return 0, false, nil
 	}
@@ -2973,6 +2999,16 @@ func globalExtPostingFilters(pq parsedQuery) ([]globalExtFilter, bool) {
 }
 
 func globalComponentQuerySupported(pq parsedQuery, terms []string) bool {
+	return globalComponentQuerySupportedMulti(pq, terms, false)
+}
+
+// globalComponentQuerySupportedMulti is globalComponentQuerySupported with an
+// explicit multi-volume flag.  Multi-volume pure-substring regexes are declined
+// from the components lane so they route to the bounded-scan regex pre-filter
+// (which matches the full-scan order and stops at the top-N); single-volume
+// regexes keep the components/literal lane so the persisted per-volume regex
+// candidates continue to serve them.
+func globalComponentQuerySupportedMulti(pq parsedQuery, terms []string, multi bool) bool {
 	minTerms := 2
 	if queryHasExplicitPathTerm(pq.Raw) || globalComponentVolumeAnchored(pq) {
 		minTerms = 1
@@ -2986,7 +3022,7 @@ func globalComponentQuerySupported(pq parsedQuery, terms []string) bool {
 	if len(pq.Dirs) != 0 || len(pq.Parents) != 0 || pq.Under != "" || len(pq.AttrFilters) != 0 {
 		minTerms = 0
 	}
-	if !globalComponentTermsSupported(pq, terms, minTerms, true) {
+	if !globalComponentTermsSupportedMulti(pq, terms, minTerms, true, multi) {
 		return false
 	}
 	for _, group := range pq.OrGroups {
@@ -2997,7 +3033,7 @@ func globalComponentQuerySupported(pq parsedQuery, terms []string) bool {
 			if len(alt.OrGroups) != 0 || len(alt.NotGroups) != 0 {
 				return false
 			}
-			if !globalComponentTermsSupported(alt, nonVolumeTerms(alt.Terms), 1, true) {
+			if !globalComponentTermsSupportedMulti(alt, nonVolumeTerms(alt.Terms), 1, true, multi) {
 				return false
 			}
 		}
@@ -3006,7 +3042,7 @@ func globalComponentQuerySupported(pq parsedQuery, terms []string) bool {
 		if len(neg.OrGroups) != 0 || len(neg.NotGroups) != 0 {
 			return false
 		}
-		if !globalComponentTermsSupported(neg, nonVolumeTerms(neg.Terms), 1, true) {
+		if !globalComponentTermsSupportedMulti(neg, nonVolumeTerms(neg.Terms), 1, true, multi) {
 			return false
 		}
 	}
@@ -3014,6 +3050,10 @@ func globalComponentQuerySupported(pq parsedQuery, terms []string) bool {
 }
 
 func globalComponentTermsSupported(pq parsedQuery, terms []string, minTerms int, allowExtFilters bool) bool {
+	return globalComponentTermsSupportedMulti(pq, terms, minTerms, allowExtFilters, false)
+}
+
+func globalComponentTermsSupportedMulti(pq parsedQuery, terms []string, minTerms int, allowExtFilters bool, multi bool) bool {
 	extFilters, extFiltersOK := globalExtPostingFilters(pq)
 	if !extFiltersOK || (!allowExtFilters && len(extFilters) != 0) {
 		return false
@@ -3023,6 +3063,17 @@ func globalComponentTermsSupported(pq parsedQuery, terms []string, minTerms int,
 	}
 	if globalRegexLiteralSupported(pq) {
 		minTerms = 0
+	}
+	// A pure-substring regex (.*literal.*) on a multi-volume service is served
+	// exactly and far faster by the bounded-scan regex pre-filter (which walks
+	// the name/id order and stops at the top-N), matching the full-scan result
+	// order.  The components iterator would otherwise materialize every path
+	// containing the literal and verify each with the regex -- seconds to
+	// minutes for a common term.  Declining here routes the query to the
+	// bounded fallback instead.  Single-volume queries keep the components
+	// regex-literal lane.
+	if multi && globalRegexLiteralSupported(pq) && queryIsPureSubstringRegex(pq) {
+		return false
 	}
 	if (len(terms) > 0 && !pq.MatchPath) || (!pq.MatchPath && len(pq.Dirs) == 0 && len(pq.Parents) == 0 && pq.Under == "" && len(extFilters) == 0 && len(pq.AttrFilters) == 0 && len(pq.OrGroups) == 0 && !globalRegexLiteralSupported(pq)) ||
 		len(terms) < minTerms || (pq.Type != "" && pq.Type != "file" && pq.Type != "dir") ||
@@ -3041,6 +3092,22 @@ func globalComponentTermsSupported(pq parsedQuery, terms []string, minTerms int,
 		}
 	}
 	return true
+}
+
+// queryIsPureSubstringRegex reports whether the query is exactly one
+// case-insensitive path regex whose single literal run makes it a pure
+// substring match (.*literal.*), with no other terms or filters.
+func queryIsPureSubstringRegex(pq parsedQuery) bool {
+	if !pq.MatchPath || pq.CaseSensitive || len(pq.Regexps) != 1 || len(pq.RegexTerms) != 1 ||
+		len(pq.Terms) != 0 || len(pq.Exts) != 0 || len(pq.Globs) != 0 || len(pq.Dirs) != 0 ||
+		len(pq.Parents) != 0 || len(pq.OrGroups) != 0 || len(pq.NotGroups) != 0 ||
+		len(pq.SizeFilters) != 0 || len(pq.DateFilters) != 0 || len(pq.AttrFilters) != 0 ||
+		pq.Type != "" || pq.Under != "" || pq.Exists || pq.HasModAfter ||
+		pq.RootBias != "" || pq.CWDBias != "" {
+		return false
+	}
+	literal := regexRequiredLiteral(pq.Regexps[0].String())
+	return len(literal) >= 3 && literal == pq.RegexTerms[0]
 }
 
 func globalRegexLiteralSupported(pq parsedQuery) bool {
@@ -4765,6 +4832,34 @@ func (vol *serviceVolumeIndex) boundedScanCandidatesHiddenTopFiltered(pq parsedQ
 	return out, true
 }
 
+// boundedScanPrefilter tries the cheap exact superset pre-filters for the
+// bounded scan in priority order: ext:/glob-ext:, a bounded type:dir subtree,
+// and a required regex literal run.  It returns (exactEmpty, filterOK):
+// exactEmpty means the query provably matches nothing on this volume (caller
+// short-circuits), filterOK means a membership filter was set, and neither
+// means no filter applies and the unfiltered scan runs.
+func (vol *serviceVolumeIndex) boundedScanPrefilter(pq parsedQuery, filter **boundedScanMembershipFilter) (exactEmpty, filterOK bool) {
+	if vol == nil || vol.index == nil || pq.CaseSensitive {
+		return false, false
+	}
+	if source, hasSource := vol.planExtFilterSource(pq); hasSource {
+		*filter = &boundedScanMembershipFilter{source: source}
+		return false, true
+	}
+	if dirFilter, hasDirFilter := vol.planDirSubtreeFilter(pq); hasDirFilter {
+		*filter = dirFilter
+		return false, true
+	}
+	if regexFilter, regexEmpty, hasRegexFilter := vol.planRegexLiteralFilter(pq); hasRegexFilter {
+		if regexEmpty {
+			return true, true
+		}
+		*filter = regexFilter
+		return false, true
+	}
+	return false, false
+}
+
 // planExtFilterSource returns a candidatePlanSource whose posting is a cheap,
 // exact superset pre-filter (ext: or glob-ext:) for the query, when one exists.
 func (vol *serviceVolumeIndex) planExtFilterSource(pq parsedQuery) (candidatePlanSource, bool) {
@@ -4773,15 +4868,133 @@ func (vol *serviceVolumeIndex) planExtFilterSource(pq parsedQuery) (candidatePla
 	}
 	for _, ext := range pq.Exts {
 		if candidate, ok := vol.extPostingCountCandidate(ext); ok {
+			// Cap the posting so a very common extension (e.g. .dll on a huge
+			// index) does not materialize a multi-hundred-MB membership map.
+			// Above the cap the unfiltered scan is no worse, and skipping the
+			// filter avoids a pathological memory spike.
+			if candidate.len() > serviceComponentMultiTermScanMaxIDs {
+				continue
+			}
 			return candidatePlanSource{posting: candidate, hasPosting: true}, true
 		}
 	}
 	if globExts, ok := simpleGlobExts(pq.Globs); ok && len(globExts) == 1 {
 		if candidate, ok := vol.extPostingCountCandidate(globExts[0]); ok {
+			if candidate.len() > serviceComponentMultiTermScanMaxIDs {
+				return candidatePlanSource{}, false
+			}
 			return candidatePlanSource{posting: candidate, hasPosting: true}, true
 		}
 	}
 	return candidatePlanSource{}, false
+}
+
+// regexRequiredLiteral finds a literal run that is guaranteed to appear in any
+// match of the regex: a depth-0 run not inside a top-level alternation and not
+// made optional by a trailing `?`/`*`/`{` quantifier.  Such a run is a safe
+// superset pre-filter for the bounded scan (every matching record's path must
+// contain it).  Returns "" when no required literal can be proven.
+func regexRequiredLiteral(pat string) string {
+	pat = strings.TrimPrefix(pat, "(?i)")
+	depth := 0
+	required := ""
+	var run []byte
+	escaped := false
+	inClass := false
+	flush := func() {
+		if depth == 0 && len(run) >= 2 {
+			required = string(run)
+		}
+		run = run[:0]
+	}
+	for i := 0; i < len(pat); i++ {
+		c := pat[i]
+		if escaped {
+			escaped = false
+			// An escaped literal rune (e.g. \_) continues the run; any other
+			// escape ends it.  Note this branch is reached with c == the
+			// escaped character.
+			if isRegexLiteralRune(rune(c)) && depth == 0 {
+				run = append(run, c)
+			} else {
+				flush()
+			}
+			continue
+		}
+		switch c {
+		case '\\':
+			escaped = true
+		case '[':
+			flush()
+			inClass = true
+		case ']':
+			inClass = false
+		case '(', '|':
+			flush()
+			if c == '(' {
+				depth++
+			}
+		case ')':
+			flush()
+			if depth > 0 {
+				depth--
+			}
+		case '?', '*', '+', '{':
+			// A quantifier makes the preceding run optional/repeatable; a run
+			// with a preceding quantifier is not provably required.
+			flush()
+		case '.':
+			if i+1 < len(pat) && (pat[i+1] == '*' || pat[i+1] == '+') {
+				flush()
+				i++
+				continue
+			}
+			flush()
+		default:
+			if !inClass && isRegexLiteralRune(rune(c)) {
+				if depth == 0 {
+					run = append(run, c)
+				} else {
+					flush()
+				}
+			} else {
+				flush()
+			}
+		}
+	}
+	flush()
+	return required
+}
+
+// planRegexLiteralFilter builds a bounded-scan membership pre-filter from a
+// required regex literal run.  A record matching the regex must contain the
+// run in its path, so the run's path posting is an exact superset of the match
+// set; the bounded scan then only regex-verifies those records.  This turns
+// rare-match regexes like `regex:README\.(md|txt)$` from a full-volume scan
+// (minutes) into a scan of just the README-containing records (sub-second).
+// empty reports that no record contains the required literal, so the query is
+// provably a zero-match on this volume and the caller can short-circuit.
+func (vol *serviceVolumeIndex) planRegexLiteralFilter(pq parsedQuery) (filter *boundedScanMembershipFilter, empty bool, ok bool) {
+	if vol == nil || vol.index == nil || pq.CaseSensitive || len(pq.Regexps) != 1 ||
+		len(pq.RegexTerms) == 0 || !pq.MatchPath {
+		return nil, false, false
+	}
+	literal := strings.ToLower(regexRequiredLiteral(pq.Regexps[0].String()))
+	if len(literal) < 3 || strings.ContainsAny(literal, `\/*?[]:`) {
+		return nil, false, false
+	}
+	ids := vol.pathTermPosting(literal)
+	if len(ids) == 0 {
+		return nil, true, true
+	}
+	if len(ids) > serviceComponentMultiTermScanMaxIDs {
+		return nil, false, false
+	}
+	members := make(map[int]struct{}, len(ids))
+	for _, id := range ids {
+		members[id] = struct{}{}
+	}
+	return &boundedScanMembershipFilter{members: members}, false, true
 }
 
 // planDirSubtreeFilter builds a membership pre-filter for `type:dir <term>`
