@@ -27,6 +27,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 	"unsafe"
 
@@ -2642,6 +2643,164 @@ type serviceResponse struct {
 	HealthMessage            string             `json:"health_message,omitempty"`
 }
 
+// servicePrincipal describes the caller of a service command and the
+// capabilities derived from its Windows identity.  A principal is produced by
+// impersonating the pipe client token (local callers) or by authenticating a
+// remote session (later phases); it is never constructed from client-supplied
+// fields.
+type servicePrincipal struct {
+	// Elevated is true for SYSTEM and for elevated (UAC) administrators.  Only
+	// elevated principals may issue mutation commands (index-usn and future
+	// mutations).
+	Elevated bool
+	// SID is the caller's user SID when it can be resolved, else "".
+	SID string
+}
+
+// serviceCapabilities is the per-caller command allowlist.  Phase 1 derives it
+// from the local principal: read-only commands for ordinary users, plus
+// mutation for elevated/SYSTEM.  Remote callers (Phase 3+) get a strict
+// read-only allowlist and sanitized projections.
+type serviceCapabilities struct {
+	// ReadOnly permits search, count, info, status, and (locally) watch-delta.
+	ReadOnly bool
+	// Mutate permits index-usn / service-index-usn and future mutation commands.
+	Mutate bool
+	// Remote marks a non-local caller; remote callers get sanitized projections
+	// and no watch-delta until later phases.
+	Remote bool
+}
+
+// impersonateNamedPipeClient exposes advapi32.ImpersonateNamedPipeClient, which
+// is not declared in x/sys/windows v0.38.0.
+var procImpersonateNamedPipeClient = syscall.NewLazyDLL("advapi32.dll").NewProc("ImpersonateNamedPipeClient")
+
+func impersonateNamedPipeClient(pipe syscall.Handle) error {
+	r1, _, e1 := procImpersonateNamedPipeClient.Call(uintptr(pipe))
+	if r1 == 0 {
+		if e1 != syscall.Errno(0) {
+			return e1
+		}
+		return syscall.EINVAL
+	}
+	return nil
+}
+
+// servicePrincipalForPipeConn builds the caller principal for a local named-pipe
+// connection by impersonating the client token.  It follows the documented
+// fail-safe sequence:
+//
+//  1. Lock the goroutine to its OS thread (impersonation is thread-local).
+//  2. Call ImpersonateNamedPipeClient and verify success; on failure, fail
+//     closed to a non-elevated (read-only) principal rather than falling through
+//     to the privileged service context.
+//  3. Inspect the client token while impersonating and copy the result.
+//  4. RevertToSelf before returning.  A failed reversion leaves this OS thread
+//     in the client's security context; the process is terminated immediately
+//     (serviceFatalExit) rather than returning that thread to the scheduler.
+//
+// The returned principal is a plain value; no impersonation remains in effect
+// on the normal path.  RevertToSelf failure does not return.
+func servicePrincipalForPipeConn(conn *os.File) servicePrincipal {
+	principal := servicePrincipal{}
+	if conn == nil {
+		return principal
+	}
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	if err := impersonateNamedPipeClient(syscall.Handle(conn.Fd())); err != nil {
+		// Failed impersonation: do not fall through to the privileged service
+		// context.  Fail closed to read-only.
+		serviceLog("pipe impersonation failed: %v; failing closed to read-only", err)
+		return principal
+	}
+
+	// serviceRevertToSelfOrDie reverts the client impersonation and, on
+	// failure, terminates the process immediately.  os.Exit does not run
+	// deferred functions, so the still-impersonating OS thread is never
+	// returned to Go's scheduler.  Must be called on the locked OS thread and
+	// only after all token inspection is complete.
+	serviceRevertToSelfOrDie := func() {
+		if err := windows.RevertToSelf(); err != nil {
+			serviceLog("FATAL: RevertToSelf failed while handling a pipe request: %v; the thread remains in the client's security context, exiting", err)
+			serviceFatalExit(1)
+		}
+	}
+
+	if th, err := windows.GetCurrentThread(); err == nil {
+		var token windows.Token
+		// openAsSelf=true: access the thread (impersonation) token using the
+		// process token's security context, which is what we want here.
+		if err := windows.OpenThreadToken(th, windows.TOKEN_QUERY, true, &token); err == nil {
+			principal = servicePrincipalFromToken(token)
+			token.Close()
+			serviceRevertToSelfOrDie()
+			return principal
+		}
+	}
+	// Could not open/read the client token: fail closed to read-only.
+	serviceRevertToSelfOrDie()
+	return servicePrincipal{}
+}
+
+// servicePrincipalFromToken derives a principal from an access token using the
+// documented policy: mutation is granted to LocalSystem, or to a UAC-elevated
+// token that is an enabled member of Builtin Administrators.  Any token or
+// group-query error leaves the principal non-elevated (read-only).
+func servicePrincipalFromToken(token windows.Token) servicePrincipal {
+	principal := servicePrincipal{}
+
+	user, err := token.GetTokenUser()
+	if err != nil || user.User.Sid == nil {
+		// The caller's identity could not be resolved.  Fail closed to a
+		// read-only principal: do not proceed to the elevation/membership
+		// checks, which would otherwise be able to grant mutation without a
+		// verified user SID.
+		return principal
+	}
+	principal.SID = user.User.Sid.String()
+
+	// LocalSystem always gets mutation.
+	if sysSID, err := windows.CreateWellKnownSid(windows.WinLocalSystemSid); err == nil && user.User.Sid.Equals(sysSID) {
+		principal.Elevated = true
+		return principal
+	}
+
+	// Elevated (UAC) and an enabled member of Builtin Administrators.
+	if token.IsElevated() {
+		if adminsSID, err := windows.CreateWellKnownSid(windows.WinBuiltinAdministratorsSid); err == nil {
+			if member, err := token.IsMember(adminsSID); err == nil && member {
+				principal.Elevated = true
+			}
+		}
+	}
+	return principal
+}
+
+// serviceFatalExit is the production process-fail-fast hook.  It is a variable
+// so tests can intercept the fatal impersonation-state path.
+var serviceFatalExit = func(code int) { os.Exit(code) }
+
+// tokenUserSID returns the user SID string for a token, or "" on failure.
+func tokenUserSID(token windows.Token) string {
+	user, err := token.GetTokenUser()
+	if err != nil || user.User.Sid == nil {
+		return ""
+	}
+	return user.User.Sid.String()
+}
+
+// localServiceCapabilities maps a local pipe principal to capabilities.  SYSTEM
+// and elevated administrators may mutate; everyone else is read-only.  Remote
+// callers are never classified through this path.
+func localServiceCapabilities(p servicePrincipal) serviceCapabilities {
+	return serviceCapabilities{
+		ReadOnly: true,
+		Mutate:   p.Elevated,
+	}
+}
+
 // Service health values reported via the info response and surfaced in the UI
 // as the bottom-right status dot.
 const (
@@ -2800,6 +2959,7 @@ type goSearchService struct {
 	sddl        string
 	processMode string
 	stop        chan struct{}
+	stopOnce    sync.Once
 	dbs         []string
 	indexes     []*Index
 	volumes     []*serviceVolumeIndex
@@ -2807,6 +2967,16 @@ type goSearchService struct {
 	loadErr     string
 	indexMu     sync.RWMutex
 	requestSeq  atomic.Int64
+}
+
+// signalServiceStop closes the stop channel exactly once.  It is safe to call
+// from the service control loop and from a pipe handler that hits an
+// unrecoverable impersonation state.
+func (s *goSearchService) signalServiceStop() {
+	if s == nil || s.stop == nil {
+		return
+	}
+	s.stopOnce.Do(func() { close(s.stop) })
 }
 
 type serviceVolumeIndex struct {
@@ -3797,7 +3967,7 @@ func (s *goSearchService) Execute(args []string, r <-chan svc.ChangeRequest, cha
 			changes <- req.CurrentStatus
 		case svc.Stop, svc.Shutdown:
 			changes <- svc.Status{State: svc.StopPending}
-			close(s.stop)
+			s.signalServiceStop()
 			<-done
 			return false, 0
 		}
@@ -7556,7 +7726,7 @@ func (s *goSearchService) createPipeInstance() (*os.File, error) {
 	handle, err := windows.CreateNamedPipe(
 		ptr,
 		windows.PIPE_ACCESS_DUPLEX,
-		windows.PIPE_TYPE_BYTE|windows.PIPE_READMODE_BYTE|windows.PIPE_WAIT,
+		windows.PIPE_TYPE_BYTE|windows.PIPE_READMODE_BYTE|windows.PIPE_WAIT|windows.PIPE_REJECT_REMOTE_CLIENTS,
 		windows.PIPE_UNLIMITED_INSTANCES,
 		64*1024,
 		64*1024,
@@ -7609,6 +7779,67 @@ func handleServiceConn(conn *os.File, s *goSearchService) {
 	var req serviceRequest
 	if err := json.NewDecoder(conn).Decode(&req); err != nil {
 		_ = json.NewEncoder(conn).Encode(serviceResponse{OK: false, Message: err.Error()})
+		return
+	}
+	// Phase 1: derive the caller's capabilities from its Windows identity by
+	// impersonating the pipe client.  Failures fail closed (read-only).  A
+	// RevertToSelf failure is process-fatal and does not return.
+	principal := servicePrincipalForPipeConn(conn)
+	caps := localServiceCapabilities(principal)
+	s.handleServiceCommand(conn, principal, caps, &req)
+}
+
+// serviceCommandClass classifies a service command for capability gating.
+// The allowlist is deny-by-default: an unrecognized command is denied.
+type serviceCommandClass int
+
+const (
+	serviceCommandReadOnly serviceCommandClass = iota
+	serviceCommandMutate
+	serviceCommandUnknown
+)
+
+// classifyServiceCommand maps a service command name to the capability class it
+// requires.  This is the single authority for which commands a caller may issue;
+// future mutation commands must be listed here to be granted to elevated
+// callers, and are otherwise denied by default.
+func classifyServiceCommand(command string) serviceCommandClass {
+	switch command {
+	case "search", "info", "status", "watch-delta":
+		return serviceCommandReadOnly
+	case "index-usn":
+		return serviceCommandMutate
+	default:
+		return serviceCommandUnknown
+	}
+}
+
+// serviceCommandAllowed reports whether a caller with the given capabilities may
+// issue a command.  Deny-by-default: unknown commands and any command exceeding
+// the caller's capabilities are rejected.
+func serviceCommandAllowed(command string, caps serviceCapabilities) bool {
+	switch classifyServiceCommand(command) {
+	case serviceCommandReadOnly:
+		return caps.ReadOnly
+	case serviceCommandMutate:
+		return caps.Mutate
+	default:
+		return false
+	}
+}
+
+// handleServiceCommand dispatches a decoded service request to the engine.
+// Phase 1 keeps the local pipe as the only transport; the principal and
+// capabilities gate commands.  Later phases reuse this dispatch from
+// the broker/remote transport with a remote principal and a strict read-only
+// capability set.
+func (s *goSearchService) handleServiceCommand(conn *os.File, principal servicePrincipal, caps serviceCapabilities, req *serviceRequest) {
+	if !serviceCommandAllowed(req.Command, caps) {
+		message := "command not permitted for this caller"
+		if classifyServiceCommand(req.Command) == serviceCommandMutate {
+			message = "this command requires elevation; rerun it from an elevated prompt"
+		}
+		_ = json.NewEncoder(conn).Encode(serviceResponse{OK: false, Message: message})
 		return
 	}
 	switch req.Command {
@@ -7694,7 +7925,7 @@ func handleServiceConn(conn *os.File, s *goSearchService) {
 			_ = json.NewEncoder(conn).Encode(serviceResponse{OK: false, Message: message, Loading: loading})
 			return
 		}
-		opts := requestToOptionsFromService(req)
+		opts := requestToOptionsFromService(*req)
 		if opts.DeadlineUnix == 0 {
 			opts.DeadlineUnix = time.Now().Add(serviceQueryTimeout - 250*time.Millisecond).UnixNano()
 		}
@@ -7785,7 +8016,7 @@ func handleServiceConn(conn *os.File, s *goSearchService) {
 			_ = json.NewEncoder(conn).Encode(serviceResponse{OK: false, Message: message, Loading: loading})
 			return
 		}
-		opts := requestToOptionsFromService(req)
+		opts := requestToOptionsFromService(*req)
 		if opts.DeadlineUnix == 0 {
 			opts.DeadlineUnix = time.Now().Add(serviceQueryTimeout - 250*time.Millisecond).UnixNano()
 		}
