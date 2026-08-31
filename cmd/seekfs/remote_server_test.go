@@ -88,6 +88,11 @@ func TestRemoteResponseAllowlist(t *testing.T) {
 	if out.Complete == nil || *out.Complete {
 		t.Errorf("complete signal lost: %+v", out)
 	}
+	// The internal planner source ("global-name") collapses to the coarse
+	// public category rather than leaking the route name.
+	if out.Source != "indexed" {
+		t.Errorf("source should be coarse category, got %q", out.Source)
+	}
 	if len(out.DBs) != 1 {
 		t.Fatalf("DBs count = %d, want 1", len(out.DBs))
 	}
@@ -390,22 +395,61 @@ func TestRemoteLimitClampedBeforeDispatch(t *testing.T) {
 	// The remote limit must be clamped server-side before the engine sees it.
 	big := serviceRequest{Command: "search", Limit: 1 << 20}
 	clampRemoteLimit(&big)
-	if big.Limit > remoteMaxResultLimit {
-		t.Errorf("clampRemoteLimit did not clamp: got %d, want <= %d", big.Limit, remoteMaxResultLimit)
+	if big.Limit != remoteMaxResultLimit {
+		t.Errorf("clampRemoteLimit(1<<20) = %d, want %d", big.Limit, remoteMaxResultLimit)
 	}
-	// Negative/zero limits are normalized to the max (they would otherwise be
-	// treated as the engine default of 100, which is fine, but the bound must
-	// still hold).
+	// A non-positive limit preserves the engine's normal default (100 results);
+	// it must not be promoted to the maximum.
 	neg := serviceRequest{Command: "search", Limit: -5}
 	clampRemoteLimit(&neg)
-	if neg.Limit != remoteMaxResultLimit {
-		t.Errorf("clampRemoteLimit(-5) = %d, want %d", neg.Limit, remoteMaxResultLimit)
+	if neg.Limit != -5 {
+		t.Errorf("clampRemoteLimit(-5) = %d, want unchanged -5", neg.Limit)
+	}
+	zero := serviceRequest{Command: "search", Limit: 0}
+	clampRemoteLimit(&zero)
+	if zero.Limit != 0 {
+		t.Errorf("clampRemoteLimit(0) = %d, want unchanged 0", zero.Limit)
+	}
+	// A positive value within the bound passes through unchanged.
+	ok := serviceRequest{Command: "search", Limit: 500}
+	clampRemoteLimit(&ok)
+	if ok.Limit != 500 {
+		t.Errorf("clampRemoteLimit(500) = %d, want 500", ok.Limit)
 	}
 	// Count-only requests do not materialize rows; leave the limit untouched.
 	co := serviceRequest{Command: "search", CountOnly: true, Limit: 1 << 20}
 	clampRemoteLimit(&co)
 	if co.Limit != 1<<20 {
 		t.Errorf("count-only limit should be untouched, got %d", co.Limit)
+	}
+}
+
+func TestRemoteSearchSourceCoarse(t *testing.T) {
+	// Detailed planner route names must collapse to stable public categories.
+	// Fuzzy behavior is conveyed by the separate Fuzzy field, not the source.
+	tests := []struct{ in, want string }{
+		{"global:filename-pngc", "indexed"},
+		{"global:filename-pngr", "indexed"},
+		{"global:filename-trigram", "indexed"},
+		{"planned:ext-top", "indexed"},
+		{"planned:boolean", "indexed"},
+		{"planned", "indexed"},
+		{"compact-name-order-scan", "bounded-scan"},
+		{"bounded-scan", "bounded-scan"},
+		{"filesystem-under-fallback", "bounded-scan"},
+		{"legacy-planner", "bounded-scan"},
+		{"count-fast-posting", "count"},
+		{"count-fast-pngc", "count"},
+		{"count-fast-pngr", "count"},
+		{"name-trigram", "indexed"},
+		{"component-trigram", "indexed"},
+		{"exact-name", "indexed"},
+		{"path-component-trigram", "indexed"},
+	}
+	for _, tt := range tests {
+		if got := remoteSearchSource(tt.in); got != tt.want {
+			t.Errorf("remoteSearchSource(%q) = %q, want %q", tt.in, got, tt.want)
+		}
 	}
 }
 

@@ -44,6 +44,15 @@ func TestServiceCommandAllowed(t *testing.T) {
 		// No capabilities at all: nothing allowed.
 		{"search", serviceCapabilities{}, false},
 		{"index-usn", serviceCapabilities{}, false},
+		// Remote read-only callers get the explicit wire allowlist: search and
+		// sanitized info only.  status is folded into info and is not a
+		// standalone remote command; watch-delta is deferred until Phase 7.
+		{"search", serviceCapabilities{ReadOnly: true, Remote: true}, true},
+		{"info", serviceCapabilities{ReadOnly: true, Remote: true}, true},
+		{"status", serviceCapabilities{ReadOnly: true, Remote: true}, false},
+		{"watch-delta", serviceCapabilities{ReadOnly: true, Remote: true}, false},
+		{"index-usn", serviceCapabilities{ReadOnly: true, Remote: true}, false},
+		{"reindex", serviceCapabilities{ReadOnly: true, Remote: true}, false},
 	}
 	for _, tt := range tests {
 		if got := serviceCommandAllowed(tt.command, tt.caps); got != tt.want {

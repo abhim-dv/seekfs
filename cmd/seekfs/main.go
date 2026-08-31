@@ -7847,13 +7847,27 @@ func classifyServiceCommand(command string) serviceCommandClass {
 	}
 }
 
+// remoteServiceCommandAllowed is the canonical remote-operation allowlist.
+// Rev 5 exposes search, count (a search option), and sanitized info to remote
+// callers; status is folded into sanitized info rather than being a separate
+// wire command, and watch-delta is deferred until Phase 7.  Everything else is
+// denied for remote callers regardless of capability.
+func remoteServiceCommandAllowed(command string) bool {
+	switch command {
+	case "search", "info":
+		return true
+	default:
+		return false
+	}
+}
+
 // serviceCommandAllowed reports whether a caller with the given capabilities may
 // issue a command.  Deny-by-default: unknown commands and any command exceeding
 // the caller's capabilities are rejected.
 func serviceCommandAllowed(command string, caps serviceCapabilities) bool {
 	switch classifyServiceCommand(command) {
 	case serviceCommandReadOnly:
-		return caps.ReadOnly
+		return caps.ReadOnly && (!caps.Remote || remoteServiceCommandAllowed(command))
 	case serviceCommandMutate:
 		return caps.Mutate
 	case serviceCommandLocalOnly:

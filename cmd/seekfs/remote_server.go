@@ -584,7 +584,7 @@ func remoteResponseFromService(resp serviceResponse) remoteResponse {
 		Message:     genericRemoteMessage(resp.Message),
 		Count:       resp.Count,
 		SearchMS:    resp.SearchMS,
-		Source:      resp.Source,
+		Source:      remoteSearchSource(resp.Source),
 		Health:      resp.Health,
 		Version:     resp.Version,
 		Commit:      resp.Commit,
@@ -625,6 +625,23 @@ func remoteResponseFromService(resp serviceResponse) remoteResponse {
 		}
 	}
 	return out
+}
+
+// remoteSearchSource maps an internal planner source route to a coarse public
+// category.  Internal sources are detailed planner names (e.g.
+// "global:filename-pngc", "planned:ext-top", "compact-name-order-scan") that
+// must not become wire API; remote callers get one of the stable route
+// categories: "count", "bounded-scan", or "indexed".  Fuzzy behavior is
+// conveyed by the separate Fuzzy field, not by the source route.
+func remoteSearchSource(source string) string {
+	switch {
+	case source == "count-fast-posting" || source == "count-fast-pngc" || source == "count-fast-pngr":
+		return "count"
+	case source == "bounded-scan" || source == "broad-scan" || source == "filesystem-under-fallback" || source == "compact-name-order-scan" || source == "legacy-planner":
+		return "bounded-scan"
+	default:
+		return "indexed"
+	}
 }
 
 // genericRemoteMessage maps internal failure detail to a stable, non-sensitive
@@ -680,13 +697,15 @@ func clampRemoteDeadline(deadlineUnix int64) int64 {
 
 // clampRemoteLimit enforces the server-owned result-limit bound before dispatch
 // so an unauthenticated loopback caller cannot force large result allocations
-// in the engine.  Count-only requests never materialize result rows, so their
-// limit is left to the engine (which ignores it for counting).
+// in the engine.  A non-positive limit preserves the engine's normal default
+// (100 results); only positive values above the maximum are clamped.  Count-only
+// requests never materialize result rows, so their limit is left to the engine
+// (which ignores it for counting).
 func clampRemoteLimit(req *serviceRequest) {
 	if req.CountOnly {
 		return
 	}
-	if req.Limit <= 0 || req.Limit > remoteMaxResultLimit {
+	if req.Limit > remoteMaxResultLimit {
 		req.Limit = remoteMaxResultLimit
 	}
 }
