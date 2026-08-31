@@ -7,93 +7,97 @@ import (
 	"encoding/json"
 	"io"
 	"net"
-	"strings"
 	"testing"
 	"time"
 )
 
-func TestSanitizeRemoteResponse(t *testing.T) {
+func TestRemoteResponseAllowlist(t *testing.T) {
 	resp := serviceResponse{
-		OK:             true,
-		Count:          3,
-		SearchMS:       12.5,
-		Source:         "global-name",
-		PlannerMode:    "global-name",
-		PID:            1234,
-		Executable:     "C:\\ProgramData\\seekfs\\seekfs.exe",
-		ExecutableHash: "abc123",
-		PipeName:       `\\.\pipe\seekfs-service`,
-		ProcessMode:    "windows-service",
-		Version:        "1.6.0",
-		Commit:         "abc",
-		Date:           "today",
-		BuildFlavor:    "release",
-		BlocksDecoded:  99,
-		ScalarDriver:   "x",
+		OK:              true,
+		Count:           3,
+		SearchMS:        12.5,
+		Source:          "global-name",
+		PlannerMode:     "global-name",
+		PID:             1234,
+		Executable:      "C:\\ProgramData\\seekfs\\seekfs.exe",
+		ExecutableHash:  "abc123",
+		PipeName:        `\\.\pipe\seekfs-service`,
+		ProcessMode:     "windows-service",
+		Version:         "1.6.0",
+		Commit:          "abc",
+		Date:            "today",
+		BuildFlavor:     "release",
+		BlocksDecoded:   99,
+		ScalarDriver:    "x",
 		ComponentBounds: "secret-bounds",
-		Terms:          []traceTerm{{Term: "x", Kind: "y"}},
-		Declines:       []traceDecline{{Source: "s", Reason: "r"}},
-		Runtime:        &runtimeMemoryInfo{HeapAllocBytes: 1},
-		Results:        []string{"C:\\foo\\bar.txt"},
-		Rows:           []jsonResult{{Path: "C:\\foo\\bar.txt"}},
-		DBs: []dbInfo{
-			{
-				Path:            "C:\\ProgramData\\seekfs\\indexes\\seekfs_c.gsi",
-				Entries:         100,
-				Volume:          "C:",
-				State:           "ready",
-				JournalID:       123,
-				Checkpoint:      456,
-				Memory:          &residentMemoryInfo{Records: 100},
-				LastPersistError: "boom",
-			},
-		},
-		Health: "ok",
+		Terms:           []traceTerm{{Term: "x", Kind: "y"}},
+		Declines:        []traceDecline{{Source: "s", Reason: "r"}},
+		Runtime:         &runtimeMemoryInfo{HeapAllocBytes: 1},
+		EligibleVolumes: []string{"C:", "F:"},
+		Results:         []string{"C:\\foo\\bar.txt"},
+		Rows:            []jsonResult{{Path: "C:\\foo\\bar.txt"}},
+		Candidates:      5,
+		Decline:         "missing-posting",
+		Fallback:        "bounded-scan",
+		Health:          "ok",
+		HealthMessage:   "volume C: stale: journal replay failed",
+		DBs:             []dbInfo{{Path: "C:\\ProgramData\\seekfs\\indexes\\seekfs_c.gsi", Entries: 100, Volume: "C:", State: "ready", JournalID: 123, Checkpoint: 456, Memory: &residentMemoryInfo{Records: 100}, LastPersistError: "boom", Source: "usn", BuiltAt: "2026-01-01T00:00:00Z", FRNRecords: 100}},
 	}
-	san := sanitizeRemoteResponse(resp)
 
-	// Physical server internals must be stripped.
-	if san.PID != 0 || san.Executable != "" || san.ExecutableHash != "" || san.PipeName != "" || san.ProcessMode != "" {
-		t.Errorf("physical identity not stripped: %+v", san)
+	out := remoteResponseFromService(resp)
+
+	// The projection type has no fields for physical internals; verify the
+	// marshaled JSON contains none of them.
+	b, err := json.Marshal(out)
+	if err != nil {
+		t.Fatalf("marshal remoteResponse: %v", err)
 	}
-	if san.Runtime != nil {
-		t.Error("runtime memory snapshot must be stripped remotely")
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(b, &raw); err != nil {
+		t.Fatalf("unmarshal: %v", err)
 	}
-	if san.BlocksDecoded != 0 || san.ScalarDriver != "" || san.ComponentBounds != "" {
-		t.Error("detailed trace internals must be stripped remotely")
+	for _, forbidden := range []string{"pid", "executable", "executable_hash", "pipe_name", "process_mode", "runtime", "journal_id", "checkpoint", "component_bounds", "blocks_decoded", "memory"} {
+		if _, ok := raw[forbidden]; ok {
+			t.Errorf("remote response leaks forbidden field %q", forbidden)
+		}
 	}
-	if san.Terms != nil || san.Declines != nil {
-		t.Error("trace terms/declines must be stripped remotely")
+
+	// Public fields preserved.
+	if out.Count != 3 || !out.OK || len(out.Results) != 1 {
+		t.Errorf("public result fields lost: %+v", out)
 	}
-	if len(san.DBs) != 1 {
-		t.Fatalf("DBs count = %d, want 1", len(san.DBs))
+	if len(out.EligibleVolumes) != 2 || out.EligibleVolumes[0] != "C:" {
+		t.Errorf("eligible volumes lost: %+v", out.EligibleVolumes)
 	}
-	d := san.DBs[0]
-	if d.Path != "" {
-		t.Errorf("db path not stripped: %q", d.Path)
+	if out.Version != "1.6.0" || out.Commit != "abc" {
+		t.Errorf("version/commit should be preserved: %+v", out)
 	}
-	if d.JournalID != 0 || d.Checkpoint != 0 {
-		t.Error("journal id/checkpoint must be stripped")
+	if len(out.DBs) != 1 {
+		t.Fatalf("DBs count = %d, want 1", len(out.DBs))
 	}
-	if d.Memory != nil {
-		t.Error("db memory must be stripped")
+	d := out.DBs[0]
+	if d.Volume != "C:" || d.State != "ready" || d.Entries != 100 || d.Source != "usn" {
+		t.Errorf("public db summary lost: %+v", d)
 	}
-	if d.LastPersistError != "" {
-		t.Error("db persist error detail must be stripped")
+	// Health message is coarse-capped to avoid leaking the stale reason/path.
+	if out.HealthMessage == "volume C: stale: journal replay failed" {
+		t.Errorf("health message leaked internal detail: %q", out.HealthMessage)
 	}
-	// Public data preserved.
-	if d.Volume != "C:" || d.State != "ready" || d.Entries != 100 {
-		t.Errorf("public db fields lost: %+v", d)
+}
+
+func TestGenericRemoteMessage(t *testing.T) {
+	tests := []struct{ in, want string }{
+		{"", ""},
+		{"loading indexes", "loading indexes"},
+		{"service running", "service running"},
+		{"service has no search indexes loaded", "service has no search indexes loaded"},
+		{"boom: C:\\ProgramData\\seekfs\\indexes\\seekfs_c.gsi: access denied", "request failed"},
+		{"permission denied on volume F:", "request failed"},
 	}
-	if san.Count != 3 || san.OK != true || len(san.Results) != 1 || len(san.Rows) != 1 {
-		t.Errorf("public result fields lost: %+v", san)
-	}
-	if san.Health != "ok" {
-		t.Errorf("health lost: %+v", san)
-	}
-	// Public version/commit preserved (harmless, non-sensitive).
-	if san.Version != "1.6.0" || san.Commit != "abc" {
-		t.Errorf("version/commit should be preserved: %+v", san)
+	for _, tt := range tests {
+		if got := genericRemoteMessage(tt.in); got != tt.want {
+			t.Errorf("genericRemoteMessage(%q) = %q, want %q", tt.in, got, tt.want)
+		}
 	}
 }
 
@@ -113,7 +117,6 @@ func TestReadRemoteFramePayload(t *testing.T) {
 		t.Errorf("payload mismatch:\n got %s\nwant %s", got, msg)
 	}
 
-	// EOF at boundary returns io.EOF cleanly.
 	if _, err := readRemoteFramePayload(bufio.NewReader(&buf)); err != io.EOF {
 		t.Errorf("expected EOF, got %v", err)
 	}
@@ -132,17 +135,14 @@ func TestReadRemoteFramePayloadTooLarge(t *testing.T) {
 
 func TestClampRemoteDeadline(t *testing.T) {
 	now := time.Now().UnixNano()
-	// Zero/non-positive -> server default (in the future).
 	if got := clampRemoteDeadline(0); got <= now {
 		t.Errorf("clampRemoteDeadline(0) = %d, want future default", got)
 	}
-	// Huge client deadline -> capped at server max.
 	farFuture := now + int64(24*time.Hour)
 	max := now + int64(serviceQueryTimeout)
 	if got := clampRemoteDeadline(farFuture); got > max {
 		t.Errorf("clampRemoteDeadline(huge) = %d, want capped at %d", got, max)
 	}
-	// A small reasonable deadline is preserved.
 	small := now + int64(time.Second)
 	if got := clampRemoteDeadline(small); got != small {
 		t.Errorf("clampRemoteDeadline(small) = %d, want %d", got, small)
@@ -164,7 +164,6 @@ func TestRemoteLoopbackServerRoundTrip(t *testing.T) {
 	}
 	defer conn.Close()
 
-	// Send a hello frame and read the response.
 	req := remoteFrame{Type: remoteFrameHello, ID: 1, V: remoteProtocolVersion}
 	writeFrame(t, conn, req)
 	resp := readFrame(t, conn)
@@ -186,6 +185,190 @@ func TestRemoteLoopbackServerRejectsNonLoopback(t *testing.T) {
 	if err := rs.start(); err == nil {
 		rs.close()
 		t.Fatal("expected non-loopback bind to be rejected")
+	}
+}
+
+func TestRemoteLoopbackSearchDeniedWhenNoIndexes(t *testing.T) {
+	s := &goSearchService{}
+	rs := newRemoteLoopbackServer(s, "127.0.0.1:0")
+	if err := rs.start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer rs.close()
+	conn, err := net.Dial("tcp", rs.ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	req := remoteFrame{Type: remoteFrameRequest, ID: 5, V: remoteProtocolVersion, Payload: mustJSON(serviceRequest{Command: "search", Query: "anything"})}
+	writeFrame(t, conn, req)
+	resp := readFrame(t, conn)
+	if resp.ID != 5 || resp.Type != remoteFrameResponse {
+		t.Fatalf("response = %+v", resp)
+	}
+	var out remoteResponse
+	if err := json.Unmarshal(resp.Payload, &out); err != nil {
+		t.Fatalf("response payload: %v", err)
+	}
+	if out.OK {
+		t.Error("expected OK=false for service with no indexes")
+	}
+	if out.Message == "" {
+		t.Error("expected a helpful message")
+	}
+}
+
+func TestRemoteZeroRequestIDRejected(t *testing.T) {
+	s := &goSearchService{}
+	rs := newRemoteLoopbackServer(s, "127.0.0.1:0")
+	if err := rs.start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer rs.close()
+	conn, err := net.Dial("tcp", rs.ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	req := remoteFrame{Type: remoteFrameRequest, ID: 0, V: remoteProtocolVersion, Payload: mustJSON(serviceRequest{Command: "search"})}
+	writeFrame(t, conn, req)
+	resp := readFrame(t, conn)
+	if resp.Type != remoteFrameError {
+		t.Fatalf("expected error frame for id=0, got %+v", resp)
+	}
+}
+
+func TestRemoteWatchDeltaDenied(t *testing.T) {
+	if serviceCommandAllowed("watch-delta", serviceCapabilities{ReadOnly: true, Remote: true}) {
+		t.Error("watch-delta must be denied for remote read-only callers")
+	}
+	if !serviceCommandAllowed("watch-delta", serviceCapabilities{ReadOnly: true}) {
+		t.Error("watch-delta must stay allowed for local read-only callers")
+	}
+}
+
+func TestRemoteDuplicateRequestID(t *testing.T) {
+	// Two concurrent requests with the same id: one may complete, but the
+	// duplicate must be rejected with an error frame, not silently accepted.
+	// We exercise handleRequest directly with a nil service (dispatch panics
+	// and recovers) to force overlap deterministically.
+	rs := newRemoteLoopbackServer(nil, "127.0.0.1:0")
+	a, b := net.Pipe()
+	rc := &remoteConn{rs: rs, conn: a, inFlight: make(map[int64]*remoteRequestState)}
+
+	// Read frames in the background: writes to net.Pipe block until read.
+	frames := make(chan remoteFrame, 4)
+	errs := make(chan error, 1)
+	go func() {
+		br := bufio.NewReader(b)
+		for i := 0; i < 2; i++ {
+			payload, err := readRemoteFramePayload(br)
+			if err != nil {
+				errs <- err
+				return
+			}
+			var f remoteFrame
+			if err := json.Unmarshal(payload, &f); err != nil {
+				errs <- err
+				return
+			}
+			frames <- f
+		}
+		close(frames)
+	}()
+
+	payload := mustJSON(serviceRequest{Command: "search"})
+	rc.handleRequest(7, payload)
+	rc.handleRequest(7, payload)
+
+	gotDup := false
+	for i := 0; i < 2; i++ {
+		select {
+		case f, ok := <-frames:
+			if !ok {
+				t.Fatal("frame channel closed early")
+			}
+			var out remoteResponse
+			_ = json.Unmarshal(f.Payload, &out)
+			if out.Message == "duplicate request id" {
+				gotDup = true
+			}
+		case err := <-errs:
+			t.Fatalf("read frame: %v", err)
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out waiting for frames")
+		}
+	}
+	if !gotDup {
+		t.Error("expected a duplicate request id rejection frame")
+	}
+}
+
+func TestRemoteShutdownCancelsInFlight(t *testing.T) {
+	// shutdown must cancel in-flight state without waiting, so a failed write
+	// from inside a request cannot deadlock on its own done channel.
+	st := &remoteRequestState{done: make(chan struct{})}
+	a, _ := net.Pipe()
+	rc := &remoteConn{conn: a, inFlight: map[int64]*remoteRequestState{3: st}}
+	rc.shutdown()
+	if !st.cancelFlag.Load() {
+		t.Error("in-flight request was not cancelled on shutdown")
+	}
+	// It must not block forever even though done is never closed.
+	select {
+	case <-time.After(50 * time.Millisecond):
+	case <-st.done:
+		t.Fatal("shutdown must not wait on done")
+	}
+}
+
+func TestRemoteCancellation(t *testing.T) {
+	st := &remoteRequestState{done: make(chan struct{})}
+	st.cancelHook = func() {}
+	if st.requestCancelFunc()() {
+		t.Error("cancel flag should be false initially")
+	}
+	st.cancel()
+	if !st.requestCancelFunc()() {
+		t.Error("cancel flag should be true after cancel")
+	}
+}
+
+func TestRemotePanicContainment(t *testing.T) {
+	// A panic inside the dispatch must not terminate the process; the request
+	// worker recovers, emits a generic error, and cleans up in-flight state.
+	// Point the server at a nil service so handleServiceCommand panics.
+	rs := newRemoteLoopbackServer(nil, "127.0.0.1:0")
+	if err := rs.start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	conn, err := net.Dial("tcp", rs.ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	defer rs.close()
+
+	// Send a search request; the nil service makes dispatch panic internally.
+	req := remoteFrame{Type: remoteFrameRequest, ID: 3, V: remoteProtocolVersion, Payload: mustJSON(serviceRequest{Command: "search", Query: "x"})}
+	writeFrame(t, conn, req)
+
+	// The server must respond (generic error) rather than crashing.
+	resp := readFrame(t, conn)
+	if resp.ID != 3 || resp.Type != remoteFrameResponse {
+		t.Fatalf("response = %+v", resp)
+	}
+	var out remoteResponse
+	if err := json.Unmarshal(resp.Payload, &out); err != nil {
+		t.Fatalf("response payload: %v", err)
+	}
+	if out.OK {
+		t.Error("expected OK=false from a panicking dispatch")
+	}
+	if out.Message != "internal error" {
+		t.Errorf("expected generic internal error, got %q", out.Message)
 	}
 }
 
@@ -217,61 +400,4 @@ func readFrame(t *testing.T, r io.Reader) remoteFrame {
 		t.Fatalf("unmarshal frame: %v", err)
 	}
 	return f
-}
-
-func TestRemoteLoopbackSearchDeniedWhenNoIndexes(t *testing.T) {
-	// A search request against a service with no loaded indexes must return a
-	// sanitized error (OK=false), not a server-internal panic or leak.
-	s := &goSearchService{}
-	rs := newRemoteLoopbackServer(s, "127.0.0.1:0")
-	if err := rs.start(); err != nil {
-		t.Fatalf("start: %v", err)
-	}
-	defer rs.close()
-	conn, err := net.Dial("tcp", rs.ln.Addr().String())
-	if err != nil {
-		t.Fatalf("dial: %v", err)
-	}
-	defer conn.Close()
-
-	req := remoteFrame{Type: remoteFrameRequest, ID: 5, V: remoteProtocolVersion, Payload: mustJSON(serviceRequest{Command: "search", Query: "anything"})}
-	writeFrame(t, conn, req)
-	resp := readFrame(t, conn)
-	if resp.ID != 5 || resp.Type != remoteFrameResponse {
-		t.Fatalf("response = %+v", resp)
-	}
-	var sresp serviceResponse
-	if err := json.Unmarshal(resp.Payload, &sresp); err != nil {
-		t.Fatalf("response payload: %v", err)
-	}
-	if sresp.OK {
-		t.Error("expected OK=false for service with no indexes")
-	}
-	if sresp.Executable != "" || sresp.PipeName != "" || sresp.PID != 0 {
-		t.Errorf("response not sanitized: %+v", sresp)
-	}
-	if sresp.Message == "" {
-		t.Error("expected a helpful message")
-	}
-}
-
-func TestRemoteWatchDeltaDenied(t *testing.T) {
-	// watch-delta is not in the read-only remote allowlist; it must be denied
-	// by the capability gate.
-	if serviceCommandAllowed("watch-delta", serviceCapabilities{ReadOnly: true, Remote: true}) {
-		t.Error("watch-delta must be denied for remote read-only callers")
-	}
-	if !serviceCommandAllowed("watch-delta", serviceCapabilities{ReadOnly: true}) {
-		t.Error("watch-delta must stay allowed for local read-only callers")
-	}
-}
-
-func TestSanitizeStripsQueryLogSensitive(t *testing.T) {
-	// Ensure sanitization is idempotent and stable.
-	resp := serviceResponse{OK: true, Count: 1, Message: "all good", Results: []string{`\\server\share\f.txt`}}
-	a := sanitizeRemoteResponse(resp)
-	b := sanitizeRemoteResponse(a)
-	if !strings.EqualFold(strings.Join(a.Results, ""), strings.Join(b.Results, "")) {
-		t.Errorf("sanitize not idempotent: %+v vs %+v", a, b)
-	}
 }

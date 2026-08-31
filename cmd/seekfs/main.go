@@ -2586,6 +2586,10 @@ type serviceRequest struct {
 	RequestSeq    int64               `json:"request_seq,omitempty"`
 	SinceVolumes  []watchVolumeCursor `json:"since_volumes,omitempty"`
 	Baseline      bool                `json:"baseline,omitempty"`
+	// CancelOverride is a transport-injected cancellation predicate used by the
+	// remote transport for connection-scoped cancellation.  It never crosses
+	// the wire and is never set from client-supplied input.
+	CancelOverride func() bool `json:"-"`
 }
 
 type serviceResponse struct {
@@ -7973,6 +7977,9 @@ func (s *goSearchService) handleServiceCommand(w io.Writer, principal servicePri
 				return req.RequestSeq < s.requestSeq.Load()
 			}
 		}
+		if req.CancelOverride != nil {
+			opts.Cancel = req.CancelOverride
+		}
 		var matches []Entry
 		var err error
 		var fuzzyApplied bool
@@ -8021,7 +8028,11 @@ func (s *goSearchService) handleServiceCommand(w io.Writer, principal servicePri
 			_ = json.NewEncoder(w).Encode(serviceResponse{OK: false, Message: err.Error()})
 			return
 		}
-		serviceLog("search query=%q ms=%.1f planner=%s source=%s decline=%s filename_driver=%s candidates=%d results=%d", req.Query, searchMS, trace.PlannerMode, trace.Source, trace.Decline, trace.FilenameDriver, trace.Candidates, len(matches))
+		if caps.Remote {
+			serviceLog("search remote ms=%.1f planner=%s source=%s decline=%s candidates=%d results=%d", searchMS, trace.PlannerMode, trace.Source, trace.Decline, trace.Candidates, len(matches))
+		} else {
+			serviceLog("search query=%q ms=%.1f planner=%s source=%s decline=%s filename_driver=%s candidates=%d results=%d", req.Query, searchMS, trace.PlannerMode, trace.Source, trace.Decline, trace.FilenameDriver, trace.Candidates, len(matches))
+		}
 		resp := serviceResponse{OK: true, Count: len(matches), SearchMS: searchMS, Fuzzy: fuzzyApplied, Source: trace.Source, Decline: trace.Decline, Candidates: trace.Candidates, PlannerMode: trace.PlannerMode, EligibleVolumes: trace.EligibleVolumes, BlocksDecoded: trace.BlocksDecoded, BlocksSkipped: trace.BlocksSkipped, ScalarDriver: trace.ScalarDriver, ScalarInterval: trace.ScalarInterval, RecordsVerified: trace.ScalarRecordsVerified, ComponentDriver: trace.ComponentDriver, ComponentRoots: trace.ComponentRoots, ComponentIntervals: trace.ComponentIntervals, ComponentCardinality: trace.ComponentCardinality, ComponentSelfHits: trace.ComponentSelfHits, ComponentBounds: trace.ComponentBounds, ComponentRecordsVerified: trace.ComponentRecordsVerified, FilenameDriver: trace.FilenameDriver, FilenameRequiredGrams: trace.FilenameRequiredGrams, FilenamePostingHint: trace.FilenamePostingHint, FilenameRecordsVerified: trace.FilenameRecordsVerified, OverlayBaseWindow: trace.OverlayBaseWindow, PostingPrefetchBytes: trace.PostingPrefetchBytes, PostingPrefetchRanges: trace.PostingPrefetchRanges, PostingPrefetchPages: trace.PostingPrefetchPages, Terms: trace.Terms, Declines: trace.Declines, Fallback: trace.Fallback, Complete: trace.completePtr()}
 		if !req.CountOnly {
 			resp.Results = make([]string, len(matches))
@@ -8063,6 +8074,9 @@ func (s *goSearchService) handleServiceCommand(w io.Writer, principal servicePri
 			opts.Cancel = func() bool {
 				return req.RequestSeq < s.requestSeq.Load()
 			}
+		}
+		if req.CancelOverride != nil {
+			opts.Cancel = req.CancelOverride
 		}
 		pq, parseErr := parseQuery(opts)
 		if parseErr != nil {
