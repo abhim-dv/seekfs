@@ -1,11 +1,46 @@
 package main
 
 import (
+	"errors"
+	"os"
 	"runtime"
 	"strings"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/windows"
 )
+
+func TestIsIndexFileLockedError(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"generic error", errors.New("disk full"), false},
+		{"access denied path error", &os.PathError{Op: "remove", Path: "C:\\x.gsi", Err: windows.ERROR_ACCESS_DENIED}, true},
+		{"sharing violation path error", &os.PathError{Op: "remove", Path: "C:\\x.gsi", Err: windows.ERROR_SHARING_VIOLATION}, true},
+		{"permission wrapped", &os.PathError{Op: "open", Path: "C:\\x.gsi", Err: os.ErrPermission}, true},
+		{"access denied text", errors.New("remove C:\\x.gsi: Access is denied."), true},
+		{"sharing violation text", errors.New("The process cannot access the file because it is being used by another process"), false},
+	}
+	for _, tt := range tests {
+		if got := isIndexFileLockedError(tt.err); got != tt.want {
+			t.Errorf("isIndexFileLockedError(%s) = %v, want %v", tt.name, got, tt.want)
+		}
+	}
+}
+
+func TestStaleRecoveryBlockedErrorIsDistinct(t *testing.T) {
+	var blocked staleRecoveryBlockedError
+	if errors.As(errors.New("x"), &blocked) {
+		t.Fatal("generic error must not match staleRecoveryBlockedError")
+	}
+	if !errors.As(staleRecoveryBlockedError{reason: "locked"}, &blocked) {
+		t.Fatal("staleRecoveryBlockedError must match itself")
+	}
+}
 
 func TestValidateUSNCheckpointTable(t *testing.T) {
 	base := usnJournalDataV0{UsnJournalID: 42, FirstUsn: 1000, LowestValidUsn: 1200, NextUsn: 9000}

@@ -4765,6 +4765,14 @@ func (s *goSearchService) staleRecoveryLoop(vol *serviceVolumeIndex) {
 			return
 		}
 		if err := s.rebuildVolumeInPlace(vol); err != nil {
+			var blocked staleRecoveryBlockedError
+			if errors.As(err, &blocked) {
+				// The index file is locked by another process; retrying is
+				// futile and would rebuild multi-gigabyte indexes on every
+				// backoff tick.  Leave the volume marked stale and stop.
+				serviceLog("stale recovery blocked volume=%s db=%s reason=%s", vol.volume, vol.dbPath, blocked.reason)
+				return
+			}
 			serviceLog("stale recovery rebuild failed volume=%s db=%s retry_after=%s err=%v", vol.volume, vol.dbPath, delay, err)
 			delay *= 2
 			if delay > staleRecoveryMax {
@@ -5163,6 +5171,15 @@ func (e staleIndexError) Error() string {
 	return e.reason
 }
 
+// staleRecoveryBlockedError reports that a stale index cannot be rebuilt right
+// now for a reason that retrying will not fix in this process lifetime (the
+// index file is memory-mapped/locked by another process that will not release
+// it).  The stale-recovery loop stops retrying on this error so it does not
+// burn CPU and build multi-gigabyte in-memory indexes on every backoff tick.
+type staleRecoveryBlockedError struct{ reason string }
+
+func (e staleRecoveryBlockedError) Error() string { return e.reason }
+
 func shouldRebuildStaleIndex(err error) bool {
 	var staleErr staleIndexError
 	if errors.As(err, &staleErr) {
@@ -5284,18 +5301,33 @@ func (s *goSearchService) rebuildVolumeInPlace(vol *serviceVolumeIndex) error {
 	}
 	buildOrders(idx)
 
+	// The freshly built in-memory index can be several gigabytes.  Release it
+	// explicitly on every failure path so the stale-recovery retry loop does
+	// not accumulate one large unreclaimed index per attempt.
+	release := func() { idx = nil; releaseServiceMemoryAfterSave() }
+
 	tmp, err := stageIndexFile(vol.dbPath, idx)
 	if err != nil {
+		release()
 		return err
 	}
 	s.indexMu.Lock()
 	if err := closeIndexMMapRecords(vol.index); err != nil {
 		s.indexMu.Unlock()
 		_ = os.Remove(tmp)
+		release()
 		return err
 	}
 	if err := commitStageIndexFile(vol.dbPath, tmp); err != nil {
 		s.indexMu.Unlock()
+		release()
+		// If the target index file is still memory-mapped or otherwise locked
+		// by another process, retrying in this process is futile and only
+		// rebuilds the whole index on every backoff tick.  Stop the recovery
+		// loop instead of burning memory indefinitely.
+		if isIndexFileLockedError(err) {
+			return staleRecoveryBlockedError{reason: fmt.Sprintf("index file %s is locked by another process; cannot rebuild stale volume %s: %v", vol.dbPath, vol.volume, err)}
+		}
 		return err
 	}
 	if err := removeWAL(vol.dbPath); err != nil {
@@ -5304,6 +5336,7 @@ func (s *goSearchService) rebuildVolumeInPlace(vol *serviceVolumeIndex) error {
 	loaded, loadErr := loadIndexForService(vol.dbPath)
 	if loadErr != nil {
 		s.indexMu.Unlock()
+		release()
 		return loadErr
 	}
 	rebuilt := newServiceVolumeIndex(vol.dbPath, loaded)
@@ -5323,6 +5356,27 @@ func (s *goSearchService) rebuildVolumeInPlace(vol *serviceVolumeIndex) error {
 	s.startBackgroundNameTrigramBuilds([]*serviceVolumeIndex{vol})
 	serviceLog("rebuilt stale index volume=%s db=%s entries=%d", rebuilt.volume, rebuilt.dbPath, rebuilt.index.entryCount())
 	return nil
+}
+
+// isIndexFileLockedError reports whether err indicates the index file could not
+// be replaced because another process holds it (memory-mapped or open).  These
+// failures will not resolve while that process runs, so the stale-recovery loop
+// stops retrying instead of rebuilding the index on every backoff tick.
+func isIndexFileLockedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var pathErr *os.PathError
+	if errors.As(err, &pathErr) {
+		if pathErr.Err == windows.ERROR_ACCESS_DENIED || pathErr.Err == windows.ERROR_SHARING_VIOLATION {
+			return true
+		}
+		if errors.Is(pathErr.Err, os.ErrPermission) {
+			return true
+		}
+	}
+	text := strings.ToLower(err.Error())
+	return strings.Contains(text, "access is denied") || strings.Contains(text, "sharing violation")
 }
 
 func (s *goSearchService) startWalkWatchers(vol *serviceVolumeIndex) {
