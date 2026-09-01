@@ -24,7 +24,26 @@ New-Item -ItemType Directory -Force -Path $Target | Out-Null
 
 $LdFlags = "-s -w -X main.version=$Version -X main.commit=$Commit -X main.date=$Date"
 go build -trimpath -ldflags $LdFlags -o (Join-Path $Target "seekfs.exe") ./cmd/seekfs
-go build -trimpath -tags "seekfs_ui production" -ldflags "$LdFlags -H windowsgui" -o (Join-Path $Target "seekfs-ui.exe") ./cmd/seekfs
+
+# The UI is launched by double-click and must run elevated so its spawned
+# service can open raw volumes for USN-based index rebuild/verification.  Embed
+# a requireAdministrator manifest into the UI binary.  The manifest and icon
+# must live in the SAME .rsrc section, so the shared cmd/seekfs/rsrc.syso is
+# temporarily regenerated with icon+manifest for the UI build and then restored,
+# leaving the CLI build (and all future builds) unaffected.
+$UiPkg = Join-Path $Root "cmd\seekfs"
+$UiSyso = Join-Path $UiPkg "rsrc.syso"
+$UiSysoBackup = Join-Path $env:TEMP "seekfs-rsrc.syso.bak"
+$UiIcon = Join-Path $UiPkg "ui_frontend\assets\seekfs.ico"
+$UiManifest = Join-Path $UiPkg "seekfs-ui.manifest"
+Copy-Item $UiSyso $UiSysoBackup -Force
+try {
+    go run github.com/akavel/rsrc@v0.10.2 -arch amd64 -ico $UiIcon -manifest $UiManifest -o $UiSyso
+    go build -trimpath -tags "seekfs_ui production" -ldflags "$LdFlags -H windowsgui" -o (Join-Path $Target "seekfs-ui.exe") ./cmd/seekfs
+} finally {
+    Copy-Item $UiSysoBackup $UiSyso -Force
+    Remove-Item $UiSysoBackup -Force -ErrorAction SilentlyContinue
+}
 
 Copy-Item README.md,LICENSE,NOTICE.md -Destination $Target
 
