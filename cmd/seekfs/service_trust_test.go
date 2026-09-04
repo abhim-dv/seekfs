@@ -406,3 +406,57 @@ func TestDoctorStatusSurfacesReplayHealth(t *testing.T) {
 		t.Fatalf("dbInfo replay fields not populated: %+v", info)
 	}
 }
+
+func TestWALCheckpointForApplied(t *testing.T) {
+	if got := walCheckpointForApplied(100, nil); got != 100 {
+		t.Fatalf("empty batch checkpoint = %d, want journal head 100", got)
+	}
+	changes := []usnChange{
+		{FRN: 11, ParentFRN: 5, USN: 90, Name: "report-new.txt"},
+		{FRN: 12, ParentFRN: 5, USN: 95, Name: "notes.txt"},
+	}
+	if got := walCheckpointForApplied(100, changes); got != 95 {
+		t.Fatalf("batch checkpoint = %d, want last applied change 95", got)
+	}
+}
+
+func TestWALTruncatedBatchClaimsAppliedCheckpoint(t *testing.T) {
+	// A replay batch truncated to serviceUSNReplayBatchMax must persist the
+	// last applied USN, not the unread journal head. replayWAL sets the volume
+	// checkpoint to the frame's NextUSN, so an over-claim would skip the
+	// truncated tail after a restart and permanently hide newly created files
+	// that fell beyond the truncated batch.
+	changes := []usnChange{
+		{FRN: 11, ParentFRN: 5, USN: 101, Name: "report-new.txt"},
+		{FRN: 12, ParentFRN: 5, USN: 102, Name: "notes.txt"},
+	}
+	const journalHead = 190
+	checkpoint := walCheckpointForApplied(journalHead, changes)
+	if checkpoint != 102 {
+		t.Fatalf("truncated batch checkpoint = %d, want last applied 102", checkpoint)
+	}
+	payload, err := encodeBinaryWALBatch(checkpoint, changes)
+	if err != nil {
+		t.Fatalf("encodeBinaryWALBatch: %v", err)
+	}
+	batch, err := decodeBinaryWALBatch(payload)
+	if err != nil {
+		t.Fatalf("decodeBinaryWALBatch: %v", err)
+	}
+	if batch.NextUSN != 102 {
+		t.Fatalf("decoded frame NextUSN = %d, want applied checkpoint 102", batch.NextUSN)
+	}
+	if len(batch.Changes) != 2 {
+		t.Fatalf("decoded frame changes = %d, want 2", len(batch.Changes))
+	}
+	// A change from the truncated tail stays ahead of the persisted
+	// checkpoint, so the next replay still picks it up. The old buggy value
+	// (journal head 190) would have hidden every change up to 190.
+	const tailUSN = 103
+	if checkpoint >= tailUSN {
+		t.Fatalf("persisted checkpoint %d already covers tail change %d", checkpoint, tailUSN)
+	}
+	if journalHead < tailUSN {
+		t.Fatalf("test setup invalid: journal head %d must exceed tail change %d", journalHead, tailUSN)
+	}
+}

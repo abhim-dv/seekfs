@@ -4790,6 +4790,18 @@ func (s *goSearchService) staleRecoveryLoop(vol *serviceVolumeIndex) {
 	}
 }
 
+// walCheckpointForApplied returns the checkpoint a replay batch may durably
+// claim: only as far as the last change actually applied. A read can return
+// more changes than fit one iteration (truncated to serviceUSNReplayBatchMax);
+// callers must persist this value, not the unread journal head, so a restart
+// replays the truncated tail instead of skipping it.
+func walCheckpointForApplied(nextUSN int64, changes []usnChange) int64 {
+	if len(changes) > 0 {
+		return changes[len(changes)-1].USN
+	}
+	return nextUSN
+}
+
 func (s *goSearchService) replayVolumeOnce(vol *serviceVolumeIndex, buffer []byte) error {
 	gen := vol.replayGen.Load()
 	handle, err := openVolume(vol.volume)
@@ -4822,14 +4834,15 @@ func (s *goSearchService) replayVolumeOnce(vol *serviceVolumeIndex, buffer []byt
 	// several iterations, yielding to search requests between batches instead
 	// of monopolizing the volume under one long apply.
 	if len(changes) > serviceUSNReplayBatchMax {
+		serviceLog("background replay large batch volume=%s changes=%d truncating to %d", vol.volume, len(changes), serviceUSNReplayBatchMax)
 		changes = changes[:serviceUSNReplayBatchMax]
 	}
 	// The checkpoint must advance only as far as the last applied change so
-	// the next iteration resumes from the truncated remainder.
-	appliedCheckpoint := nextUSN
-	if len(changes) > 0 {
-		appliedCheckpoint = changes[len(changes)-1].USN
-	}
+	// the next iteration resumes from the truncated remainder. The WAL must
+	// claim the same applied checkpoint: persisting the unread journal head
+	// would skip the truncated tail after a restart, permanently hiding
+	// newly created files that fell beyond the truncated batch.
+	appliedCheckpoint := walCheckpointForApplied(nextUSN, changes)
 	vol.mu.Lock()
 	if vol.checkpoint != startUSN || vol.replayGen.Load() != gen {
 		// Another path (stale rebuild) replaced the index while this read was
@@ -4837,7 +4850,7 @@ func (s *goSearchService) replayVolumeOnce(vol *serviceVolumeIndex, buffer []byt
 		vol.mu.Unlock()
 		return nil
 	}
-	if err := appendWAL(vol.dbPath, nextUSN, changes); err != nil {
+	if err := appendWAL(vol.dbPath, appliedCheckpoint, changes); err != nil {
 		vol.state = "stale"
 		vol.staleReason = err.Error()
 		vol.mu.Unlock()
@@ -4914,6 +4927,23 @@ func (s *goSearchService) persistVolumeIfDue(vol *serviceVolumeIndex, force bool
 		vol.mu.Unlock()
 		return
 	}
+	// A persist folds the whole overlay into a fresh index and stages a
+	// multi-GB file, holding vol.mu for minutes on large volumes. Replay and
+	// searches observe a frozen overlay meanwhile, so log the window: a query
+	// that misses a just-created file during this window is expected, and the
+	// next replay iteration picks the retained journal changes up.
+	watermark := 0
+	if vol.overlay != nil {
+		watermark = int(vol.overlay.watermark.Load())
+	}
+	var walBytes int64
+	if vol.dbPath != "" {
+		if info, err := os.Stat(walPath(vol.dbPath)); err == nil {
+			walBytes = info.Size()
+		}
+	}
+	persistStart := time.Now()
+	serviceLog("background persist start volume=%s db=%s overlay_slots=%d wal_bytes=%d", vol.volume, vol.dbPath, watermark, walBytes)
 	compacted := compactOverlayIndex(vol)
 	tmp, err := stageIndexFile(vol.dbPath, compacted)
 	if err != nil {
@@ -4974,6 +5004,7 @@ func (s *goSearchService) persistVolumeIfDue(vol *serviceVolumeIndex, force bool
 	s.indexMu.Unlock()
 	vol.mu.Unlock()
 	if saved {
+		serviceLog("background persist complete volume=%s db=%s records=%d duration=%s", vol.volume, vol.dbPath, compacted.compactRecordCount(), time.Since(persistStart).Round(time.Millisecond))
 		releaseServiceMemoryAfterSave()
 		s.startBackgroundNameOrderBuilds([]*serviceVolumeIndex{vol})
 		s.startBackgroundNameTrigramBuilds([]*serviceVolumeIndex{vol})
