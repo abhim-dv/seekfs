@@ -505,3 +505,28 @@ func TestEntryToJSONUsesIndexedSizeAndModifiedTime(t *testing.T) {
 		t.Fatal("indexed modified time was not serialized")
 	}
 }
+
+func TestPollServiceInfoReadyGivesUpOnDeadPipe(t *testing.T) {
+	// Against a pipe with no listener the handshake must fail fast (two quick
+	// attempts), not hang: ensureServiceReady spawns a service on failure, and
+	// must not be stalled by it.
+	app := &UIApp{pipeName: `\\.\pipe\seekfs-test-nonexistent-pipe`}
+	start := time.Now()
+	_, err := app.pollServiceInfoReady()
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("expected an error polling a nonexistent pipe")
+	}
+	if elapsed > 30*time.Second {
+		t.Fatalf("dead-pipe poll took %s, want a bounded fast failure", elapsed)
+	}
+}
+
+func TestIsServiceTimeoutErrorMapping(t *testing.T) {
+	if !isServiceTimeoutError(errors.New("service request timed out after 500ms")) {
+		t.Fatal("timeout text must classify as a service timeout")
+	}
+	if isServiceTimeoutError(errors.New(`open \\.\pipe\x: The system cannot find the file specified.`)) {
+		t.Fatal("missing-pipe error must not classify as a service timeout")
+	}
+}

@@ -244,7 +244,7 @@ func (a *UIApp) search(req UISearchRequest, seq int64) UISearchResponse {
 }
 
 func (a *UIApp) ensureServiceReady(dbs []string) {
-	resp, err := callServiceWithTimeout(a.pipeName, serviceRequest{Command: "info"}, 500*time.Millisecond)
+	resp, err := a.pollServiceInfoReady()
 	if err == nil && !a.serviceResponseIsFresh(resp) {
 		if serviceResponseIsVerifiedStandalone(resp) {
 			if stopErr := a.stopStaleStandaloneService(resp.PID); stopErr == nil {
@@ -299,6 +299,31 @@ func (a *UIApp) ensureServiceReady(dbs []string) {
 	}
 	a.ready = false
 	a.readyMessage = "Service is not ready. Run elevated: seekfs launch " + uiDBArgs(dbs)
+}
+
+// pollServiceInfoReady tries the service info handshake several times before
+// giving up.  A live service can be momentarily unresponsive (e.g. mid
+// persist-swap while it holds the global lock); treating one slow reply as a
+// dead service spawns a SECOND service over the same pipe and index files,
+// and the two processes then fight over the .gsi files and interleave WAL
+// frames.  Timeout errors (server alive but slow) get the full retry budget;
+// fast connect failures (no listener) give up after two attempts.
+func (a *UIApp) pollServiceInfoReady() (serviceResponse, error) {
+	var resp serviceResponse
+	var err error
+	for attempt := 0; attempt < 4; attempt++ {
+		if attempt > 0 {
+			time.Sleep(2 * time.Second)
+		}
+		resp, err = callServiceWithTimeout(a.pipeName, serviceRequest{Command: "info"}, 500*time.Millisecond)
+		if err == nil {
+			return resp, nil
+		}
+		if !isServiceTimeoutError(err) && attempt >= 1 {
+			return resp, err
+		}
+	}
+	return resp, err
 }
 
 type serviceIdentityExpectation struct {
