@@ -38,7 +38,7 @@ $UiIcon = Join-Path $UiPkg "ui_frontend\assets\seekfs.ico"
 $UiManifest = Join-Path $UiPkg "seekfs-ui.manifest"
 Copy-Item $UiSyso $UiSysoBackup -Force
 try {
-    go run github.com/akavel/rsrc@v0.10.2 -arch amd64 -ico $UiIcon -manifest $UiManifest -o $UiSyso
+    go run ./scripts/ui-rsrcgen -arch amd64 -ico $UiIcon -manifest $UiManifest -o $UiSyso
     go build -trimpath -tags "seekfs_ui production" -ldflags "$LdFlags -H windowsgui" -o (Join-Path $Target "seekfs-ui.exe") ./cmd/seekfs
 } finally {
     Copy-Item $UiSysoBackup $UiSyso -Force

@@ -3059,6 +3059,10 @@ type overlaySegment struct {
 	tombstone overlayBaseIDSet
 	shadowed  overlayBaseIDSet
 	watermark atomic.Int32
+	// checkpointAtRotate is set when persist snapshots the segment: the volume
+	// checkpoint at snapshot time, which covers every change in this segment.
+	// It is the checkpoint the folded index may durably claim.
+	checkpointAtRotate atomic.Int64
 }
 
 type overlayBaseIDSet struct {
@@ -4601,6 +4605,7 @@ var (
 func (s *goSearchService) replayVolumeLoop(vol *serviceVolumeIndex) {
 	buffer := make([]byte, 4*1024*1024)
 	gen := vol.replayGen.Load()
+	rebuildBlocked := false
 	for {
 		if cur := vol.replayGen.Load(); cur != gen {
 			// A watchdog restart or rebuild took ownership; retire quietly.
@@ -4626,9 +4631,21 @@ func (s *goSearchService) replayVolumeLoop(vol *serviceVolumeIndex) {
 					time.Sleep(replayIdleDelay)
 					continue
 				}
-				serviceLog("background stale rebuild failed volume=%s db=%s err=%v", vol.volume, vol.dbPath, rebuildErr)
+				var blocked staleRecoveryBlockedError
+				if errors.As(rebuildErr, &blocked) {
+					// The index file is locked by another process; retrying the
+					// full rebuild every replayErrorDelay would re-run the
+					// multi-gigabyte build each tick.  Stop attempting until
+					// the volume recovers through the stale-recovery path.
+					rebuildBlocked = true
+					serviceLog("background stale rebuild blocked volume=%s db=%s reason=%s", vol.volume, vol.dbPath, blocked.reason)
+				}
 			}
-			s.indexMu.Lock()
+		if rebuildBlocked {
+			time.Sleep(staleRecoveryMax)
+			continue
+		}
+		s.indexMu.Lock()
 			vol.state = "stale"
 			vol.staleReason = err.Error()
 			s.indexMu.Unlock()
@@ -4914,24 +4931,13 @@ func (s *goSearchService) persistVolumeIfDue(vol *serviceVolumeIndex, force bool
 	// NOT hold the global service lock here: the overlay fold and the multi-GB
 	// v9 tmp write can take minutes, and taking indexMu.Lock() during that
 	// window would wedge every pipe request (info/search block at RLock).
-	// Holding vol.mu only briefly pauses this volume's replay loop; the USN
-	// journal retains any changes read but not yet applied, and the next
-	// replay iteration resumes from the persisted checkpoint.
-	vol.mu.Lock()
-	if !vol.dirty || vol.dbPath == "" {
-		vol.mu.Unlock()
-		return
-	}
-	now = time.Now()
-	if !vol.persistRetryAfter.IsZero() && now.Before(vol.persistRetryAfter) {
-		vol.mu.Unlock()
-		return
-	}
-	// A persist folds the whole overlay into a fresh index and stages a
-	// multi-GB file, holding vol.mu for minutes on large volumes. Replay and
-	// searches observe a frozen overlay meanwhile, so log the window: a query
-	// that misses a just-created file during this window is expected, and the
-	// next replay iteration picks the retained journal changes up.
+	//
+	// vol.mu is held only for the two fast sections: the overlay snapshot and
+	// the final swap.  The fold and the multi-GB stage run WITHOUT vol.mu so
+	// the replay loop keeps applying USN changes while persist works; new
+	// files created during a persist stay searchable.  The swap carries the
+	// live overlay's post-snapshot changes into the replacement (rewriting the
+	// WAL down to those frames for crash recovery) so nothing regresses.
 	watermark := 0
 	if vol.overlay != nil {
 		watermark = int(vol.overlay.watermark.Load())
@@ -4944,9 +4950,35 @@ func (s *goSearchService) persistVolumeIfDue(vol *serviceVolumeIndex, force bool
 	}
 	persistStart := time.Now()
 	serviceLog("background persist start volume=%s db=%s overlay_slots=%d wal_bytes=%d", vol.volume, vol.dbPath, watermark, walBytes)
-	compacted := compactOverlayIndex(vol)
+	vol.mu.Lock()
+	if !vol.dirty || vol.dbPath == "" {
+		vol.mu.Unlock()
+		return
+	}
+	now = time.Now()
+	if !vol.persistRetryAfter.IsZero() && now.Before(vol.persistRetryAfter) {
+		vol.mu.Unlock()
+		return
+	}
+	// Snapshot the overlay instead of pausing replay: the fold and the
+	// multi-GB stage below run WITHOUT vol.mu, so the replay loop keeps
+	// applying USN changes (into the live overlay) and new files created
+	// during a persist stay searchable.  Overlay records are append-only and
+	// base records are never mutated in place, so a copy taken under vol.mu
+	// is a stable point-in-time view for the fold; the swap later carries the
+	// live overlay's post-snapshot delta into the replacement.
+	foldCheckpoint := vol.checkpoint
+	foldOverlay := snapshotOverlayForFold(vol.overlay)
+	snapshotWatermark := 0
+	if foldOverlay != nil {
+		foldOverlay.checkpointAtRotate.Store(foldCheckpoint)
+		snapshotWatermark = len(foldOverlay.records)
+	}
+	vol.mu.Unlock()
+	compacted := compactOverlayIndexLocked(vol, foldOverlay)
 	tmp, err := stageIndexFile(vol.dbPath, compacted)
 	if err != nil {
+		vol.mu.Lock()
 		vol.notePersistFailureLocked(err, now)
 		vol.mu.Unlock()
 		serviceLog("background persist stage error volume=%s db=%s failures=%d retry_after=%s err=%v", vol.volume, vol.dbPath, vol.persistFailures, vol.persistRetryAfter.Format(time.RFC3339Nano), err)
@@ -4954,11 +4986,14 @@ func (s *goSearchService) persistVolumeIfDue(vol *serviceVolumeIndex, force bool
 	}
 	saved := false
 	// The disk write is done and durable; only the fast swap-in remains.
-	// Take the global lock so no search is mid-flight against the mmap view
-	// we are about to close, unmap the old file, replace it, and reload.
+	// Take the global lock plus vol.mu so no search is mid-flight against the
+	// mmap view we are about to close and no replay batch is mid-apply while
+	// the volume state is replaced; the critical section is fast.
 	s.indexMu.Lock()
+	vol.mu.Lock()
 	if closeErr := closeIndexMMapRecords(vol.index); closeErr != nil {
 		vol.notePersistFailureLocked(closeErr, time.Now())
+		vol.mu.Unlock()
 		s.indexMu.Unlock()
 		_ = os.Remove(tmp)
 		serviceLog("background persist unmap error volume=%s db=%s err=%v", vol.volume, vol.dbPath, closeErr)
@@ -4966,6 +5001,7 @@ func (s *goSearchService) persistVolumeIfDue(vol *serviceVolumeIndex, force bool
 	}
 	if commitErr := commitStageIndexFile(vol.dbPath, tmp); commitErr != nil {
 		vol.notePersistFailureLocked(commitErr, time.Now())
+		vol.mu.Unlock()
 		s.indexMu.Unlock()
 		serviceLog("background persist commit error volume=%s db=%s err=%v", vol.volume, vol.dbPath, commitErr)
 		return
@@ -4973,6 +5009,7 @@ func (s *goSearchService) persistVolumeIfDue(vol *serviceVolumeIndex, force bool
 	loaded, loadErr := loadIndexForService(vol.dbPath)
 	if loadErr != nil {
 		vol.notePersistFailureLocked(loadErr, time.Now())
+		vol.mu.Unlock()
 		s.indexMu.Unlock()
 		serviceLog("background persist reload error volume=%s db=%s err=%v", vol.volume, vol.dbPath, loadErr)
 		return
@@ -4985,6 +5022,25 @@ func (s *goSearchService) persistVolumeIfDue(vol *serviceVolumeIndex, force bool
 	replacement.persistFailures = 0
 	replacement.persistRetryAfter = time.Time{}
 	replacement.lastPersistErr = ""
+	// The folded index claimed checkpoint foldCheckpoint, but replay kept
+	// applying later changes into the live overlay while the multi-GB file was
+	// being staged.  Carry ONLY that post-snapshot delta into the replacement
+	// (the pre-snapshot slots are folded into the new base already), so the
+	// carried overlay does not re-fold the same records on the next persist.
+	// The WAL is rewritten down to the post-snapshot frames: pre-snapshot
+	// frames are folded into the index file, and the kept frames are the only
+	// durable record of the carried delta for crash recovery (replay is
+	// idempotent per batch).
+	seeded := 0
+	if replacement.index.Compact && replacement.index.Source == "usn" && vol.overlay != nil {
+		replacement.overlay = carryOverlayDelta(vol.overlay, snapshotWatermark, foldOverlay)
+		seeded = int(replacement.overlay.watermark.Load())
+		if replacement.checkpoint < vol.checkpoint {
+			replacement.checkpoint = vol.checkpoint
+			replacement.index.Checkpoint = vol.checkpoint
+		}
+	}
+	replacement.publishSnapshot()
 	replaceServiceVolumeContents(vol, replacement)
 	for i, existing := range s.volumes {
 		if existing == vol {
@@ -4992,19 +5048,25 @@ func (s *goSearchService) persistVolumeIfDue(vol *serviceVolumeIndex, force bool
 			break
 		}
 	}
-	if err := removeWAL(vol.dbPath); err != nil {
-		serviceLog("wal cleanup error volume=%s db=%s err=%v", vol.volume, vol.dbPath, err)
+	if replacement.index.Compact && replacement.index.Source == "usn" {
+		if frames, framesErr := readWALFramesAfter(vol.dbPath, foldCheckpoint); framesErr == nil {
+			if rewriteErr := rewriteWAL(vol.dbPath, frames); rewriteErr != nil {
+				serviceLog("background persist wal rewrite error volume=%s db=%s err=%v", vol.volume, vol.dbPath, rewriteErr)
+			}
+		} else {
+			serviceLog("background persist wal rewrite skipped volume=%s db=%s err=%v", vol.volume, vol.dbPath, framesErr)
+		}
 	}
-	vol.dirty = false
+	vol.dirty = seeded > 0
 	vol.lastPersist = time.Now()
 	vol.persistFailures = 0
 	vol.persistRetryAfter = time.Time{}
 	vol.lastPersistErr = ""
 	saved = true
-	s.indexMu.Unlock()
 	vol.mu.Unlock()
+	s.indexMu.Unlock()
 	if saved {
-		serviceLog("background persist complete volume=%s db=%s records=%d duration=%s", vol.volume, vol.dbPath, compacted.compactRecordCount(), time.Since(persistStart).Round(time.Millisecond))
+		serviceLog("background persist complete volume=%s db=%s records=%d seeded=%d duration=%s", vol.volume, vol.dbPath, compacted.compactRecordCount(), seeded, time.Since(persistStart).Round(time.Millisecond))
 		releaseServiceMemoryAfterSave()
 		s.startBackgroundNameOrderBuilds([]*serviceVolumeIndex{vol})
 		s.startBackgroundNameTrigramBuilds([]*serviceVolumeIndex{vol})
@@ -5068,15 +5130,22 @@ func closeIndexMMapRecords(idx *Index) error {
 }
 
 func compactOverlayIndex(vol *serviceVolumeIndex) *Index {
+	return compactOverlayIndexLocked(vol, vol.overlay)
+}
+
+// compactOverlayIndexLocked folds the given point-in-time overlay snapshot
+// into the base index.  The caller passes either the live segment (while
+// holding vol.mu) or a snapshotOverlayForFold copy (without the lock).
+func compactOverlayIndexLocked(vol *serviceVolumeIndex, foldOverlay *overlaySegment) *Index {
 	base := vol.index
 	out := &Index{
-		Version:    indexVersionV9,
+		Version:      indexVersionV9,
 		Roots:        append([]string(nil), base.Roots...),
 		BuiltAt:      time.Now(),
 		Source:       base.Source,
 		Volume:       base.Volume,
 		JournalID:    base.JournalID,
-		Checkpoint:   vol.checkpoint,
+		Checkpoint:   foldCheckpointForFold(vol, foldOverlay),
 		ContentHash:  base.ContentHash,
 		Compact:      true,
 		CompactAttrs: base.CompactAttrs,
@@ -5084,8 +5153,9 @@ func compactOverlayIndex(vol *serviceVolumeIndex) *Index {
 	if out.Volume == "" {
 		out.Volume = vol.volume
 	}
-	records := make([]CompactRecord, 0, base.compactRecordCount()+len(vol.overlay.records))
-	if vol.overlay == nil {
+	var records []CompactRecord
+	if foldOverlay == nil {
+		records = make([]CompactRecord, 0, base.compactRecordCount())
 		for id := 0; id < base.compactRecordCount(); id++ {
 			rec := base.compactRecord(id)
 			if !rec.Deleted {
@@ -5095,11 +5165,12 @@ func compactOverlayIndex(vol *serviceVolumeIndex) *Index {
 			}
 		}
 	} else {
+		records = make([]CompactRecord, 0, base.compactRecordCount()+len(foldOverlay.records))
 		for id := 0; id < base.compactRecordCount(); id++ {
-			if vol.overlay.tombstone.contains(int32(id)) {
+			if foldOverlay.tombstone.contains(int32(id)) {
 				continue
 			}
-			if vol.overlay.shadowed.contains(int32(id)) {
+			if foldOverlay.shadowed.contains(int32(id)) {
 				continue
 			}
 			rec := base.compactRecord(id)
@@ -5110,13 +5181,13 @@ func compactOverlayIndex(vol *serviceVolumeIndex) *Index {
 			rec.Name = strings.Clone(rec.Name)
 			records = append(records, rec)
 		}
-		watermark := int(vol.overlay.watermark.Load())
-		if watermark > len(vol.overlay.records) {
-			watermark = len(vol.overlay.records)
+		watermark := int(foldOverlay.watermark.Load())
+		if watermark > len(foldOverlay.records) {
+			watermark = len(foldOverlay.records)
 		}
 		for slot := 0; slot < watermark; slot++ {
-			rec := vol.overlay.records[slot]
-			if current, ok := vol.overlay.byFRN[rec.FRN]; ok && current != int32(slot) {
+			rec := foldOverlay.records[slot]
+			if current, ok := foldOverlay.byFRN[rec.FRN]; ok && current != int32(slot) {
 				continue
 			}
 			if rec.Deleted {
@@ -5144,6 +5215,106 @@ func compactOverlayIndex(vol *serviceVolumeIndex) *Index {
 	out.Records = records
 	buildOrders(out)
 	return out
+}
+
+// snapshotOverlayForFold returns a deep point-in-time copy of the overlay
+// segment.  Caller must hold vol.mu.  The copy is safe to read without the
+// lock afterwards because the live segment's records/byFRN are append-only
+// (replay never mutates an existing slot) and the base-id sets only grow.
+func snapshotOverlayForFold(live *overlaySegment) *overlaySegment {
+	if live == nil {
+		return nil
+	}
+	out := &overlaySegment{}
+	watermark := int(live.watermark.Load())
+	if watermark > len(live.records) {
+		watermark = len(live.records)
+	}
+	out.records = append([]CompactRecord(nil), live.records[:watermark]...)
+	out.byFRN = make(map[uint64]int32, len(live.byFRN))
+	for frn, slot := range live.byFRN {
+		if int(slot) < watermark {
+			out.byFRN[frn] = slot
+		}
+	}
+	out.tombstone = copyOverlayBaseIDSet(live.tombstone)
+	out.shadowed = copyOverlayBaseIDSet(live.shadowed)
+	out.watermark.Store(int32(len(out.records)))
+	return out
+}
+
+func copyOverlayBaseIDSet(set overlayBaseIDSet) overlayBaseIDSet {
+	out := overlayBaseIDSet{
+		bits:  append([]uint64(nil), set.bits...),
+		ids:   append([]int32(nil), set.ids...),
+		count: set.count,
+	}
+	return out
+}
+
+// carryOverlayDelta builds the replacement overlay from the live segment's
+// post-snapshot slots [from, watermark).  Caller must hold vol.mu (both at
+// snapshot time and here).  The pre-snapshot slots are folded into the new
+// base already, so only the post-snapshot tail is kept; slots are rebased to
+// start at zero so the carried overlay stays compact across persists.
+// Pre-snapshot tombstones/shadows are folded into the new base too, so only
+// IDs added after the snapshot (absent from the fold copy) are carried.
+// Slot identity is preserved consistently within the rebased segment: byFRN
+// values shift by -from, and the per-call seen/path caches in overlayEntry
+// are always built against the same records slice.
+func carryOverlayDelta(live *overlaySegment, from int, foldOverlay *overlaySegment) *overlaySegment {
+	if live == nil {
+		return nil
+	}
+	out := newOverlaySegment()
+	watermark := int(live.watermark.Load())
+	if watermark > len(live.records) {
+		watermark = len(live.records)
+	}
+	if watermark > from {
+		out.records = append([]CompactRecord(nil), live.records[from:watermark]...)
+		for frn, slot := range live.byFRN {
+			if int(slot) >= from && int(slot) < watermark {
+				out.byFRN[frn] = slot - int32(from)
+			}
+		}
+		if foldOverlay != nil {
+			out.tombstone = overlayBaseIDSetDelta(live.tombstone, foldOverlay.tombstone)
+			out.shadowed = overlayBaseIDSetDelta(live.shadowed, foldOverlay.shadowed)
+		} else {
+			out.tombstone = copyOverlayBaseIDSet(live.tombstone)
+			out.shadowed = copyOverlayBaseIDSet(live.shadowed)
+		}
+	}
+	out.watermark.Store(int32(len(out.records)))
+	return out
+}
+
+// overlayBaseIDSetDelta returns the entries of live that are absent from snap:
+// the base IDs tombstoned/shadowed after the fold snapshot.  Those are the
+// only set entries the replacement overlay must carry; the snapshot ones are
+// already folded into the replacement base index.
+func overlayBaseIDSetDelta(live, snap overlayBaseIDSet) overlayBaseIDSet {
+	out := overlayBaseIDSet{}
+	for _, id := range live.ids {
+		if !snap.contains(id) {
+			out.add(id)
+		}
+	}
+	return out
+}
+
+// foldCheckpointForFold returns the checkpoint the fold may claim: the volume
+// checkpoint captured when the overlay was snapshotted (persist passes that value
+// via the snapshot's checkpointAtRotate), which by construction covers every
+// change in the folded snapshot.
+func foldCheckpointForFold(vol *serviceVolumeIndex, foldOverlay *overlaySegment) int64 {
+	if foldOverlay != nil {
+		if cp := foldOverlay.checkpointAtRotate.Load(); cp > 0 {
+			return cp
+		}
+	}
+	return vol.checkpoint
 }
 
 func persistFailureBackoff(failures int) time.Duration {
@@ -5825,6 +5996,99 @@ func (vol *serviceVolumeIndex) replayBinaryWAL(r io.Reader) error {
 
 func walPath(dbPath string) string {
 	return dbPath + ".wal"
+}
+
+// readWALFramesAfter decodes every complete binary WAL frame whose NextUSN is
+// past checkpoint, in file order.  Read-only: the WAL is left untouched.
+func readWALFramesAfter(dbPath string, checkpoint int64) ([]walBatch, error) {
+	f, err := os.Open(walPath(dbPath))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	defer f.Close()
+	br := bufio.NewReaderSize(f, 1024*1024)
+	prefix, err := br.Peek(len(walMagicV1))
+	if err != nil || !bytes.Equal(prefix, walMagicV1) {
+		// Legacy JSON WAL (or empty/invalid magic): nothing to rewrite safely.
+		return nil, nil
+	}
+	_, _ = br.Discard(len(walMagicV1))
+	var frames []walBatch
+	for {
+		var header [8]byte
+		if _, err := io.ReadFull(br, header[:]); err != nil {
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+				break
+			}
+			return frames, err
+		}
+		length := binary.LittleEndian.Uint32(header[0:4])
+		wantCRC := binary.LittleEndian.Uint32(header[4:8])
+		if length == 0 || length > 64*1024*1024 {
+			return frames, fmt.Errorf("invalid wal frame length %d", length)
+		}
+		payload := make([]byte, length)
+		if _, err := io.ReadFull(br, payload); err != nil {
+			return frames, err
+		}
+		if got := crc32.ChecksumIEEE(payload); got != wantCRC {
+			return frames, fmt.Errorf("wal frame crc mismatch got=%08x want=%08x", got, wantCRC)
+		}
+		batch, err := decodeBinaryWALBatch(payload)
+		if err != nil {
+			return frames, err
+		}
+		if batch.NextUSN <= checkpoint {
+			continue
+		}
+		frames = append(frames, batch)
+	}
+	return frames, nil
+}
+
+// rewriteWAL replaces the binary WAL with exactly the given frames, writing to
+// a temp file and renaming so a crash mid-rewrite leaves either the old or the
+// new WAL, never an empty one.  Called after persist to drop frames already
+// folded into the index while keeping post-snapshot frames recoverable.
+func rewriteWAL(dbPath string, frames []walBatch) error {
+	if dbPath == "" {
+		return errors.New("wal rewrite requires a db path")
+	}
+	if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(dbPath), filepath.Base(walPath(dbPath))+".*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	writeErr := func() error {
+		if _, err := tmp.Write(walMagicV1); err != nil {
+			return err
+		}
+		for _, frame := range frames {
+			if err := appendBinaryWALFrame(tmp, frame.NextUSN, frame.Changes); err != nil {
+				return err
+			}
+		}
+		if err := tmp.Sync(); err != nil {
+			return err
+		}
+		return tmp.Close()
+	}()
+	if writeErr != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return writeErr
+	}
+	if err := os.Rename(tmpName, walPath(dbPath)); err != nil {
+		_ = os.Remove(tmpName)
+		return err
+	}
+	return nil
 }
 
 func appendWAL(dbPath string, nextUSN int64, changes []usnChange) error {

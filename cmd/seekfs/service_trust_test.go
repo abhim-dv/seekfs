@@ -460,3 +460,62 @@ func TestWALTruncatedBatchClaimsAppliedCheckpoint(t *testing.T) {
 		t.Fatalf("test setup invalid: journal head %d must exceed tail change %d", journalHead, tailUSN)
 	}
 }
+
+func TestPersistOverlayCarryKeepsPostSnapshotChanges(t *testing.T) {
+	// A background persist folds a point-in-time overlay snapshot while replay
+	// keeps applying changes into the live overlay.  The swap must carry the
+	// live overlay into the replacement so post-snapshot changes (e.g. a file
+	// created while the multi-GB index file was being staged) stay searchable
+	// instead of vanishing for the remainder of the persist window.
+	vol := &serviceVolumeIndex{volume: "C:", dbPath: t.TempDir() + "\\persist-carry.gsi"}
+	vol.index = &Index{Version: indexVersionV9, Compact: true, Source: "usn", Volume: "C:"}
+	vol.overlay = newOverlaySegment()
+	// Pre-snapshot change: folded into the new base index by the persist.
+	vol.applyUSNChanges([]usnChange{{FRN: 100, ParentFRN: 0, USN: 10, Name: "folded.txt", Reason: usnReasonFileCreate}})
+	foldOverlay := snapshotOverlayForFold(vol.overlay)
+	foldOverlay.checkpointAtRotate.Store(vol.checkpoint)
+	// Post-snapshot change: applied while persist stages the multi-GB file.
+	vol.applyUSNChanges([]usnChange{{FRN: 200, ParentFRN: 0, USN: 20, Name: "fresh.txt", Reason: usnReasonFileCreate}})
+	if _, ok := vol.idForFRN(200); ok {
+		t.Fatal("post-snapshot change must live in the overlay, not the base")
+	}
+	folded := compactOverlayIndexLocked(vol, foldOverlay)
+	if folded.Checkpoint != 10 {
+		t.Fatalf("folded checkpoint = %d, want the at-snapshot value 10", folded.Checkpoint)
+	}
+	// Swap section: the replacement base is the persisted fold (in production
+	// it is loaded from the staged index file), carrying only the post-snapshot
+	// overlay delta.
+	replacement := newServiceVolumeIndex(vol.dbPath, folded)
+	replacement.overlay = carryOverlayDelta(vol.overlay, len(foldOverlay.records), foldOverlay)
+	replacement.publishSnapshot()
+	if replacement.checkpoint < vol.checkpoint {
+		replacement.checkpoint = vol.checkpoint
+	}
+	if _, ok := replacement.overlay.byFRN[200]; !ok {
+		t.Fatal("post-snapshot FRN 200 missing from carried overlay")
+	}
+	if _, ok := replacement.overlay.byFRN[100]; ok {
+		t.Fatal("pre-snapshot FRN 100 must not be carried (already folded)")
+	}
+	if got := replacement.overlay.tombstone.len() + replacement.overlay.shadowed.len(); got != 0 {
+		t.Fatalf("carried overlay re-carried %d pre-snapshot base-id set entries", got)
+	}
+	replaceServiceVolumeContents(vol, replacement)
+	// The folded record must be visible through the base index...
+	got, err := searchServiceVolumes([]*serviceVolumeIndex{vol}, queryOptions{Query: "folded.txt", Limit: 10}, false)
+	if err != nil {
+		t.Fatalf("search folded: %v", err)
+	}
+	if !sameStringSet(pathsOf(got), []string{`C:\folded.txt`}) {
+		t.Fatalf("folded.txt search = %v", pathsOf(got))
+	}
+	// ...and the post-snapshot record through the carried overlay snapshot.
+	snap := vol.snap.Load()
+	if snap == nil {
+		t.Fatal("no published snapshot after swap")
+	}
+	if overlay := vol.overlayRankedMatches(snap, parsedQuery{Terms: []string{"fresh.txt"}}, map[int]string{}); len(overlay) == 0 {
+		t.Fatal("file fresh.txt not searchable from carried overlay after persist swap")
+	}
+}
