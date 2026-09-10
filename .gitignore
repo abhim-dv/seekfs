@@ -43,5 +43,8 @@ docs/USER_RESEARCH_*.md
 docs/WATCH_COMMAND_DESIGN.md
 docs/R5_EXHAUSTIVE_IMPLEMENTATION_PLAN.md
 docs/RESEARCH_*.md
+docs/*_RESEARCH.md
 docs/*_SCOPE_*.md
 docs/*_IMPLEMENTATION_SCOPE.md
+research/
+.watchrel/
