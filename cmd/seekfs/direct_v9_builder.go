@@ -1119,7 +1119,8 @@ func directV9WriteTopologySections(ctx context.Context, cw *countingWriter, fina
 	parentPath := filepath.Join(spoolDir, "direct-v9-parents.tmp")
 	offsetsPath := filepath.Join(spoolDir, "direct-v9-child-offsets.tmp")
 	rootsPath := filepath.Join(spoolDir, "direct-v9-roots.tmp")
-	*owned = append(*owned, parentPath, offsetsPath, rootsPath)
+	sizesPath := filepath.Join(spoolDir, "direct-v9-sizes.tmp")
+	*owned = append(*owned, parentPath, offsetsPath, rootsPath, sizesPath)
 	parents, err := os.Create(parentPath)
 	if err != nil {
 		return nil, nil, err
@@ -1129,13 +1130,21 @@ func directV9WriteTopologySections(ctx context.Context, cw *countingWriter, fina
 		_ = parents.Close()
 		return nil, nil, err
 	}
+	sizes, err := os.Create(sizesPath)
+	if err != nil {
+		_ = parents.Close()
+		_ = roots.Close()
+		return nil, nil, err
+	}
 	parentWriter := bufio.NewWriterSize(parents, 256*1024)
 	rootWriter := bufio.NewWriterSize(roots, 256*1024)
+	sizeWriter := bufio.NewWriterSize(sizes, 256*1024)
 	counts := make([]uint32, recordCount)
 	final, err := os.Open(finalPath)
 	if err != nil {
 		_ = parents.Close()
 		_ = roots.Close()
+		_ = sizes.Close()
 		return nil, nil, err
 	}
 	frnMap, frns, err := directV9MapFRNs(frnPath, recordCount)
@@ -1143,6 +1152,7 @@ func directV9WriteTopologySections(ctx context.Context, cw *countingWriter, fina
 		_ = final.Close()
 		_ = parents.Close()
 		_ = roots.Close()
+		_ = sizes.Close()
 		return nil, nil, err
 	}
 	if frnMap != nil {
@@ -1155,6 +1165,7 @@ func directV9WriteTopologySections(ctx context.Context, cw *countingWriter, fina
 			_ = final.Close()
 			_ = parents.Close()
 			_ = roots.Close()
+			_ = sizes.Close()
 			return nil, nil, ctx.Err()
 		default:
 		}
@@ -1163,7 +1174,23 @@ func directV9WriteTopologySections(ctx context.Context, cw *countingWriter, fina
 			_ = final.Close()
 			_ = parents.Close()
 			_ = roots.Close()
+			_ = sizes.Close()
 			return nil, nil, readErr
+		}
+		// Directory aggregate sizes sum descendant file sizes; a directory's
+		// own entry contributes nothing so the subtree post-order sum is exact.
+		var size uint64
+		if rec.Mode&uint32(os.ModeDir) == 0 && rec.Size > 0 {
+			size = uint64(rec.Size)
+		}
+		var sz [8]byte
+		binary.LittleEndian.PutUint64(sz[:], size)
+		if _, err := sizeWriter.Write(sz[:]); err != nil {
+			_ = final.Close()
+			_ = parents.Close()
+			_ = roots.Close()
+			_ = sizes.Close()
+			return nil, nil, err
 		}
 		parentID := int32(-1)
 		if rec.ParentFRN != 0 {
@@ -1173,6 +1200,7 @@ func directV9WriteTopologySections(ctx context.Context, cw *countingWriter, fina
 			_ = final.Close()
 			_ = parents.Close()
 			_ = roots.Close()
+			_ = sizes.Close()
 			return nil, nil, errors.New("direct v9 topology self-parent")
 		}
 		var b [4]byte
@@ -1182,6 +1210,7 @@ func directV9WriteTopologySections(ctx context.Context, cw *countingWriter, fina
 				_ = final.Close()
 				_ = parents.Close()
 				_ = roots.Close()
+				_ = sizes.Close()
 				return nil, nil, err
 			}
 		} else {
@@ -1192,6 +1221,7 @@ func directV9WriteTopologySections(ctx context.Context, cw *countingWriter, fina
 			_ = final.Close()
 			_ = parents.Close()
 			_ = roots.Close()
+			_ = sizes.Close()
 			return nil, nil, err
 		}
 	}
@@ -1199,15 +1229,24 @@ func directV9WriteTopologySections(ctx context.Context, cw *countingWriter, fina
 	if err := parentWriter.Flush(); err != nil {
 		_ = parents.Close()
 		_ = roots.Close()
+		_ = sizes.Close()
 		return nil, nil, err
 	}
 	if err := rootWriter.Flush(); err != nil {
 		_ = parents.Close()
 		_ = roots.Close()
+		_ = sizes.Close()
+		return nil, nil, err
+	}
+	if err := sizeWriter.Flush(); err != nil {
+		_ = parents.Close()
+		_ = roots.Close()
+		_ = sizes.Close()
 		return nil, nil, err
 	}
 	_ = parents.Close()
 	_ = roots.Close()
+	_ = sizes.Close()
 	if err := directV9CheckParentCycles(ctx, parentPath, recordCount); err != nil {
 		return nil, nil, err
 	}
@@ -1365,30 +1404,45 @@ func directV9WriteTopologySections(ctx context.Context, cw *countingWriter, fina
 	return entries, reports, nil
 }
 
-func directV9WriteSubtreeSection(ctx context.Context, cw *countingWriter, parentPath string, recordCount int, rankPaths []string, owned *[]string, scratchHigh *int64) (indexSectionTableEntry, directV9SectionReport, []string, error) {
+func directV9WriteSubtreeSection(ctx context.Context, cw *countingWriter, parentPath, sizesPath string, recordCount int, rankPaths []string, owned *[]string, scratchHigh *int64) ([]indexSectionTableEntry, []directV9SectionReport, []string, error) {
 	parents := make([]int32, recordCount)
 	f, err := os.Open(parentPath)
 	if err != nil {
-		return indexSectionTableEntry{}, directV9SectionReport{}, nil, err
+		return nil, nil, nil, err
 	}
 	parentReader := bufio.NewReaderSize(f, 256*1024)
 	for id := range parents {
 		var b [4]byte
 		if _, err := io.ReadFull(parentReader, b[:]); err != nil {
 			_ = f.Close()
-			return indexSectionTableEntry{}, directV9SectionReport{}, nil, err
+			return nil, nil, nil, err
 		}
 		value := binary.LittleEndian.Uint32(b[:])
 		if value == ^uint32(0) {
 			parents[id] = -1
 		} else if value >= uint32(recordCount) {
 			_ = f.Close()
-			return indexSectionTableEntry{}, directV9SectionReport{}, nil, errors.New("direct v9 subtree parent out of range")
+			return nil, nil, nil, errors.New("direct v9 subtree parent out of range")
 		} else {
 			parents[id] = int32(value)
 		}
 	}
 	_ = f.Close()
+	sizes := make([]uint64, recordCount)
+	sf, err := os.Open(sizesPath)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	sizeReader := bufio.NewReaderSize(sf, 256*1024)
+	for id := range sizes {
+		var b [8]byte
+		if _, err := io.ReadFull(sizeReader, b[:]); err != nil {
+			_ = sf.Close()
+			return nil, nil, nil, err
+		}
+		sizes[id] = binary.LittleEndian.Uint64(b[:])
+	}
+	_ = sf.Close()
 	counts := make([]uint32, recordCount)
 	roots := make([]uint32, 0, 16)
 	for id, parent := range parents {
@@ -1452,10 +1506,21 @@ func directV9WriteSubtreeSection(ctx context.Context, cw *countingWriter, parent
 		visit(uint32(id))
 	}
 	if len(order) != recordCount {
-		return indexSectionTableEntry{}, directV9SectionReport{}, nil, errors.New("direct v9 subtree traversal did not cover all records")
+		return nil, nil, nil, errors.New("direct v9 subtree traversal did not cover all records")
+	}
+	// Aggregate each record's subtree file bytes.  Children precede their
+	// parent in the pre-order, so a reverse pass sees every child first.
+	subtreeBytes := make([]uint64, recordCount)
+	for pos := len(order) - 1; pos >= 0; pos-- {
+		id := order[pos]
+		sum := sizes[id]
+		for childPos := offsets[id]; childPos < offsets[id+1]; childPos++ {
+			sum += subtreeBytes[children[childPos]]
+		}
+		subtreeBytes[id] = sum
 	}
 	if err := writeAlignment(cw, 8); err != nil {
-		return indexSectionTableEntry{}, directV9SectionReport{}, nil, err
+		return nil, nil, nil, err
 	}
 	offset := uint64(cw.n)
 	writePart := func(values []uint32) error {
@@ -1469,19 +1534,19 @@ func directV9WriteSubtreeSection(ctx context.Context, cw *countingWriter, parent
 		return err
 	}
 	if err := writePart(start); err != nil {
-		return indexSectionTableEntry{}, directV9SectionReport{}, nil, err
+		return nil, nil, nil, err
 	}
 	if err := writePart(end); err != nil {
-		return indexSectionTableEntry{}, directV9SectionReport{}, nil, err
+		return nil, nil, nil, err
 	}
 	if err := writePart(order); err != nil {
-		return indexSectionTableEntry{}, directV9SectionReport{}, nil, err
+		return nil, nil, nil, err
 	}
 	subtreeRankPaths := make([]string, 0, len(rankPaths))
 	for rankIndex, rankPath := range rankPaths {
 		rankFile, openErr := os.Open(rankPath)
 		if openErr != nil {
-			return indexSectionTableEntry{}, directV9SectionReport{}, nil, openErr
+			return nil, nil, nil, openErr
 		}
 		ranks := make([]uint32, recordCount)
 		best := make([]uint32, recordCount)
@@ -1493,7 +1558,7 @@ func directV9WriteSubtreeSection(ctx context.Context, cw *countingWriter, parent
 		for id := range ranks {
 			if _, err := io.ReadFull(rankReader, buf[:]); err != nil {
 				_ = rankFile.Close()
-				return indexSectionTableEntry{}, directV9SectionReport{}, nil, err
+				return nil, nil, nil, err
 			}
 			ranks[id] = binary.LittleEndian.Uint32(buf[:])
 		}
@@ -1509,7 +1574,7 @@ func directV9WriteSubtreeSection(ctx context.Context, cw *countingWriter, parent
 		}
 		bestPath := filepath.Join(filepath.Dir(parentPath), fmt.Sprintf("direct-v9-subtree-rank-%d.tmp", rankIndex))
 		if err := os.WriteFile(bestPath, uint32SliceBytes(best), 0o600); err != nil {
-			return indexSectionTableEntry{}, directV9SectionReport{}, nil, err
+			return nil, nil, nil, err
 		}
 		*owned = append(*owned, bestPath)
 		subtreeRankPaths = append(subtreeRankPaths, bestPath)
@@ -1517,7 +1582,7 @@ func directV9WriteSubtreeSection(ctx context.Context, cw *countingWriter, parent
 		// by size, modified, extension, type, and path subtree minima.
 		if rankIndex > 0 {
 			if err := writePart(best); err != nil {
-				return indexSectionTableEntry{}, directV9SectionReport{}, nil, err
+				return nil, nil, nil, err
 			}
 		}
 	}
@@ -1529,7 +1594,27 @@ func directV9WriteSubtreeSection(ctx context.Context, cw *countingWriter, parent
 	if scratch > *scratchHigh {
 		*scratchHigh = scratch
 	}
-	return entry, directV9SectionReport{Name: "SUBT", Tag: indexSectionSUBT, Runs: 0, Bytes: int64(entry.length), ScratchBytes: scratch}, subtreeRankPaths, nil
+	// Directory aggregate sizes: one uint64 per record (0 for files).
+	if err := writeAlignment(cw, 8); err != nil {
+		return nil, nil, nil, err
+	}
+	subsOffset := uint64(cw.n)
+	if len(subtreeBytes) > 0 {
+		if _, err := cw.Write(uint64SliceBytes(subtreeBytes)); err != nil {
+			return nil, nil, nil, err
+		}
+	}
+	subsEntry := indexSectionTableEntry{tag: indexSectionSUBS, offset: subsOffset, length: uint64(cw.n) - subsOffset}
+	subsScratch := int64(recordCount) * 8
+	if subsScratch > *scratchHigh {
+		*scratchHigh = subsScratch
+	}
+	entries := []indexSectionTableEntry{entry, subsEntry}
+	reports := []directV9SectionReport{
+		{Name: "SUBT", Tag: indexSectionSUBT, Runs: 0, Bytes: int64(entry.length), ScratchBytes: scratch},
+		{Name: "SUBS", Tag: indexSectionSUBS, Runs: 0, Bytes: int64(subsEntry.length), ScratchBytes: subsScratch},
+	}
+	return entries, reports, subtreeRankPaths, nil
 }
 
 func uint32SliceBytes(values []uint32) []byte {
@@ -1539,6 +1624,17 @@ func uint32SliceBytes(values []uint32) []byte {
 	bytes := make([]byte, len(values)*4)
 	for i, value := range values {
 		binary.LittleEndian.PutUint32(bytes[i*4:], value)
+	}
+	return bytes
+}
+
+func uint64SliceBytes(values []uint64) []byte {
+	if len(values) == 0 {
+		return nil
+	}
+	bytes := make([]byte, len(values)*8)
+	for i, value := range values {
+		binary.LittleEndian.PutUint64(bytes[i*8:], value)
 	}
 	return bytes
 }
@@ -2186,16 +2282,17 @@ func directV9WriteAtomic(ctx context.Context, opts directV9BuildOptions, finalPa
 		*sectionReports = append(*sectionReports, topologyReports...)
 	}
 	parentPath := filepath.Join(filepath.Dir(finalPath), "direct-v9-parents.tmp")
+	sizesPath := filepath.Join(filepath.Dir(finalPath), "direct-v9-sizes.tmp")
 	t0 = time.Now()
-	subtreeEntry, subtreeReport, subtreeRankPaths, subtreeErr := directV9WriteSubtreeSection(ctx, cw, parentPath, recordCount, rankScratchPaths, owned, scratchHigh)
+	subtreeEntries, subtreeReports, subtreeRankPaths, subtreeErr := directV9WriteSubtreeSection(ctx, cw, parentPath, sizesPath, recordCount, rankScratchPaths, owned, scratchHigh)
 	if subtreeErr != nil {
 		cleanup()
 		return 0, subtreeErr
 	}
 	reportPhase("subtree", time.Since(t0))
-	entries = append(entries, subtreeEntry)
+	entries = append(entries, subtreeEntries...)
 	if sectionReports != nil {
-		*sectionReports = append(*sectionReports, subtreeReport)
+		*sectionReports = append(*sectionReports, subtreeReports...)
 	}
 	t0 = time.Now()
 	auxEntries, auxReports, auxErr := directV9WriteAuxiliarySections(ctx, cw, finalPath, recordCount, opts.RunRecords, rankScratchPaths[0], subtreeRankPaths, filepath.Dir(finalPath), owned, scratchHigh)

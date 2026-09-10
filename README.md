@@ -144,8 +144,10 @@ Representative warm service CLI timings:
 
 - Windows and NTFS are the primary target.
 - Result ranking is simple and not Everything-compatible.
-- Directory sizes are reported as 0 (Everything reports folders at the recursive
-  size of their contents).
+- Directory sizes are the recursive size of their contents, persisted in the
+  v9 index and refreshed on persist. Between persists they do not track live
+  creates/deletes (the USN journal carries no file size), so a folder's size
+  can lag a rebuild like file sizes already do.
 - `size:`, `dm:`, and `attrib:` require an index built with file metadata. NTFS
   service indexes capture this from the MFT; older indexes without this metadata
   return a clear error for these filters.

@@ -85,6 +85,9 @@ const (
 	indexSectionTRNK uint32 = 'T'<<24 | 'R'<<16 | 'N'<<8 | 'K'
 	indexSectionPRNK uint32 = 'P'<<24 | 'R'<<16 | 'N'<<8 | 'K'
 	indexSectionSUBT uint32 = 'S'<<24 | 'U'<<16 | 'B'<<8 | 'T'
+	// SUBS is the per-record recursive directory size (uint64 per record, 0 for
+	// files); written immediately after SUBT.  Older readers ignore it.
+	indexSectionSUBS uint32 = 'S'<<24 | 'U'<<16 | 'B'<<8 | 'S'
 	indexSectionCHLD uint32 = 'C'<<24 | 'H'<<16 | 'L'<<8 | 'D'
 	indexSectionFRNS uint32 = 'F'<<24 | 'R'<<16 | 'N'<<8 | 'S'
 	indexSectionLOWR uint32 = 'L'<<24 | 'O'<<16 | 'W'<<8 | 'R'
@@ -355,6 +358,7 @@ type indexDerivedSections struct {
 	SubtreeExtRank   []uint32
 	SubtreeTypeRank  []uint32
 	SubtreePathRank  []uint32
+	SubtreeBytes     []uint64
 	FRNs             []uint64
 	FRNRecordIDs     []uint32
 	LowerBlob        []byte
@@ -1336,6 +1340,7 @@ func newCompactionVolumeIndex(dbPath string, idx *Index) *serviceVolumeIndex {
 		vol.subtreeOrder = idx.Derived.SubtreeOrder
 		vol.subtreeStart = idx.Derived.SubtreeStart
 		vol.subtreeEnd = idx.Derived.SubtreeEnd
+		vol.subtreeBytes = idx.Derived.SubtreeBytes
 		if len(vol.childOffsets) == 0 || len(vol.childIDs) == 0 {
 			// The fallback subtree walk only needs the packed child graph.  Do
 			// not build the optional DFS interval arrays during WAL replay.
@@ -3130,6 +3135,7 @@ type serviceVolumeIndex struct {
 	subtreeOrder      []uint32
 	subtreeStart      []uint32
 	subtreeEnd        []uint32
+	subtreeBytes      []uint64
 	subtreeSizeRank   []uint32
 	subtreeModRank    []uint32
 	subtreeExtRank    []uint32
@@ -4589,6 +4595,9 @@ func (vol *serviceVolumeIndex) applyDerivedSections() {
 		vol.subtreeExtRank = derived.SubtreeExtRank
 		vol.subtreeTypeRank = derived.SubtreeTypeRank
 		vol.subtreePathRank = derived.SubtreePathRank
+	}
+	if len(derived.SubtreeBytes) > 0 {
+		vol.subtreeBytes = derived.SubtreeBytes
 	}
 	if len(derived.FRNs) > 0 && len(derived.FRNRecordIDs) == len(derived.FRNs) {
 		vol.frns = derived.FRNs
@@ -11063,28 +11072,9 @@ func searchCompactWithCacheHidden(idx *Index, opts queryOptions, countOnly bool,
 			}
 			continue
 		}
-		path := idx.reconstructCompactPathCached(recIndex, pathCache)
-		entry := Entry{
-			Path:        path,
-			Name:        rec.Name,
-			LowerPath:   strings.ToLower(path),
-			LowerName:   idx.compactLowerNameAt(recIndex),
-			Mode:        rec.Mode,
-			Size:        rec.Size,
-			ModUnix:     rec.ModUnix,
-			IndexSource: idx.Source,
-		}
+		entry := compactEntryFromRecord(idx, recIndex, rec, pathCache, true)
 		if entryMatches(entry, pq, pq.MatchPath) {
-			results = append(results, Entry{
-				Path:        entry.Path,
-				Name:        entry.Name,
-				LowerPath:   entry.LowerPath,
-				LowerName:   entry.LowerName,
-				Mode:        entry.Mode,
-				Size:        entry.Size,
-				ModUnix:     entry.ModUnix,
-				IndexSource: entry.IndexSource,
-			})
+			results = append(results, entry)
 			if !countOnly && len(results) >= limit {
 				break
 			}
@@ -11135,6 +11125,9 @@ func compactEntryFromRecord(idx *Index, recIndex int, rec CompactRecord, pathCac
 		Size:        rec.Size,
 		ModUnix:     rec.ModUnix,
 		IndexSource: idx.Source,
+	}
+	if rec.Mode&uint32(os.ModeDir) != 0 && recIndex >= 0 && recIndex < len(idx.Derived.SubtreeBytes) {
+		entry.Size = int64(idx.Derived.SubtreeBytes[recIndex])
 	}
 	if withLower {
 		entry.LowerPath = strings.ToLower(path)
@@ -18646,6 +18639,11 @@ func forEachDerivedSection(idx *Index, nameTokens []string, emit func(indexSecti
 	); err != nil {
 		return err
 	}
+	if subtreeBytes := vol.buildSubtreeBytes(); len(subtreeBytes) > 0 {
+		if err := emitSection(indexSectionSUBS, encodeUint64Section(subtreeBytes)); err != nil {
+			return err
+		}
+	}
 	populatePersistenceFRNs(vol, idx)
 	if err := emitSection(indexSectionFRNS, encodeFRNSection(vol.frns, vol.frnRecordIDs)); err != nil {
 		return err
@@ -18770,6 +18768,10 @@ func derivedSectionInfo(derived indexDerivedSections) ([]string, int) {
 			len(derived.SubtreeSizeRank) + len(derived.SubtreeModRank) + len(derived.SubtreeExtRank) +
 			len(derived.SubtreeTypeRank) + len(derived.SubtreePathRank))
 	}
+	if len(derived.SubtreeBytes) > 0 {
+		sections = append(sections, "SUBS")
+		bytes += 8 * len(derived.SubtreeBytes)
+	}
 	if len(derived.FRNs) > 0 || len(derived.FRNRecordIDs) > 0 {
 		sections = append(sections, "FRNS")
 		bytes += 8*len(derived.FRNs) + 4*len(derived.FRNRecordIDs)
@@ -18827,6 +18829,10 @@ func encodeUint32Section(parts ...[]uint32) []byte {
 		_ = binary.Write(&buf, binary.LittleEndian, part)
 	}
 	return buf.Bytes()
+}
+
+func encodeUint64Section(values []uint64) []byte {
+	return uint64SliceBytes(values)
 }
 
 func encodeFRNSection(frns []uint64, ids []uint32) []byte {
@@ -19352,6 +19358,37 @@ func (vol *serviceVolumeIndex) buildSubtreeMinRanks(ranks []uint32) []uint32 {
 	return best
 }
 
+// buildSubtreeBytes computes the recursive file-byte total for every record
+// (0 for plain files, which report their own size directly).  The subtree
+// order is depth-first, so a reverse walk sees every child before its parent.
+// Deleted records contribute nothing.
+func (vol *serviceVolumeIndex) buildSubtreeBytes() []uint64 {
+	if vol == nil || vol.index == nil || len(vol.subtreeOrder) == 0 {
+		return nil
+	}
+	recordCount := vol.index.compactRecordCount()
+	bytes := make([]uint64, recordCount)
+	for pos := len(vol.subtreeOrder) - 1; pos >= 0; pos-- {
+		id := int(vol.subtreeOrder[pos])
+		if id < 0 || id >= recordCount {
+			continue
+		}
+		rec := vol.index.compactRecord(id)
+		var sum uint64
+		if !rec.Deleted && rec.Mode&uint32(os.ModeDir) == 0 && rec.Size > 0 {
+			sum = uint64(rec.Size)
+		}
+		for _, childID32 := range vol.childIDsForRecord(id) {
+			childID := int(childID32)
+			if childID >= 0 && childID < recordCount {
+				sum += bytes[childID]
+			}
+		}
+		bytes[id] = sum
+	}
+	return bytes
+}
+
 func loadIndex(path string) (*Index, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -19604,6 +19641,8 @@ func decodeDerivedSection(out *indexDerivedSections, tag uint32, section []byte,
 		if len(parts) == 3 {
 			out.SubtreeStart, out.SubtreeEnd, out.SubtreeOrder = parts[0], parts[1], parts[2]
 		}
+	case indexSectionSUBS:
+		out.SubtreeBytes = decodeUint64Section(section, 1)
 	case indexSectionFRNS:
 		frns, ids := decodeFRNSection(section)
 		out.FRNs, out.FRNRecordIDs = frns, ids
@@ -19670,6 +19709,13 @@ func decodeUint32Section(data []byte, parts int) [][]uint32 {
 		return nil
 	}
 	return out
+}
+
+func decodeUint64Section(data []byte, parts int) []uint64 {
+	if parts != 1 || len(data) == 0 || len(data)%8 != 0 {
+		return nil
+	}
+	return mappedUint64Slice(data)
 }
 
 func decodeFRNSection(data []byte) ([]uint64, []uint32) {

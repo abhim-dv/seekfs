@@ -54,7 +54,7 @@ func TestDirectV9BuilderIsSourceOrderIndependentAndResolvesParents(t *testing.T)
 	if firstHash != secondHash {
 		t.Fatalf("source order changed direct output: %s != %s", firstHash, secondHash)
 	}
-	if firstStats.FinalIDRule != "ascending-frn; duplicate-frn-rejected" || len(secondStats.Sections) != 16 || secondStats.Sections[0] != "RANK" {
+	if firstStats.FinalIDRule != "ascending-frn; duplicate-frn-rejected" || len(secondStats.Sections) != 17 || secondStats.Sections[0] != "RANK" {
 		t.Fatalf("unexpected build stats: %#v / %#v", firstStats, secondStats)
 	}
 	idx, err := loadIndexMMap(first)

@@ -932,7 +932,7 @@ func TestEngineV9UpgradeIndexCommand(t *testing.T) {
 		t.Fatalf("version = %d, want %d", loaded.Version, indexVersionV9)
 	}
 	sections, bytes := derivedSectionInfo(loaded.Derived)
-	if !reflect.DeepEqual(sections, []string{"RANK", "ERNK", "TRNK", "PRNK", "CHLD", "SUBT", "FRNS", "LOWR", "PNGR"}) {
+	if !reflect.DeepEqual(sections, []string{"RANK", "ERNK", "TRNK", "PRNK", "CHLD", "SUBT", "SUBS", "FRNS", "LOWR", "PNGR"}) {
 		t.Fatalf("sections = %v", sections)
 	}
 	if bytes == 0 {
