@@ -1601,6 +1601,16 @@ func normalizeVolume(volume string) string {
 }
 
 func openVolume(volume string) (windows.Handle, error) {
+	return openVolumeWithFlags(volume, windows.FILE_ATTRIBUTE_NORMAL)
+}
+
+// openVolumeOverlapped opens the volume for asynchronous I/O so a blocking
+// change-journal read can be aborted with CancelIoEx (see usnOverlappedReader).
+func openVolumeOverlapped(volume string) (windows.Handle, error) {
+	return openVolumeWithFlags(volume, windows.FILE_ATTRIBUTE_NORMAL|windows.FILE_FLAG_OVERLAPPED)
+}
+
+func openVolumeWithFlags(volume string, flags uint32) (windows.Handle, error) {
 	path := `\\.\` + strings.TrimRight(volume, `\`)
 	ptr, err := windows.UTF16PtrFromString(path)
 	if err != nil {
@@ -1612,7 +1622,7 @@ func openVolume(volume string) (windows.Handle, error) {
 		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
 		nil,
 		windows.OPEN_EXISTING,
-		windows.FILE_ATTRIBUTE_NORMAL,
+		flags,
 		0,
 	)
 }
@@ -1717,6 +1727,113 @@ func makeReadUSNJournalRequest(journalID uint64, startUSN int64, timeout time.Du
 		BytesToWaitFor:    bytesToWaitFor,
 		UsnJournalID:      journalID,
 	}
+}
+
+// usnOverlappedReader issues FSCTL_READ_USN_JOURNAL against a volume handle
+// opened for asynchronous I/O, so the blocking wait for the next change can be
+// aborted with CancelIoEx when the service is stopping or a watchdog restart
+// retires the replay loop.  The synchronous readUSNChangesWait path blocks
+// inside the kernel and cannot be interrupted, so shutdown and recovery had to
+// wait for the next filesystem change on a quiet volume.
+type usnOverlappedReader struct {
+	handle windows.Handle
+	event  windows.Handle
+	// req is held on the heap for the reader's lifetime: FSCTL_READ_USN_JOURNAL
+	// is METHOD_NEITHER, so the kernel reads this input struct directly and it
+	// must stay alive and unmoved until the overlapped request is reaped.
+	req readUSNJournalDataV0
+}
+
+func openUSNOverlappedReader(volume string) (*usnOverlappedReader, error) {
+	handle, err := openVolumeOverlapped(volume)
+	if err != nil {
+		return nil, err
+	}
+	event, err := windows.CreateEvent(nil, 0, 0, nil)
+	if err != nil {
+		windows.CloseHandle(handle)
+		return nil, err
+	}
+	return &usnOverlappedReader{handle: handle, event: event}, nil
+}
+
+func (r *usnOverlappedReader) close() {
+	if r == nil {
+		return
+	}
+	if r.event != 0 {
+		windows.CloseHandle(r.event)
+		r.event = 0
+	}
+	if r.handle != 0 {
+		windows.CloseHandle(r.handle)
+		r.handle = 0
+	}
+}
+
+// read waits until the journal has at least one record after startUSN, or
+// until cancel reports true.  A zero Timeout with a nonzero BytesToWaitFor
+// leaves the request outstanding until a record arrives or the I/O is
+// canceled, so cancel() is polled while the overlapped request is pending.
+// canceled is true when the wait was aborted; the in-flight request is always
+// drained before returning so the shared buffer can be reused.
+func (r *usnOverlappedReader) read(journalID uint64, startUSN int64, buffer []byte, cancel func() bool) (nextUSN int64, changes []usnChange, canceled bool, err error) {
+	if len(buffer) < 4096 {
+		buffer = make([]byte, 4096)
+	}
+	// The overlapped request may outlive this call's local reasoning; keep the
+	// reader (which pins r.req) and the output buffer alive until it is reaped.
+	defer runtime.KeepAlive(r)
+	defer runtime.KeepAlive(buffer)
+	r.req = makeReadUSNJournalRequest(journalID, startUSN, 0, 1)
+	_ = windows.ResetEvent(r.event)
+	ov := &windows.Overlapped{HEvent: r.event}
+	var bytesReturned uint32
+	ioErr := windows.DeviceIoControl(
+		r.handle,
+		fsctlReadUSNJournal,
+		(*byte)(unsafe.Pointer(&r.req)),
+		uint32(unsafe.Sizeof(r.req)),
+		&buffer[0],
+		uint32(len(buffer)),
+		&bytesReturned,
+		ov,
+	)
+	if ioErr != nil {
+		if ioErr != windows.ERROR_IO_PENDING {
+			if ioErr == windows.ERROR_HANDLE_EOF {
+				return startUSN, nil, false, nil
+			}
+			return startUSN, nil, false, ioErr
+		}
+		for {
+			waitResult, waitErr := windows.WaitForSingleObject(r.event, 250)
+			if waitErr != nil {
+				_ = windows.CancelIoEx(r.handle, ov)
+				_ = windows.GetOverlappedResult(r.handle, ov, &bytesReturned, true)
+				return startUSN, nil, false, waitErr
+			}
+			if waitResult == windows.WAIT_OBJECT_0 {
+				break
+			}
+			if cancel != nil && cancel() {
+				_ = windows.CancelIoEx(r.handle, ov)
+				_ = windows.GetOverlappedResult(r.handle, ov, &bytesReturned, true)
+				return startUSN, nil, true, nil
+			}
+		}
+		if err := windows.GetOverlappedResult(r.handle, ov, &bytesReturned, false); err != nil {
+			if err == windows.ERROR_OPERATION_ABORTED {
+				return startUSN, nil, true, nil
+			}
+			if err == windows.ERROR_HANDLE_EOF {
+				return startUSN, nil, false, nil
+			}
+			return startUSN, nil, false, err
+		}
+	}
+	next, parsed, parseErr := parseUSNChangeBuffer(buffer[:bytesReturned])
+	return next, parsed, false, parseErr
 }
 
 func parseUSNChangeBuffer(buffer []byte) (int64, []usnChange, error) {
@@ -4626,6 +4743,12 @@ func (s *goSearchService) replayVolumeLoop(vol *serviceVolumeIndex) {
 		vol.mu.Unlock()
 		applied, err := s.replayVolumeOnce(vol, buffer)
 		if err != nil {
+			if vol.replayGen.Load() != gen {
+				// Retired by a watchdog restart or rebuild while the read was
+				// in flight; its replacement owns the volume now, so do not
+				// clobber the new state with this loop's error.
+				return
+			}
 			serviceLog("background replay error volume=%s db=%s err=%v", vol.volume, vol.dbPath, err)
 			vol.mu.Lock()
 			vol.lastReplayErr = err.Error()
@@ -4652,13 +4775,20 @@ func (s *goSearchService) replayVolumeLoop(vol *serviceVolumeIndex) {
 			continue
 		}
 		s.indexMu.Lock()
-			vol.state = "stale"
-			vol.staleReason = err.Error()
+			if vol.replayGen.Load() == gen {
+				vol.state = "stale"
+				vol.staleReason = err.Error()
+			}
 			s.indexMu.Unlock()
 			time.Sleep(replayErrorDelay)
 			continue
 		}
 		if !applied {
+			select {
+			case <-s.stop:
+				return
+			default:
+			}
 			time.Sleep(replayIdleDelay)
 		}
 	}
@@ -4760,6 +4890,12 @@ func (s *goSearchService) observeReplayStall(vol *serviceVolumeIndex, cp, journa
 	reason := fmt.Sprintf("replay stall: checkpoint %d frozen while journal next is %d; %d restarts did not help, rebuilding", cp, journalNext, strikes)
 	serviceLog("replay stall detected volume=%s reason=%s", vol.volume, reason)
 	s.indexMu.Lock()
+	// Retire the current replay loop before the recovery rebuild starts: the
+	// restarts of strikes 1-2 could not revive it, so it must not clobber the
+	// stale reason while the (possibly multi-minute) rebuild is in flight.
+	// Bumping the generation under the same lock keeps a retired loop's final
+	// state write from racing this reason.
+	vol.replayGen.Add(1)
 	vol.state = "stale"
 	vol.staleReason = reason
 	vol.lastReplayErr = "replay stall watchdog"
@@ -4837,20 +4973,38 @@ func walCheckpointForApplied(nextUSN int64, changes []usnChange) int64 {
 // caught up (the wait read timed out with no records).
 func (s *goSearchService) replayVolumeOnce(vol *serviceVolumeIndex, buffer []byte) (bool, error) {
 	gen := vol.replayGen.Load()
-	handle, err := openVolume(vol.volume)
+	queryHandle, err := openVolume(vol.volume)
 	if err != nil {
 		return false, err
 	}
-	defer windows.CloseHandle(handle)
+	defer windows.CloseHandle(queryHandle)
 
 	s.indexMu.RLock()
 	fromUSN := vol.checkpoint
 	journalID := vol.journalID
 	s.indexMu.RUnlock()
-	if journal, err := queryUSNJournal(handle); err != nil {
+	if journal, err := queryUSNJournal(queryHandle); err != nil {
 		return false, err
 	} else if err := validateUSNCheckpoint(vol, journal); err != nil {
 		return false, err
+	}
+
+	reader, err := openUSNOverlappedReader(vol.volume)
+	if err != nil {
+		return false, err
+	}
+	defer reader.close()
+
+	cancel := func() bool {
+		if vol.replayGen.Load() != gen {
+			return true
+		}
+		select {
+		case <-s.stop:
+			return true
+		default:
+			return false
+		}
 	}
 
 	applied := false
@@ -4858,9 +5012,12 @@ func (s *goSearchService) replayVolumeOnce(vol *serviceVolumeIndex, buffer []byt
 		if vol.replayGen.Load() != gen {
 			return applied, nil
 		}
-		nextUSN, changes, err := readUSNChangesWait(handle, journalID, fromUSN, buffer, 5*time.Second, 1)
+		nextUSN, changes, canceled, err := reader.read(journalID, fromUSN, buffer, cancel)
 		if err != nil {
 			return applied, err
+		}
+		if canceled {
+			return applied, nil
 		}
 		if nextUSN <= fromUSN {
 			break
