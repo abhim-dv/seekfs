@@ -49,6 +49,12 @@ func TestDirectV9DirectorySubtreeBytes(t *testing.T) {
 		t.Fatalf("subtree bytes = %v, want %v", idx.Derived.SubtreeBytes, want)
 	}
 
+	// The size rank must order directories by their recursive total:
+	// 0=C, 7=f3, 50=f2, 100=B, 100=f1, 150=A, 1000=f4, 1157=root.
+	if got, wantOrder := idx.Derived.SizeOrder, []uint32{6, 5, 4, 2, 3, 1, 7, 0}; !equalUint32s(got, wantOrder) {
+		t.Fatalf("size order = %v, want %v", got, wantOrder)
+	}
+
 	// A directory entry reports the aggregate; a file keeps its own size.
 	cache := map[int]string{}
 	if got := compactEntryFromRecord(idx, 1, idx.compactRecord(1), cache, false).Size; got != 150 {
@@ -73,5 +79,32 @@ func TestDirectV9DirectorySubtreeBytes(t *testing.T) {
 	emptyEntry := compactEntryFromRecord(idx, 6, idx.compactRecord(6), cache, true)
 	if entryMatches(emptyEntry, pq, false) {
 		t.Fatal("empty dir should not match size:>200")
+	}
+}
+
+// sort:size ranks through entrySizeRank, which must use the directory aggregate
+// so a small file sorts before a large file and both before a large directory.
+func TestEntrySizeRankOrdersByDirectoryAggregate(t *testing.T) {
+	idx := &Index{
+		Version: indexVersionV9,
+		Compact: true,
+		Volume:  "C:",
+		Records: []CompactRecord{
+			{FRN: 1, Parent: -1, ParentFRN: 0, Name: ".", Mode: uint32(os.ModeDir)},
+			{FRN: 2, Parent: 0, ParentFRN: 1, Name: "small.bin", Size: 10},
+			{FRN: 3, Parent: 0, ParentFRN: 1, Name: "big.bin", Size: 1000},
+		},
+	}
+	idx.Derived.SubtreeBytes = []uint64{1010, 10, 1000}
+	idx.Derived.SizeOrder, idx.Derived.SizeRank = buildCompactSizeOrderRank(idx)
+	vol := newServiceVolumeIndex("", idx)
+	vol.subtreeBytes = idx.Derived.SubtreeBytes
+	cache := map[int]string{}
+	rank := func(id int) int {
+		return vol.entrySizeRank(compactEntryFromRecord(idx, id, idx.compactRecord(id), cache, false))
+	}
+	small, big, root := rank(1), rank(2), rank(0)
+	if !(small < big && big < root) {
+		t.Fatalf("size ranks small=%d big=%d root=%d; want small<big<root", small, big, root)
 	}
 }

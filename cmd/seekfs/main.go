@@ -129,6 +129,17 @@ const (
 	usnReasonFileDelete         = 0x00000200
 	usnReasonRenameOld          = 0x00001000
 	usnReasonRenameNew          = 0x00002000
+	usnReasonDataOverwrite      = 0x00000001
+	usnReasonDataExtend         = 0x00000002
+	usnReasonDataTruncation     = 0x00000004
+	usnReasonBasicInfoChange    = 0x00008000
+	usnReasonClose              = 0x80000000
+	// usnReasonNeedsInfoRefresh marks the journal reasons after which the file's
+	// indexed size/modification time may have changed and must be re-read
+	// (matching Everything, which re-reads file metadata on these events).
+	usnReasonNeedsInfoRefresh = usnReasonDataOverwrite | usnReasonDataExtend |
+		usnReasonDataTruncation | usnReasonBasicInfoChange | usnReasonClose |
+		usnReasonFileCreate | usnReasonRenameNew | usnReasonRenameOld
 	serviceName                 = "seekfs"
 	defaultServicePipe          = `\\.\pipe\seekfs-service`
 	defaultServiceSDDL          = `D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)`
@@ -332,6 +343,11 @@ type Index struct {
 	baseDeletedState       atomic.Uint32 // 0 unknown, 1 no deleted records, 2 has deleted records
 	componentCoverageMu    sync.Mutex
 	componentCoverageCache map[string]mappedComponentCoverage
+	// dirSizeDelta holds per-base-directory size adjustments from the live
+	// overlay, published as an immutable map so lock-free readers see a stable
+	// view.  It is reset when the volume is persisted (the new base already
+	// includes the overlay).
+	dirSizeDelta atomic.Pointer[map[int]int64]
 }
 
 type indexDerivedSections struct {
@@ -3136,6 +3152,7 @@ type serviceVolumeIndex struct {
 	subtreeStart      []uint32
 	subtreeEnd        []uint32
 	subtreeBytes      []uint64
+	dirSizeDelta      map[int]int64
 	subtreeSizeRank   []uint32
 	subtreeModRank    []uint32
 	subtreeExtRank    []uint32
@@ -5853,21 +5870,30 @@ func openDirectoryForChanges(root string) (windows.Handle, error) {
 }
 
 func (vol *serviceVolumeIndex) applyUSNChanges(changes []usnChange) {
-	for _, change := range changes {
+	// Refresh a changed file's metadata once per batch, at its last change, so
+	// a file written across many DATA_EXTEND events is statted a single time.
+	lastChange := make(map[uint64]int, len(changes))
+	for i, change := range changes {
+		if change.FRN != 0 {
+			lastChange[change.FRN] = i
+		}
+	}
+	for i, change := range changes {
 		if change.FRN == 0 {
 			continue
 		}
-		vol.recordOverlayChange(change)
+		vol.recordOverlayChange(change, i == lastChange[change.FRN] && change.Reason&usnReasonNeedsInfoRefresh != 0)
 		if change.USN > vol.checkpoint {
 			vol.checkpoint = change.USN
 		}
 	}
 	vol.index.Checkpoint = vol.checkpoint
 	vol.dirty = true
+	vol.publishDirSizeDelta()
 	vol.publishSnapshot()
 }
 
-func (vol *serviceVolumeIndex) recordOverlayChange(change usnChange) {
+func (vol *serviceVolumeIndex) recordOverlayChange(change usnChange, refreshInfo bool) {
 	if vol == nil {
 		return
 	}
@@ -5878,6 +5904,10 @@ func (vol *serviceVolumeIndex) recordOverlayChange(change usnChange) {
 	if change.Reason&usnReasonRenameOld != 0 && change.Reason&usnReasonRenameNew == 0 {
 		return
 	}
+	// Snapshot the file's current effective size and parent so the ancestor
+	// folder-size deltas can subtract the old contribution and add the new one.
+	beforeSize := vol.effectiveAccountingSize(change.FRN)
+	oldParent := vol.effectiveParentFRN(change.FRN)
 	if change.Reason&usnReasonFileDelete != 0 {
 		rec := CompactRecord{FRN: change.FRN, ParentFRN: change.ParentFRN, Name: change.Name, Deleted: true}
 		// Only directories can have descendants, so the O(overlay) cascade
@@ -5918,6 +5948,11 @@ func (vol *serviceVolumeIndex) recordOverlayChange(change usnChange) {
 			vol.cascadeOverlayDelete(change.FRN)
 		}
 		overlay.watermark.Store(int32(len(overlay.records)))
+		if beforeSize != 0 {
+			if parent := firstNonZeroFRN(rec.ParentFRN, oldParent); parent != 0 {
+				vol.addAncestorDirDelta(parent, -beforeSize)
+			}
+		}
 		return
 	}
 	rec := CompactRecord{
@@ -5937,11 +5972,171 @@ func (vol *serviceVolumeIndex) recordOverlayChange(change usnChange) {
 		if rec.ParentFRN == 0 {
 			rec.ParentFRN = base.ParentFRN
 		}
+		// A USN record carries neither size nor timestamp.  Preserve the base
+		// values so a rename or modify does not report a zero size; the live
+		// refresh below replaces them when the change affects file data.
+		rec.Size = base.Size
+		rec.ModUnix = base.ModUnix
 	}
 	slot := int32(len(overlay.records))
 	overlay.byFRN[change.FRN] = slot
 	overlay.records = append(overlay.records, rec)
 	overlay.watermark.Store(int32(len(overlay.records)))
+	if refreshInfo {
+		vol.refreshOverlayFileInfo(int(slot))
+	}
+	afterSize := vol.effectiveAccountingSize(change.FRN)
+	afterParent := overlay.records[slot].ParentFRN
+	if beforeSize != 0 && oldParent != 0 {
+		vol.addAncestorDirDelta(oldParent, -beforeSize)
+	}
+	if afterSize != 0 {
+		if parent := firstNonZeroFRN(afterParent, oldParent); parent != 0 {
+			vol.addAncestorDirDelta(parent, afterSize)
+		}
+	}
+}
+
+// effectiveAccountingSize returns the size a record currently contributes to
+// its ancestors' recursive totals: its own size for a file, the recursive
+// subtree total for a directory, and 0 when it is deleted or unknown.  A live
+// overlay slot wins over the base record.
+func (vol *serviceVolumeIndex) effectiveAccountingSize(frn uint64) int64 {
+	if vol == nil || frn == 0 {
+		return 0
+	}
+	if vol.overlay != nil {
+		if slot, ok := vol.overlay.byFRN[frn]; ok && slot >= 0 && int(slot) < len(vol.overlay.records) {
+			rec := vol.overlay.records[slot]
+			if rec.Deleted {
+				return 0
+			}
+			if rec.Mode&uint32(os.ModeDir) != 0 {
+				if id, ok := vol.idForFRN(frn); ok {
+					return vol.baseDirRecursiveSize(id)
+				}
+				return 0
+			}
+			return rec.Size
+		}
+	}
+	if id, ok := vol.idForFRN(frn); ok {
+		rec := vol.index.compactRecord(id)
+		if rec.Mode&uint32(os.ModeDir) != 0 {
+			return vol.baseDirRecursiveSize(id)
+		}
+		return rec.Size
+	}
+	return 0
+}
+
+func (vol *serviceVolumeIndex) effectiveParentFRN(frn uint64) uint64 {
+	if vol == nil || frn == 0 {
+		return 0
+	}
+	if vol.overlay != nil {
+		if slot, ok := vol.overlay.byFRN[frn]; ok && slot >= 0 && int(slot) < len(vol.overlay.records) {
+			return vol.overlay.records[slot].ParentFRN
+		}
+	}
+	if id, ok := vol.idForFRN(frn); ok {
+		return vol.index.compactRecord(id).ParentFRN
+	}
+	return 0
+}
+
+func (vol *serviceVolumeIndex) baseDirRecursiveSize(id int) int64 {
+	if id < 0 || id >= len(vol.subtreeBytes) {
+		return 0
+	}
+	size := int64(vol.subtreeBytes[id])
+	if vol.dirSizeDelta != nil {
+		size += vol.dirSizeDelta[id]
+	}
+	if size < 0 {
+		return 0
+	}
+	return size
+}
+
+// addAncestorDirDelta adds delta to every base-directory ancestor of dirFRN.
+// Overlay-created directories are traversed but not recorded: they are not
+// base-index records and have no persisted size of their own.
+func (vol *serviceVolumeIndex) addAncestorDirDelta(dirFRN uint64, delta int64) {
+	if vol == nil || delta == 0 || dirFRN == 0 {
+		return
+	}
+	for depth := 0; depth < 4096 && dirFRN != 0; depth++ {
+		if vol.overlay != nil {
+			if slot, ok := vol.overlay.byFRN[dirFRN]; ok && slot >= 0 && int(slot) < len(vol.overlay.records) {
+				dirFRN = vol.overlay.records[slot].ParentFRN
+				continue
+			}
+		}
+		id, ok := vol.idForFRN(dirFRN)
+		if !ok {
+			return
+		}
+		if vol.dirSizeDelta == nil {
+			vol.dirSizeDelta = make(map[int]int64)
+		}
+		vol.dirSizeDelta[id] += delta
+		next := vol.index.compactRecord(id).ParentFRN
+		if next == dirFRN {
+			return
+		}
+		dirFRN = next
+	}
+}
+
+func firstNonZeroFRN(values ...uint64) uint64 {
+	for _, v := range values {
+		if v != 0 {
+			return v
+		}
+	}
+	return 0
+}
+
+// publishDirSizeDelta stores an immutable copy of the working delta map so
+// lock-free readers see a stable view.
+func (vol *serviceVolumeIndex) publishDirSizeDelta() {
+	if vol == nil || vol.index == nil {
+		return
+	}
+	if len(vol.dirSizeDelta) == 0 {
+		vol.index.dirSizeDelta.Store(nil)
+		return
+	}
+	snapshot := make(map[int]int64, len(vol.dirSizeDelta))
+	for id, delta := range vol.dirSizeDelta {
+		snapshot[id] = delta
+	}
+	vol.index.dirSizeDelta.Store(&snapshot)
+}
+
+// refreshOverlayFileInfo re-reads a just-recorded file's size and modification
+// time from the live filesystem.  The USN journal reports changes but carries
+// no metadata, so without this the overlay (and any base it is later folded
+// into) reports a zero size for every created or modified file.  This mirrors
+// Everything, which re-reads file metadata when the journal reports a change.
+func (vol *serviceVolumeIndex) refreshOverlayFileInfo(slot int) {
+	if vol == nil || vol.overlay == nil || vol.volume == "" {
+		return
+	}
+	if slot < 0 || slot >= len(vol.overlay.records) {
+		return
+	}
+	path := vol.overlayRecordPath(vol.overlay.records, vol.overlay.byFRN, slot, map[int32]struct{}{}, make(map[int]string))
+	if path == "" {
+		return
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return
+	}
+	vol.overlay.records[slot].Size = info.Size()
+	vol.overlay.records[slot].ModUnix = info.ModTime().UnixNano()
 }
 
 func (vol *serviceVolumeIndex) tombstoneBaseSubtree(rootID int) {
@@ -6765,12 +6960,29 @@ func buildCompactNameOrderRank(idx *Index) ([]uint32, []uint32) {
 }
 
 func buildCompactSizeOrderRank(idx *Index) ([]uint32, []uint32) {
+	if idx == nil {
+		return nil, nil
+	}
+	return buildCompactSizeOrderRankWithDirBytes(idx, idx.Derived.SubtreeBytes)
+}
+
+// buildCompactSizeOrderRankWithDirBytes orders records by their effective size:
+// a directory uses its recursive subtree total from dirBytes, a file its own
+// size.  This keeps sort:size and the size order scan correct for directories.
+func buildCompactSizeOrderRankWithDirBytes(idx *Index, dirBytes []uint64) ([]uint32, []uint32) {
 	recordCount := 0
 	if idx != nil {
 		recordCount = idx.compactRecordCount()
 	}
 	if recordCount == 0 {
 		return nil, nil
+	}
+	sizeAt := func(id int) int64 {
+		rec := idx.compactRecord(id)
+		if rec.Mode&uint32(os.ModeDir) != 0 && id >= 0 && id < len(dirBytes) {
+			return int64(dirBytes[id])
+		}
+		return rec.Size
 	}
 	order := make([]uint32, 0, recordCount)
 	for id := 0; id < recordCount; id++ {
@@ -6781,9 +6993,8 @@ func buildCompactSizeOrderRank(idx *Index) ([]uint32, []uint32) {
 	}
 	sort.Slice(order, func(i, j int) bool {
 		a, b := int(order[i]), int(order[j])
-		ar, br := idx.compactRecord(a), idx.compactRecord(b)
-		if ar.Size != br.Size {
-			return ar.Size < br.Size
+		if as, bs := sizeAt(a), sizeAt(b); as != bs {
+			return as < bs
 		}
 		an, bn := idx.compactLowerNameAt(a), idx.compactLowerNameAt(b)
 		if an != bn {
@@ -8812,6 +9023,8 @@ func replaceServiceVolumeContents(dst, src *serviceVolumeIndex) {
 	dst.subtreeExtRank = src.subtreeExtRank
 	dst.subtreeTypeRank = src.subtreeTypeRank
 	dst.subtreePathRank = src.subtreePathRank
+	dst.subtreeBytes = src.subtreeBytes
+	dst.dirSizeDelta = nil
 	dst.exactNames = src.exactNames
 	dst.pathCache = src.pathCache
 	dst.queryIndex = src.queryIndex
@@ -9857,15 +10070,25 @@ func (vol *serviceVolumeIndex) entrySizeRank(entry Entry) int {
 		return 0
 	}
 	order := vol.sizeOrderForRank()
-	recordCount := vol.index.compactRecordCount()
 	pos := sort.Search(len(order), func(i int) bool {
-		id := int(order[i])
-		if id < 0 || id >= recordCount {
-			return false
-		}
-		return vol.index.compactRecord(id).Size >= entry.Size
+		return vol.effectiveRecordSize(int(order[i])) >= entry.Size
 	})
 	return pos
+}
+
+// effectiveRecordSize is the size a record is ranked by: a directory's
+// recursive subtree total (from the persisted SUBS column) or a file's own
+// size.  The live overlay delta is intentionally excluded so the value stays
+// monotonic in the persisted size order the binary search walks.
+func (vol *serviceVolumeIndex) effectiveRecordSize(id int) int64 {
+	if vol == nil || vol.index == nil || id < 0 || id >= vol.index.compactRecordCount() {
+		return 0
+	}
+	rec := vol.index.compactRecord(id)
+	if rec.Mode&uint32(os.ModeDir) != 0 && id < len(vol.subtreeBytes) {
+		return int64(vol.subtreeBytes[id])
+	}
+	return rec.Size
 }
 
 func (vol *serviceVolumeIndex) entryModifiedRank(entry Entry) int {
@@ -11127,7 +11350,14 @@ func compactEntryFromRecord(idx *Index, recIndex int, rec CompactRecord, pathCac
 		IndexSource: idx.Source,
 	}
 	if rec.Mode&uint32(os.ModeDir) != 0 && recIndex >= 0 && recIndex < len(idx.Derived.SubtreeBytes) {
-		entry.Size = int64(idx.Derived.SubtreeBytes[recIndex])
+		size := int64(idx.Derived.SubtreeBytes[recIndex])
+		if delta := idx.dirSizeDelta.Load(); delta != nil {
+			size += (*delta)[recIndex]
+		}
+		if size < 0 {
+			size = 0
+		}
+		entry.Size = size
 	}
 	if withLower {
 		entry.LowerPath = strings.ToLower(path)
@@ -18518,12 +18748,20 @@ func forEachDerivedSection(idx *Index, nameTokens []string, emit func(indexSecti
 	vol.queryIndex.nameOrder = nil
 	nameOrder = nil
 
+	// Build the child graph and recursive directory sizes before the size rank:
+	// sort:size must rank a directory by its subtree total, not its stored 0.
+	if len(vol.childOffsets) == 0 || len(vol.childIDs) == 0 {
+		vol.buildCompactChildren()
+	}
+	if len(vol.subtreeOrder) == 0 && len(vol.childOffsets) > 0 {
+		vol.buildSubtreeRanges()
+	}
+	vol.subtreeBytes = vol.buildSubtreeBytes()
+	v9PersistTrace("children-ready")
+
 	var sizeRank, modRank, extRank, typeRank, pathRank []uint32
 	if idx.compactHasSize() {
-		order, rank := vol.queryIndex.sizeOrder, vol.queryIndex.sizeRank
-		if len(order) == 0 || len(rank) == 0 {
-			order, rank = buildCompactSizeOrderRank(idx)
-		}
+		order, rank := buildCompactSizeOrderRankWithDirBytes(idx, vol.subtreeBytes)
 		vol.queryIndex.sizeOrder, vol.queryIndex.sizeRank = order, rank
 		sizeRank = rank
 		v9PersistTrace("size-rank-ready")
@@ -18639,8 +18877,8 @@ func forEachDerivedSection(idx *Index, nameTokens []string, emit func(indexSecti
 	); err != nil {
 		return err
 	}
-	if subtreeBytes := vol.buildSubtreeBytes(); len(subtreeBytes) > 0 {
-		if err := emitSection(indexSectionSUBS, encodeUint64Section(subtreeBytes)); err != nil {
+	if len(vol.subtreeBytes) > 0 {
+		if err := emitSection(indexSectionSUBS, encodeUint64Section(vol.subtreeBytes)); err != nil {
 			return err
 		}
 	}

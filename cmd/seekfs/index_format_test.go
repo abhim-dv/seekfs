@@ -743,11 +743,16 @@ func TestEngineV9WritesAndLoadsSizeRankSection(t *testing.T) {
 	if len(loaded.Derived.SizeOrder) != loaded.compactRecordCount() || len(loaded.Derived.SizeRank) != loaded.compactRecordCount() {
 		t.Fatalf("size rank section missing: %+v", loaded.Derived)
 	}
-	if got := loaded.compactRecord(int(loaded.Derived.SizeOrder[0])).Name; got != "." {
-		t.Fatalf("first size-ranked record = %q, want root", got)
+	// Directories rank by their recursive total (root = 310 here), so the
+	// order is small.txt (10), large.txt (300), root (310).
+	if got := loaded.compactRecord(int(loaded.Derived.SizeOrder[0])).Name; got != "small.txt" {
+		t.Fatalf("first size-ranked record = %q, want small.txt", got)
 	}
-	if got := loaded.compactRecord(int(loaded.Derived.SizeOrder[1])).Name; got != "small.txt" {
-		t.Fatalf("second size-ranked record = %q, want small.txt", got)
+	if got := loaded.compactRecord(int(loaded.Derived.SizeOrder[1])).Name; got != "large.txt" {
+		t.Fatalf("second size-ranked record = %q, want large.txt", got)
+	}
+	if got := loaded.compactRecord(int(loaded.Derived.SizeOrder[2])).Name; got != "." {
+		t.Fatalf("third size-ranked record = %q, want root", got)
 	}
 	sections, _ := derivedSectionInfo(loaded.Derived)
 	if !slices.Contains(sections, "SRNK") {

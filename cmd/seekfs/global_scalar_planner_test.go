@@ -402,7 +402,7 @@ func TestGlobalScalarRangeMappedResidentParity(t *testing.T) {
 			query string
 			want  int
 		}{
-			{query: "size:>=100", want: 2},
+			{query: "size:>=100", want: 3},
 			{query: "", want: 2},
 		} {
 			trace := &searchTrace{}

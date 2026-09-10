@@ -134,7 +134,7 @@ func equalUint64s(a, b []uint64) bool {
 func TestDirectV9RankFamiliesMatchComparator(t *testing.T) {
 	records := []directV9Record{
 		{FRN: 40, Name: "zeta.TXT", Path: `X:\zeta.TXT`, Size: 0, ModUnix: 0},
-		{FRN: 10, Name: "dir", Path: `X:\dir`, Mode: uint32(os.ModeDir), Size: 5, ModUnix: 20},
+		{FRN: 10, Name: "dir", Path: `X:\dir`, Mode: uint32(os.ModeDir), Size: 0, ModUnix: 20},
 		{FRN: 30, Name: "a.go", Path: `X:\dir\a.go`, Size: 5, ModUnix: 10},
 		{FRN: 20, Name: ".profile", Path: `X:\.profile`, Size: 2, ModUnix: 30},
 	}

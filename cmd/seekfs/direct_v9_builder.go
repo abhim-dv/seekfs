@@ -142,6 +142,9 @@ type directV9RankSpec struct {
 	Tag  uint32
 	Name string
 	Key  func(directV9Record) string
+	// KeyWithID, when set, overrides Key and receives the record id so the
+	// size rank can order directories by their recursive subtree total.
+	KeyWithID func(uint32, directV9Record) string
 }
 
 type directV9RankReport struct {
@@ -1404,6 +1407,143 @@ func directV9WriteTopologySections(ctx context.Context, cw *countingWriter, fina
 	return entries, reports, nil
 }
 
+// directV9ComputeDirBytes computes the recursive file-byte total for every
+// record (0 for plain files) in one read-only pass over the record spool.  The
+// size rank is emitted before the child and subtree sections, so it cannot use
+// their in-memory graph; this pre-pass gives SRNK the directory totals it needs
+// to order directories by subtree size instead of their stored 0.
+func directV9ComputeDirBytes(ctx context.Context, finalPath, frnPath string, recordCount int) ([]uint64, error) {
+	if recordCount <= 0 {
+		return nil, nil
+	}
+	frnMap, frns, err := directV9MapFRNs(frnPath, recordCount)
+	if err != nil {
+		return nil, err
+	}
+	if frnMap != nil {
+		defer frnMap.close()
+	}
+	parents := make([]int32, recordCount)
+	sizes := make([]uint64, recordCount)
+	f, err := os.Open(finalPath)
+	if err != nil {
+		return nil, err
+	}
+	r := bufio.NewReaderSize(f, 256*1024)
+	for id := 0; id < recordCount; id++ {
+		if id&0xfffff == 0 {
+			select {
+			case <-ctx.Done():
+				_ = f.Close()
+				return nil, ctx.Err()
+			default:
+			}
+		}
+		var header [directV9SpoolHeaderBytes]byte
+		if _, err := io.ReadFull(r, header[:]); err != nil {
+			_ = f.Close()
+			return nil, err
+		}
+		mode := binary.LittleEndian.Uint32(header[16:20])
+		size := int64(binary.LittleEndian.Uint64(header[20:28]))
+		parentFRN := binary.LittleEndian.Uint64(header[8:16])
+		nameLen := int(binary.LittleEndian.Uint32(header[36:40]))
+		pathLen := int(binary.LittleEndian.Uint32(header[40:44]))
+		if nameLen < 0 || pathLen < 0 {
+			_ = f.Close()
+			return nil, errors.New("direct v9 spool length overflow")
+		}
+		if _, err := r.Discard(nameLen + pathLen); err != nil {
+			_ = f.Close()
+			return nil, err
+		}
+		if mode&uint32(os.ModeDir) == 0 && size > 0 {
+			sizes[id] = uint64(size)
+		}
+		parentID := int32(-1)
+		if parentFRN != 0 {
+			parentID = directV9LookupIDMapped(frns, parentFRN)
+		}
+		if parentID == int32(id) {
+			parentID = -1
+		}
+		parents[id] = parentID
+	}
+	_ = f.Close()
+
+	counts := make([]uint32, recordCount)
+	roots := make([]uint32, 0, 16)
+	for id, parent := range parents {
+		if parent < 0 {
+			roots = append(roots, uint32(id))
+		} else {
+			counts[parent]++
+		}
+	}
+	offsets := make([]uint32, recordCount+1)
+	for i := 0; i < recordCount; i++ {
+		offsets[i+1] = offsets[i] + counts[i]
+	}
+	children := make([]uint32, offsets[recordCount])
+	next := append([]uint32(nil), offsets[:recordCount]...)
+	for id, parent := range parents {
+		if parent >= 0 {
+			children[next[parent]] = uint32(id)
+			next[parent]++
+		}
+	}
+	order := make([]uint32, 0, recordCount)
+	seen := make([]bool, recordCount)
+	type frame struct {
+		id   uint32
+		next uint32
+	}
+	visit := func(root uint32) {
+		if int(root) >= recordCount || seen[root] {
+			return
+		}
+		seen[root] = true
+		order = append(order, root)
+		stack := []frame{{id: root}}
+		for len(stack) > 0 {
+			top := &stack[len(stack)-1]
+			childStart, childEnd := offsets[top.id], offsets[top.id+1]
+			if childStart+top.next < childEnd {
+				child := children[childStart+top.next]
+				top.next++
+				if !seen[child] {
+					seen[child] = true
+					order = append(order, child)
+					stack = append(stack, frame{id: child})
+				}
+				continue
+			}
+			stack = stack[:len(stack)-1]
+		}
+	}
+	for _, root := range roots {
+		visit(root)
+	}
+	for id := 0; id < recordCount; id++ {
+		if !seen[id] {
+			visit(uint32(id))
+		}
+	}
+	if len(order) != recordCount {
+		return nil, errors.New("direct v9 dir-bytes traversal did not cover all records")
+	}
+	bytes := make([]uint64, recordCount)
+	for pos := len(order) - 1; pos >= 0; pos-- {
+		id := order[pos]
+		sum := sizes[id]
+		for childPos := offsets[id]; childPos < offsets[id+1]; childPos++ {
+			sum += bytes[children[childPos]]
+		}
+		bytes[id] = sum
+	}
+	return bytes, nil
+}
+
 func directV9WriteSubtreeSection(ctx context.Context, cw *countingWriter, parentPath, sizesPath string, recordCount int, rankPaths []string, owned *[]string, scratchHigh *int64) ([]indexSectionTableEntry, []directV9SectionReport, []string, error) {
 	parents := make([]int32, recordCount)
 	f, err := os.Open(parentPath)
@@ -2470,6 +2610,24 @@ func buildDirectV9(ctx context.Context, opts directV9BuildOptions) (stats direct
 		stats.RecordBytes = int64(recordCount) * compactDiskRecordBytes
 	}
 	rankSpecs := directV9RankSpecs()
+	// Give the size rank the recursive directory totals so a directory is
+	// ordered by its subtree size, matching the persisted SUBS column.
+	if dirBytes, err := directV9ComputeDirBytes(ctx, finalPath, frnPath, recordCount); err != nil {
+		return stats, err
+	} else if len(dirBytes) == recordCount {
+		for i := range rankSpecs {
+			if rankSpecs[i].Tag != indexSectionSRNK {
+				continue
+			}
+			bytes := dirBytes
+			rankSpecs[i].KeyWithID = func(id uint32, rec directV9Record) string {
+				if rec.Mode&uint32(os.ModeDir) != 0 && int(id) < len(bytes) {
+					return directV9SignedOrderKey(int64(bytes[id])) + "\x00" + strings.ToLower(rec.Name)
+				}
+				return directV9SignedOrderKey(rec.Size) + "\x00" + strings.ToLower(rec.Name)
+			}
+		}
+	}
 	stats.RankRecords = recordCount
 	stats.RankBytes = int64(len(rankSpecs)) * (8 + int64(recordCount)*8)
 	finalSpoolBytes := spoolBytes

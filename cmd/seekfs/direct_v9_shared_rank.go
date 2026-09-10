@@ -193,6 +193,9 @@ func directV9BuildRankRunsShared(ctx context.Context, finalPath, spoolDir string
 		if !rec.Deleted() {
 			for i, spec := range specs {
 				key := spec.Key(rec)
+				if spec.KeyWithID != nil {
+					key = spec.KeyWithID(id, rec)
+				}
 				chunks[i] = append(chunks[i], directV9RankItem{Key: key, ID: id})
 				chunkBytes[i] += int64(len(key))
 				result.LiveCounts[spec.Name]++

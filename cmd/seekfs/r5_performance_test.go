@@ -43,15 +43,15 @@ func TestR5MappedScalarRangeCountUsesQualifyingInterval(t *testing.T) {
 	count, ok, err := countServiceVolumes([]*serviceVolumeIndex{vol}, queryOptions{
 		Query: "size:>=4095", Trace: trace,
 	})
-	if err != nil || !ok || count != 1 {
-		t.Fatalf("count = %d handled=%v err=%v, want 1 true nil", count, ok, err)
+	if err != nil || !ok || count != 2 {
+		t.Fatalf("count = %d handled=%v err=%v, want 2 true nil", count, ok, err)
 	}
 	if trace.Source != "global:scalar-range" {
 		t.Fatalf("trace source = %q, want global:scalar-range", trace.Source)
 	}
 	scalar, ok := scalarRangeForVolume(vol, mustParseQuery(t, queryOptions{Query: "size:>=4095"}))
-	if !ok || scalar.end-scalar.start != 1 {
-		t.Fatalf("scalar interval = %+v ok=%v, want one qualifying record", scalar, ok)
+	if !ok || scalar.end-scalar.start != 2 {
+		t.Fatalf("scalar interval = %+v ok=%v, want two qualifying records (file + root dir)", scalar, ok)
 	}
 }
 
