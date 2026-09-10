@@ -139,6 +139,11 @@ const (
 	// single replay iteration.  A large backlog is drained across several
 	// iterations so search requests are never starved by one long apply.
 	serviceUSNReplayBatchMax = 10_000
+	// serviceUSNReplayDrainBatches bounds how many batches one replay call
+	// applies before yielding.  The volume handle is held open across the
+	// drain so a catch-up does not pay a CreateFile + journal query per batch,
+	// while still letting the watchdog retire the loop between calls.
+	serviceUSNReplayDrainBatches = 8
 	compactDiskRecordBytes      = 43
 	compactWideDiskRecordBytes  = 45
 	compactDiskFlag             = 1
@@ -4619,7 +4624,8 @@ func (s *goSearchService) replayVolumeLoop(vol *serviceVolumeIndex) {
 		vol.mu.Lock()
 		vol.lastReplayAt = time.Now()
 		vol.mu.Unlock()
-		if err := s.replayVolumeOnce(vol, buffer); err != nil {
+		applied, err := s.replayVolumeOnce(vol, buffer)
+		if err != nil {
 			serviceLog("background replay error volume=%s db=%s err=%v", vol.volume, vol.dbPath, err)
 			vol.mu.Lock()
 			vol.lastReplayErr = err.Error()
@@ -4652,7 +4658,9 @@ func (s *goSearchService) replayVolumeLoop(vol *serviceVolumeIndex) {
 			time.Sleep(replayErrorDelay)
 			continue
 		}
-		time.Sleep(replayIdleDelay)
+		if !applied {
+			time.Sleep(replayIdleDelay)
+		}
 	}
 }
 
@@ -4819,74 +4827,88 @@ func walCheckpointForApplied(nextUSN int64, changes []usnChange) int64 {
 	return nextUSN
 }
 
-func (s *goSearchService) replayVolumeOnce(vol *serviceVolumeIndex, buffer []byte) error {
+// replayVolumeOnce reads and applies pending USN changes for one volume.  It
+// holds the volume handle open across a bounded drain: the blocking wait read
+// (BytesToWaitFor=1) returns as soon as a record is available, so re-opening
+// the volume per batch would add a CreateFile + journal query to every tiny
+// batch on a busy volume.  It returns applied=true when it advanced the
+// checkpoint so the caller re-arms immediately instead of adding an idle delay
+// to the visibility latency; applied=false means the journal was already
+// caught up (the wait read timed out with no records).
+func (s *goSearchService) replayVolumeOnce(vol *serviceVolumeIndex, buffer []byte) (bool, error) {
 	gen := vol.replayGen.Load()
 	handle, err := openVolume(vol.volume)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer windows.CloseHandle(handle)
 
 	s.indexMu.RLock()
-	startUSN := vol.checkpoint
+	fromUSN := vol.checkpoint
 	journalID := vol.journalID
 	s.indexMu.RUnlock()
 	if journal, err := queryUSNJournal(handle); err != nil {
-		return err
+		return false, err
 	} else if err := validateUSNCheckpoint(vol, journal); err != nil {
-		return err
+		return false, err
 	}
 
-	var nextUSN int64
-	var changes []usnChange
-	err = nil
-	nextUSN, changes, err = readUSNChangesWait(handle, journalID, startUSN, buffer, 5*time.Second, 1)
-	if err != nil {
-		return err
-	}
-	if nextUSN <= startUSN {
-		return nil
-	}
-	// Bound the per-iteration batch so a large USN backlog is applied across
-	// several iterations, yielding to search requests between batches instead
-	// of monopolizing the volume under one long apply.
-	if len(changes) > serviceUSNReplayBatchMax {
-		serviceLog("background replay large batch volume=%s changes=%d truncating to %d", vol.volume, len(changes), serviceUSNReplayBatchMax)
-		changes = changes[:serviceUSNReplayBatchMax]
-	}
-	// The checkpoint must advance only as far as the last applied change so
-	// the next iteration resumes from the truncated remainder. The WAL must
-	// claim the same applied checkpoint: persisting the unread journal head
-	// would skip the truncated tail after a restart, permanently hiding
-	// newly created files that fell beyond the truncated batch.
-	appliedCheckpoint := walCheckpointForApplied(nextUSN, changes)
-	vol.mu.Lock()
-	if vol.checkpoint != startUSN || vol.replayGen.Load() != gen {
-		// Another path (stale rebuild) replaced the index while this read was
-		// in flight; its replay owns the volume now. Drop this batch.
+	applied := false
+	for batch := 0; batch < serviceUSNReplayDrainBatches; batch++ {
+		if vol.replayGen.Load() != gen {
+			return applied, nil
+		}
+		nextUSN, changes, err := readUSNChangesWait(handle, journalID, fromUSN, buffer, 5*time.Second, 1)
+		if err != nil {
+			return applied, err
+		}
+		if nextUSN <= fromUSN {
+			break
+		}
+		// Bound the per-iteration batch so a large USN backlog is applied
+		// across several iterations, yielding to search requests between
+		// batches instead of monopolizing the volume under one long apply.
+		if len(changes) > serviceUSNReplayBatchMax {
+			serviceLog("background replay large batch volume=%s changes=%d truncating to %d", vol.volume, len(changes), serviceUSNReplayBatchMax)
+			changes = changes[:serviceUSNReplayBatchMax]
+		}
+		// The checkpoint must advance only as far as the last applied change
+		// so the next iteration resumes from the truncated remainder. The WAL
+		// must claim the same applied checkpoint: persisting the unread
+		// journal head would skip the truncated tail after a restart,
+		// permanently hiding newly created files that fell beyond the
+		// truncated batch.
+		appliedCheckpoint := walCheckpointForApplied(nextUSN, changes)
+		vol.mu.Lock()
+		if vol.checkpoint != fromUSN || vol.replayGen.Load() != gen {
+			// Another path (stale rebuild) replaced the index while this read
+			// was in flight; its replay owns the volume now. Drop this batch.
+			vol.mu.Unlock()
+			return applied, nil
+		}
+		if err := appendWAL(vol.dbPath, appliedCheckpoint, changes); err != nil {
+			vol.state = "stale"
+			vol.staleReason = err.Error()
+			vol.mu.Unlock()
+			return applied, err
+		}
+		vol.applyUSNChanges(changes)
+		vol.checkpoint = appliedCheckpoint
+		vol.index.Checkpoint = appliedCheckpoint
+		vol.state = "ready"
+		vol.staleReason = ""
+		vol.lastReplayAt = time.Now()
+		vol.lastReplayNext = nextUSN
+		vol.lastReplayErr = ""
+		vol.replayStrikes = 0
+		vol.stallObservedCp = 0
+		vol.stallObservedAt = time.Time{}
+		vol.dirty = true
 		vol.mu.Unlock()
-		return nil
+		applied = true
+		fromUSN = appliedCheckpoint
 	}
-	if err := appendWAL(vol.dbPath, appliedCheckpoint, changes); err != nil {
-		vol.state = "stale"
-		vol.staleReason = err.Error()
-		vol.mu.Unlock()
-		return err
-	}
-	vol.applyUSNChanges(changes)
-	vol.checkpoint = appliedCheckpoint
-	vol.index.Checkpoint = appliedCheckpoint
-	vol.state = "ready"
-	vol.staleReason = ""
-	vol.lastReplayAt = time.Now()
-	vol.lastReplayNext = nextUSN
-	vol.lastReplayErr = ""
-	vol.replayStrikes = 0
-	vol.stallObservedCp = 0
-	vol.stallObservedAt = time.Time{}
-	vol.dirty = true
-	vol.mu.Unlock()
-	return nil
+	return applied, nil
 }
 
 func (s *goSearchService) persistVolumeLoop(vol *serviceVolumeIndex) {
