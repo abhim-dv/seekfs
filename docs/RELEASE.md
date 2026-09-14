@@ -11,7 +11,7 @@ seekfs-windows-amd64.zip
 Contents:
 
 - `seekfs.exe`
-- `seekfs-service.exe`
+- `seekfs-ui.exe`
 - `README.md`
 - `LICENSE`
 - `NOTICE.md`
