@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -137,5 +138,60 @@ func TestNameGramExternalRepeatedGramsMatchInMemory(t *testing.T) {
 				t.Fatalf("%s cap=%d PNGR differs: external=%d in-memory=%d", cfg.name, maxPosting, len(got), len(want))
 			}
 		}
+	}
+}
+
+// TestNameGramBuildersFoldUnicodeLikeQueries guards the case-folding contract:
+// the query side grams strings.ToLower(term), so every name-gram builder must
+// gram the lowercased name, not the original-case name with ASCII-only folding,
+// or a non-ASCII name produces a gram the query can never look up.
+func TestNameGramBuildersFoldUnicodeLikeQueries(t *testing.T) {
+	idx := &Index{Volume: "C:", Source: "usn"}
+	names := []string{"École.txt", "Key.txt", "Ünter.csv", "café", "ABC.dat", "Straße", "ΑΒΓ.log"}
+	for _, name := range names {
+		idx.Records = append(idx.Records, CompactRecord{Name: name, Parent: -1})
+	}
+	selective := buildSelectiveNameTrigramIndex(idx, 1<<30)
+	ext, _, err := buildNameGramIndexExternal(context.Background(), idx, 3, 1<<30, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	full := buildNameTrigramIndex(idx)
+	for _, name := range names {
+		for _, gram := range uniqueFixedGramKeysFoldASCII(strings.ToLower(name), 3) {
+			if _, ok := selective.counts[gram]; !ok {
+				t.Fatalf("selective missing query gram %d for %q", gram, name)
+			}
+			if _, ok := ext.counts[gram]; !ok {
+				t.Fatalf("external missing query gram %d for %q", gram, name)
+			}
+			if _, ok := full.counts[gram]; !ok {
+				t.Fatalf("full missing query gram %d for %q", gram, name)
+			}
+		}
+	}
+}
+
+// TestMergeRunKeysRejectsTruncatedRun ensures a short read in a spill run fails
+// the build instead of silently producing an incomplete index.
+func TestMergeRunKeysRejectsTruncatedRun(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "run.tmp")
+	tbl := newGramSpillTable(8)
+	for id := uint32(0); id < 50; id++ {
+		tbl.add(0x616263, id)
+	}
+	if err := writeGramRunGrouped(path, []uint32{0x616263}, tbl); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Truncate(path, fi.Size()-3); err != nil {
+		t.Fatal(err)
+	}
+	err = mergeRunKeys(context.Background(), []string{path}, func(uint32, []uint32) error { return nil })
+	if err == nil {
+		t.Fatal("mergeRunKeys accepted a truncated run")
 	}
 }

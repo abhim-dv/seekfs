@@ -46,6 +46,10 @@ func TestRegexRequiredLiteralAlternativesCoverage(t *testing.T) {
 		// \0 consumes its octal digits; they must not become literals.
 		{`\0123`, nil},
 		{`.\0111`, nil},
+		// non-ASCII patterns decline: the parser is byte-based while regex
+		// quantifiers bind to runes.
+		{`abcé?`, nil},
+		{`café.*\.txt`, nil},
 	}
 	for _, tc := range cases {
 		got := regexRequiredLiteralAlternatives(tc.pattern)

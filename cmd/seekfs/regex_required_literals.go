@@ -30,6 +30,14 @@ import "strings"
 // widened (backreferences, conditionals, `\K`, `\G`) returns nil instead.
 func regexRequiredLiteralAlternatives(pattern string) [][]string {
 	pattern = strings.TrimPrefix(pattern, "(?i)")
+	// This parser consumes bytes, but Go regex quantifiers bind to runes and the
+	// literals are later compared as bytes.  A non-ASCII pattern (e.g. "abcé?")
+	// could therefore prove an unsound run, so decline non-ASCII patterns.
+	for i := 0; i < len(pattern); i++ {
+		if pattern[i] >= 0x80 {
+			return nil
+		}
+	}
 	p := &rxParser{src: pattern}
 	node := p.parseAlt()
 	if node == nil || p.pos != len(p.src) {

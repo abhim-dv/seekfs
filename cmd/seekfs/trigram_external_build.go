@@ -264,8 +264,10 @@ func spillGramRange(ctx context.Context, idx *Index, gramSize int, scratchDir st
 		// records are visited in id order, so each gram's ids append already
 		// sorted, and only the distinct grams need a sort.  The custom table
 		// avoids a Go map's bucket indirection, keep-alive hazards, and the
-		// read-modify-write needed to append through a map value.
-		name := rec.Name
+		// read-modify-write needed to append through a map value.  Grams are
+		// folded from the lowercased name so they match the query side, which
+		// folds strings.ToLower(term) (not just ASCII case).
+		name := idx.compactLowerNameOf(id, rec)
 		if len(name) >= gramSize {
 			id32 := uint32(id)
 			for i := 0; i+gramSize <= len(name); i++ {
@@ -389,6 +391,14 @@ func (t *gramSpillTable) sortedGrams(dst []uint32) []uint32 {
 // reset empties each id list but keeps its slot and backing array (a gram seen
 // again reuses the capacity) rather than freeing them, which would make every
 // flush re-grow every slice and inflate the build's GC peak.
+//
+// Trade-off: this deliberately retains one id-slice per distinct gram (capacity
+// = that gram's largest single-buffer posting) and a key slot per distinct gram
+// ever seen by this worker.  That is bounded by the total distinct grams in the
+// worker's record range, not by the active buffer budget.  Clearing the keys and
+// recycling only a one-buffer slice pool was measured to make the full-volume
+// build's peak MUCH worse (F: 6.5 GiB vs 4.4 GiB, from GC churn), so bounded
+// peak wins over a stricter steady-state bound here.
 func (t *gramSpillTable) reset() {
 	for i, k := range t.keys {
 		if k != 0 {
@@ -497,6 +507,7 @@ type gramRunReader struct {
 	prevID    uint32
 	haveGram  bool
 	done      bool
+	err       error
 }
 
 const gramRunReadBytes = 64 * 1024
@@ -539,6 +550,7 @@ func (r *gramRunReader) refill() bool {
 	if n <= 0 {
 		r.eof = true
 		if err != nil && !errors.Is(err, io.EOF) {
+			r.err = err
 			r.done = true
 		}
 		return false
@@ -564,6 +576,10 @@ func (r *gramRunReader) ensureGram() bool {
 		}
 		count, ok := r.readUvarint()
 		if !ok {
+			// A gram header with no count is a truncated run, not a clean end.
+			if r.err == nil {
+				r.err = io.ErrUnexpectedEOF
+			}
 			r.done = true
 			return false
 		}
@@ -584,6 +600,10 @@ func (r *gramRunReader) ensureGram() bool {
 func (r *gramRunReader) nextID() (uint32, bool) {
 	d, ok := r.readUvarint()
 	if !ok {
+		// A gram whose declared ids are cut short is a truncated run.
+		if r.err == nil {
+			r.err = io.ErrUnexpectedEOF
+		}
 		r.done = true
 		return 0, false
 	}
@@ -729,6 +749,11 @@ func mergeRunKeys(ctx context.Context, paths []string, emit func(gram uint32, id
 		}
 	}()
 	mt := newMergeTree(readers)
+	for _, r := range readers {
+		if r.err != nil {
+			return r.err
+		}
+	}
 	var ids []uint32
 	for {
 		gram, ok := mt.winner()
@@ -752,8 +777,13 @@ func mergeRunKeys(ctx context.Context, paths []string, emit func(gram uint32, id
 				}
 				ids = append(ids, id)
 			}
+			if r.err != nil {
+				return r.err
+			}
 			if r.ensureGram() {
 				mt.setGram(i, r.gram)
+			} else if r.err != nil {
+				return r.err
 			} else {
 				mt.retire(i)
 			}

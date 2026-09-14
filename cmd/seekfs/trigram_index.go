@@ -345,7 +345,7 @@ func buildSelectiveCompactNameGramSegmentsBoth(idx *Index, start, end int, gramS
 		if rec.Deleted {
 			continue
 		}
-		grams = appendUniqueFixedGramKeysFoldASCII(grams, idx.compactNameAt(id), gramSize)
+		grams = appendUniqueFixedGramKeysFoldASCII(grams, idx.compactLowerNameAt(id), gramSize)
 		for _, gram := range grams {
 			if counts[gram] > maxPostingCount {
 				omittedRaw[gram] = append(omittedRaw[gram], uint32(id))
@@ -455,7 +455,7 @@ func countCompactNameGramSegment(idx *Index, start, end int, gramSize int) map[u
 		if rec.Deleted {
 			continue
 		}
-		grams = appendUniqueFixedGramKeysFoldASCII(grams, idx.compactNameAt(id), gramSize)
+		grams = appendUniqueFixedGramKeysFoldASCII(grams, idx.compactLowerNameAt(id), gramSize)
 		for _, gram := range grams {
 			counts[gram]++
 		}
@@ -506,7 +506,7 @@ func buildSelectiveCompactNameGramSegment(idx *Index, start, end int, gramSize i
 		if rec.Deleted {
 			continue
 		}
-		grams = appendUniqueFixedGramKeysFoldASCII(grams, idx.compactNameAt(id), gramSize)
+		grams = appendUniqueFixedGramKeysFoldASCII(grams, idx.compactLowerNameAt(id), gramSize)
 		for _, gram := range grams {
 			if counts[gram] > maxPostingCount {
 				continue
@@ -1120,3 +1120,6 @@ func decodeDeltaUvarint32(encoded []byte, count int) []uint32 {
 	}
 	return out
 }
+
+
+
