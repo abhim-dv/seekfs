@@ -456,7 +456,12 @@ func TestDirectV9ConcurrentWalkBuilderOutputIsWorkerIndependent(t *testing.T) {
 }
 
 func TestDirectV9WalkPreflightUsesStableArtifactRootAcrossFreshRuns(t *testing.T) {
-	root := t.TempDir()
+	// The preflight canonicalizes paths (EvalSymlinks), so compare in canonical
+	// space; a symlinked or short-named temp root would otherwise alias.
+	root, err := directV9CanonicalPath(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	stable := filepath.Join(root, ".r5tmp")
 	if err := os.MkdirAll(stable, 0o700); err != nil {
 		t.Fatal(err)

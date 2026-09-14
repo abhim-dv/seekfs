@@ -115,8 +115,17 @@ func TestDirectV9ConcurrentWalkCloseDiscardsBufferedRoot(t *testing.T) {
 }
 
 func TestDirectV9ConcurrentWalkIndexesReparseEntriesWithoutFollowingTargets(t *testing.T) {
-	root := t.TempDir()
-	external := t.TempDir()
+	// The walk canonicalizes its root (EvalSymlinks), so build and compare paths
+	// in canonical space; a symlinked or short-named temp root would otherwise
+	// make the walk's record paths alias the raw t.TempDir() paths.
+	root, err := directV9CanonicalPath(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	external, err := directV9CanonicalPath(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(filepath.Join(external, "outside.txt"), []byte("outside"), 0o600); err != nil {
 		t.Fatal(err)
 	}
