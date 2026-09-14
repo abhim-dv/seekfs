@@ -58,3 +58,18 @@ Use `seekfs config` so agents and users do not need to locate the file manually:
 .\seekfs.exe config set dbs = '["F:\\seekfs_c.gsi", "F:\\seekfs_f.gsi"]'
 .\seekfs.exe config get dbs
 ```
+
+## Build tuning (name trigrams)
+
+Index builds are bounded and parallel by default. These environment variables
+exist for low-memory or unusual environments; the defaults are fine otherwise.
+
+| Variable | Meaning | Default |
+| --- | --- | --- |
+| `SEEKFS_NAME_GRAM_EXTERNAL` | `0` forces the in-memory name-gram builder; any other value forces the external, bounded-memory builder | external for real volumes, in-memory for small indexes |
+| `SEEKFS_NAME_GRAM_EXTERNAL_MIN_RECORDS` | Record-count floor below which the in-memory builder is used | `250000` |
+| `SEEKFS_NAME_GRAM_SPOOL_DIR` | Directory for external-builder spill files | system temp directory |
+| `SEEKFS_GRAM_SPILL_BYTES` | Per-worker spill buffer budget, in bytes | `67108864` (64 MiB) |
+| `SEEKFS_GRAM_SPILL_WORKERS` | Parallel spill workers | `GOMAXPROCS`, capped at 8 |
+| `SEEKFS_GRAM_MERGE_WORKERS` | Parallel merge workers | `GOMAXPROCS`, capped at 8 |
+| `SEEKFS_GRAM_MERGE_FANIN` | Maximum runs merged per pass (minimum 2) | `32` |
