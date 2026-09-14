@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -423,4 +424,45 @@ func sameTrigramIntSet(a, b []int) bool {
 		}
 	}
 	return true
+}
+
+// TestReconstructLowerPathMatchesCached pins buildCompactPathOrderRank (the
+// map-free path-rank builder) to the original map-cache comparator, including
+// the edge case where a topmost component matches the root basename only in
+// case, and where a len-1 ancestor chain vs a longer descendant chain changes
+// the root-name skip.  The comparison is on the resulting order, since the
+// original resolves keys lazily in comparator order with a shared cache.
+func TestReconstructLowerPathMatchesCached(t *testing.T) {
+	idx := &Index{Volume: "C:", Roots: []string{`C:\Users\Alice`}}
+	add := func(name string, parent int) {
+		idx.Records = append(idx.Records, CompactRecord{Name: name, Parent: int32(parent)})
+	}
+	add(".", -1)
+	add("alice", 0)
+	add("file.txt", 1)
+	add("Alice", 0)
+	add("Sub", 3)
+	n := len(idx.Records)
+
+	refOrder := liveCompactIDs(idx, n)
+	cache := make(map[int]string)
+	sort.Slice(refOrder, func(i, j int) bool {
+		a, b := int(refOrder[i]), int(refOrder[j])
+		ap := strings.ToLower(idx.reconstructCompactPathCached(a, cache))
+		bp := strings.ToLower(idx.reconstructCompactPathCached(b, cache))
+		if ap != bp {
+			return ap < bp
+		}
+		return a < b
+	})
+
+	gotOrder, _ := buildCompactPathOrderRank(idx)
+	if len(gotOrder) != len(refOrder) {
+		t.Fatalf("order length got=%d want=%d", len(gotOrder), len(refOrder))
+	}
+	for i := range refOrder {
+		if gotOrder[i] != refOrder[i] {
+			t.Fatalf("order[%d] got=%d want=%d", i, gotOrder[i], refOrder[i])
+		}
+	}
 }

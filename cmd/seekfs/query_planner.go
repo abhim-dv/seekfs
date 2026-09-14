@@ -1502,7 +1502,16 @@ func searchServiceVolumesGlobalBoundedFallbackSnapshot(snapshot globalQuerySnaps
 		if countOnly || !orderReady || volumePQ.RootBias != "" || volumePQ.CWDBias != "" {
 			volumePQ.Limit = 0
 			volumePQ.CountOnly = true
-			localIDs, ok = vol.boundedScanCandidates(volumePQ)
+			var filter *boundedScanMembershipFilter
+			exactEmpty, filterOK := vol.boundedScanPrefilter(volumePQ, &filter)
+			if exactEmpty {
+				localIDs = []int{}
+				ok = true
+			} else if filterOK {
+				localIDs, ok = vol.boundedScanCandidatesFiltered(volumePQ, filter)
+			} else {
+				localIDs, ok = vol.boundedScanCandidates(volumePQ)
+			}
 		} else {
 			hidden := hiddenBaseIDs{}
 			if volumeIndex < len(snapshots) && snapshots[volumeIndex] != nil {
@@ -4660,8 +4669,24 @@ func (vol *serviceVolumeIndex) broadPathScanCandidates(pq parsedQuery) ([]int, b
 // predicate the shared verifier uses. Specialized postings can beat this, but
 // no query should need to fall through to older per-term reconstruction routes.
 func (vol *serviceVolumeIndex) boundedScanCandidates(pq parsedQuery) ([]int, bool) {
+	return vol.boundedScanCandidatesFiltered(pq, nil)
+}
+
+// boundedScanCandidatesFiltered is boundedScanCandidates with an optional cheap
+// posting membership pre-filter.  Records outside the filter are skipped before
+// the full entry verification, so a count or non-order-ready scan for a query
+// with a cheap exact superset (ext:, a bounded type:dir subtree, or a required
+// regex literal run) touches only the candidate subset instead of every record.
+func (vol *serviceVolumeIndex) boundedScanCandidatesFiltered(pq parsedQuery, filter *boundedScanMembershipFilter) ([]int, bool) {
 	if vol == nil || vol.index == nil {
 		return nil, false
+	}
+	if filter != nil && filter.members == nil && filter.source.hasPosting {
+		ids := filter.source.posting.materialize()
+		filter.members = make(map[int]struct{}, len(ids))
+		for _, id := range ids {
+			filter.members[int(id)] = struct{}{}
+		}
 	}
 	recordCount := vol.index.compactRecordCount()
 	if recordCount == 0 {
@@ -4678,6 +4703,9 @@ func (vol *serviceVolumeIndex) boundedScanCandidates(pq parsedQuery) ([]int, boo
 				return nil, false
 			}
 			id := compactUint32OrderAt(order, pos)
+			if filter != nil && !filter.contains(id) {
+				continue
+			}
 			if _, ok := compactCandidateEntryIfMatch(vol.index, pq, id, cache, true, false); !ok {
 				continue
 			}
@@ -4698,6 +4726,9 @@ func (vol *serviceVolumeIndex) boundedScanCandidates(pq parsedQuery) ([]int, boo
 				return nil, false
 			}
 			id := compactUint32OrderAt(order, pos)
+			if filter != nil && !filter.contains(id) {
+				continue
+			}
 			if _, ok := compactCandidateEntryIfMatch(vol.index, pq, id, cache, true, false); ok {
 				out = append(out, id)
 			}
@@ -4723,6 +4754,9 @@ func (vol *serviceVolumeIndex) boundedScanCandidates(pq parsedQuery) ([]int, boo
 					return
 				}
 				id := compactUint32OrderAt(order, pos)
+				if filter != nil && !filter.contains(id) {
+					continue
+				}
 				if _, ok := compactCandidateEntryIfMatch(vol.index, pq, id, cache, true, false); ok {
 					local = append(local, id)
 				}
@@ -4979,20 +5013,55 @@ func (vol *serviceVolumeIndex) planRegexLiteralFilter(pq parsedQuery) (filter *b
 		len(pq.RegexTerms) == 0 || !pq.MatchPath {
 		return nil, false, false
 	}
-	literal := strings.ToLower(regexRequiredLiteral(pq.Regexps[0].String()))
-	if len(literal) < 3 || strings.ContainsAny(literal, `\/*?[]:`) {
+	disjuncts := regexRequiredLiteralAlternatives(pq.Regexps[0].String())
+	if len(disjuncts) == 0 {
 		return nil, false, false
 	}
-	ids := vol.pathTermPosting(literal)
-	if len(ids) == 0 {
+	members := make(map[int]struct{}, 64)
+	kept := 0
+	for _, runs := range disjuncts {
+		hasUsable := false
+		var best []int
+		for _, run := range runs {
+			if len(run) < 3 || strings.ContainsAny(run, `\/*?[]:`) {
+				continue
+			}
+			hasUsable = true
+			ids := vol.pathTermPosting(run)
+			if len(ids) == 0 {
+				// This run is absent from the volume; another run (or another
+				// disjunct) may still narrow the scan, so do not treat it as an
+				// empty query here.
+				continue
+			}
+			if best == nil || len(ids) < len(best) {
+				best = ids
+			}
+		}
+		if !hasUsable {
+			// This disjunct has no run we can prove required.  Skipping it
+			// would let a match through with none of the chosen literals, so
+			// no sound filter can be built from the pattern.
+			return nil, false, false
+		}
+		if best == nil {
+			// Every usable run of this disjunct is absent, so this branch can
+			// never match.  The union of the remaining branches is still an
+			// exact superset of the match set.
+			continue
+		}
+		if len(members)+len(best) > serviceComponentMultiTermScanMaxIDs {
+			return nil, false, false
+		}
+		for _, id := range best {
+			members[id] = struct{}{}
+		}
+		kept++
+	}
+	if kept == 0 {
+		// Every disjunct was proven impossible, so the query matches nothing on
+		// this volume.
 		return nil, true, true
-	}
-	if len(ids) > serviceComponentMultiTermScanMaxIDs {
-		return nil, false, false
-	}
-	members := make(map[int]struct{}, len(ids))
-	for _, id := range ids {
-		members[id] = struct{}{}
 	}
 	return &boundedScanMembershipFilter{members: members}, false, true
 }

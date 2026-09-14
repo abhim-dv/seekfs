@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"container/heap"
 	"container/list"
+	"context"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
@@ -6923,6 +6924,33 @@ func (vol *serviceVolumeIndex) rebuildNameOrderLocked() {
 		vol.volume, vol.index.compactRecordCount(), (len(order)+len(ranks))*4, time.Since(start).Round(time.Millisecond))
 }
 
+// liveCompactIDs returns the ids of non-deleted compact records in ascending
+// order.  Every rank builder ranks exactly this set; sharing it keeps the ranks
+// consistent and moves the boilerplate here.
+func liveCompactIDs(idx *Index, recordCount int) []uint32 {
+	order := make([]uint32, 0, recordCount)
+	for id := 0; id < recordCount; id++ {
+		if !idx.compactDeletedAt(id) {
+			order = append(order, uint32(id))
+		}
+	}
+	return order
+}
+
+// compactRanksFromOrder derives rank[id] = position of id in order.
+func compactRanksFromOrder(order []uint32, recordCount int) []uint32 {
+	ranks := make([]uint32, recordCount)
+	for i := range ranks {
+		ranks[i] = uint32(i)
+	}
+	for pos, id32 := range order {
+		if id := int(id32); id >= 0 && id < recordCount {
+			ranks[id] = uint32(pos)
+		}
+	}
+	return ranks
+}
+
 func buildCompactNameOrderRank(idx *Index) ([]uint32, []uint32) {
 	recordCount := 0
 	if idx != nil {
@@ -6932,31 +6960,23 @@ func buildCompactNameOrderRank(idx *Index) ([]uint32, []uint32) {
 		return nil, nil
 	}
 	order := make([]uint32, 0, recordCount)
+	lower := make([]string, recordCount)
 	for id := 0; id < recordCount; id++ {
 		rec := idx.compactRecord(id)
-		if !rec.Deleted {
-			order = append(order, uint32(id))
+		if rec.Deleted {
+			continue
 		}
+		order = append(order, uint32(id))
+		lower[id] = idx.compactLowerNameOf(id, rec)
 	}
 	sort.Slice(order, func(i, j int) bool {
-		a, b := int(order[i]), int(order[j])
-		an, bn := idx.compactLowerNameAt(a), idx.compactLowerNameAt(b)
-		if an == bn {
-			return a < b
+		a, b := order[i], order[j]
+		if lower[a] != lower[b] {
+			return lower[a] < lower[b]
 		}
-		return an < bn
+		return a < b
 	})
-	ranks := make([]uint32, recordCount)
-	for i := range ranks {
-		ranks[i] = uint32(i)
-	}
-	for pos, id32 := range order {
-		id := int(id32)
-		if id >= 0 && id < recordCount {
-			ranks[id] = uint32(pos)
-		}
-	}
-	return order, ranks
+	return order, compactRanksFromOrder(order, recordCount)
 }
 
 func buildCompactSizeOrderRank(idx *Index) ([]uint32, []uint32) {
@@ -6977,42 +6997,35 @@ func buildCompactSizeOrderRankWithDirBytes(idx *Index, dirBytes []uint64) ([]uin
 	if recordCount == 0 {
 		return nil, nil
 	}
-	sizeAt := func(id int) int64 {
-		rec := idx.compactRecord(id)
-		if rec.Mode&uint32(os.ModeDir) != 0 && id >= 0 && id < len(dirBytes) {
-			return int64(dirBytes[id])
-		}
-		return rec.Size
-	}
 	order := make([]uint32, 0, recordCount)
+	lower := make([]string, recordCount)
+	size := make([]int64, recordCount)
 	for id := 0; id < recordCount; id++ {
 		rec := idx.compactRecord(id)
-		if !rec.Deleted {
-			order = append(order, uint32(id))
+		if rec.Deleted {
+			continue
+		}
+		order = append(order, uint32(id))
+		lower[id] = idx.compactLowerNameOf(id, rec)
+		// A directory sorts by its recursive subtree total when known, a file by
+		// its own size (matches buildCompactSizeOrderRankWithDirBytes' sizeAt).
+		if rec.Mode&uint32(os.ModeDir) != 0 && id >= 0 && id < len(dirBytes) {
+			size[id] = int64(dirBytes[id])
+		} else {
+			size[id] = rec.Size
 		}
 	}
 	sort.Slice(order, func(i, j int) bool {
-		a, b := int(order[i]), int(order[j])
-		if as, bs := sizeAt(a), sizeAt(b); as != bs {
-			return as < bs
+		a, b := order[i], order[j]
+		if size[a] != size[b] {
+			return size[a] < size[b]
 		}
-		an, bn := idx.compactLowerNameAt(a), idx.compactLowerNameAt(b)
-		if an != bn {
-			return an < bn
+		if lower[a] != lower[b] {
+			return lower[a] < lower[b]
 		}
 		return a < b
 	})
-	ranks := make([]uint32, recordCount)
-	for i := range ranks {
-		ranks[i] = uint32(i)
-	}
-	for pos, id32 := range order {
-		id := int(id32)
-		if id >= 0 && id < recordCount {
-			ranks[id] = uint32(pos)
-		}
-	}
-	return order, ranks
+	return order, compactRanksFromOrder(order, recordCount)
 }
 
 func buildCompactModifiedOrderRank(idx *Index) ([]uint32, []uint32) {
@@ -7024,41 +7037,34 @@ func buildCompactModifiedOrderRank(idx *Index) ([]uint32, []uint32) {
 		return nil, nil
 	}
 	order := make([]uint32, 0, recordCount)
+	lower := make([]string, recordCount)
+	mod := make([]int64, recordCount)
 	for id := 0; id < recordCount; id++ {
 		rec := idx.compactRecord(id)
-		if !rec.Deleted {
-			order = append(order, uint32(id))
+		if rec.Deleted {
+			continue
 		}
+		order = append(order, uint32(id))
+		lower[id] = idx.compactLowerNameOf(id, rec)
+		mod[id] = rec.ModUnix
 	}
 	sort.Slice(order, func(i, j int) bool {
-		a, b := int(order[i]), int(order[j])
-		ar, br := idx.compactRecord(a), idx.compactRecord(b)
-		if ar.ModUnix != br.ModUnix {
-			if ar.ModUnix == 0 {
+		a, b := order[i], order[j]
+		if mod[a] != mod[b] {
+			if mod[a] == 0 {
 				return false
 			}
-			if br.ModUnix == 0 {
+			if mod[b] == 0 {
 				return true
 			}
-			return ar.ModUnix > br.ModUnix
+			return mod[a] > mod[b]
 		}
-		an, bn := idx.compactLowerNameAt(a), idx.compactLowerNameAt(b)
-		if an != bn {
-			return an < bn
+		if lower[a] != lower[b] {
+			return lower[a] < lower[b]
 		}
 		return a < b
 	})
-	ranks := make([]uint32, recordCount)
-	for i := range ranks {
-		ranks[i] = uint32(i)
-	}
-	for pos, id32 := range order {
-		id := int(id32)
-		if id >= 0 && id < recordCount {
-			ranks[id] = uint32(pos)
-		}
-	}
-	return order, ranks
+	return order, compactRanksFromOrder(order, recordCount)
 }
 
 func buildCompactExtensionOrderRank(idx *Index) ([]uint32, []uint32) {
@@ -7070,35 +7076,28 @@ func buildCompactExtensionOrderRank(idx *Index) ([]uint32, []uint32) {
 		return nil, nil
 	}
 	order := make([]uint32, 0, recordCount)
+	lower := make([]string, recordCount)
+	ext := make([]string, recordCount)
 	for id := 0; id < recordCount; id++ {
 		rec := idx.compactRecord(id)
-		if !rec.Deleted {
-			order = append(order, uint32(id))
+		if rec.Deleted {
+			continue
 		}
+		order = append(order, uint32(id))
+		lower[id] = idx.compactLowerNameOf(id, rec)
+		ext[id] = compactRecordLowerExt(rec)
 	}
 	sort.Slice(order, func(i, j int) bool {
-		a, b := int(order[i]), int(order[j])
-		ae, be := compactRecordLowerExt(idx.compactRecord(a)), compactRecordLowerExt(idx.compactRecord(b))
-		if ae != be {
-			return ae < be
+		a, b := order[i], order[j]
+		if ext[a] != ext[b] {
+			return ext[a] < ext[b]
 		}
-		an, bn := idx.compactLowerNameAt(a), idx.compactLowerNameAt(b)
-		if an != bn {
-			return an < bn
+		if lower[a] != lower[b] {
+			return lower[a] < lower[b]
 		}
 		return a < b
 	})
-	ranks := make([]uint32, recordCount)
-	for i := range ranks {
-		ranks[i] = uint32(i)
-	}
-	for pos, id32 := range order {
-		id := int(id32)
-		if id >= 0 && id < recordCount {
-			ranks[id] = uint32(pos)
-		}
-	}
-	return order, ranks
+	return order, compactRanksFromOrder(order, recordCount)
 }
 
 func buildCompactTypeOrderRank(idx *Index) ([]uint32, []uint32) {
@@ -7110,36 +7109,28 @@ func buildCompactTypeOrderRank(idx *Index) ([]uint32, []uint32) {
 		return nil, nil
 	}
 	order := make([]uint32, 0, recordCount)
+	lower := make([]string, recordCount)
+	ty := make([]uint8, recordCount)
 	for id := 0; id < recordCount; id++ {
 		rec := idx.compactRecord(id)
-		if !rec.Deleted {
-			order = append(order, uint32(id))
+		if rec.Deleted {
+			continue
 		}
+		order = append(order, uint32(id))
+		lower[id] = idx.compactLowerNameOf(id, rec)
+		ty[id] = uint8(compactRecordTypeRank(rec))
 	}
 	sort.Slice(order, func(i, j int) bool {
-		a, b := int(order[i]), int(order[j])
-		ar, br := idx.compactRecord(a), idx.compactRecord(b)
-		at, bt := compactRecordTypeRank(ar), compactRecordTypeRank(br)
-		if at != bt {
-			return at < bt
+		a, b := order[i], order[j]
+		if ty[a] != ty[b] {
+			return ty[a] < ty[b]
 		}
-		an, bn := idx.compactLowerNameAt(a), idx.compactLowerNameAt(b)
-		if an != bn {
-			return an < bn
+		if lower[a] != lower[b] {
+			return lower[a] < lower[b]
 		}
 		return a < b
 	})
-	ranks := make([]uint32, recordCount)
-	for i := range ranks {
-		ranks[i] = uint32(i)
-	}
-	for pos, id32 := range order {
-		id := int(id32)
-		if id >= 0 && id < recordCount {
-			ranks[id] = uint32(pos)
-		}
-	}
-	return order, ranks
+	return order, compactRanksFromOrder(order, recordCount)
 }
 
 func buildCompactPathOrderRank(idx *Index) ([]uint32, []uint32) {
@@ -7150,34 +7141,32 @@ func buildCompactPathOrderRank(idx *Index) ([]uint32, []uint32) {
 	if recordCount == 0 {
 		return nil, nil
 	}
-	order := make([]uint32, 0, recordCount)
-	for id := 0; id < recordCount; id++ {
-		rec := idx.compactRecord(id)
-		if !rec.Deleted {
-			order = append(order, uint32(id))
-		}
-	}
-	cache := make(map[int]string)
+	order := liveCompactIDs(idx, recordCount)
+	keys := make([]string, recordCount)
+	computed := make([]bool, recordCount)
+	seen := make([]int32, recordCount)
+	var gen int32
+	var parts []string
 	sort.Slice(order, func(i, j int) bool {
-		a, b := int(order[i]), int(order[j])
-		ap := strings.ToLower(idx.reconstructCompactPathCached(a, cache))
-		bp := strings.ToLower(idx.reconstructCompactPathCached(b, cache))
-		if ap != bp {
-			return ap < bp
+		a, b := order[i], order[j]
+		// Resolve keys lazily in comparator order with a shared memo, exactly as
+		// the original map-cache path did.  The root-name skip depends on the
+		// cached ancestor's chain length, so eager id-order precomputation could
+		// disagree with the original in that edge case.
+		if !computed[a] {
+			gen++
+			parts = idx.reconstructLowerPathInto(int(a), keys, computed, seen, gen, parts[:0])
+		}
+		if !computed[b] {
+			gen++
+			parts = idx.reconstructLowerPathInto(int(b), keys, computed, seen, gen, parts[:0])
+		}
+		if keys[a] != keys[b] {
+			return keys[a] < keys[b]
 		}
 		return a < b
 	})
-	ranks := make([]uint32, recordCount)
-	for i := range ranks {
-		ranks[i] = uint32(i)
-	}
-	for pos, id32 := range order {
-		id := int(id32)
-		if id >= 0 && id < recordCount {
-			ranks[id] = uint32(pos)
-		}
-	}
-	return order, ranks
+	return order, compactRanksFromOrder(order, recordCount)
 }
 
 func compactRecordTypeRank(rec CompactRecord) int {
@@ -7367,11 +7356,31 @@ func (vol *serviceVolumeIndex) rebuildNameTrigramsLocked() {
 	}
 	start := time.Now()
 	var ti *compressedTrigramIndex
-	if serviceLowMemoryMode() {
-		ti = buildSelectiveNameTrigramIndex(vol.index, serviceLowMemoryTrigramStoredPostingMax())
-	} else {
-		ti = buildNameTrigramIndex(vol.index)
-		ti.dropCommonPostings(trigramStoredPostingMaxCount)
+	if shouldUseExternalNameGram(vol.index.compactRecordCount()) {
+		maxPosting := serviceLowMemoryTrigramStoredPostingMax()
+		if !serviceLowMemoryMode() {
+			// Match buildNameTrigramIndex + dropCommonPostings: store every
+			// gram, then drop the common postings, leaving no omitted marker.
+			maxPosting = 1 << 30
+		}
+		pngr, _, err := buildNameGramIndexExternal(context.Background(), vol.index, 3, maxPosting, nameGramSpoolDir())
+		if err == nil {
+			if !serviceLowMemoryMode() {
+				pngr.dropCommonPostings(trigramStoredPostingMaxCount)
+			}
+			ti = pngr
+		} else {
+			serviceLog("external name trigram build failed volume=%s records=%d err=%v; using in-memory builder",
+				vol.volume, vol.index.compactRecordCount(), err)
+		}
+	}
+	if ti == nil {
+		if serviceLowMemoryMode() {
+			ti = buildSelectiveNameTrigramIndex(vol.index, serviceLowMemoryTrigramStoredPostingMax())
+		} else {
+			ti = buildNameTrigramIndex(vol.index)
+			ti.dropCommonPostings(trigramStoredPostingMaxCount)
+		}
 	}
 	vol.searchMu.Lock()
 	vol.nameTrigrams.Store(ti)
@@ -7899,33 +7908,66 @@ func (m *MMapRecords) At(i int) CompactRecord {
 	return rec
 }
 
-func (m *MMapRecords) lowerNameAt(i int) string {
-	if m != nil && i >= 0 && i < m.count {
-		derived := m.fileDerived()
-		if len(derived.LowerOffs) > 0 && len(derived.LowerLens) == len(derived.LowerOffs) {
-			base, ok := m.recordOffset(i)
-			if ok {
-				_, nameID := m.recordRefs(base + 16)
-				token := int(nameID)
-				if token >= 0 && token < len(derived.LowerOffs) {
-					off := derived.LowerOffs[token]
-					if off == packedLowerSameAsName {
-						return m.nameAtRecord(i)
-					}
-					length := derived.LowerLens[token]
-					end := int(off) + int(length)
-					if end >= int(off) && end <= len(derived.LowerBlob) {
-						return stringView(derived.LowerBlob[int(off):end])
-					}
-				}
+// lowerNameByID lowercases a name that was already resolved from its token.
+// Callers that have parsed a record once can reuse its Name/NameOff instead of
+// re-parsing the record refs via lowerNameAt.
+func (m *MMapRecords) lowerNameByID(nameID uint32, name string) string {
+	if m == nil {
+		return ""
+	}
+	derived := m.fileDerived()
+	if len(derived.LowerOffs) > 0 && len(derived.LowerLens) == len(derived.LowerOffs) {
+		token := int(nameID)
+		if token >= 0 && token < len(derived.LowerOffs) {
+			off := derived.LowerOffs[token]
+			if off == packedLowerSameAsName {
+				return name
+			}
+			length := derived.LowerLens[token]
+			end := int(off) + int(length)
+			if end >= int(off) && end <= len(derived.LowerBlob) {
+				return stringView(derived.LowerBlob[int(off):end])
 			}
 		}
 	}
-	name := m.nameAtRecord(i)
 	if name == "" {
 		return ""
 	}
 	return strings.ToLower(name)
+}
+
+func (m *MMapRecords) lowerNameAt(i int) string {
+	if m == nil || i < 0 || i >= m.count {
+		return ""
+	}
+	base, ok := m.recordOffset(i)
+	if !ok {
+		return ""
+	}
+	_, nameID := m.recordRefs(base + 16)
+	name, _ := m.nameByID(nameID)
+	return m.lowerNameByID(nameID, name)
+}
+
+// deletedAt reports a record's deleted flag without materializing the whole
+// record or its name.
+func (m *MMapRecords) deletedAt(i int) bool {
+	if m == nil || i < 0 || i >= m.count {
+		return false
+	}
+	base, ok := m.recordOffset(i)
+	if !ok {
+		return false
+	}
+	refBytes := 6
+	if m.wideRefs {
+		refBytes = 8
+	}
+	delOff := base + 16 + refBytes + 20
+	if delOff >= len(m.recordData) {
+		return false
+	}
+	return m.recordData[delOff] != 0
 }
 
 func (m *MMapRecords) nameAtRecord(i int) string {
@@ -11159,6 +11201,33 @@ func (idx *Index) compactLowerNameAt(i int) string {
 		return idx.PackedRecords.lowerNameAt(i)
 	}
 	return compactLowerName(idx.compactRecord(i))
+}
+
+// compactLowerNameOf lowercases a record's name from a record the caller already
+// parsed, so rank builders avoid a second mmap recordRefs parse per record.
+func (idx *Index) compactLowerNameOf(i int, rec CompactRecord) string {
+	if idx.MMapRecords != nil {
+		return idx.MMapRecords.lowerNameByID(rec.NameOff, rec.Name)
+	}
+	if idx.PackedRecords != nil {
+		return idx.PackedRecords.lowerNameAt(i)
+	}
+	return compactLowerName(rec)
+}
+
+// compactDeletedAt reports a record's deleted flag without materializing the
+// record or its name; the rank builders only need liveness in their first pass.
+func (idx *Index) compactDeletedAt(i int) bool {
+	if idx.MMapRecords != nil {
+		return idx.MMapRecords.deletedAt(i)
+	}
+	if idx.PackedRecords != nil {
+		return idx.PackedRecords.deletedAt(i)
+	}
+	if i < 0 || i >= len(idx.Records) {
+		return false
+	}
+	return idx.Records[i].Deleted
 }
 
 func (idx *Index) setCompactRecord(i int, rec CompactRecord) {
@@ -17834,6 +17903,67 @@ func (idx *Index) reconstructCompactPathCached(i int, cache map[int]string) stri
 	return path
 }
 
+// reconstructLowerPathInto is the map-free path builder used by the path rank.
+// paths is a memo indexed by record id that doubles as the rank's sort-key
+// array; computed marks which ids already have a path.  seen is generation-
+// stamped so one array detects cycles across calls without clearing.  parts is a
+// reusable scratch buffer holding RAW component names: the root-name skip test
+// must compare raw strings exactly as reconstructCompactPathCached does, while
+// each component is lowercased only when joined so the returned path matches
+// strings.ToLower(reconstructCompactPathCached(...)).
+func (idx *Index) reconstructLowerPathInto(i int, paths []string, computed []bool, seen []int32, gen int32, parts []string) []string {
+	if i < 0 || i >= len(paths) || computed[i] {
+		return parts
+	}
+	cur := i
+	for depth := 0; depth < 1024; depth++ {
+		if cur < 0 || cur >= len(paths) {
+			break
+		}
+		if computed[cur] {
+			path := paths[cur]
+			for p := len(parts) - 1; p >= 0; p-- {
+				path += `\` + strings.ToLower(parts[p])
+			}
+			paths[i] = path
+			computed[i] = true
+			return parts
+		}
+		if seen[cur] == gen {
+			break
+		}
+		seen[cur] = gen
+		rec := idx.compactRecord(cur)
+		if rec.Name != "." {
+			parts = append(parts, rec.Name)
+		}
+		if rec.Parent < 0 {
+			break
+		}
+		cur = int(rec.Parent)
+	}
+	root := idx.Volume
+	rootName := ""
+	if len(idx.Roots) > 0 {
+		root = strings.TrimRight(idx.Roots[0], `\`)
+		rootName = filepath.Base(root)
+	}
+	path := strings.ToLower(root)
+	for p := len(parts) - 1; p >= 0; p-- {
+		part := strings.ToLower(parts[p])
+		if path == "" {
+			path = part
+		} else if rootName != "" && p == len(parts)-1 && parts[p] == rootName && len(parts) > 1 {
+			continue
+		} else {
+			path += `\` + part
+		}
+	}
+	paths[i] = path
+	computed[i] = true
+	return parts
+}
+
 func containsAll(s string, terms []string) bool {
 	for _, term := range terms {
 		if !strings.Contains(s, term) {
@@ -18393,33 +18523,65 @@ func writeIndexV9File(f *os.File, idx *Index) error {
 		Compact:    compactDiskFlag,
 	}
 	recordCount := idx.compactRecordCount()
-	nameIDs := make(map[string]uint32, max(1, recordCount/2))
 	nameBlob := make([]byte, 0, recordCount*16)
 	nameOffs := make([]uint32, 0, recordCount)
 	nameLens := make([]uint16, 0, recordCount)
 	nameTokens := make([]string, 0, recordCount)
 	nameIDForRecord := make([]uint32, recordCount)
-	for i := 0; i < recordCount; i++ {
-		rec := idx.compactRecord(i)
-		if len(rec.Name) > int(^uint16(0)) {
-			return errors.New("compact name too large")
+	if recs := idx.MMapRecords; recs != nil && len(recs.tokenTable) > 0 {
+		// The source is already tokenized: every record references a stable name
+		// token, so dedup by token id (O(1), no string hashing) and compact away
+		// tokens that no longer appear.  Hashing every name string dominated the
+		// record-table pass on multi-million-name volumes.
+		srcToDst := make([]int32, len(recs.tokenTable)/6)
+		for i := range srcToDst {
+			srcToDst[i] = -1
 		}
-		id, ok := nameIDs[rec.Name]
-		if !ok {
-			id = uint32(len(nameOffs))
-			nameIDs[rec.Name] = id
-			nameOffs = append(nameOffs, uint32(len(nameBlob)))
-			nameLens = append(nameLens, uint16(len(rec.Name)))
-			nameTokens = append(nameTokens, rec.Name)
-			nameBlob = append(nameBlob, rec.Name...)
+		for i := 0; i < recordCount; i++ {
+			rec := idx.compactRecord(i)
+			if len(rec.Name) > int(^uint16(0)) {
+				return errors.New("compact name too large")
+			}
+			token := int(rec.NameOff)
+			if token < 0 || token >= len(srcToDst) {
+				return errors.New("compact name token out of range")
+			}
+			id := srcToDst[token]
+			if id < 0 {
+				id = int32(len(nameOffs))
+				srcToDst[token] = id
+				nameOffs = append(nameOffs, uint32(len(nameBlob)))
+				nameLens = append(nameLens, uint16(len(rec.Name)))
+				nameTokens = append(nameTokens, rec.Name)
+				nameBlob = append(nameBlob, rec.Name...)
+			}
+			nameIDForRecord[i] = uint32(id)
 		}
-		nameIDForRecord[i] = id
+		srcToDst = nil
+	} else {
+		nameIDs := make(map[string]uint32, max(1, recordCount/2))
+		for i := 0; i < recordCount; i++ {
+			rec := idx.compactRecord(i)
+			if len(rec.Name) > int(^uint16(0)) {
+				return errors.New("compact name too large")
+			}
+			id, ok := nameIDs[rec.Name]
+			if !ok {
+				id = uint32(len(nameOffs))
+				nameIDs[rec.Name] = id
+				nameOffs = append(nameOffs, uint32(len(nameBlob)))
+				nameLens = append(nameLens, uint16(len(rec.Name)))
+				nameTokens = append(nameTokens, rec.Name)
+				nameBlob = append(nameBlob, rec.Name...)
+			}
+			nameIDForRecord[i] = id
+		}
+		// The deduplication map is only needed while assigning record references.
+		// Drop it before derived-section generation; retaining millions of string
+		// keys here was the second large peak in v8->v9 conversion.
+		nameIDs = nil
+		debug.FreeOSMemory()
 	}
-	// The deduplication map is only needed while assigning record references.
-	// Drop it before derived-section generation; retaining millions of string
-	// keys here was the second large peak in v8->v9 conversion.
-	nameIDs = nil
-	debug.FreeOSMemory()
 	header.NameBlobLen = uint64(len(nameBlob))
 	header.TokenCount = uint64(len(nameOffs))
 	if compactNeedsWideDiskRecords(recordCount, len(nameOffs)) {
@@ -18824,6 +18986,11 @@ func forEachDerivedSection(idx *Index, nameTokens []string, emit func(indexSecti
 		}
 		vol.queryIndex.pathOrder = nil
 	}
+	// The path rank's lowercased full-path keys are the build's largest transient
+	// by an order of magnitude (multi-GiB on multi-million-record volumes).
+	// Release them before the derived posting families and subtree minima
+	// allocate on top, so peak stays bounded instead of riding on GC timing.
+	runtime.GC()
 	// Extension postings only need the raw rank vectors. Emit this family
 	// before subtree minima are prepared, so those raw vectors can be released
 	// as each corresponding subtree-minimum vector is built.
@@ -18909,10 +19076,30 @@ func forEachDerivedSection(idx *Index, nameTokens []string, emit func(indexSecti
 	vol.subtreeSizeRank, vol.subtreeModRank, vol.subtreeExtRank = nil, nil, nil
 	vol.subtreeTypeRank, vol.subtreePathRank = nil, nil
 
-	nameGrams := buildSelectiveNameTrigramIndex(idx, serviceLowMemoryTrigramStoredPostingMax())
+	if shouldUseExternalNameGram(idx.compactRecordCount()) {
+		pngr, pngc, gramErr := buildNameGramIndexExternal(context.Background(), idx, 3, serviceLowMemoryTrigramStoredPostingMax(), nameGramSpoolDir())
+		if gramErr != nil {
+			return gramErr
+		}
+		if err := emitSection(indexSectionPNGR, encodeGramPostingSection(pngr, nameRank)); err != nil {
+			return err
+		}
+		if pngc != nil && selfNameGramSectionsEnabled() {
+			if err := emitSection(indexSectionPNGC, encodeGramPostingSection(pngc, nameRank)); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	nameGrams, nameGramsCompanion := buildSelectiveNameGramIndexWithCompanion(idx, serviceLowMemoryTrigramStoredPostingMax())
 	gramData := encodeGramPostingSection(nameGrams, nameRank)
-	selfNameGramData := optionalSelfNameGramSection(idx, nameGrams, nameRank)
+	var selfNameGramData []byte
+	if nameGramsCompanion != nil && selfNameGramSectionsEnabled() {
+		selfNameGramData = encodeGramPostingSection(nameGramsCompanion, nameRank)
+	}
 	nameGrams = nil
+	nameGramsCompanion = nil
 	if err := emitSection(indexSectionPNGR, gramData); err != nil {
 		return err
 	}
