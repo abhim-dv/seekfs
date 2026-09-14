@@ -59,7 +59,13 @@ func buildNameTrigramIndex(idx *Index) *compressedTrigramIndex {
 }
 
 func buildSelectiveNameTrigramIndex(idx *Index, maxPostingCount int) *compressedTrigramIndex {
-	return buildSelectiveCompactNameTrigramIndex(idx, maxPostingCount)
+	return buildSelectiveCompactNameGramIndex(idx, 3, maxPostingCount)
+}
+
+// buildSelectiveNameGramIndexWithCompanion is the persist-path entry point: it
+// returns the selective PNGR index and the PNGC companion from one pass.
+func buildSelectiveNameGramIndexWithCompanion(idx *Index, maxPostingCount int) (*compressedTrigramIndex, *compressedTrigramIndex) {
+	return buildSelectiveCompactNameGramIndexWithCompanion(idx, 3, maxPostingCount)
 }
 
 func buildSelectiveNameQuadgramIndex(idx *Index, maxPostingCount int) *compressedTrigramIndex {
@@ -196,20 +202,36 @@ func buildSelectiveCompactNameTrigramIndex(idx *Index, maxPostingCount int) *com
 }
 
 func buildSelectiveCompactNameGramIndex(idx *Index, gramSize int, maxPostingCount int) *compressedTrigramIndex {
+	selective, _ := buildSelectiveCompactNameGramIndexInternal(idx, gramSize, maxPostingCount, false)
+	return selective
+}
+
+// buildSelectiveCompactNameGramIndexWithCompanion builds the selective PNGR
+// index and the PNGC companion (postings for the grams the selective index
+// omitted) in a single pass.  The old persist path built a full second index
+// with buildNameTrigramIndex just to recover the omitted grams' postings, which
+// doubled both the build time and the peak heap; routing stored and omitted
+// grams together removes that second full build.
+func buildSelectiveCompactNameGramIndexWithCompanion(idx *Index, gramSize int, maxPostingCount int) (*compressedTrigramIndex, *compressedTrigramIndex) {
+	return buildSelectiveCompactNameGramIndexInternal(idx, gramSize, maxPostingCount, true)
+}
+
+func buildSelectiveCompactNameGramIndexInternal(idx *Index, gramSize int, maxPostingCount int, wantCompanion bool) (ti, companion *compressedTrigramIndex) {
 	recordCount := 0
 	if idx != nil {
 		recordCount = idx.compactRecordCount()
 	}
-	ti := &compressedTrigramIndex{
+	ti = &compressedTrigramIndex{
 		counts:             make(map[uint32]int),
 		gramCountsComplete: true,
 		gramSize:           gramSize,
 		recordCount:        recordCount,
 	}
 	if idx == nil || recordCount == 0 || maxPostingCount <= 0 {
-		return ti
+		return ti, nil
 	}
 	chunks := trigramBuildChunks(recordCount)
+	var omittedSegments []trigramSegment
 	if serviceLowMemoryMode() {
 		for _, chunk := range chunks {
 			counts := countCompactNameGramSegment(idx, chunk[0], chunk[1], gramSize)
@@ -220,6 +242,17 @@ func buildSelectiveCompactNameGramIndex(idx *Index, gramSize int, maxPostingCoun
 		debug.FreeOSMemory()
 		ti.segments = make([]trigramSegment, 0, len(chunks))
 		for _, chunk := range chunks {
+			if wantCompanion {
+				stored, omitted := buildSelectiveCompactNameGramSegmentsBoth(idx, chunk[0], chunk[1], gramSize, ti.counts, maxPostingCount)
+				if stored.end > stored.start {
+					ti.segments = append(ti.segments, stored)
+					ti.postingBytes += stored.postingBytes
+				}
+				if omitted.end > omitted.start && len(omitted.postings) > 0 {
+					omittedSegments = append(omittedSegments, omitted)
+				}
+				continue
+			}
 			segment := buildSelectiveCompactNameGramSegment(idx, chunk[0], chunk[1], gramSize, ti.counts, maxPostingCount)
 			if segment.end <= segment.start {
 				continue
@@ -229,7 +262,7 @@ func buildSelectiveCompactNameGramIndex(idx *Index, gramSize int, maxPostingCoun
 		}
 		ti.markOmittedPostings(maxPostingCount)
 		ti.compactForLowMemory()
-		return ti
+		return ti, companionFromOmittedSegments(omittedSegments, recordCount, gramSize)
 	}
 	workers := min(len(chunks), min(trigramBuildMaxWorkers, max(1, runtime.GOMAXPROCS(0))))
 	localCounts := make([]map[uint32]int, len(chunks))
@@ -255,7 +288,8 @@ func buildSelectiveCompactNameGramIndex(idx *Index, gramSize int, maxPostingCoun
 			ti.counts[gram] += count
 		}
 	}
-	results := make([]trigramSegment, len(chunks))
+	storedResults := make([]trigramSegment, len(chunks))
+	omittedResults := make([]trigramSegment, len(chunks))
 	jobs = make(chan int)
 	wg = sync.WaitGroup{}
 	for worker := 0; worker < workers; worker++ {
@@ -264,7 +298,11 @@ func buildSelectiveCompactNameGramIndex(idx *Index, gramSize int, maxPostingCoun
 			defer wg.Done()
 			for chunkID := range jobs {
 				start, end := chunks[chunkID][0], chunks[chunkID][1]
-				results[chunkID] = buildSelectiveCompactNameGramSegment(idx, start, end, gramSize, ti.counts, maxPostingCount)
+				if wantCompanion {
+					storedResults[chunkID], omittedResults[chunkID] = buildSelectiveCompactNameGramSegmentsBoth(idx, start, end, gramSize, ti.counts, maxPostingCount)
+					continue
+				}
+				storedResults[chunkID] = buildSelectiveCompactNameGramSegment(idx, start, end, gramSize, ti.counts, maxPostingCount)
 			}
 		}()
 	}
@@ -273,8 +311,8 @@ func buildSelectiveCompactNameGramIndex(idx *Index, gramSize int, maxPostingCoun
 	}
 	close(jobs)
 	wg.Wait()
-	ti.segments = make([]trigramSegment, 0, len(results))
-	for _, segment := range results {
+	ti.segments = make([]trigramSegment, 0, len(storedResults))
+	for _, segment := range storedResults {
 		if segment.end <= segment.start {
 			continue
 		}
@@ -282,7 +320,74 @@ func buildSelectiveCompactNameGramIndex(idx *Index, gramSize int, maxPostingCoun
 		ti.postingBytes += segment.postingBytes
 	}
 	ti.markOmittedPostings(maxPostingCount)
-	return ti
+	if wantCompanion {
+		for i := range omittedResults {
+			if omittedResults[i].end > omittedResults[i].start && len(omittedResults[i].postings) > 0 {
+				omittedSegments = append(omittedSegments, omittedResults[i])
+			}
+		}
+	}
+	return ti, companionFromOmittedSegments(omittedSegments, recordCount, gramSize)
+}
+
+// buildSelectiveCompactNameGramSegmentsBoth is the selective build pass with
+// both outputs: grams at or below the posting cap go to stored, the rest to
+// omitted.  Ids stay in record order, so omitting chunks concatenate into
+// globally sorted postings exactly as trigramPostingIDs would produce.
+func buildSelectiveCompactNameGramSegmentsBoth(idx *Index, start, end int, gramSize int, counts map[uint32]int, maxPostingCount int) (stored, omitted trigramSegment) {
+	stored = trigramSegment{start: start, end: end, postings: make(map[uint32]compressedPosting)}
+	omitted = trigramSegment{start: start, end: end, postings: make(map[uint32]compressedPosting)}
+	storedRaw := make(map[uint32][]uint32)
+	omittedRaw := make(map[uint32][]uint32)
+	var grams []uint32
+	for id := start; id < end; id++ {
+		rec := idx.compactRecord(id)
+		if rec.Deleted {
+			continue
+		}
+		grams = appendUniqueFixedGramKeysFoldASCII(grams, idx.compactNameAt(id), gramSize)
+		for _, gram := range grams {
+			if counts[gram] > maxPostingCount {
+				omittedRaw[gram] = append(omittedRaw[gram], uint32(id))
+				continue
+			}
+			storedRaw[gram] = append(storedRaw[gram], uint32(id))
+		}
+	}
+	for gram, ids := range storedRaw {
+		encoded := encodeDeltaUvarint32(ids)
+		stored.postings[gram] = compressedPosting{count: len(ids), data: encoded}
+		stored.postingBytes += len(encoded)
+	}
+	for gram, ids := range omittedRaw {
+		encoded := encodeDeltaUvarint32(ids)
+		omitted.postings[gram] = compressedPosting{count: len(ids), data: encoded}
+		omitted.postingBytes += len(encoded)
+	}
+	return stored, omitted
+}
+
+func companionFromOmittedSegments(segments []trigramSegment, recordCount, gramSize int) *compressedTrigramIndex {
+	if len(segments) == 0 {
+		return nil
+	}
+	out := &compressedTrigramIndex{
+		counts:             make(map[uint32]int),
+		gramCountsComplete: true,
+		gramSize:           gramSize,
+		recordCount:        recordCount,
+		segments:           segments,
+	}
+	for _, segment := range segments {
+		for gram, posting := range segment.postings {
+			out.counts[gram] += posting.count
+			out.postingBytes += len(posting.data)
+		}
+	}
+	if len(out.counts) == 0 {
+		return nil
+	}
+	return out
 }
 
 func trigramBuildChunks(recordCount int) [][2]int {
@@ -306,12 +411,14 @@ func buildCompactTrigramSegment(idx *Index, start, end int, text func(id int, ca
 	}
 	raw := make(map[uint32][]uint32)
 	cache := make(map[int]string)
+	var grams []uint32
 	for id := start; id < end; id++ {
 		rec := idx.compactRecord(id)
 		if rec.Deleted {
 			continue
 		}
-		for _, gram := range uniqueTrigramKeys(text(id, cache)) {
+		grams = appendUniqueTrigramKeys(grams, text(id, cache))
+		for _, gram := range grams {
 			raw[gram] = append(raw[gram], uint32(id))
 		}
 	}
@@ -326,12 +433,14 @@ func buildCompactTrigramSegment(idx *Index, start, end int, text func(id int, ca
 func countCompactTrigramSegment(idx *Index, start, end int, text func(id int, cache map[int]string) string) map[uint32]int {
 	counts := make(map[uint32]int)
 	cache := make(map[int]string)
+	var grams []uint32
 	for id := start; id < end; id++ {
 		rec := idx.compactRecord(id)
 		if rec.Deleted {
 			continue
 		}
-		for _, gram := range uniqueTrigramKeys(text(id, cache)) {
+		grams = appendUniqueTrigramKeys(grams, text(id, cache))
+		for _, gram := range grams {
 			counts[gram]++
 		}
 	}
@@ -340,12 +449,14 @@ func countCompactTrigramSegment(idx *Index, start, end int, text func(id int, ca
 
 func countCompactNameGramSegment(idx *Index, start, end int, gramSize int) map[uint32]int {
 	counts := make(map[uint32]int)
+	var grams []uint32
 	for id := start; id < end; id++ {
 		rec := idx.compactRecord(id)
 		if rec.Deleted {
 			continue
 		}
-		for _, gram := range uniqueFixedGramKeysFoldASCII(idx.compactNameAt(id), gramSize) {
+		grams = appendUniqueFixedGramKeysFoldASCII(grams, idx.compactNameAt(id), gramSize)
+		for _, gram := range grams {
 			counts[gram]++
 		}
 	}
@@ -360,12 +471,14 @@ func buildSelectiveCompactTrigramSegment(idx *Index, start, end int, text func(i
 	}
 	raw := make(map[uint32][]uint32)
 	cache := make(map[int]string)
+	var grams []uint32
 	for id := start; id < end; id++ {
 		rec := idx.compactRecord(id)
 		if rec.Deleted {
 			continue
 		}
-		for _, gram := range uniqueTrigramKeys(text(id, cache)) {
+		grams = appendUniqueTrigramKeys(grams, text(id, cache))
+		for _, gram := range grams {
 			if counts[gram] > maxPostingCount {
 				continue
 			}
@@ -387,12 +500,14 @@ func buildSelectiveCompactNameGramSegment(idx *Index, start, end int, gramSize i
 		postings: make(map[uint32]compressedPosting),
 	}
 	raw := make(map[uint32][]uint32)
+	var grams []uint32
 	for id := start; id < end; id++ {
 		rec := idx.compactRecord(id)
 		if rec.Deleted {
 			continue
 		}
-		for _, gram := range uniqueFixedGramKeysFoldASCII(idx.compactNameAt(id), gramSize) {
+		grams = appendUniqueFixedGramKeysFoldASCII(grams, idx.compactNameAt(id), gramSize)
+		for _, gram := range grams {
 			if counts[gram] > maxPostingCount {
 				continue
 			}
@@ -882,6 +997,56 @@ func uniqueFixedGramKeysFoldASCII(s string, n int) []uint32 {
 		out = append(out, key)
 	}
 	return out
+}
+
+// appendUniqueTrigramKeys appends the unique 3-grams of s to dst and returns the
+// result.  The segment build loops reuse one scratch slice per worker so the
+// per-record map allocation of uniqueFixedGramKeys is avoided.  The returned
+// slice aliases dst, so callers must consume it before the next call.
+func appendUniqueTrigramKeys(dst []uint32, s string) []uint32 {
+	return appendUniqueFixedGramKeys(dst, s, 3)
+}
+
+func appendUniqueFixedGramKeys(dst []uint32, s string, n int) []uint32 {
+	dst = dst[:0]
+	if (n != 3 && n != 4) || len(s) < n {
+		return dst
+	}
+	for i := 0; i+n <= len(s); i++ {
+		key := fixedGramKey(s, i, n)
+		dup := false
+		for _, k := range dst {
+			if k == key {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			dst = append(dst, key)
+		}
+	}
+	return dst
+}
+
+func appendUniqueFixedGramKeysFoldASCII(dst []uint32, s string, n int) []uint32 {
+	dst = dst[:0]
+	if (n != 3 && n != 4) || len(s) < n {
+		return dst
+	}
+	for i := 0; i+n <= len(s); i++ {
+		key := fixedGramKeyFoldASCII(s, i, n)
+		dup := false
+		for _, k := range dst {
+			if k == key {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			dst = append(dst, key)
+		}
+	}
+	return dst
 }
 
 func fixedGramKey(s string, start int, n int) uint32 {

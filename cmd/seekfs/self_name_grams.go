@@ -39,11 +39,9 @@ func optionalSelfNameGramIndex(idx *Index, selective *compressedTrigramIndex) *c
 	return out
 }
 
-func optionalSelfNameGramSection(idx *Index, selective *compressedTrigramIndex, ranks []uint32) []byte {
-	if raw := strings.TrimSpace(os.Getenv("SEEKFS_V9_SELF_NAME_GRAMS")); raw != "" && !envBool("SEEKFS_V9_SELF_NAME_GRAMS") {
-		return nil
-	}
-	return encodeGramPostingSection(optionalSelfNameGramIndex(idx, selective), ranks)
+func selfNameGramSectionsEnabled() bool {
+	raw := strings.TrimSpace(os.Getenv("SEEKFS_V9_SELF_NAME_GRAMS"))
+	return raw == "" || envBool("SEEKFS_V9_SELF_NAME_GRAMS")
 }
 
 // completeSelfNameGramIterators combines the original selective PNGR source
