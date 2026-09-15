@@ -5293,12 +5293,18 @@ func (s *goSearchService) persistVolumeIfDue(vol *serviceVolumeIndex, force bool
 		}
 	}
 	if replacement.index.Compact && replacement.index.Source == "usn" {
-		if frames, framesErr := readWALFramesAfter(vol.dbPath, foldCheckpoint); framesErr == nil {
-			if rewriteErr := rewriteWAL(vol.dbPath, frames); rewriteErr != nil {
-				serviceLog("background persist wal rewrite error volume=%s db=%s err=%v", vol.volume, vol.dbPath, rewriteErr)
-			}
-		} else {
-			serviceLog("background persist wal rewrite skipped volume=%s db=%s err=%v", vol.volume, vol.dbPath, framesErr)
+		// Keep the readable prefix even when the read stopped early: a corrupt
+		// or truncated tail (a persist killed mid-append) must not block the
+		// rewrite.  Skipping it leaves the WAL above its size trigger, so the
+		// next fold is due immediately and folds run back to back.  The dropped
+		// tail is unrecoverable from the WAL either way and the journal still
+		// covers that USN range on the next startup catch-up.
+		frames, framesErr := readWALFramesAfter(vol.dbPath, foldCheckpoint)
+		if framesErr != nil {
+			serviceLog("background persist wal rewrite truncating corrupt tail volume=%s db=%s readable_frames=%d err=%v", vol.volume, vol.dbPath, len(frames), framesErr)
+		}
+		if rewriteErr := rewriteWAL(vol.dbPath, frames); rewriteErr != nil {
+			serviceLog("background persist wal rewrite error volume=%s db=%s err=%v", vol.volume, vol.dbPath, rewriteErr)
 		}
 	}
 	vol.dirty = seeded > 0
