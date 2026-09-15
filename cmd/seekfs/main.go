@@ -170,6 +170,12 @@ const (
 	packedSize64Sentinel        = ^uint32(0)
 )
 
+// overlayCompactionSlotFraction scales the persist watermark for large
+// volumes: a fold becomes due once the pending overlay reaches this fraction
+// of the record count (never below overlayCompactionMaxSlots), so a single
+// busy folder cannot force back-to-back multi-GB folds.
+const overlayCompactionSlotFraction = 32
+
 type Entry struct {
 	Path        string
 	Name        string
@@ -1335,6 +1341,7 @@ func newCompactionVolumeIndex(dbPath string, idx *Index) *serviceVolumeIndex {
 		lastPersist: time.Now(),
 	}
 	if idx.Compact && idx.Source == "usn" {
+		vol.ownedDirFRNs = ownedReplayDirFRNs(idx.Volume)
 		recordCount := idx.compactRecordCount()
 		if len(idx.Derived.FRNs) == recordCount && len(idx.Derived.FRNRecordIDs) == recordCount {
 			vol.frns = idx.Derived.FRNs
@@ -3142,6 +3149,19 @@ type serviceVolumeIndex struct {
 	checkpoint        int64
 	state             string
 	staleReason       string
+	// ownedDirFRNs holds the NTFS file references of directories that hold
+	// seekfs's own artifacts (the seekfs dir and the name-gram spool dir) for
+	// this volume.  USN changes whose ParentFRN is in this set are consumed
+	// without entering the overlay, so the service does not index its own
+	// multi-GB staged writes, WAL, logs, and spill files.  Built once at
+	// volume load and read-only afterwards; a nil map disables the filter.
+	ownedDirFRNs map[uint64]struct{}
+	// ownedDynamicDirFRNs extends ownedDirFRNs with directories created under
+	// owned directories at runtime (the external builder's MkdirTemp scratch
+	// dirs), whose own children must be filtered too.  Guarded by ownedDirMu.
+	ownedDynamicDirFRNs map[uint64]struct{}
+	ownedDirMu          sync.RWMutex
+
 	frnToID           map[uint64]int
 	frns              []uint64
 	frnRecordIDs      []uint32
@@ -4431,6 +4451,7 @@ func newServiceVolumeIndex(dbPath string, idx *Index) *serviceVolumeIndex {
 		lastPersist: time.Now(),
 	}
 	if idx.Compact && idx.Source == "usn" {
+		vol.ownedDirFRNs = ownedReplayDirFRNs(idx.Volume)
 		recordCount := idx.compactRecordCount()
 		largeResident := recordCount >= 1_000_000 || serviceLowMemoryMode()
 		if !largeResident {
@@ -4690,6 +4711,10 @@ func catchUpServiceVolume(vol *serviceVolumeIndex) error {
 		if nextUSN <= vol.checkpoint {
 			break
 		}
+		// seekfs's own artifact churn is dropped before the WAL and the overlay
+		// so the checkpoint can advance past it (nextUSN below) without either
+		// growing from records that are never indexed.
+		changes = vol.filterOwnedReplayChanges(changes)
 		if err := appendWAL(vol.dbPath, nextUSN, changes); err != nil {
 			vol.state = "stale"
 			vol.staleReason = err.Error()
@@ -5070,6 +5095,10 @@ func (s *goSearchService) replayVolumeOnce(vol *serviceVolumeIndex, buffer []byt
 			vol.mu.Unlock()
 			return applied, nil
 		}
+		// Filter after the applied checkpoint is derived from the full batch:
+		// the checkpoint must still cover the truncated tail (see above), while
+		// seekfs's own artifact churn must not reach the WAL or the overlay.
+		changes = vol.filterOwnedReplayChanges(changes)
 		if err := appendWAL(vol.dbPath, appliedCheckpoint, changes); err != nil {
 			vol.state = "stale"
 			vol.staleReason = err.Error()
@@ -5279,13 +5308,36 @@ func (s *goSearchService) persistVolumeIfDue(vol *serviceVolumeIndex, force bool
 	}
 }
 
+// overlayCompactionSlotLimit returns the overlay watermark at which a persist
+// becomes due.  The fixed floor of overlayCompactionMaxSlots keeps small
+// volumes responsive, but a fixed slot count on a large volume means a single
+// busy folder (a build tree, node_modules, or a spool) can make the pending
+// delta a large fraction of the record set and trigger back-to-back multi-GB
+// folds.  Scaling the limit to a fraction of the record count keeps the fold
+// cost proportionate to the index: the pending overlay stays a few percent of
+// the records, and the WAL/tombstone/age triggers still bound latency.
+func (vol *serviceVolumeIndex) overlayCompactionSlotLimit() int {
+	if vol == nil || vol.index == nil {
+		return overlayCompactionMaxSlots
+	}
+	return overlayCompactionSlotLimitFor(vol.index.compactRecordCount())
+}
+
+func overlayCompactionSlotLimitFor(recordCount int) int {
+	limit := overlayCompactionMaxSlots
+	if scaled := recordCount / overlayCompactionSlotFraction; scaled > limit {
+		limit = scaled
+	}
+	return limit
+}
+
 func (vol *serviceVolumeIndex) compactionDue(now time.Time) bool {
 	if vol == nil {
 		return false
 	}
 	if vol.overlay != nil {
 		watermark := int(vol.overlay.watermark.Load())
-		if watermark >= overlayCompactionMaxSlots {
+		if watermark >= vol.overlayCompactionSlotLimit() {
 			return true
 		}
 		baseCount := 0
@@ -5883,6 +5935,20 @@ func (vol *serviceVolumeIndex) applyUSNChanges(changes []usnChange) {
 		if change.FRN == 0 {
 			continue
 		}
+		// Changes inside directories that hold seekfs's own artifacts (the
+		// seekfs dir, the name-gram spool, and the builder's random scratch
+		// dirs) are consumed without entering the overlay.  The offline walk
+		// refuses those directories too, and replaying their churn used to
+		// inflate the overlay watermark until a persist was due the moment the
+		// previous one finished.  The checkpoint still advances (below and in
+		// every caller) so replay never re-reads the skipped records, and the
+		// WAL keeps the full stream so checkpoints stay derivable.
+		if vol.consumeOwnedReplayChange(change) {
+			if change.USN > vol.checkpoint {
+				vol.checkpoint = change.USN
+			}
+			continue
+		}
 		vol.recordOverlayChange(change, i == lastChange[change.FRN] && change.Reason&usnReasonNeedsInfoRefresh != 0)
 		if change.USN > vol.checkpoint {
 			vol.checkpoint = change.USN
@@ -5892,6 +5958,111 @@ func (vol *serviceVolumeIndex) applyUSNChanges(changes []usnChange) {
 	vol.dirty = true
 	vol.publishDirSizeDelta()
 	vol.publishSnapshot()
+}
+
+// filterOwnedReplayChanges drops changes that fall inside directories holding
+// seekfs's own artifacts.  Applying it before the WAL append and the overlay
+// apply keeps the multi-GB staged index, the service log, and the external
+// builder's spill files out of both, so their churn can no longer fill the WAL
+// or inflate the overlay watermark until a persist is due the moment the
+// previous one finished.  The checkpoint is advanced past the dropped records
+// by the caller, so replay never re-reads them.  Callers must derive any
+// checkpoint from the unfiltered batch first.  The returned slice may alias
+// changes.
+func (vol *serviceVolumeIndex) filterOwnedReplayChanges(changes []usnChange) []usnChange {
+	if vol == nil || len(changes) == 0 {
+		return changes
+	}
+	if len(vol.ownedDirFRNs) == 0 && !vol.hasDynamicOwnedDirs() {
+		return changes
+	}
+	kept := changes[:0]
+	for _, change := range changes {
+		if vol.consumeOwnedReplayChange(change) {
+			continue
+		}
+		kept = append(kept, change)
+	}
+	return kept
+}
+
+// consumeOwnedReplayChange reports whether a USN change belongs inside a
+// directory that holds seekfs's own artifacts and must not be indexed.  It also
+// maintains the dynamic owned-dir set: a directory created under an owned
+// directory (the external builder's MkdirTemp scratch dirs) joins the set so
+// its children are filtered, and a directory that is removed or moved out
+// retires so a reused reference cannot hide real files.  A nil or empty owned
+// set keeps this to a map lookup, so volumes without artifacts on them (any
+// volume other than the one holding the seekfs dir) are unaffected.
+func (vol *serviceVolumeIndex) consumeOwnedReplayChange(change usnChange) bool {
+	if vol == nil || change.FRN == 0 {
+		return false
+	}
+	if vol.ownedReplayParent(change.ParentFRN) {
+		vol.noteOwnedChildDir(change)
+		return true
+	}
+	if vol.hasDynamicOwnedDirs() {
+		vol.retireOwnedDir(change.FRN)
+	}
+	return false
+}
+
+// ownedReplayParent reports whether parent is an owned artifact directory.
+// The static set is built once at load and never mutated, so it is read
+// without the lock; only the dynamic set needs synchronization.
+func (vol *serviceVolumeIndex) ownedReplayParent(parent uint64) bool {
+	if parent == 0 {
+		return false
+	}
+	if _, ok := vol.ownedDirFRNs[parent]; ok {
+		return true
+	}
+	vol.ownedDirMu.RLock()
+	_, ok := vol.ownedDynamicDirFRNs[parent]
+	vol.ownedDirMu.RUnlock()
+	return ok
+}
+
+func (vol *serviceVolumeIndex) hasDynamicOwnedDirs() bool {
+	vol.ownedDirMu.RLock()
+	defer vol.ownedDirMu.RUnlock()
+	return len(vol.ownedDynamicDirFRNs) > 0
+}
+
+// noteOwnedChildDir tracks a directory created or removed directly under an
+// owned directory.  A create/rename-in adds its reference; a delete or
+// rename-out retires it.  Non-directory changes and plain deletes of files are
+// no-ops.
+func (vol *serviceVolumeIndex) noteOwnedChildDir(change usnChange) {
+	if change.Attr&fileAttributeDir == 0 {
+		return
+	}
+	created := change.Reason&(usnReasonFileCreate|usnReasonRenameNew) != 0
+	removed := change.Reason&usnReasonFileDelete != 0 ||
+		change.Reason&usnReasonRenameOld != 0 && change.Reason&usnReasonRenameNew == 0
+	if !created && !removed {
+		return
+	}
+	vol.ownedDirMu.Lock()
+	defer vol.ownedDirMu.Unlock()
+	if created {
+		if vol.ownedDynamicDirFRNs == nil {
+			vol.ownedDynamicDirFRNs = make(map[uint64]struct{})
+		}
+		vol.ownedDynamicDirFRNs[change.FRN] = struct{}{}
+		return
+	}
+	delete(vol.ownedDynamicDirFRNs, change.FRN)
+}
+
+// retireOwnedDir drops frn from the dynamic set.  Called for changes whose
+// parent is not owned: a tracked directory that now lives outside the owned
+// tree (or whose reference was reused) must stop filtering its children.
+func (vol *serviceVolumeIndex) retireOwnedDir(frn uint64) {
+	vol.ownedDirMu.Lock()
+	delete(vol.ownedDynamicDirFRNs, frn)
+	vol.ownedDirMu.Unlock()
 }
 
 func (vol *serviceVolumeIndex) recordOverlayChange(change usnChange, refreshInfo bool) {
@@ -21105,6 +21276,114 @@ func seekFSExclusionDirsUnder(sourceRoot string) []string {
 func defaultIndexDir() string {
 	return filepath.Join(defaultSeekFSDir(), "indexes")
 }
+
+// ntfsFileReference returns the NTFS file reference for an existing file or
+// directory, in the same form the USN journal reports as FRN/ParentFRN: the
+// 48-bit MFT record number with the 16-bit sequence stripped (see
+// fileReferenceRecordNumber).  Opening with no requested access plus
+// FILE_FLAG_BACKUP_SEMANTICS works for directories and needs no privilege; the
+// id comes from FileIdInfo, whose FILE_ID_128 carries the 64-bit MFT reference
+// in its first 8 bytes on NTFS.  FILE_ID_INFO is not exported by x/sys, so it
+// is declared locally.
+type fileIDInfo struct {
+	VolumeSerialNumber uint64
+	FileID             [16]byte
+}
+
+// fileReferenceFromFileID converts a FileIdInfo FILE_ID_128 to the journal's
+// FRN form.  The sequence number MUST be stripped: the journal parser applies
+// fileReferenceRecordNumber to every record it reads, so an unmasked reference
+// would never equal a ParentFRN and the owned-dir filter would silently match
+// nothing (verified against a real index: C:\ProgramData is FRN 31305).
+func fileReferenceFromFileID(fileID [16]byte) uint64 {
+	return fileReferenceRecordNumber(binary.LittleEndian.Uint64(fileID[:8]))
+}
+
+func ntfsFileReference(path string) (uint64, error) {
+	pathPtr, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return 0, err
+	}
+	handle, err := windows.CreateFile(pathPtr, 0,
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
+		nil, windows.OPEN_EXISTING, windows.FILE_FLAG_BACKUP_SEMANTICS, 0)
+	if err != nil {
+		return 0, err
+	}
+	defer windows.CloseHandle(handle)
+	var info fileIDInfo
+	if err := windows.GetFileInformationByHandleEx(handle, windows.FileIdInfo,
+		(*byte)(unsafe.Pointer(&info)), uint32(unsafe.Sizeof(info))); err != nil {
+		return 0, err
+	}
+	return fileReferenceFromFileID(info.FileID), nil
+}
+
+const (
+	ownedDirWalkMaxDepth = 6
+	ownedDirWalkMaxDirs  = 4096
+)
+
+// ownedReplayDirFRNs collects the NTFS directory references that hold seekfs's
+// own artifacts for an indexed volume: the configured and default seekfs dirs
+// (which the offline walk already refuses to index) plus the name-gram spool
+// dir, each including their descendant directories.  Only directories are
+// collected, and USN records carry ParentFRN, so a single set check filters
+// every artifact change without path reconstruction.  Called once when the
+// volume is loaded; a directory that appears later under an owned directory
+// (the builder's random scratch dirs) is picked up by the dynamic set instead.
+// A reference is resolved from its live path, so a directory that no longer
+// exists contributes nothing.
+func ownedReplayDirFRNs(volume string) map[uint64]struct{} {
+	vol := normalizeVolume(volume)
+	if len(vol) != 2 || vol[1] != ':' {
+		return nil
+	}
+	root := vol + "\\"
+	canonicalRoot, err := directV9CanonicalPath(root)
+	if err != nil {
+		return nil
+	}
+	dirs := seekFSExclusionDirsUnder(canonicalRoot)
+	spool := nameGramSpoolDir()
+	if canonical, spoolErr := directV9CanonicalPath(spool); spoolErr == nil &&
+		directV9PathUnderAny(canonical, []string{canonicalRoot}) {
+		dirs = append(dirs, canonical)
+	}
+	out := make(map[uint64]struct{})
+	for _, dir := range dirs {
+		collectOwnedDirFRNs(dir, out, 0)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func collectOwnedDirFRNs(dir string, out map[uint64]struct{}, depth int) {
+	if depth > ownedDirWalkMaxDepth || len(out) >= ownedDirWalkMaxDirs {
+		return
+	}
+	frn, err := ntfsFileReference(dir)
+	if err != nil {
+		return
+	}
+	out[frn] = struct{}{}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		if len(out) >= ownedDirWalkMaxDirs {
+			return
+		}
+		collectOwnedDirFRNs(filepath.Join(dir, entry.Name()), out, depth+1)
+	}
+}
+
 
 func defaultVolumeDB(indexDir, volume string) string {
 	letter := strings.ToLower(strings.TrimSuffix(strings.TrimRight(volume, `\`), ":"))
