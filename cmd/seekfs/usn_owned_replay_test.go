@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/binary"
 	"os"
 	"path/filepath"
 	"testing"
@@ -126,6 +127,30 @@ func TestOverlayCompactionSlotLimitScalesWithRecords(t *testing.T) {
 	records := overlayCompactionMaxSlots * overlayCompactionSlotFraction * 2
 	if got, want := overlayCompactionSlotLimitFor(records), records/overlayCompactionSlotFraction; got != want {
 		t.Fatalf("large index limit = %d, want %d", got, want)
+	}
+}
+
+// The FileIdInfo value carries the MFT sequence number in its high 16 bits,
+// while the journal (and every FRN in the index) uses the bare 48-bit MFT
+// record number.  An unmasked reference never equals a ParentFRN, so the whole
+// owned-dir filter would silently match nothing.
+func TestFileReferenceFromFileIDStripsSequence(t *testing.T) {
+	var fileID [16]byte
+	binary.LittleEndian.PutUint64(fileID[:8], 2<<48|31305)
+	if got := fileReferenceFromFileID(fileID); got != 31305 {
+		t.Fatalf("fileReferenceFromFileID = %d, want 31305 (sequence stripped)", got)
+	}
+}
+
+// ntfsFileReference resolves a live directory to that same journal form.
+func TestNtfsFileReferenceMatchesMaskedFileID(t *testing.T) {
+	dir := t.TempDir()
+	frn, err := ntfsFileReference(dir)
+	if err != nil {
+		t.Fatalf("ntfsFileReference(%s): %v", dir, err)
+	}
+	if frn == 0 || frn >= 1<<48 {
+		t.Fatalf("ntfsFileReference(%s) = %d, want a nonzero 48-bit MFT record number", dir, frn)
 	}
 }
 

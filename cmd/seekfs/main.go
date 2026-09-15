@@ -21277,15 +21277,26 @@ func defaultIndexDir() string {
 	return filepath.Join(defaultSeekFSDir(), "indexes")
 }
 
-// ntfsFileReference returns the 64-bit NTFS file reference (the same value the
-// USN journal reports as FRN/ParentFRN) for an existing file or directory.
-// Opening with no requested access plus FILE_FLAG_BACKUP_SEMANTICS works for
-// directories and needs no privilege; the id comes from FileIdInfo, whose
-// FILE_ID_128 carries the 64-bit MFT reference in its first 8 bytes on NTFS.
-// FILE_ID_INFO is not exported by x/sys, so it is declared locally.
+// ntfsFileReference returns the NTFS file reference for an existing file or
+// directory, in the same form the USN journal reports as FRN/ParentFRN: the
+// 48-bit MFT record number with the 16-bit sequence stripped (see
+// fileReferenceRecordNumber).  Opening with no requested access plus
+// FILE_FLAG_BACKUP_SEMANTICS works for directories and needs no privilege; the
+// id comes from FileIdInfo, whose FILE_ID_128 carries the 64-bit MFT reference
+// in its first 8 bytes on NTFS.  FILE_ID_INFO is not exported by x/sys, so it
+// is declared locally.
 type fileIDInfo struct {
 	VolumeSerialNumber uint64
 	FileID             [16]byte
+}
+
+// fileReferenceFromFileID converts a FileIdInfo FILE_ID_128 to the journal's
+// FRN form.  The sequence number MUST be stripped: the journal parser applies
+// fileReferenceRecordNumber to every record it reads, so an unmasked reference
+// would never equal a ParentFRN and the owned-dir filter would silently match
+// nothing (verified against a real index: C:\ProgramData is FRN 31305).
+func fileReferenceFromFileID(fileID [16]byte) uint64 {
+	return fileReferenceRecordNumber(binary.LittleEndian.Uint64(fileID[:8]))
 }
 
 func ntfsFileReference(path string) (uint64, error) {
@@ -21305,7 +21316,7 @@ func ntfsFileReference(path string) (uint64, error) {
 		(*byte)(unsafe.Pointer(&info)), uint32(unsafe.Sizeof(info))); err != nil {
 		return 0, err
 	}
-	return binary.LittleEndian.Uint64(info.FileID[:8]), nil
+	return fileReferenceFromFileID(info.FileID), nil
 }
 
 const (
