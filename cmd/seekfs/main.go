@@ -150,6 +150,10 @@ const (
 	overlayCompactionMaxSlots   = 64 * 1024
 	overlayCompactionMaxWAL     = 64 * 1024 * 1024
 	overlayCompactionTombstoneP = 5
+	// staleTempSweepInterval bounds how often a running service reaps abandoned
+	// index stage temporaries; the sweep itself only removes files older than an
+	// hour, so a live persist is never touched.
+	staleTempSweepInterval = time.Hour
 	// serviceUSNReplayBatchMax bounds the number of USN changes applied in a
 	// single replay iteration.  A large backlog is drained across several
 	// iterations so search requests are never starved by one long apply.
@@ -3123,6 +3127,10 @@ type goSearchService struct {
 	loadErr     string
 	indexMu     sync.RWMutex
 	requestSeq  atomic.Int64
+	// lastTempSweep holds the unix-nano time of the last stale index temp sweep,
+	// so the periodic sweep runs once per interval no matter how many volume
+	// loops call it.
+	lastTempSweep atomic.Int64
 	// remoteAddr, when non-empty, is a loopback address (Mode L) that this
 	// service also listens on with the versioned JSON frame transport.  It is
 	// empty (disabled) by default.
@@ -5138,6 +5146,7 @@ func (s *goSearchService) persistVolumeLoop(vol *serviceVolumeIndex) {
 			s.persistVolumeIfDue(vol, true)
 			return
 		case <-ticker.C:
+			s.sweepStaleIndexTempFilesIfDue(time.Now())
 			s.persistVolumeIfDue(vol, false)
 		}
 	}
@@ -18486,6 +18495,23 @@ func saveIndex(path string, idx *Index) error {
 		return err
 	}
 	return commitStageIndexFile(path, tmp)
+}
+
+// sweepStaleIndexTempFilesIfDue reaps abandoned index stage temporaries at most
+// once per staleTempSweepInterval.  The startup sweep alone never runs again on
+// a long-lived service, so each interrupted persist (killed mid-write, or a
+// failing disk) leaves a multi-GB temp file behind that can fill the drive and
+// then block every later persist, which is how a full disk turns into a
+// permanent persist-failure loop.
+func (s *goSearchService) sweepStaleIndexTempFilesIfDue(now time.Time) {
+	if s == nil || len(s.dbs) == 0 {
+		return
+	}
+	if now.Sub(time.Unix(0, s.lastTempSweep.Load())) < staleTempSweepInterval {
+		return
+	}
+	s.lastTempSweep.Store(now.UnixNano())
+	s.sweepStaleIndexTempFiles()
 }
 
 // sweepStaleIndexTempFiles removes leftover stageIndexFile temporaries for the
