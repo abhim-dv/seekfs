@@ -114,7 +114,11 @@ func nameGramSpoolDir() string {
 	if dir := strings.TrimSpace(os.Getenv("SEEKFS_NAME_GRAM_SPOOL_DIR")); dir != "" {
 		return dir
 	}
-	return os.TempDir()
+	// Default under the seekfs dir rather than the system temp dir.  The seekfs
+	// dir is excluded from indexing, so the many spill and merge scratch dirs a
+	// large build writes here cannot feed the service's own USN churn back into
+	// the overlay and its persist loop.
+	return filepath.Join(defaultSeekFSDir(), "gram-spool")
 }
 
 // buildNameGramIndexExternal returns the selective PNGR index and the optional
@@ -143,6 +147,13 @@ func buildNameGramIndexExternal(ctx context.Context, idx *Index, gramSize, maxPo
 		return pngr, nil, nil
 	}
 
+	// The scratch root is not necessarily pre-existing (the default spool lives
+	// under the seekfs dir), and MkdirTemp requires it to exist.
+	if scratchDir != "" {
+		if err := os.MkdirAll(scratchDir, 0o755); err != nil {
+			return nil, nil, err
+		}
+	}
 	owned, err := os.MkdirTemp(scratchDir, "seekfs-name-gram-")
 	if err != nil {
 		return nil, nil, err
