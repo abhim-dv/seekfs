@@ -222,7 +222,7 @@ func (vol *serviceVolumeIndex) completeExtTermTopPosting(term string, limit int,
 				continue
 			}
 			verified++
-			if !vol.nameTrigramCandidateMatches(id, term) {
+			if !vol.nameTrigramCandidateMatches(id, term) || !vol.recordMatchesNonPath(id, rec, pq) {
 				continue
 			}
 			add(id32)
@@ -335,9 +335,11 @@ func (vol *serviceVolumeIndex) completeFilenameRankedPosting(term string, limit 
 				continue
 			}
 			verified++
-			if vol.nameTrigramCandidateMatches(id, term) {
-				add(id32)
+			rec := vol.index.compactRecord(id)
+			if rec.Deleted || !vol.recordMatchesNonPath(id, rec, pq) {
+				continue
 			}
+			add(id32)
 		}
 	}
 	out := make([]int, len(h))
@@ -603,6 +605,11 @@ func (vol *serviceVolumeIndex) completeMultiTermNameGramCandidates(terms []strin
 // It retains only one decoded posting block at a time.
 func (vol *serviceVolumeIndex) completeFilenameCountPosting(term string, pq parsedQuery) (int, bool) {
 	if vol == nil || vol.index == nil || len(vol.recentIDs) > 0 {
+		return 0, false
+	}
+	// The posting intersection counts name matches only; scalar predicates
+	// must be verified per record, so those counts stay on the exact path.
+	if len(pq.SizeFilters) > 0 || len(pq.DateFilters) > 0 {
 		return 0, false
 	}
 	its, counts, exactZero, complete := completeSelfNameGramIterators(vol.index, term)

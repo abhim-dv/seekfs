@@ -12,7 +12,7 @@ func globalNameQuerySupported(pq parsedQuery) bool {
 		pq.Type == "" && pq.Under == "" && !pq.Exists && !pq.HasModAfter &&
 		len(pq.Dirs) == 0 &&
 		len(pq.Regexps) == 0 && len(pq.RegexTerms) == 0 && len(pq.Parents) == 0 &&
-		len(pq.SizeFilters) == 0 && len(pq.DateFilters) == 0 && len(pq.AttrFilters) == 0 &&
+		len(pq.AttrFilters) == 0 &&
 		len(pq.OrGroups) == 0 && len(pq.NotGroups) == 0 && pq.CWDBias == "" && pq.RootBias == ""
 }
 
@@ -63,7 +63,8 @@ func countServiceVolumesGlobalNameSnapshot(snapshot globalQuerySnapshot, opts qu
 	if !globalNameQuerySupported(pq) {
 		return 0, false, nil
 	}
-	if countNonVolumeTerms(pq.Terms) == 1 && !globalSnapshotsHaveHidden(snapshot.overlays) {
+	if countNonVolumeTerms(pq.Terms) == 1 && len(pq.SizeFilters) == 0 && len(pq.DateFilters) == 0 &&
+		!globalSnapshotsHaveHidden(snapshot.overlays) {
 		count := 0
 		completeSource := true
 		usedPNGC := false

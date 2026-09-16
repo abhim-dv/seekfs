@@ -387,6 +387,56 @@ func globalNameTestVolumes(withTrigrams bool) []*serviceVolumeIndex {
 	}
 }
 
+// TestGlobalNamePlannerAppliesSizeFilter covers the name+scalar shape: the
+// filename trigram planner drives candidate generation and the size predicate
+// is verified per record (ranked-posting lane), so a name match below the
+// threshold is never returned and the excluded record never inflates counts.
+func TestGlobalNamePlannerAppliesSizeFilter(t *testing.T) {
+	const mb = int64(1024 * 1024)
+	makeVolume := func(volume string, recs []CompactRecord) *serviceVolumeIndex {
+		records := []CompactRecord{{FRN: 1, ParentFRN: 1, Parent: -1, Name: ".", Mode: uint32(os.ModeDir)}}
+		records = append(records, recs...)
+		idx := &Index{Source: "usn", Volume: volume, Compact: true, Records: records}
+		buildOrders(idx)
+		vol := newServiceVolumeIndex(volume+"-sizefilter.gsi", idx)
+		vol.rebuildNameTrigramsLocked()
+		return vol
+	}
+	volumes := []*serviceVolumeIndex{
+		makeVolume("C:", []CompactRecord{
+			{FRN: 2, ParentFRN: 1, Parent: 0, Name: "big.pdf", Size: 200 * mb},
+			{FRN: 3, ParentFRN: 1, Parent: 0, Name: "small.pdf", Size: 10 * mb},
+		}),
+		makeVolume("F:", []CompactRecord{
+			{FRN: 4, ParentFRN: 1, Parent: 0, Name: "huge.pdf", Size: 3 * 1024 * mb},
+			{FRN: 5, ParentFRN: 1, Parent: 0, Name: "big.txt", Size: 500 * mb},
+		}),
+	}
+	trace := &searchTrace{}
+	got, err := searchServiceVolumes(volumes, queryOptions{Query: ".pdf size:>100mb", Limit: 20, Trace: trace}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{`C:\big.pdf`, `F:\huge.pdf`}
+	if paths := pathsOf(got); !slices.Equal(paths, want) {
+		t.Fatalf("paths = %v, want %v", paths, want)
+	}
+	if trace.PlannerMode != "global-name" {
+		t.Fatalf("planner mode = %q, want global-name", trace.PlannerMode)
+	}
+	count, ok, err := countServiceVolumes(volumes, queryOptions{Query: ".pdf size:>100mb"})
+	if err != nil || !ok || count != 2 {
+		t.Fatalf("count = %d ok=%v err=%v, want 2 true nil", count, ok, err)
+	}
+	under, err := searchServiceVolumes(volumes, queryOptions{Query: ".pdf size:<100mb", Limit: 20}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if paths := pathsOf(under); !slices.Equal(paths, []string{`C:\small.pdf`}) {
+		t.Fatalf("under paths = %v, want [C:\\small.pdf]", paths)
+	}
+}
+
 func traceHasDecline(declines []traceDecline, source, reason string) bool {
 	for _, decline := range declines {
 		if decline.Source == source && decline.Reason == reason {
