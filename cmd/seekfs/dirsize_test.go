@@ -8,11 +8,11 @@ import (
 	"time"
 )
 
-// TestDirectV9DirectorySubtreeBytes builds a small tree with known file sizes
+// TestDirectDirectorySubtreeBytes builds a small tree with known file sizes
 // and checks the persisted recursive directory sizes, both through the decoded
 // derived section and through the Entry a search would report.
-func TestDirectV9DirectorySubtreeBytes(t *testing.T) {
-	records := []directV9Record{
+func TestDirectDirectorySubtreeBytes(t *testing.T) {
+	records := []directRecord{
 		{FRN: 1, ParentFRN: 0, Mode: uint32(os.ModeDir), Name: "root"},
 		{FRN: 2, ParentFRN: 1, Mode: uint32(os.ModeDir), Name: "A"},
 		{FRN: 3, ParentFRN: 2, Mode: uint32(os.ModeDir), Name: "B"},
@@ -24,14 +24,14 @@ func TestDirectV9DirectorySubtreeBytes(t *testing.T) {
 	}
 	dir := t.TempDir()
 	path := filepath.Join(dir, "dirsizes.gsi")
-	if _, err := buildDirectV9(context.Background(), directV9BuildOptions{
+	if _, err := buildDirect(context.Background(), directBuildOptions{
 		OutputPath: path,
 		SpoolDir:   filepath.Join(dir, "spool"),
 		Roots:      []string{"X:\\"},
 		Volume:     "X:",
 		Source:     "direct-test",
 		BuiltAt:    time.Unix(123, 0),
-		Records:    newDirectV9SliceSource(records),
+		Records:    newDirectSliceSource(records),
 		RunRecords: 4,
 		RunBytes:   4096,
 	}); err != nil {
@@ -86,7 +86,7 @@ func TestDirectV9DirectorySubtreeBytes(t *testing.T) {
 // so a small file sorts before a large file and both before a large directory.
 func TestEntrySizeRankOrdersByDirectoryAggregate(t *testing.T) {
 	idx := &Index{
-		Version: indexVersionV9,
+		Version: indexVersion,
 		Compact: true,
 		Volume:  "C:",
 		Records: []CompactRecord{

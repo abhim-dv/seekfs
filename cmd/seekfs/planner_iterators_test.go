@@ -117,7 +117,7 @@ func TestGlobalSubtreeIntervalIteratorUsesSubtreeMetadata(t *testing.T) {
 
 func TestMappedComponentCoverageMergesNestedRootsAndHiddenSelfHits(t *testing.T) {
 	idx := &Index{
-		Version: indexVersionV9, Source: "usn", Volume: "C:", Compact: true,
+		Version: indexVersion, Source: "usn", Volume: "C:", Compact: true,
 		Records: []CompactRecord{
 			{FRN: 1, ParentFRN: 1, Parent: -1, Name: ".", Mode: uint32(os.ModeDir)},
 			{FRN: 2, ParentFRN: 1, Parent: 0, Name: "needle", Mode: uint32(os.ModeDir)},
@@ -151,7 +151,7 @@ func TestMappedComponentCoverageMergesNestedRootsAndHiddenSelfHits(t *testing.T)
 
 func TestMappedComponentSubstringCoverageUsesCompletePCMPDictionary(t *testing.T) {
 	idx := &Index{
-		Version: indexVersionV9, Source: "usn", Volume: "C:", Compact: true,
+		Version: indexVersion, Source: "usn", Volume: "C:", Compact: true,
 		Records: []CompactRecord{
 			{FRN: 1, ParentFRN: 1, Parent: -1, Name: ".", Mode: uint32(os.ModeDir)},
 			{FRN: 2, ParentFRN: 1, Parent: 0, Name: "Windows", Mode: uint32(os.ModeDir)},
@@ -295,11 +295,11 @@ func TestR5HolisticPlannerGeneratedCoverageMatrix(t *testing.T) {
 			baseF := cloneCompactIndex(baseC)
 			baseF.Volume, baseF.Roots = "F:", []string{`F:\`}
 			if tc.volume == "mixed-v8" {
-				baseF.Version = indexVersionV9
+				baseF.Version = indexVersion
 				baseF.Derived = indexDerivedSections{}
 			}
 			if tc.volume == "missing-derived" {
-				baseF.Version = indexVersionV9
+				baseF.Version = indexVersion
 				baseF.Derived = indexDerivedSections{}
 			}
 			volC := newServiceVolumeIndex(fmt.Sprintf("r5-matrix-c-%d.gsi", i), baseC)
@@ -416,7 +416,7 @@ func TestR5GeneratedOverlayCoverageMatrix(t *testing.T) {
 	for _, state := range states {
 		state := state
 		t.Run(state.name, func(t *testing.T) {
-			vol := engineV9OverlaySearchTestVolume(t)
+			vol := engineOverlaySearchTestVolume(t)
 			logical := make(map[uint64]CompactRecord, vol.index.compactRecordCount())
 			for i := 0; i < vol.index.compactRecordCount(); i++ {
 				rec := vol.index.compactRecord(i)
@@ -480,7 +480,7 @@ func TestR5RequiredAdversarialCoverageMatrix(t *testing.T) {
 	buildOrders(baseC)
 	baseF := cloneCompactIndex(baseC)
 	baseF.Volume, baseF.Roots = "F:", []string{`F:\`}
-	baseF.Version, baseF.Derived = indexVersionV9, indexDerivedSections{}
+	baseF.Version, baseF.Derived = indexVersion, indexDerivedSections{}
 	volC := newServiceVolumeIndex("r5-adversarial-c.gsi", baseC)
 	volF := newServiceVolumeIndex("r5-adversarial-f-v8.gsi", baseF)
 
@@ -566,7 +566,7 @@ func TestR5RequiredAdversarialCoverageMatrix(t *testing.T) {
 func TestMappedComponentTopUsesDescendantRankBounds(t *testing.T) {
 	const roots = 2048
 	idx := &Index{
-		Version: indexVersionV9, Source: "usn", Volume: "C:", Compact: true,
+		Version: indexVersion, Source: "usn", Volume: "C:", Compact: true,
 		Roots: []string{`C:\`}, Records: make([]CompactRecord, 0, 1+roots*3),
 	}
 	idx.Records = append(idx.Records, CompactRecord{FRN: 1, ParentFRN: 1, Parent: -1, Name: ".", Mode: uint32(os.ModeDir)})

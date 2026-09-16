@@ -14,7 +14,7 @@ import (
 	"strings"
 )
 
-func directV9ScanNames(finalPath, tokenPath string) (int64, int, error) {
+func directScanNames(finalPath, tokenPath string) (int64, int, error) {
 	f, err := os.Open(finalPath)
 	if err != nil {
 		return 0, 0, err
@@ -34,7 +34,7 @@ func directV9ScanNames(finalPath, tokenPath string) (int64, int, error) {
 	var offset uint64
 	var count int
 	for {
-		rec, readErr := readDirectV9SpoolRecord(r)
+		rec, readErr := readDirectSpoolRecord(r)
 		if errors.Is(readErr, io.EOF) {
 			break
 		}
@@ -42,7 +42,7 @@ func directV9ScanNames(finalPath, tokenPath string) (int64, int, error) {
 			return 0, 0, readErr
 		}
 		if len(rec.Name) > int(^uint16(0)) || offset > uint64(^uint32(0))-uint64(len(rec.Name)) {
-			return 0, 0, errors.New("direct v9 name table exceeds on-disk limits")
+			return 0, 0, errors.New("direct name table exceeds on-disk limits")
 		}
 		if tokenWriter != nil {
 			var entry [6]byte
@@ -64,34 +64,34 @@ func directV9ScanNames(finalPath, tokenPath string) (int64, int, error) {
 	return int64(offset), count, nil
 }
 
-func directV9FoldName(rec directV9Record) string { return strings.ToLower(rec.Name) }
+func directFoldName(rec directRecord) string { return strings.ToLower(rec.Name) }
 
-func directV9SignedOrderKey(value int64) string {
+func directSignedOrderKey(value int64) string {
 	var b [8]byte
 	u := uint64(value) ^ (uint64(1) << 63)
 	binary.BigEndian.PutUint64(b[:], u)
 	return string(b[:])
 }
 
-func directV9LowerExt(rec directV9Record) string {
+func directLowerExt(rec directRecord) string {
 	ext := strings.TrimPrefix(filepath.Ext(rec.Name), ".")
 	return strings.ToLower(ext)
 }
 
-func directV9LowerPath(rec directV9Record) string {
+func directLowerPath(rec directRecord) string {
 	if rec.Path != "" {
 		return strings.ToLower(filepath.Clean(rec.Path))
 	}
 	return strings.ToLower(rec.Name)
 }
 
-func directV9RankSpecs() []directV9RankSpec {
-	return []directV9RankSpec{
-		{Tag: indexSectionRANK, Name: "RANK", Key: directV9FoldName},
-		{Tag: indexSectionSRNK, Name: "SRNK", Key: func(rec directV9Record) string {
-			return directV9SignedOrderKey(rec.Size) + "\x00" + strings.ToLower(rec.Name)
+func directRankSpecs() []directRankSpec {
+	return []directRankSpec{
+		{Tag: indexSectionRANK, Name: "RANK", Key: directFoldName},
+		{Tag: indexSectionSRNK, Name: "SRNK", Key: func(rec directRecord) string {
+			return directSignedOrderKey(rec.Size) + "\x00" + strings.ToLower(rec.Name)
 		}},
-		{Tag: indexSectionMRNK, Name: "MRNK", Key: func(rec directV9Record) string {
+		{Tag: indexSectionMRNK, Name: "MRNK", Key: func(rec directRecord) string {
 			if rec.ModUnix == 0 {
 				return "\x01" + strings.ToLower(rec.Name)
 			}
@@ -100,34 +100,34 @@ func directV9RankSpecs() []directV9RankSpec {
 			binary.BigEndian.PutUint64(b[:], ^u)
 			return "\x00" + string(b[:]) + "\x00" + strings.ToLower(rec.Name)
 		}},
-		{Tag: indexSectionERNK, Name: "ERNK", Key: func(rec directV9Record) string {
-			return directV9LowerExt(rec) + "\x00" + strings.ToLower(rec.Name)
+		{Tag: indexSectionERNK, Name: "ERNK", Key: func(rec directRecord) string {
+			return directLowerExt(rec) + "\x00" + strings.ToLower(rec.Name)
 		}},
-		{Tag: indexSectionTRNK, Name: "TRNK", Key: func(rec directV9Record) string {
+		{Tag: indexSectionTRNK, Name: "TRNK", Key: func(rec directRecord) string {
 			kind := byte(1)
 			if rec.Mode&uint32(os.ModeDir) != 0 {
 				kind = 0
 			}
 			return string([]byte{kind}) + "\x00" + strings.ToLower(rec.Name)
 		}},
-		{Tag: indexSectionPRNK, Name: "PRNK", Key: func(rec directV9Record) string {
-			return directV9LowerPath(rec)
+		{Tag: indexSectionPRNK, Name: "PRNK", Key: func(rec directRecord) string {
+			return directLowerPath(rec)
 		}},
 	}
 }
 
-func directV9BuildRankRuns(ctx context.Context, finalPath, spoolDir string, maxRecords int, spec directV9RankSpec, owned *[]string) ([]directV9RunFile, int, int64, error) {
+func directBuildRankRuns(ctx context.Context, finalPath, spoolDir string, maxRecords int, spec directRankSpec, owned *[]string) ([]directRunFile, int, int64, error) {
 	f, err := os.Open(finalPath)
 	if err != nil {
 		return nil, 0, 0, err
 	}
 	defer f.Close()
 	if maxRecords <= 0 {
-		maxRecords = directV9DefaultRunRecords
+		maxRecords = directDefaultRunRecords
 	}
 	r := bufio.NewReaderSize(f, 256*1024)
-	chunk := make([]directV9RankItem, 0, min(maxRecords, 4096))
-	var runs []directV9RunFile
+	chunk := make([]directRankItem, 0, min(maxRecords, 4096))
+	var runs []directRunFile
 	flush := func() error {
 		if len(chunk) == 0 {
 			return nil
@@ -138,7 +138,7 @@ func directV9BuildRankRuns(ctx context.Context, finalPath, spoolDir string, maxR
 			}
 			return chunk[i].ID < chunk[j].ID
 		})
-		path := filepath.Join(spoolDir, fmt.Sprintf("direct-v9-rank-%s-%06d.tmp", spec.Name, len(runs)))
+		path := filepath.Join(spoolDir, fmt.Sprintf("direct-rank-%s-%06d.tmp", spec.Name, len(runs)))
 		run, err := os.Create(path)
 		if err != nil {
 			return err
@@ -155,7 +155,7 @@ func directV9BuildRankRuns(ctx context.Context, finalPath, spoolDir string, maxR
 			bytesWritten += 4
 			if uint64(len(item.Key)) > uint64(^uint32(0)) {
 				_ = run.Close()
-				return errors.New("direct v9 rank key too large")
+				return errors.New("direct rank key too large")
 			}
 			var n [4]byte
 			binary.LittleEndian.PutUint32(n[:], uint32(len(item.Key)))
@@ -177,8 +177,8 @@ func directV9BuildRankRuns(ctx context.Context, finalPath, spoolDir string, maxR
 			return err
 		}
 		*owned = append(*owned, path)
-		runs = append(runs, directV9RunFile{path: path, bytes: bytesWritten})
-		chunk = make([]directV9RankItem, 0, min(maxRecords, 4096))
+		runs = append(runs, directRunFile{path: path, bytes: bytesWritten})
+		chunk = make([]directRankItem, 0, min(maxRecords, 4096))
 		return nil
 	}
 	var id uint32
@@ -189,7 +189,7 @@ func directV9BuildRankRuns(ctx context.Context, finalPath, spoolDir string, maxR
 			return nil, 0, 0, ctx.Err()
 		default:
 		}
-		rec, readErr := readDirectV9SpoolRecord(r)
+		rec, readErr := readDirectSpoolRecord(r)
 		if errors.Is(readErr, io.EOF) {
 			if err := flush(); err != nil {
 				return nil, 0, 0, err
@@ -204,7 +204,7 @@ func directV9BuildRankRuns(ctx context.Context, finalPath, spoolDir string, maxR
 			return nil, 0, 0, readErr
 		}
 		if !rec.Deleted() {
-			chunk = append(chunk, directV9RankItem{Key: spec.Key(rec), ID: id})
+			chunk = append(chunk, directRankItem{Key: spec.Key(rec), ID: id})
 			count++
 		}
 		id++
@@ -216,37 +216,37 @@ func directV9BuildRankRuns(ctx context.Context, finalPath, spoolDir string, maxR
 	}
 }
 
-// directV9Record has no deletion field in the first direct slice.  Keeping
+// directRecord has no deletion field in the first direct slice.  Keeping
 // this method makes the rank writer's contract explicit for the next source
 // slice, which will carry tombstones from USN/MFT.
-func (r directV9Record) Deleted() bool { return false }
+func (r directRecord) Deleted() bool { return false }
 
-func directV9ReadRankItem(r *bufio.Reader) (directV9RankItem, error) {
+func directReadRankItem(r *bufio.Reader) (directRankItem, error) {
 	var idBytes [4]byte
 	if _, err := io.ReadFull(r, idBytes[:]); err != nil {
-		return directV9RankItem{}, err
+		return directRankItem{}, err
 	}
 	var lenBytes [4]byte
 	if _, err := io.ReadFull(r, lenBytes[:]); err != nil {
-		return directV9RankItem{}, err
+		return directRankItem{}, err
 	}
 	keyLen := binary.LittleEndian.Uint32(lenBytes[:])
 	if uint64(keyLen) > uint64(^uint(0)>>1) {
-		return directV9RankItem{}, errors.New("direct v9 rank key too large")
+		return directRankItem{}, errors.New("direct rank key too large")
 	}
 	key := make([]byte, int(keyLen))
 	if _, err := io.ReadFull(r, key); err != nil {
-		return directV9RankItem{}, err
+		return directRankItem{}, err
 	}
-	return directV9RankItem{ID: binary.LittleEndian.Uint32(idBytes[:]), Key: string(key)}, nil
+	return directRankItem{ID: binary.LittleEndian.Uint32(idBytes[:]), Key: string(key)}, nil
 }
 
-// directV9ComputeRankFamily merges one rank family's external-sort runs into
+// directComputeRankFamily merges one rank family's external-sort runs into
 // its section bytes plus a rank-by-id array, writing both to private temp
 // files.  It is safe to run for multiple families concurrently: each family
 // touches only its own runs and its own temp paths, and the output file order
 // is preserved by the caller's serial emission phase.
-func directV9ComputeRankFamily(ctx context.Context, tag uint32, runs []directV9RunFile, recordCount, liveCount int, sectionPath, rankPath string, owned *[]string) (int64, error) {
+func directComputeRankFamily(ctx context.Context, tag uint32, runs []directRunFile, recordCount, liveCount int, sectionPath, rankPath string, owned *[]string) (int64, error) {
 	section, err := os.Create(sectionPath)
 	if err != nil {
 		return 0, err
@@ -266,7 +266,7 @@ func directV9ComputeRankFamily(ctx context.Context, tag uint32, runs []directV9R
 	ranks := make([]byte, recordCount*4)
 	readers := make([]*bufio.Reader, len(runs))
 	files := make([]*os.File, len(runs))
-	h := &directV9RankHeap{}
+	h := &directRankHeap{}
 	heap.Init(h)
 	for i, run := range runs {
 		f, openErr := os.Open(run.path)
@@ -276,7 +276,7 @@ func directV9ComputeRankFamily(ctx context.Context, tag uint32, runs []directV9R
 		}
 		files[i] = f
 		readers[i] = bufio.NewReaderSize(f, 256*1024)
-		item, readErr := directV9ReadRankItem(readers[i])
+		item, readErr := directReadRankItem(readers[i])
 		if readErr == nil {
 			heap.Push(h, itemWithRun{item: item, run: i})
 		} else if !errors.Is(readErr, io.EOF) {
@@ -303,7 +303,7 @@ func directV9ComputeRankFamily(ctx context.Context, tag uint32, runs []directV9R
 		}
 		written += 4
 		binary.LittleEndian.PutUint32(ranks[head.item.ID*4:head.item.ID*4+4], uint32(rank))
-		next, readErr := directV9ReadRankItem(readers[head.run])
+		next, readErr := directReadRankItem(readers[head.run])
 		if readErr == nil {
 			heap.Push(h, itemWithRun{item: next, run: head.run})
 		} else if !errors.Is(readErr, io.EOF) {
@@ -346,9 +346,9 @@ func directV9ComputeRankFamily(ctx context.Context, tag uint32, runs []directV9R
 	return written, nil
 }
 
-// directV9EmitRankSection streams a computed rank-family section into the
+// directEmitRankSection streams a computed rank-family section into the
 // output writer with alignment, preserving the section byte layout exactly.
-func directV9EmitRankSection(cw *countingWriter, tag uint32, sectionPath string) (indexSectionTableEntry, error) {
+func directEmitRankSection(cw *countingWriter, tag uint32, sectionPath string) (indexSectionTableEntry, error) {
 	if err := writeAlignment(cw, 8); err != nil {
 		return indexSectionTableEntry{}, err
 	}
@@ -360,7 +360,7 @@ func directV9EmitRankSection(cw *countingWriter, tag uint32, sectionPath string)
 }
 
 type itemWithRun struct {
-	item directV9RankItem
+	item directRankItem
 	run  int
 }
 

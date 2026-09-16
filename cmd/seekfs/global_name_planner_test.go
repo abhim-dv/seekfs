@@ -119,7 +119,7 @@ func TestGlobalNamePlannerMissingTrigramFallsBackGlobally(t *testing.T) {
 }
 
 func TestGlobalNamePlannerBroadTrigramRescuedByCompleteLane(t *testing.T) {
-	t.Setenv("SEEKFS_V9_SELF_NAME_GRAMS", "1")
+	t.Setenv("SEEKFS_SELF_NAME_GRAMS", "1")
 	t.Setenv("SEEKFS_LOW_MEMORY_TRIGRAM_MAX_POSTING", "1")
 	makeVolume := func(volume string) *serviceVolumeIndex {
 		records := []CompactRecord{
@@ -290,7 +290,7 @@ func scopedNamePostingTestVolume(volume string, withPNGC bool) *serviceVolumeInd
 // answered by the multi-term posting-intersection lane instead of falling to
 // the bounded scan.
 func TestMultiTermPNGCIntersection(t *testing.T) {
-	t.Setenv("SEEKFS_V9_SELF_NAME_GRAMS", "1")
+	t.Setenv("SEEKFS_SELF_NAME_GRAMS", "1")
 	t.Setenv("SEEKFS_LOW_MEMORY_TRIGRAM_MAX_POSTING", "1")
 	vol := scopedNamePostingTestVolume("C:", true)
 	// "a-scan" and "scan.raw" both share "scan"; "a-scan.nrrd" and "b-scan.nrrd"
@@ -338,7 +338,7 @@ func TestMultiTermPNGCIntersection(t *testing.T) {
 // NOT include the bounded-scan fallback and the result stays complete for the
 // real two-volume scenario with a common-gram query.
 func TestMultiTermPNGCIntersectionBeatsBoundedScan(t *testing.T) {
-	t.Setenv("SEEKFS_V9_SELF_NAME_GRAMS", "1")
+	t.Setenv("SEEKFS_SELF_NAME_GRAMS", "1")
 	t.Setenv("SEEKFS_LOW_MEMORY_TRIGRAM_MAX_POSTING", "1")
 	cVol := scopedNamePostingTestVolume("C:", true)
 	fVol := scopedNamePostingTestVolume("F:", true)

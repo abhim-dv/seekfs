@@ -18,23 +18,6 @@ import (
 	"time"
 )
 
-func TestPostingRankBoundsDecodeLegacyV9WithoutNameBounds(t *testing.T) {
-	legacy := encodeUint32Section(
-		[]uint32{10, 20},
-		[]uint32{11, 21},
-		[]uint32{12, 22},
-		[]uint32{13, 23},
-		[]uint32{14, 24},
-	)
-	got := decodePostingRankBounds(legacy)
-	if got.BlockCount != 2 || len(got.Name) != 0 || !slices.Equal(got.Path, []uint32{14, 24}) {
-		t.Fatalf("legacy rank bounds = %+v, want five-column bounds without Name", got)
-	}
-	if got.ranksForSort("") != nil {
-		t.Fatalf("legacy default rank bounds = %v, want nil fallback", got.ranksForSort(""))
-	}
-}
-
 func TestPostingRankBoundsRoundTripIncludesDefaultNameOrder(t *testing.T) {
 	want := postingRankBounds{
 		BlockCount: 2,
@@ -54,11 +37,11 @@ func TestPostingRankBoundsRoundTripIncludesDefaultNameOrder(t *testing.T) {
 	}
 }
 
-func TestCompactIndexV9RoundTripKeepsFRNMetadata(t *testing.T) {
+func TestCompactIndexRoundTripKeepsFRNMetadata(t *testing.T) {
 	builtAt := time.Unix(0, 123456789)
 	modified := time.Unix(0, 987654321)
 	idx := &Index{
-		Version:      indexVersionV9,
+		Version:      indexVersion,
 		Roots:        []string{`C:\`},
 		BuiltAt:      builtAt,
 		Source:       "usn",
@@ -100,8 +83,8 @@ func TestCompactIndexV9RoundTripKeepsFRNMetadata(t *testing.T) {
 		t.Fatalf("loadIndex: %v", err)
 	}
 
-	if got.Version != indexVersionV9 {
-		t.Fatalf("Version = %d, want %d", got.Version, indexVersionV9)
+	if got.Version != indexVersion {
+		t.Fatalf("Version = %d, want %d", got.Version, indexVersion)
 	}
 	if got.Source != "usn" || got.Volume != "C:" || got.JournalID != 42 || got.Checkpoint != 99 {
 		t.Fatalf("index metadata was not preserved: %+v", got)
@@ -130,7 +113,7 @@ func TestCompactIndexMMapRoundTripKeepsPathAndMetadata(t *testing.T) {
 	t.Setenv("SEEKFS_MEMORY_MODE", "lowmem")
 	modified := time.Unix(0, 987654321)
 	idx := &Index{
-		Version:      indexVersionV9,
+		Version:      indexVersion,
 		Roots:        []string{`F:\`},
 		BuiltAt:      time.Unix(0, 123456789),
 		Source:       "usn",
@@ -218,9 +201,9 @@ func TestCompactDiskRecordBytesSwitchesToWideAtNarrowLimit(t *testing.T) {
 	}
 }
 
-func TestEngineV9WritesAndLoadsDerivedSections(t *testing.T) {
+func TestEngineWritesAndLoadsDerivedSections(t *testing.T) {
 	idx := &Index{
-		Version:      indexVersionV9,
+		Version:      indexVersion,
 		Roots:        []string{`C:\`},
 		BuiltAt:      time.Unix(0, 123),
 		Source:       "usn",
@@ -246,8 +229,8 @@ func TestEngineV9WritesAndLoadsDerivedSections(t *testing.T) {
 		t.Fatalf("load v9 mmap: %v", err)
 	}
 	defer loaded.MMapRecords.file.close()
-	if loaded.Version != indexVersionV9 {
-		t.Fatalf("version = %d, want %d", loaded.Version, indexVersionV9)
+	if loaded.Version != indexVersion {
+		t.Fatalf("version = %d, want %d", loaded.Version, indexVersion)
 	}
 	if !loaded.compactHasAttrs() {
 		t.Fatal("v9 compact attr capability was not preserved")
@@ -313,10 +296,10 @@ func TestEngineV9WritesAndLoadsDerivedSections(t *testing.T) {
 	}
 }
 
-func TestEngineV9LowmemMappedStartupSkipsResidentPathRebuilds(t *testing.T) {
+func TestEngineLowmemMappedStartupSkipsResidentPathRebuilds(t *testing.T) {
 	t.Setenv("SEEKFS_MEMORY_MODE", "lowmem")
 	idx := &Index{
-		Version: indexVersionV9,
+		Version: indexVersion,
 		Roots:   []string{`C:\`},
 		BuiltAt: time.Unix(0, 789),
 		Source:  "usn",
@@ -444,10 +427,10 @@ func TestEngineV9LowmemMappedStartupSkipsResidentPathRebuilds(t *testing.T) {
 	}
 }
 
-func TestReadIndexV9LoadsDerivedSectionsWithoutMMap(t *testing.T) {
+func TestReadIndexLoadsDerivedSectionsWithoutMMap(t *testing.T) {
 	t.Setenv("SEEKFS_MEMORY_MODE", "")
 	idx := &Index{
-		Version:      indexVersionV9,
+		Version:      indexVersion,
 		Roots:        []string{`F:\`},
 		BuiltAt:      time.Unix(0, 456),
 		Source:       "usn",
@@ -510,10 +493,10 @@ func TestReadIndexV9LoadsDerivedSectionsWithoutMMap(t *testing.T) {
 	}
 }
 
-func TestEngineV9LowmemMappedBoundedScanUsesMappedRankOrder(t *testing.T) {
+func TestEngineLowmemMappedBoundedScanUsesMappedRankOrder(t *testing.T) {
 	t.Setenv("SEEKFS_MEMORY_MODE", "lowmem")
 	idx := &Index{
-		Version: indexVersionV9,
+		Version: indexVersion,
 		Roots:   []string{`C:\`},
 		BuiltAt: time.Unix(0, 790),
 		Source:  "usn",
@@ -560,10 +543,10 @@ func TestEngineV9LowmemMappedBoundedScanUsesMappedRankOrder(t *testing.T) {
 	}
 }
 
-func TestEngineV9MappedExtTopTraceReportsSkippedBlocks(t *testing.T) {
+func TestEngineMappedExtTopTraceReportsSkippedBlocks(t *testing.T) {
 	t.Setenv("SEEKFS_MEMORY_MODE", "lowmem")
 	idx := &Index{
-		Version: indexVersionV9,
+		Version: indexVersion,
 		Roots:   []string{`C:\`},
 		BuiltAt: time.Unix(0, 791),
 		Source:  "usn",
@@ -716,9 +699,9 @@ func TestEngineV9MappedExtTopTraceReportsSkippedBlocks(t *testing.T) {
 	}
 }
 
-func TestEngineV9WritesAndLoadsSizeRankSection(t *testing.T) {
+func TestEngineWritesAndLoadsSizeRankSection(t *testing.T) {
 	idx := &Index{
-		Version: indexVersionV9,
+		Version: indexVersion,
 		Roots:   []string{`C:\`},
 		BuiltAt: time.Unix(0, 124),
 		Source:  "usn",
@@ -760,9 +743,9 @@ func TestEngineV9WritesAndLoadsSizeRankSection(t *testing.T) {
 	}
 }
 
-func TestEngineV9WritesAndLoadsModifiedRankSection(t *testing.T) {
+func TestEngineWritesAndLoadsModifiedRankSection(t *testing.T) {
 	idx := &Index{
-		Version: indexVersionV9,
+		Version: indexVersion,
 		Roots:   []string{`C:\`},
 		BuiltAt: time.Unix(0, 125),
 		Source:  "usn",
@@ -796,9 +779,9 @@ func TestEngineV9WritesAndLoadsModifiedRankSection(t *testing.T) {
 	}
 }
 
-func TestEngineV9WritesAndLoadsExtensionRankSection(t *testing.T) {
+func TestEngineWritesAndLoadsExtensionRankSection(t *testing.T) {
 	idx := &Index{
-		Version: indexVersionV9,
+		Version: indexVersion,
 		Roots:   []string{`C:\`},
 		BuiltAt: time.Unix(0, 126),
 		Source:  "usn",
@@ -832,9 +815,9 @@ func TestEngineV9WritesAndLoadsExtensionRankSection(t *testing.T) {
 	}
 }
 
-func TestEngineV9WritesAndLoadsTypeRankSection(t *testing.T) {
+func TestEngineWritesAndLoadsTypeRankSection(t *testing.T) {
 	idx := &Index{
-		Version: indexVersionV9,
+		Version: indexVersion,
 		Roots:   []string{`C:\`},
 		BuiltAt: time.Unix(0, 127),
 		Source:  "usn",
@@ -868,9 +851,9 @@ func TestEngineV9WritesAndLoadsTypeRankSection(t *testing.T) {
 	}
 }
 
-func TestEngineV9WritesAndLoadsPathRankSection(t *testing.T) {
+func TestEngineWritesAndLoadsPathRankSection(t *testing.T) {
 	idx := &Index{
-		Version: indexVersionV9,
+		Version: indexVersion,
 		Roots:   []string{`C:\`},
 		BuiltAt: time.Unix(0, 128),
 		Source:  "usn",
@@ -906,9 +889,9 @@ func TestEngineV9WritesAndLoadsPathRankSection(t *testing.T) {
 	}
 }
 
-func TestEngineV9UpgradeIndexCommand(t *testing.T) {
+func TestEngineUpgradeIndexCommand(t *testing.T) {
 	idx := &Index{
-		Version: indexVersionV9,
+		Version: indexVersion,
 		Roots:   []string{`F:\`},
 		BuiltAt: time.Unix(0, 456),
 		Source:  "usn",
@@ -933,8 +916,8 @@ func TestEngineV9UpgradeIndexCommand(t *testing.T) {
 		t.Fatalf("load upgraded index: %v", err)
 	}
 	defer loaded.MMapRecords.file.close()
-	if loaded.Version != indexVersionV9 {
-		t.Fatalf("version = %d, want %d", loaded.Version, indexVersionV9)
+	if loaded.Version != indexVersion {
+		t.Fatalf("version = %d, want %d", loaded.Version, indexVersion)
 	}
 	sections, bytes := derivedSectionInfo(loaded.Derived)
 	if !reflect.DeepEqual(sections, []string{"RANK", "ERNK", "TRNK", "PRNK", "CHLD", "SUBT", "SUBS", "FRNS", "LOWR", "PNGR"}) {
@@ -945,7 +928,7 @@ func TestEngineV9UpgradeIndexCommand(t *testing.T) {
 	}
 }
 
-func TestServiceSearchCountCompatibilityMatrixV9AndMissingDerived(t *testing.T) {
+func TestServiceSearchCountCompatibilityMatrixAndMissingDerived(t *testing.T) {
 	base := compatibilityMatrixIndex()
 	queries := []queryOptions{
 		{Query: "path:workspace alpha", Limit: 20},
@@ -1007,7 +990,7 @@ func TestServiceSearchCountCompatibilityMatrixV9AndMissingDerived(t *testing.T) 
 
 func compatibilityMatrixIndex() *Index {
 	idx := &Index{
-		Version: indexVersionV9,
+		Version: indexVersion,
 		Roots:   []string{`C:\`},
 		BuiltAt: time.Unix(0, 987),
 		Source:  "usn",
@@ -1026,7 +1009,7 @@ func compatibilityMatrixIndex() *Index {
 	return idx
 }
 
-func roundTripCompatibilityIndex(t *testing.T, idx *Index, v9, clearDerived bool) *Index {
+func roundTripCompatibilityIndex(t *testing.T, idx *Index, withDerived, clearDerived bool) *Index {
 	t.Helper()
 	db := filepath.Join(t.TempDir(), "compat-v9.gsi")
 	if err := saveIndex(db, cloneCompactIndex(idx)); err != nil {
@@ -1071,7 +1054,7 @@ func cloneCompactIndex(idx *Index) *Index {
 	return out
 }
 
-func TestEngineV9OverlaySnapshotScaffold(t *testing.T) {
+func TestEngineOverlaySnapshotScaffold(t *testing.T) {
 	idx := &Index{
 		Source:  "usn",
 		Volume:  "F:",
@@ -1100,7 +1083,7 @@ func TestEngineV9OverlaySnapshotScaffold(t *testing.T) {
 	}
 }
 
-func TestEngineV9OverlaySnapshotIsStableAcrossLaterChanges(t *testing.T) {
+func TestEngineOverlaySnapshotIsStableAcrossLaterChanges(t *testing.T) {
 	idx := &Index{
 		Source:  "usn",
 		Volume:  "F:",
@@ -1132,9 +1115,9 @@ func TestEngineV9OverlaySnapshotIsStableAcrossLaterChanges(t *testing.T) {
 	}
 }
 
-func TestEngineV9OverlayServiceSearchMergesCreatesAndDeletes(t *testing.T) {
+func TestEngineOverlayServiceSearchMergesCreatesAndDeletes(t *testing.T) {
 	idx := &Index{
-		Version: indexVersionV9,
+		Version: indexVersion,
 		Roots:   []string{`F:\`},
 		BuiltAt: time.Unix(0, 789),
 		Source:  "usn",
@@ -1177,10 +1160,10 @@ func TestEngineV9OverlayServiceSearchMergesCreatesAndDeletes(t *testing.T) {
 	}
 }
 
-func TestEngineV9OverlayAttribFilterMatchesCreates(t *testing.T) {
+func TestEngineOverlayAttribFilterMatchesCreates(t *testing.T) {
 	t.Setenv("SEEKFS_GLOBAL_PLANNER", "1")
 	idx := &Index{
-		Version:      indexVersionV9,
+		Version:      indexVersion,
 		Roots:        []string{`F:\`},
 		BuiltAt:      time.Unix(0, 790),
 		Source:       "usn",
@@ -1237,7 +1220,7 @@ func TestEngineV9OverlayAttribFilterMatchesCreates(t *testing.T) {
 	}
 }
 
-func TestEngineV9OverlayMergeFillsLimitAndRanksCreates(t *testing.T) {
+func TestEngineOverlayMergeFillsLimitAndRanksCreates(t *testing.T) {
 	records := []CompactRecord{{FRN: 100, ParentFRN: 100, Parent: -1, Name: ".", Mode: uint32(os.ModeDir)}}
 	for i := 0; i < 40; i++ {
 		records = append(records, CompactRecord{
@@ -1248,7 +1231,7 @@ func TestEngineV9OverlayMergeFillsLimitAndRanksCreates(t *testing.T) {
 		})
 	}
 	idx := &Index{
-		Version: indexVersionV9,
+		Version: indexVersion,
 		Roots:   []string{`F:\`},
 		Source:  "usn",
 		Volume:  "F:",
@@ -1292,9 +1275,9 @@ func TestEngineV9OverlayMergeFillsLimitAndRanksCreates(t *testing.T) {
 	}
 }
 
-func TestEngineV9OverlaySortPathRanksCreateBeforeBaseInsertionPoint(t *testing.T) {
+func TestEngineOverlaySortPathRanksCreateBeforeBaseInsertionPoint(t *testing.T) {
 	idx := &Index{
-		Version: indexVersionV9,
+		Version: indexVersion,
 		Roots:   []string{`F:\`},
 		Source:  "usn",
 		Volume:  "F:",
@@ -1323,8 +1306,8 @@ func TestEngineV9OverlaySortPathRanksCreateBeforeBaseInsertionPoint(t *testing.T
 	}
 }
 
-func TestEngineV9OverlayCountOnlySearchIncludesCreatesAndExcludesTombstones(t *testing.T) {
-	vol := engineV9OverlaySearchTestVolume(t)
+func TestEngineOverlayCountOnlySearchIncludesCreatesAndExcludesTombstones(t *testing.T) {
+	vol := engineOverlaySearchTestVolume(t)
 	vol.applyUSNChanges([]usnChange{
 		{FRN: 102, ParentFRN: 100, USN: 20, Reason: usnReasonFileCreate, Name: "needle-overlay.txt"},
 		{FRN: 101, USN: 21, Reason: usnReasonFileDelete},
@@ -1346,9 +1329,9 @@ func TestEngineV9OverlayCountOnlySearchIncludesCreatesAndExcludesTombstones(t *t
 	}
 }
 
-func TestEngineV9DirectoryDeleteTombstonesBaseDescendants(t *testing.T) {
+func TestEngineDirectoryDeleteTombstonesBaseDescendants(t *testing.T) {
 	idx := &Index{
-		Version: indexVersionV9,
+		Version: indexVersion,
 		Roots:   []string{`F:\`},
 		BuiltAt: time.Unix(0, 789),
 		Source:  "usn",
@@ -1398,8 +1381,8 @@ func TestEngineV9DirectoryDeleteTombstonesBaseDescendants(t *testing.T) {
 	}
 }
 
-func TestEngineV9OverlayRenameSearchHidesOldPathAndShowsNewPath(t *testing.T) {
-	vol := engineV9OverlaySearchTestVolume(t)
+func TestEngineOverlayRenameSearchHidesOldPathAndShowsNewPath(t *testing.T) {
+	vol := engineOverlaySearchTestVolume(t)
 	vol.applyUSNChanges([]usnChange{
 		{FRN: 101, ParentFRN: 100, USN: 20, Reason: usnReasonRenameOld, Name: "needle-base.txt"},
 		{FRN: 101, ParentFRN: 100, USN: 21, Reason: usnReasonRenameNew, Name: "needle-renamed.txt"},
@@ -1421,8 +1404,8 @@ func TestEngineV9OverlayRenameSearchHidesOldPathAndShowsNewPath(t *testing.T) {
 	}
 }
 
-func TestEngineV9OverlaySearchReconstructsChildPathThroughBaseParent(t *testing.T) {
-	vol := engineV9OverlaySearchTestVolume(t)
+func TestEngineOverlaySearchReconstructsChildPathThroughBaseParent(t *testing.T) {
+	vol := engineOverlaySearchTestVolume(t)
 	vol.applyUSNChanges([]usnChange{{
 		FRN:       201,
 		ParentFRN: 200,
@@ -1440,7 +1423,7 @@ func TestEngineV9OverlaySearchReconstructsChildPathThroughBaseParent(t *testing.
 	}
 }
 
-func TestEngineV9CompactOverlayIndexMergesBaseAndOverlay(t *testing.T) {
+func TestEngineCompactOverlayIndexMergesBaseAndOverlay(t *testing.T) {
 	idx := &Index{
 		Source:  "usn",
 		Volume:  "F:",
@@ -1477,10 +1460,10 @@ func TestEngineV9CompactOverlayIndexMergesBaseAndOverlay(t *testing.T) {
 	}
 }
 
-func TestEngineV9PersistVolumeCompactsOverlayToMappedBase(t *testing.T) {
+func TestEnginePersistVolumeCompactsOverlayToMappedBase(t *testing.T) {
 	db := filepath.Join(t.TempDir(), "state.gsi")
 	idx := &Index{
-		Version: indexVersionV9,
+		Version: indexVersion,
 		Roots:   []string{`F:\`},
 		BuiltAt: time.Unix(0, 123),
 		Source:  "usn",
@@ -1643,7 +1626,7 @@ func TestWalkWatcherRebuildPathRefreshesWalkIndex(t *testing.T) {
 		t.Fatalf("write old fixture: %v", err)
 	}
 	db := filepath.Join(t.TempDir(), "walk.gsi")
-	idx := &Index{Version: indexVersionV9, Roots: []string{root}, BuiltAt: time.Now(), Source: "walk"}
+	idx := &Index{Version: indexVersion, Roots: []string{root}, BuiltAt: time.Now(), Source: "walk"}
 	if err := walkRoot(root, idx); err != nil {
 		t.Fatalf("walk fixture: %v", err)
 	}
@@ -1678,7 +1661,7 @@ func TestWalkWatcherRebuildPathRefreshesWalkIndex(t *testing.T) {
 	}
 }
 
-func TestEngineV9OverlayCompactionDueTriggers(t *testing.T) {
+func TestEngineOverlayCompactionDueTriggers(t *testing.T) {
 	idx := &Index{
 		Source:  "usn",
 		Volume:  "F:",
@@ -1729,7 +1712,7 @@ func TestEngineV9OverlayCompactionDueTriggers(t *testing.T) {
 	}
 }
 
-func TestEngineV9LockVolumeSearchDoesNotSerializeOnSearchMu(t *testing.T) {
+func TestEngineLockVolumeSearchDoesNotSerializeOnSearchMu(t *testing.T) {
 	vol := &serviceVolumeIndex{}
 	vol.searchMu.Lock()
 	defer vol.searchMu.Unlock()
@@ -1743,7 +1726,7 @@ func TestEngineV9LockVolumeSearchDoesNotSerializeOnSearchMu(t *testing.T) {
 	}
 }
 
-func TestEngineV9SnapshotServiceVolumeForSearchUsesStableBase(t *testing.T) {
+func TestEngineSnapshotServiceVolumeForSearchUsesStableBase(t *testing.T) {
 	oldIdx := &Index{
 		Source:  "usn",
 		Volume:  "F:",
@@ -1785,7 +1768,7 @@ func TestEngineV9SnapshotServiceVolumeForSearchUsesStableBase(t *testing.T) {
 	}
 }
 
-func TestEngineV9ReadViewCachesUseSnapshotGeneration(t *testing.T) {
+func TestEngineReadViewCachesUseSnapshotGeneration(t *testing.T) {
 	idx := &Index{
 		Source:  "usn",
 		Volume:  "F:",
@@ -1830,10 +1813,10 @@ func TestEngineV9ReadViewCachesUseSnapshotGeneration(t *testing.T) {
 	}
 }
 
-func engineV9OverlaySearchTestVolume(t *testing.T) *serviceVolumeIndex {
+func engineOverlaySearchTestVolume(t *testing.T) *serviceVolumeIndex {
 	t.Helper()
 	idx := &Index{
-		Version: indexVersionV9,
+		Version: indexVersion,
 		Roots:   []string{`F:\`},
 		BuiltAt: time.Unix(0, 789),
 		Source:  "usn",
@@ -1862,7 +1845,7 @@ func engineV9OverlaySearchTestVolume(t *testing.T) *serviceVolumeIndex {
 	return newServiceVolumeIndex(db, loaded)
 }
 
-func TestEngineV9OverlayMutationStateMachineMatchesFreshOracle(t *testing.T) {
+func TestEngineOverlayMutationStateMachineMatchesFreshOracle(t *testing.T) {
 	logical := map[uint64]CompactRecord{
 		100: {FRN: 100, ParentFRN: 100, Parent: -1, Name: ".", Mode: uint32(os.ModeDir), Size: 0},
 	}
@@ -1922,7 +1905,7 @@ func TestEngineV9OverlayMutationStateMachineMatchesFreshOracle(t *testing.T) {
 	}
 }
 
-func TestEngineV9ConcurrentChurnQueryStress(t *testing.T) {
+func TestEngineConcurrentChurnQueryStress(t *testing.T) {
 	idx := freshIndexFromLogicalRecords("F:", map[uint64]CompactRecord{
 		100: {FRN: 100, ParentFRN: 100, Parent: -1, Name: ".", Mode: uint32(os.ModeDir)},
 	})
@@ -2608,7 +2591,7 @@ func syntheticCompactIndex(n int) *Index {
 	return idx
 }
 
-func BenchmarkV9DerivedSectionStreaming(b *testing.B) {
+func BenchmarkDerivedSectionStreaming(b *testing.B) {
 	idx := syntheticCompactIndex(20_000)
 	nameTokens := make([]string, len(idx.Records))
 	for i := range idx.Records {
@@ -2630,7 +2613,7 @@ func BenchmarkV9DerivedSectionStreaming(b *testing.B) {
 	b.ReportMetric(float64(maxSectionBytes), "max_section_bytes")
 }
 
-func TestV9DerivedSectionLifetimeBound(t *testing.T) {
+func TestDerivedSectionLifetimeBound(t *testing.T) {
 	idx := syntheticCompactIndex(20_000)
 	nameTokens := make([]string, len(idx.Records))
 	for i := range idx.Records {
@@ -2655,7 +2638,7 @@ func TestV9DerivedSectionLifetimeBound(t *testing.T) {
 	t.Logf("derived section bytes retained-all=%d streamed-max=%d", retainedBytes, maxInFlight)
 }
 
-func TestV9SubtreeSectionStreamingGoldenAndScratchCap(t *testing.T) {
+func TestSubtreeSectionStreamingGoldenAndScratchCap(t *testing.T) {
 	if subtreeSectionScratchBytes > 64*1024 {
 		t.Fatalf("SUBT scratch cap=%d; want <= 65536", subtreeSectionScratchBytes)
 	}
@@ -2713,7 +2696,7 @@ func (w *partialWriteErrorWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-func TestV9SubtreeSectionWriteFailureReportsPartialWrite(t *testing.T) {
+func TestSubtreeSectionWriteFailureReportsPartialWrite(t *testing.T) {
 	section := &subtreeSectionBlob{parts: [][]uint32{make([]uint32, 10_000)}}
 	w := &partialWriteErrorWriter{limit: 97}
 	written, err := writeSubtreeSection(w, section)
@@ -2725,7 +2708,7 @@ func TestV9SubtreeSectionWriteFailureReportsPartialWrite(t *testing.T) {
 	}
 }
 
-func TestV9SaveIndexFailureDoesNotReplaceSource(t *testing.T) {
+func TestSaveIndexFailureDoesNotReplaceSource(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "atomic.gsi")
 	valid := syntheticCompactIndex(32)
@@ -2757,14 +2740,14 @@ func TestV9SaveIndexFailureDoesNotReplaceSource(t *testing.T) {
 	}
 }
 
-func TestV9PersistencePreparationStagesBoundLiveHeap(t *testing.T) {
+func TestPersistencePreparationStagesBoundLiveHeap(t *testing.T) {
 	idx := syntheticCompactIndex(100_000)
 	nameTokens := make([]string, len(idx.Records))
 	for i := range idx.Records {
 		nameTokens[i] = idx.Records[i].Name
 	}
 	stages := make(map[string]uint64)
-	v9PersistStageObserver = func(stage string, _ runtime.MemStats) {
+	persistStageObserver = func(stage string, _ runtime.MemStats) {
 		runtime.GC()
 		var mem runtime.MemStats
 		runtime.ReadMemStats(&mem)
@@ -2772,8 +2755,8 @@ func TestV9PersistencePreparationStagesBoundLiveHeap(t *testing.T) {
 			stages[stage] = mem.HeapAlloc
 		}
 	}
-	defer func() { v9PersistStageObserver = nil }()
-	t.Setenv("SEEKFS_V9_PERSIST_TRACE", "1")
+	defer func() { persistStageObserver = nil }()
+	t.Setenv("SEEKFS_PERSIST_TRACE", "1")
 	runtime.GC()
 	if _, err := writeDerivedSectionStreamObserved(&countingWriter{w: io.Discard}, idx, nameTokens, nil); err != nil {
 		t.Fatal(err)
@@ -2793,10 +2776,10 @@ func TestV9PersistencePreparationStagesBoundLiveHeap(t *testing.T) {
 	}
 }
 
-func TestV9PersistenceBoundedChildMode(t *testing.T) {
-	mode := os.Getenv("SEEKFS_V9_PERSIST_MODE")
+func TestPersistenceBoundedChildMode(t *testing.T) {
+	mode, _ := envFirst("SEEKFS_PERSIST_MODE", "SEEKFS_V9_PERSIST_MODE")
 	if mode != "staged" {
-		t.Skip("set SEEKFS_V9_PERSIST_MODE=staged for child-process measurement")
+		t.Skip("set SEEKFS_PERSIST_MODE=staged for child-process measurement")
 	}
 	idx := syntheticCompactIndex(100_000)
 	nameTokens := make([]string, len(idx.Records))

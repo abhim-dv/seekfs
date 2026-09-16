@@ -13,7 +13,7 @@ import (
 func newOwnedReplayTestVolume(t *testing.T) *serviceVolumeIndex {
 	t.Helper()
 	idx := &Index{
-		Version: indexVersionV9,
+		Version: indexVersion,
 		Compact: true,
 		Volume:  "C:",
 		Records: []CompactRecord{

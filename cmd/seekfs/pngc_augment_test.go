@@ -16,7 +16,7 @@ import (
 
 func TestPNGCAugmentPreservesSectionsAndQueryParity(t *testing.T) {
 	t.Setenv("SEEKFS_LOW_MEMORY_TRIGRAM_MAX_POSTING", "1")
-	t.Setenv("SEEKFS_V9_SELF_NAME_GRAMS", "0")
+	t.Setenv("SEEKFS_SELF_NAME_GRAMS", "0")
 	dir := t.TempDir()
 	sourceBase := filepath.Join(dir, "source-base.gsi")
 	source := filepath.Join(dir, "source.gsi")
@@ -32,7 +32,7 @@ func TestPNGCAugmentPreservesSectionsAndQueryParity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	oldTable, err := readRawV9SectionTable(source, int64(len(before)))
+	oldTable, err := readRawSectionTable(source, int64(len(before)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -53,7 +53,7 @@ func TestPNGCAugmentPreservesSectionsAndQueryParity(t *testing.T) {
 	if got, _ := fileSHA256(source); got != result.SourceSHA256 {
 		t.Fatalf("source hash changed: got %s want %s", got, result.SourceSHA256)
 	}
-	newTable, err := readRawV9SectionTable(target, int64(len(after)))
+	newTable, err := readRawSectionTable(target, int64(len(after)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,7 +99,7 @@ func TestPNGCAugmentPreservesSectionsAndQueryParity(t *testing.T) {
 
 func TestPNGCAugmentRejectsCorruptionDuplicateAndCleansUp(t *testing.T) {
 	t.Setenv("SEEKFS_LOW_MEMORY_TRIGRAM_MAX_POSTING", "1")
-	t.Setenv("SEEKFS_V9_SELF_NAME_GRAMS", "0")
+	t.Setenv("SEEKFS_SELF_NAME_GRAMS", "0")
 	dir := t.TempDir()
 	source := filepath.Join(dir, "source.gsi")
 	if err := saveIndex(source, dottedPathBenchmarkIndex(1000)); err != nil {
@@ -145,7 +145,7 @@ func TestPNGCAugmentRejectsCorruptionDuplicateAndCleansUp(t *testing.T) {
 
 func TestPNGCAugmentFixtureMeasurement(t *testing.T) {
 	t.Setenv("SEEKFS_LOW_MEMORY_TRIGRAM_MAX_POSTING", "1")
-	t.Setenv("SEEKFS_V9_SELF_NAME_GRAMS", "0")
+	t.Setenv("SEEKFS_SELF_NAME_GRAMS", "0")
 	for _, records := range []int{50_000, 200_000, 500_000} {
 		t.Run(fmt.Sprintf("records-%d", records), func(t *testing.T) {
 			dir := t.TempDir()
@@ -254,7 +254,7 @@ func TestPNGCAugmentStreamingRejectsSpoolCorruptionAndWriteFailure(t *testing.T)
 
 func TestPNGCAugmentLegacyNoMetadataUsesBoundedDiscovery(t *testing.T) {
 	t.Setenv("SEEKFS_LOW_MEMORY_TRIGRAM_MAX_POSTING", "1")
-	t.Setenv("SEEKFS_V9_SELF_NAME_GRAMS", "0")
+	t.Setenv("SEEKFS_SELF_NAME_GRAMS", "0")
 	dir := t.TempDir()
 	source := filepath.Join(dir, "legacy.gsi")
 	if err := saveIndex(source, dottedPathBenchmarkIndex(500_000)); err != nil {
@@ -301,7 +301,7 @@ func TestPNGCAugmentLegacyNoMetadataUsesBoundedDiscovery(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	table, err := readRawV9SectionTable(target, int64(len(data)))
+	table, err := readRawSectionTable(target, int64(len(data)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -400,7 +400,7 @@ func addUnknownSectionForTest(source, target string) error {
 	if err != nil {
 		return err
 	}
-	table, err := readRawV9SectionTable(source, int64(len(data)))
+	table, err := readRawSectionTable(source, int64(len(data)))
 	if err != nil {
 		return err
 	}
@@ -437,7 +437,7 @@ func stripPNGRMetadataForTest(path string) error {
 	if err != nil {
 		return err
 	}
-	table, err := readRawV9SectionTable(path, int64(len(data)))
+	table, err := readRawSectionTable(path, int64(len(data)))
 	if err != nil {
 		return err
 	}

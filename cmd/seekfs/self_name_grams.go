@@ -40,8 +40,8 @@ func optionalSelfNameGramIndex(idx *Index, selective *compressedTrigramIndex) *c
 }
 
 func selfNameGramSectionsEnabled() bool {
-	raw := strings.TrimSpace(os.Getenv("SEEKFS_V9_SELF_NAME_GRAMS"))
-	return raw == "" || envBool("SEEKFS_V9_SELF_NAME_GRAMS")
+	raw, ok := envFirst("SEEKFS_SELF_NAME_GRAMS", "SEEKFS_V9_SELF_NAME_GRAMS")
+	return !ok || envTruthy(raw)
 }
 
 // completeSelfNameGramIterators combines the original selective PNGR source

@@ -484,8 +484,8 @@ func globalComponentTopIDs(volumes []*serviceVolumeIndex, pq parsedQuery, limit 
 		var ids []int
 		var ok bool
 		if len(vol.subtreeOrder) == 0 && (len(vol.childOffsets) > 0 || vol.children != nil) {
-			// v8-compatible low-memory indexes retain exact child ranges but
-			// omit SUBT rank metadata. The cached exact path posting is still a
+			// Low-memory indexes may retain exact child ranges but omit SUBT
+			// rank metadata. The cached exact path posting is still a
 			// complete set source; rank only that set instead of materializing
 			// every match through the generic component iterator.
 			ids = topCandidateIDsByRank(vol.pathTermPosting(term), limit, vol.index, vol.rankForQuery(pq))

@@ -97,7 +97,7 @@ func rebuildWalkIndex(vol *serviceVolumeIndex) (*Index, error) {
 		Source:  "walk",
 	}
 	if idx.Version == 0 {
-		idx.Version = indexVersionV9
+		idx.Version = indexVersion
 	}
 	for _, root := range idx.Roots {
 		if err := walkRoot(root, idx); err != nil {

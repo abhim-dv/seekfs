@@ -11,7 +11,7 @@ import (
 func TestR5MappedScalarRangeCountUsesQualifyingInterval(t *testing.T) {
 	const files = 4096
 	idx := &Index{
-		Version: indexVersionV9,
+		Version: indexVersion,
 		Source:  "usn",
 		Volume:  "C:",
 		Roots:   []string{`C:\`},

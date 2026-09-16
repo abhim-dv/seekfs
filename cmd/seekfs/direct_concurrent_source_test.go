@@ -12,36 +12,36 @@ import (
 	"testing"
 )
 
-func TestDirectV9ConcurrentWalkWorkerCountsHaveStableRecords(t *testing.T) {
+func TestDirectConcurrentWalkWorkerCountsHaveStableRecords(t *testing.T) {
 	root := t.TempDir()
 	for i := 0; i < 96; i++ {
 		dir := filepath.Join(root, "d", "nested")
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			t.Fatal(err)
 		}
-		path := filepath.Join(dir, filepath.Base(t.Name())+"-"+itoaForDirectV9Test(i)+".txt")
+		path := filepath.Join(dir, filepath.Base(t.Name())+"-"+itoaForDirectTest(i)+".txt")
 		if err := os.WriteFile(path, []byte("x"), 0o600); err != nil {
 			t.Fatal(err)
 		}
 	}
 
-	var want []directV9Record
+	var want []directRecord
 	for _, workers := range []int{1, 4, 8} {
-		report := &directV9WalkReport{}
-		source, err := newDirectV9ConcurrentWalkSourceWithOptions(root, nil, nil, report, directV9ConcurrentWalkOptions{Workers: workers, Queue: 3})
+		report := &directWalkReport{}
+		source, err := newDirectConcurrentWalkSourceWithOptions(root, nil, nil, report, directConcurrentWalkOptions{Workers: workers, Queue: 3})
 		if err != nil {
 			t.Fatal(err)
 		}
-		got := collectDirectV9ConcurrentRecords(t, source)
+		got := collectDirectConcurrentRecords(t, source)
 		if report.Skipped != 0 || report.Inaccessible != 0 || !report.SourceComplete {
 			t.Fatalf("workers=%d report=%+v", workers, report)
 		}
-		sortDirectV9Records(got)
+		sortDirectRecords(got)
 		if want == nil {
 			want = got
-		} else if !sameDirectV9Records(want, got) {
+		} else if !sameDirectRecords(want, got) {
 			for i := range want {
-				if !sameDirectV9Record(want[i], got[i]) {
+				if !sameDirectRecord(want[i], got[i]) {
 					t.Fatalf("workers=%d changed record[%d]: want=%+v got=%+v", workers, i, want[i], got[i])
 				}
 			}
@@ -50,7 +50,7 @@ func TestDirectV9ConcurrentWalkWorkerCountsHaveStableRecords(t *testing.T) {
 	}
 }
 
-func TestDirectV9ConcurrentWalkHonorsExclusionsAndSuffixes(t *testing.T) {
+func TestDirectConcurrentWalkHonorsExclusionsAndSuffixes(t *testing.T) {
 	root := t.TempDir()
 	owned := filepath.Join(root, ".r5tmp")
 	if err := os.MkdirAll(filepath.Join(owned, "nested"), 0o755); err != nil {
@@ -65,30 +65,30 @@ func TestDirectV9ConcurrentWalkHonorsExclusionsAndSuffixes(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	report := &directV9WalkReport{}
-	source, err := newDirectV9ConcurrentWalkSourceWithExclusions(root, []string{owned}, []string{".gsi"}, report, 4, 2)
+	report := &directWalkReport{}
+	source, err := newDirectConcurrentWalkSourceWithExclusions(root, []string{owned}, []string{".gsi"}, report, 4, 2)
 	if err != nil {
 		t.Fatal(err)
 	}
-	got := collectDirectV9ConcurrentRecords(t, source)
+	got := collectDirectConcurrentRecords(t, source)
 	if len(got) != 2 || report.Excluded < 2 || !report.SourceComplete {
 		t.Fatalf("records/report=%d/%+v", len(got), report)
 	}
 }
 
-func TestDirectV9ConcurrentWalkCancellationClosesBoundedPipeline(t *testing.T) {
+func TestDirectConcurrentWalkCancellationClosesBoundedPipeline(t *testing.T) {
 	root := t.TempDir()
 	for i := 0; i < 512; i++ {
-		path := filepath.Join(root, "file-"+itoaForDirectV9Test(i))
+		path := filepath.Join(root, "file-"+itoaForDirectTest(i))
 		if err := os.WriteFile(path, []byte("x"), 0o600); err != nil {
 			t.Fatal(err)
 		}
 	}
-	source, err := newDirectV9ConcurrentWalkSourceWithOptions(root, nil, nil, nil, directV9ConcurrentWalkOptions{Workers: 8, Queue: 1})
+	source, err := newDirectConcurrentWalkSourceWithOptions(root, nil, nil, nil, directConcurrentWalkOptions{Workers: 8, Queue: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
-	walk := source.(*directV9ConcurrentWalkSource)
+	walk := source.(*directConcurrentWalkSource)
 	if _, err := source.Next(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -98,12 +98,12 @@ func TestDirectV9ConcurrentWalkCancellationClosesBoundedPipeline(t *testing.T) {
 	}
 }
 
-func TestDirectV9ConcurrentWalkCloseDiscardsBufferedRoot(t *testing.T) {
-	source, err := newDirectV9ConcurrentWalkSourceWithOptions(t.TempDir(), nil, nil, nil, directV9ConcurrentWalkOptions{Workers: 1, Queue: 1})
+func TestDirectConcurrentWalkCloseDiscardsBufferedRoot(t *testing.T) {
+	source, err := newDirectConcurrentWalkSourceWithOptions(t.TempDir(), nil, nil, nil, directConcurrentWalkOptions{Workers: 1, Queue: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
-	walk := source.(*directV9ConcurrentWalkSource)
+	walk := source.(*directConcurrentWalkSource)
 	<-walk.finish
 	if got := len(walk.records); got != 1 {
 		t.Fatalf("buffered records=%d, want root record", got)
@@ -114,15 +114,15 @@ func TestDirectV9ConcurrentWalkCloseDiscardsBufferedRoot(t *testing.T) {
 	}
 }
 
-func TestDirectV9ConcurrentWalkIndexesReparseEntriesWithoutFollowingTargets(t *testing.T) {
+func TestDirectConcurrentWalkIndexesReparseEntriesWithoutFollowingTargets(t *testing.T) {
 	// The walk canonicalizes its root (EvalSymlinks), so build and compare paths
 	// in canonical space; a symlinked or short-named temp root would otherwise
 	// make the walk's record paths alias the raw t.TempDir() paths.
-	root, err := directV9CanonicalPath(t.TempDir())
+	root, err := directCanonicalPath(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
-	external, err := directV9CanonicalPath(t.TempDir())
+	external, err := directCanonicalPath(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -145,10 +145,10 @@ func TestDirectV9ConcurrentWalkIndexesReparseEntriesWithoutFollowingTargets(t *t
 	}
 	junction := filepath.Join(root, "junction")
 	cycle := filepath.Join(root, "cycle")
-	if err := makeDirectV9Junction(junction, filepath.Join(external, "target-dir")); err != nil {
+	if err := makeDirectJunction(junction, filepath.Join(external, "target-dir")); err != nil {
 		t.Skipf("directory junction unavailable: %v", err)
 	}
-	if err := makeDirectV9Junction(cycle, root); err != nil {
+	if err := makeDirectJunction(cycle, root); err != nil {
 		_ = os.Remove(junction)
 		t.Skipf("cycle junction unavailable: %v", err)
 	}
@@ -156,12 +156,12 @@ func TestDirectV9ConcurrentWalkIndexesReparseEntriesWithoutFollowingTargets(t *t
 
 	wantHash := ""
 	for _, workers := range []int{1, 4, 8} {
-		report := &directV9WalkReport{}
-		source, err := newDirectV9ConcurrentWalkSourceWithOptions(root, nil, nil, report, directV9ConcurrentWalkOptions{Workers: workers, Queue: workers * 2})
+		report := &directWalkReport{}
+		source, err := newDirectConcurrentWalkSourceWithOptions(root, nil, nil, report, directConcurrentWalkOptions{Workers: workers, Queue: workers * 2})
 		if err != nil {
 			t.Fatal(err)
 		}
-		records := collectDirectV9ConcurrentRecords(t, source)
+		records := collectDirectConcurrentRecords(t, source)
 		if !report.SourceComplete || report.Inaccessible != 0 || report.Skipped != 0 || report.ReparseNotFollowed < 2 {
 			t.Fatalf("workers=%d report=%+v", workers, report)
 		}
@@ -180,18 +180,18 @@ func TestDirectV9ConcurrentWalkIndexesReparseEntriesWithoutFollowingTargets(t *t
 		}
 
 		dir := t.TempDir()
-		report = &directV9WalkReport{}
-		source, err = newDirectV9ConcurrentWalkSourceWithOptions(root, nil, nil, report, directV9ConcurrentWalkOptions{Workers: workers, Queue: workers * 2})
+		report = &directWalkReport{}
+		source, err = newDirectConcurrentWalkSourceWithOptions(root, nil, nil, report, directConcurrentWalkOptions{Workers: workers, Queue: workers * 2})
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := buildDirectV9(context.Background(), directV9BuildOptions{
+		if _, err := buildDirect(context.Background(), directBuildOptions{
 			OutputPath: filepath.Join(dir, "walk.gsi"), SpoolDir: filepath.Join(dir, "spool"), Records: source,
 			RunRecords: 8, RankWorkers: workers, WalkReport: report, Source: "direct-reparse-test",
 		}); err != nil {
 			t.Fatal(err)
 		}
-		gotHash := directV9FileHash(t, filepath.Join(dir, "walk.gsi"))
+		gotHash := directFileHash(t, filepath.Join(dir, "walk.gsi"))
 		if wantHash == "" {
 			wantHash = gotHash
 		} else if gotHash != wantHash {
@@ -200,7 +200,7 @@ func TestDirectV9ConcurrentWalkIndexesReparseEntriesWithoutFollowingTargets(t *t
 	}
 }
 
-func makeDirectV9Junction(path, target string) error {
+func makeDirectJunction(path, target string) error {
 	if filepath.Separator != '\\' {
 		return errors.New("directory junctions require Windows")
 	}
@@ -211,14 +211,14 @@ func makeDirectV9Junction(path, target string) error {
 	return nil
 }
 
-func collectDirectV9ConcurrentRecords(t *testing.T, source directV9RecordSource) []directV9Record {
+func collectDirectConcurrentRecords(t *testing.T, source directRecordSource) []directRecord {
 	t.Helper()
 	defer func() {
 		if closeable, ok := source.(interface{ Close() }); ok {
 			closeable.Close()
 		}
 	}()
-	var records []directV9Record
+	var records []directRecord
 	for {
 		record, err := source.Next(context.Background())
 		if errors.Is(err, io.EOF) {
@@ -231,7 +231,7 @@ func collectDirectV9ConcurrentRecords(t *testing.T, source directV9RecordSource)
 	}
 }
 
-func sortDirectV9Records(records []directV9Record) {
+func sortDirectRecords(records []directRecord) {
 	sort.Slice(records, func(i, j int) bool {
 		if records[i].FRN != records[j].FRN {
 			return records[i].FRN < records[j].FRN
@@ -240,24 +240,24 @@ func sortDirectV9Records(records []directV9Record) {
 	})
 }
 
-func sameDirectV9Records(a, b []directV9Record) bool {
+func sameDirectRecords(a, b []directRecord) bool {
 	if len(a) != len(b) {
 		return false
 	}
 	for i := range a {
-		if !sameDirectV9Record(a[i], b[i]) {
+		if !sameDirectRecord(a[i], b[i]) {
 			return false
 		}
 	}
 	return true
 }
 
-func sameDirectV9Record(a, b directV9Record) bool {
+func sameDirectRecord(a, b directRecord) bool {
 	return a.FRN == b.FRN && a.ParentFRN == b.ParentFRN && a.Mode == b.Mode &&
 		a.Size == b.Size && a.ModUnix == b.ModUnix && a.Name == b.Name && a.Path == b.Path
 }
 
-func itoaForDirectV9Test(n int) string {
+func itoaForDirectTest(n int) string {
 	const digits = "0123456789"
 	if n == 0 {
 		return "0"

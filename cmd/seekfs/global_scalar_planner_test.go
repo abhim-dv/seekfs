@@ -363,7 +363,7 @@ func TestGlobalScalarRangeOverlayParity(t *testing.T) {
 
 func TestGlobalScalarRangeMappedResidentParity(t *testing.T) {
 	idx := &Index{
-		Version: indexVersionV9,
+		Version: indexVersion,
 		Source:  "usn",
 		Volume:  "C:",
 		Roots:   []string{`C:\`},

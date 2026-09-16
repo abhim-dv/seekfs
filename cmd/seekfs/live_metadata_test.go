@@ -9,7 +9,7 @@ import (
 func liveMetadataVolume(t *testing.T, root string) *serviceVolumeIndex {
 	t.Helper()
 	idx := &Index{
-		Version: indexVersionV9,
+		Version: indexVersion,
 		Compact: true,
 		Volume:  "C:",
 		Roots:   []string{root},
@@ -28,7 +28,7 @@ func liveMetadataVolume(t *testing.T, root string) *serviceVolumeIndex {
 // base record's size rather than reporting zero.
 func TestOverlayChangePreservesBaseSizeWhenNoLiveStat(t *testing.T) {
 	idx := &Index{
-		Version: indexVersionV9,
+		Version: indexVersion,
 		Compact: true,
 		Volume:  "C:",
 		Records: []CompactRecord{
@@ -60,7 +60,7 @@ func TestLiveFolderSizeDeltaTracksFileChange(t *testing.T) {
 		t.Fatal(err)
 	}
 	idx := &Index{
-		Version: indexVersionV9,
+		Version: indexVersion,
 		Compact: true,
 		Volume:  "C:",
 		Roots:   []string{root},
@@ -90,7 +90,7 @@ func TestLiveFolderSizeDeltaTracksFileChange(t *testing.T) {
 // Deleting a file must subtract its size from ancestor directories.
 func TestLiveFolderSizeDeltaTracksDelete(t *testing.T) {
 	idx := &Index{
-		Version: indexVersionV9,
+		Version: indexVersion,
 		Compact: true,
 		Volume:  "C:",
 		Records: []CompactRecord{

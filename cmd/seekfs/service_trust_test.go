@@ -468,7 +468,7 @@ func TestPersistOverlayCarryKeepsPostSnapshotChanges(t *testing.T) {
 	// created while the multi-GB index file was being staged) stay searchable
 	// instead of vanishing for the remainder of the persist window.
 	vol := &serviceVolumeIndex{volume: "C:", dbPath: t.TempDir() + "\\persist-carry.gsi"}
-	vol.index = &Index{Version: indexVersionV9, Compact: true, Source: "usn", Volume: "C:"}
+	vol.index = &Index{Version: indexVersion, Compact: true, Source: "usn", Volume: "C:"}
 	vol.overlay = newOverlaySegment()
 	// Pre-snapshot change: folded into the new base index by the persist.
 	vol.applyUSNChanges([]usnChange{{FRN: 100, ParentFRN: 0, USN: 10, Name: "folded.txt", Reason: usnReasonFileCreate}})

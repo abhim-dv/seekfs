@@ -11,7 +11,7 @@ import (
 	"strings"
 )
 
-// directV9WriteLOWRSectionFromSpool writes the existing LOWR wire format
+// directWriteLOWRSectionFromSpool writes the existing LOWR wire format
 // directly from the canonical record spool.  It reads the spool once, writing
 // the folded-name blob to a bounded temp file and the per-record offset/length
 // table to a second temp file; the section header is emitted from the final
@@ -19,19 +19,19 @@ import (
 //
 // The caller owns alignment and section-table insertion. The returned entry
 // starts at the writer's current offset.
-func directV9WriteLOWRSectionFromSpool(ctx context.Context, cw *countingWriter, finalPath string, recordCount int) (indexSectionTableEntry, error) {
+func directWriteLOWRSectionFromSpool(ctx context.Context, cw *countingWriter, finalPath string, recordCount int) (indexSectionTableEntry, error) {
 	if cw == nil {
-		return indexSectionTableEntry{}, errors.New("direct v9 LOWR writer is nil")
+		return indexSectionTableEntry{}, errors.New("direct LOWR writer is nil")
 	}
 	if recordCount < 0 || uint64(recordCount) > uint64(^uint32(0)) {
-		return indexSectionTableEntry{}, errors.New("direct v9 LOWR record count out of range")
+		return indexSectionTableEntry{}, errors.New("direct LOWR record count out of range")
 	}
 	if recordCount == 0 {
 		return indexSectionTableEntry{}, nil
 	}
 
-	blobPath := filepath.Join(filepath.Dir(finalPath), "direct-v9-lowr-blob.tmp")
-	tablePath := filepath.Join(filepath.Dir(finalPath), "direct-v9-lowr-table.tmp")
+	blobPath := filepath.Join(filepath.Dir(finalPath), "direct-lowr-blob.tmp")
+	tablePath := filepath.Join(filepath.Dir(finalPath), "direct-lowr-table.tmp")
 	defer os.Remove(blobPath)
 	defer os.Remove(tablePath)
 	blob, err := os.Create(blobPath)
@@ -47,17 +47,17 @@ func directV9WriteLOWRSectionFromSpool(ctx context.Context, cw *countingWriter, 
 	tableWriter := bufio.NewWriterSize(table, 256*1024)
 
 	var blobBytes uint64
-	count, err := directV9ForEachSpoolName(ctx, finalPath, recordCount, func(_ int, name string) error {
-		lower := directV9LOWRName(name)
+	count, err := directForEachSpoolName(ctx, finalPath, recordCount, func(_ int, name string) error {
+		lower := directLOWRName(name)
 		var off uint32 = packedLowerSameAsName
 		if lower != name {
 			if blobBytes > uint64(^uint32(0)) {
-				return errors.New("direct v9 LOWR offset exceeds on-disk limits")
+				return errors.New("direct LOWR offset exceeds on-disk limits")
 			}
 			off = uint32(blobBytes)
 			blobBytes += uint64(len(lower))
 			if blobBytes > uint64(^uint32(0)) {
-				return errors.New("direct v9 LOWR blob exceeds on-disk limits")
+				return errors.New("direct LOWR blob exceeds on-disk limits")
 			}
 			if _, err := blobWriter.WriteString(lower); err != nil {
 				return err
@@ -83,7 +83,7 @@ func directV9WriteLOWRSectionFromSpool(ctx context.Context, cw *countingWriter, 
 	if count != recordCount {
 		_ = blob.Close()
 		_ = table.Close()
-		return indexSectionTableEntry{}, errors.New("direct v9 LOWR record count mismatch")
+		return indexSectionTableEntry{}, errors.New("direct LOWR record count mismatch")
 	}
 	if err := blobWriter.Flush(); err != nil {
 		_ = blob.Close()
@@ -107,14 +107,14 @@ func directV9WriteLOWRSectionFromSpool(ctx context.Context, cw *countingWriter, 
 		return indexSectionTableEntry{}, err
 	}
 	if uint64(blobInfo.Size()) != blobBytes {
-		return indexSectionTableEntry{}, errors.New("direct v9 LOWR blob length mismatch")
+		return indexSectionTableEntry{}, errors.New("direct LOWR blob length mismatch")
 	}
 
 	offset := uint64(cw.n)
 	var header [8]byte
 	binary.LittleEndian.PutUint32(header[0:4], uint32(recordCount))
 	binary.LittleEndian.PutUint32(header[4:8], uint32(blobBytes))
-	if err := directV9WriteBytes(cw, header[:]); err != nil {
+	if err := directWriteBytes(cw, header[:]); err != nil {
 		return indexSectionTableEntry{}, err
 	}
 	if err := copyFileToWriter(cw, tablePath); err != nil {
@@ -136,7 +136,7 @@ func copyFileToWriter(cw *countingWriter, path string) error {
 	return err
 }
 
-func directV9LOWRName(name string) string {
+func directLOWRName(name string) string {
 	lower := strings.ToLower(name)
 	if len(lower) > int(^uint16(0)) {
 		lower = lower[:int(^uint16(0))]
@@ -144,7 +144,7 @@ func directV9LOWRName(name string) string {
 	return lower
 }
 
-func directV9ForEachSpoolName(ctx context.Context, finalPath string, expected int, fn func(int, string) error) (int, error) {
+func directForEachSpoolName(ctx context.Context, finalPath string, expected int, fn func(int, string) error) (int, error) {
 	f, err := os.Open(finalPath)
 	if err != nil {
 		return 0, err
@@ -158,10 +158,10 @@ func directV9ForEachSpoolName(ctx context.Context, finalPath string, expected in
 			return count, ctx.Err()
 		default:
 		}
-		rec, readErr := readDirectV9SpoolRecord(r)
+		rec, readErr := readDirectSpoolRecord(r)
 		if errors.Is(readErr, io.EOF) {
 			if count != expected {
-				return count, errors.New("direct v9 spool record count mismatch")
+				return count, errors.New("direct spool record count mismatch")
 			}
 			return count, nil
 		}
@@ -169,7 +169,7 @@ func directV9ForEachSpoolName(ctx context.Context, finalPath string, expected in
 			return count, readErr
 		}
 		if count >= expected {
-			return count, errors.New("direct v9 spool contains extra records")
+			return count, errors.New("direct spool contains extra records")
 		}
 		if err := fn(count, rec.Name); err != nil {
 			return count, err
@@ -178,7 +178,7 @@ func directV9ForEachSpoolName(ctx context.Context, finalPath string, expected in
 	}
 }
 
-func directV9WriteBytes(cw *countingWriter, p []byte) error {
+func directWriteBytes(cw *countingWriter, p []byte) error {
 	n, err := cw.Write(p)
 	if err != nil {
 		return err
@@ -193,14 +193,14 @@ func directV9WriteBytes(cw *countingWriter, p []byte) error {
 // deliberately keep the existing sorting, deduplication, block metadata, and
 // decode contracts in one place until the direct builder has its streaming
 // posting pipeline.
-func directV9EncodePATRSection(attrBits map[uint32][]uint32) []byte {
+func directEncodePATRSection(attrBits map[uint32][]uint32) []byte {
 	return encodeAttrPostingSection(attrBits)
 }
 
-func directV9EncodePEXTSection(postings map[string][]uint32, ranks []uint32) []byte {
+func directEncodePEXTSection(postings map[string][]uint32, ranks []uint32) []byte {
 	return encodeStringPostingSection(postings, ranks)
 }
 
-func directV9EncodePCMPSection(postings map[string][]uint32, ranks []uint32) []byte {
+func directEncodePCMPSection(postings map[string][]uint32, ranks []uint32) []byte {
 	return encodeStringPostingSection(postings, ranks)
 }

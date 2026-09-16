@@ -24,13 +24,13 @@ func readIndexWithReaderAt(r io.Reader, ra io.ReaderAt, size int64) (*Index, err
 		return nil, err
 	}
 	sectionTableOffset := uint64(0)
-	if header.Magic != indexMagicV9 {
+	if header.Magic != indexMagic {
 		return nil, errors.New("unsupported index format: only the v9 index format is supported")
 	}
 	if err := binary.Read(r, binary.LittleEndian, &sectionTableOffset); err != nil {
 		return nil, err
 	}
-	if header.Version != indexVersionV9 {
+	if header.Version != indexVersion {
 		return nil, fmt.Errorf("unsupported index version %d: only v9 indexes are supported", header.Version)
 	}
 	if header.EntryCount > uint64(^uint(0)>>1) || header.RootCount > uint64(^uint(0)>>1) {
@@ -369,7 +369,7 @@ func stageIndexFile(path string, idx *Index) (string, error) {
 		ensureCompactIndexForService(idx)
 		buildOrders(idx)
 	}
-	err = writeIndexV9File(f, idx)
+	err = writeIndexFile(f, idx)
 	syncErr := f.Sync()
 	closeErr := f.Close()
 	if err != nil {
@@ -513,13 +513,13 @@ type indexSectionTableEntry struct {
 	flags  uint32
 }
 
-func writeIndexV9File(f *os.File, idx *Index) error {
+func writeIndexFile(f *os.File, idx *Index) error {
 	bw := bufio.NewWriterSize(f, 16*1024*1024)
 	cw := &countingWriter{w: bw}
 	sectionOffsetPatch := int64(binary.Size(diskHeader{}))
 	header := diskHeader{
-		Magic:      indexMagicV9,
-		Version:    indexVersionV9,
+		Magic:      indexMagic,
+		Version:    indexVersion,
 		EntryCount: uint64(idx.compactRecordCount()),
 		RootCount:  uint64(len(idx.Roots)),
 		BuiltUnix:  idx.BuiltAt.UnixNano(),
@@ -583,7 +583,7 @@ func writeIndexV9File(f *os.File, idx *Index) error {
 		}
 		// The deduplication map is only needed while assigning record references.
 		// Drop it before derived-section generation; retaining millions of string
-		// keys here was the second large peak in v8->v9 conversion.
+		// keys here was the second large peak in index conversion.
 		nameIDs = nil
 		debug.FreeOSMemory()
 	}
@@ -670,12 +670,12 @@ func writeIndexV9File(f *os.File, idx *Index) error {
 	nameLens = nil
 	nameBlob = nil
 	debug.FreeOSMemory()
-	v9PersistTrace("record-table")
+	persistTrace("record-table")
 	table, err := writeDerivedSectionStream(cw, idx, nameTokens)
 	if err != nil {
 		return err
 	}
-	v9PersistTrace("derived-complete")
+	persistTrace("derived-complete")
 	if err := writeAlignment(cw, 8); err != nil {
 		return err
 	}
@@ -712,27 +712,27 @@ func writeIndexV9File(f *os.File, idx *Index) error {
 	return err
 }
 
-var v9PersistStageObserver func(string, runtime.MemStats)
+var persistStageObserver func(string, runtime.MemStats)
 
-func releaseV9PersistStage() {
+func releasePersistStage() {
 	if serviceLowMemoryMode() {
 		runtime.GC()
 		debug.FreeOSMemory()
 	}
 }
 
-func v9PersistTrace(stage string) {
-	if os.Getenv("SEEKFS_V9_PERSIST_TRACE") != "1" {
+func persistTrace(stage string) {
+	if v, _ := envFirst("SEEKFS_PERSIST_TRACE", "SEEKFS_V9_PERSIST_TRACE"); v != "1" {
 		return
 	}
 	var mem runtime.MemStats
 	runtime.ReadMemStats(&mem)
-	if v9PersistStageObserver != nil {
-		v9PersistStageObserver(stage, mem)
+	if persistStageObserver != nil {
+		persistStageObserver(stage, mem)
 	}
-	fmt.Fprintf(os.Stderr, "v9-persist stage=%s time=%s heap_alloc=%d heap_inuse=%d heap_objects=%d\n",
+	fmt.Fprintf(os.Stderr, "persist stage=%s time=%s heap_alloc=%d heap_inuse=%d heap_objects=%d\n",
 		stage, time.Now().Format(time.RFC3339Nano), mem.HeapAlloc, mem.HeapInuse, mem.HeapObjects)
-	if dir := os.Getenv("SEEKFS_V9_PERSIST_PROFILE_DIR"); dir != "" {
+	if dir, _ := envFirst("SEEKFS_PERSIST_PROFILE_DIR", "SEEKFS_V9_PERSIST_PROFILE_DIR"); dir != "" {
 		if os.MkdirAll(dir, 0o755) == nil {
 			name := strings.NewReplacer("\\", "_", "/", "_", ":", "_").Replace(stage)
 			if f, err := os.Create(filepath.Join(dir, name+".pprof")); err == nil {
@@ -774,8 +774,8 @@ func newDerivedSectionVolumeIndexMode(idx *Index, staged bool) *serviceVolumeInd
 		pathCache:   make(map[int]string),
 		lastPersist: time.Now(),
 	}
-	// Reuse already-persisted topology without copying it.  v8 inputs have no
-	// derived topology and are filled by buildDerivedSectionBlobs below.
+	// Reuse already-persisted topology without copying it.  An index built
+	// without derived topology is filled by buildDerivedSectionBlobs below.
 	vol.childOffsets = idx.Derived.ChildOffsets
 	vol.childIDs = idx.Derived.ChildIDs
 	vol.rootIDs = idx.Derived.RootIDs
@@ -894,7 +894,7 @@ func forEachDerivedSection(idx *Index, nameTokens []string, emit func(indexSecti
 	if vol == nil {
 		return nil
 	}
-	v9PersistTrace("resident-prepared")
+	persistTrace("resident-prepared")
 	emitSection := func(tag uint32, data []byte) error {
 		return emit(indexSectionBlob{tag: tag, data: data})
 	}
@@ -907,7 +907,7 @@ func forEachDerivedSection(idx *Index, nameTokens []string, emit func(indexSecti
 		nameOrder, nameRank = buildCompactNameOrderRank(idx)
 	}
 	vol.queryIndex.nameOrder, vol.queryIndex.nameRank = nameOrder, nameRank
-	v9PersistTrace("name-rank-ready")
+	persistTrace("name-rank-ready")
 	if err := emitSection(indexSectionRANK, encodeUint32Section(nameOrder, nameRank)); err != nil {
 		return err
 	}
@@ -923,14 +923,14 @@ func forEachDerivedSection(idx *Index, nameTokens []string, emit func(indexSecti
 		vol.buildSubtreeRanges()
 	}
 	vol.subtreeBytes = vol.buildSubtreeBytes()
-	v9PersistTrace("children-ready")
+	persistTrace("children-ready")
 
 	var sizeRank, modRank, extRank, typeRank, pathRank []uint32
 	if idx.compactHasSize() {
 		order, rank := buildCompactSizeOrderRankWithDirBytes(idx, vol.subtreeBytes)
 		vol.queryIndex.sizeOrder, vol.queryIndex.sizeRank = order, rank
 		sizeRank = rank
-		v9PersistTrace("size-rank-ready")
+		persistTrace("size-rank-ready")
 		if err := emitSection(indexSectionSRNK, encodeUint32Section(order, rank)); err != nil {
 			return err
 		}
@@ -944,7 +944,7 @@ func forEachDerivedSection(idx *Index, nameTokens []string, emit func(indexSecti
 		}
 		vol.queryIndex.modOrder, vol.queryIndex.modRank = order, rank
 		modRank = rank
-		v9PersistTrace("modified-rank-ready")
+		persistTrace("modified-rank-ready")
 		if err := emitSection(indexSectionMRNK, encodeUint32Section(order, rank)); err != nil {
 			return err
 		}
@@ -958,7 +958,7 @@ func forEachDerivedSection(idx *Index, nameTokens []string, emit func(indexSecti
 		}
 		vol.queryIndex.extOrder, vol.queryIndex.extRank = order, rank
 		extRank = rank
-		v9PersistTrace("extension-rank-ready")
+		persistTrace("extension-rank-ready")
 		if err := emitSection(indexSectionERNK, encodeUint32Section(order, rank)); err != nil {
 			return err
 		}
@@ -971,7 +971,7 @@ func forEachDerivedSection(idx *Index, nameTokens []string, emit func(indexSecti
 		}
 		vol.queryIndex.typeOrder, vol.queryIndex.typeRank = order, rank
 		typeRank = rank
-		v9PersistTrace("type-rank-ready")
+		persistTrace("type-rank-ready")
 		if err := emitSection(indexSectionTRNK, encodeUint32Section(order, rank)); err != nil {
 			return err
 		}
@@ -984,7 +984,7 @@ func forEachDerivedSection(idx *Index, nameTokens []string, emit func(indexSecti
 		}
 		vol.queryIndex.pathOrder, vol.queryIndex.pathRank = order, rank
 		pathRank = rank
-		v9PersistTrace("path-rank-ready")
+		persistTrace("path-rank-ready")
 		if err := emitSection(indexSectionPRNK, encodeUint32Section(order, rank)); err != nil {
 			return err
 		}
@@ -1012,11 +1012,11 @@ func forEachDerivedSection(idx *Index, nameTokens []string, emit func(indexSecti
 	if len(vol.childOffsets) == 0 || len(vol.childIDs) == 0 {
 		vol.buildCompactChildren()
 	}
-	v9PersistTrace("children-ready")
+	persistTrace("children-ready")
 	if len(vol.subtreeOrder) == 0 && len(vol.childOffsets) > 0 {
 		vol.buildSubtreeRanges()
 	}
-	v9PersistTrace("subtree-ready")
+	persistTrace("subtree-ready")
 	if len(sizeRank) == 0 {
 		sizeRank = nameRank
 	}
@@ -1036,8 +1036,8 @@ func forEachDerivedSection(idx *Index, nameTokens []string, emit func(indexSecti
 	vol.subtreePathRank = vol.buildSubtreeMinRanks(pathRank)
 	pathRank = nil
 	vol.queryIndex.pathRank = nil
-	releaseV9PersistStage()
-	v9PersistTrace("derived-prepared")
+	releasePersistStage()
+	persistTrace("derived-prepared")
 	if err := emitSection(indexSectionCHLD, encodeUint32Section(vol.childOffsets, vol.childIDs, vol.rootIDs)); err != nil {
 		return err
 	}
@@ -1128,7 +1128,7 @@ func writeDerivedSectionStreamObserved(cw *countingWriter, idx *Index, nameToken
 		if len(section.data) == 0 && section.subtree == nil {
 			return nil
 		}
-		v9PersistTrace(fmt.Sprintf("section-%08x", section.tag))
+		persistTrace(fmt.Sprintf("section-%08x", section.tag))
 		if err := writeAlignment(cw, 8); err != nil {
 			return err
 		}
@@ -1151,7 +1151,7 @@ func writeDerivedSectionStreamObserved(cw *countingWriter, idx *Index, nameToken
 			observe(int(length))
 		}
 		table = append(table, indexSectionTableEntry{tag: section.tag, offset: offset, length: length, flags: section.flags})
-		v9PersistTrace(fmt.Sprintf("after-%08x", section.tag))
+		persistTrace(fmt.Sprintf("after-%08x", section.tag))
 		if observe != nil {
 			observe(0)
 		}
@@ -1493,12 +1493,7 @@ func encodePostingRankBounds(bounds postingRankBounds) []byte {
 
 func decodePostingRankBounds(data []byte) postingRankBounds {
 	parts := decodeUint32Section(data, 6)
-	legacy := false
-	if len(parts) != 6 {
-		parts = decodeUint32Section(data, 5)
-		legacy = true
-	}
-	if (len(parts) != 6 && len(parts) != 5) || len(parts[0]) == 0 {
+	if len(parts) != 6 || len(parts[0]) == 0 {
 		return postingRankBounds{}
 	}
 	blockCount := len(parts[0])
@@ -1506,9 +1501,6 @@ func decodePostingRankBounds(data []byte) postingRankBounds {
 		if len(part) != blockCount {
 			return postingRankBounds{}
 		}
-	}
-	if legacy {
-		return postingRankBounds{BlockCount: blockCount, Size: parts[0], Modified: parts[1], Extension: parts[2], Type: parts[3], Path: parts[4]}
 	}
 	return postingRankBounds{BlockCount: blockCount, Name: parts[0], Size: parts[1], Modified: parts[2], Extension: parts[3], Type: parts[4], Path: parts[5]}
 }

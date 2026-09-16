@@ -152,7 +152,7 @@ func TestCompactChildrenBuildNotNeededAfterVolumeConstruction(t *testing.T) {
 
 func TestServiceVolumesForQueryMatchesWalkRootVolume(t *testing.T) {
 	idx := &Index{
-		Version: indexVersionV9,
+		Version: indexVersion,
 		Roots:   []string{`F:\fixture-root\churn-soak`},
 		Source:  "walk",
 		Entries: []Entry{{

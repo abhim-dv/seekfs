@@ -13,56 +13,56 @@ import (
 )
 
 const (
-	directV9ConcurrentDefaultWorkers = 4
-	directV9ConcurrentDefaultQueue   = 2
+	directConcurrentDefaultWorkers = 4
+	directConcurrentDefaultQueue   = 2
 )
 
-// directV9ConcurrentWalkOptions bounds the only in-flight filesystem work.
+// directConcurrentWalkOptions bounds the only in-flight filesystem work.
 // Records are still ordered by the builder's final FRN sort, so worker
 // completion order is deliberately not part of the output contract.
-type directV9ConcurrentWalkOptions struct {
+type directConcurrentWalkOptions struct {
 	Workers int
 	Queue   int
 }
 
-func (o directV9ConcurrentWalkOptions) normalized() (directV9ConcurrentWalkOptions, error) {
+func (o directConcurrentWalkOptions) normalized() (directConcurrentWalkOptions, error) {
 	if o.Workers < 0 || o.Queue < 0 {
-		return directV9ConcurrentWalkOptions{}, errors.New("direct v9 concurrent walk limits must be non-negative")
+		return directConcurrentWalkOptions{}, errors.New("direct concurrent walk limits must be non-negative")
 	}
 	if o.Workers == 0 {
-		o.Workers = directV9ConcurrentDefaultWorkers
+		o.Workers = directConcurrentDefaultWorkers
 	}
 	if o.Queue == 0 {
-		o.Queue = o.Workers * directV9ConcurrentDefaultQueue
+		o.Queue = o.Workers * directConcurrentDefaultQueue
 	}
 	if o.Queue < 1 {
-		return directV9ConcurrentWalkOptions{}, errors.New("direct v9 concurrent walk queue must be positive")
+		return directConcurrentWalkOptions{}, errors.New("direct concurrent walk queue must be positive")
 	}
 	return o, nil
 }
 
-type directV9ConcurrentWalkJob struct {
+type directConcurrentWalkJob struct {
 	path  string
 	entry os.DirEntry
 }
 
-type directV9ConcurrentDirBatch struct {
+type directConcurrentDirBatch struct {
 	root  string
 	items []os.DirEntry
 	done  bool
 	err   error
 }
 
-type directV9FileInfoDirEntry struct{ info fs.FileInfo }
+type directFileInfoDirEntry struct{ info fs.FileInfo }
 
-func (e directV9FileInfoDirEntry) Name() string               { return e.info.Name() }
-func (e directV9FileInfoDirEntry) IsDir() bool                { return e.info.IsDir() }
-func (e directV9FileInfoDirEntry) Type() fs.FileMode          { return e.info.Mode().Type() }
-func (e directV9FileInfoDirEntry) Info() (fs.FileInfo, error) { return e.info, nil }
+func (e directFileInfoDirEntry) Name() string               { return e.info.Name() }
+func (e directFileInfoDirEntry) IsDir() bool                { return e.info.IsDir() }
+func (e directFileInfoDirEntry) Type() fs.FileMode          { return e.info.Mode().Type() }
+func (e directFileInfoDirEntry) Info() (fs.FileInfo, error) { return e.info, nil }
 
-type directV9ConcurrentWalkSource struct {
-	records chan directV9Record
-	jobs    chan directV9ConcurrentWalkJob
+type directConcurrentWalkSource struct {
+	records chan directRecord
+	jobs    chan directConcurrentWalkJob
 	done    chan struct{}
 	finish  chan struct{}
 
@@ -71,31 +71,31 @@ type directV9ConcurrentWalkSource struct {
 	reportMu   sync.Mutex
 	errMu      sync.Mutex
 	err        error
-	report     *directV9WalkReport
+	report     *directWalkReport
 	root       string
 	dirWorkers int
 }
 
-// newDirectV9ConcurrentWalkSource is the unfiltered convenience constructor.
-func newDirectV9ConcurrentWalkSource(root string, workers, queue int) (directV9RecordSource, error) {
-	return newDirectV9ConcurrentWalkSourceWithOptions(root, nil, nil, nil,
-		directV9ConcurrentWalkOptions{Workers: workers, Queue: queue})
+// newDirectConcurrentWalkSource is the unfiltered convenience constructor.
+func newDirectConcurrentWalkSource(root string, workers, queue int) (directRecordSource, error) {
+	return newDirectConcurrentWalkSourceWithOptions(root, nil, nil, nil,
+		directConcurrentWalkOptions{Workers: workers, Queue: queue})
 }
 
-// newDirectV9ConcurrentWalkSourceWithOptions starts a bounded, read-only walk.
+// newDirectConcurrentWalkSourceWithOptions starts a bounded, read-only walk.
 // The producer retains at most Queue jobs and each worker retains one record;
 // results are likewise bounded by Queue.
-func newDirectV9ConcurrentWalkSourceWithOptions(root string, exclusionRoots, exclusionSuffixes []string, report *directV9WalkReport, options directV9ConcurrentWalkOptions) (directV9RecordSource, error) {
+func newDirectConcurrentWalkSourceWithOptions(root string, exclusionRoots, exclusionSuffixes []string, report *directWalkReport, options directConcurrentWalkOptions) (directRecordSource, error) {
 	options, err := options.normalized()
 	if err != nil {
 		return nil, err
 	}
-	abs, canonicalExclusions, err := directV9ConcurrentCanonicalPaths(root, exclusionRoots)
+	abs, canonicalExclusions, err := directConcurrentCanonicalPaths(root, exclusionRoots)
 	if err != nil {
 		return nil, err
 	}
-	if directV9PathIsReparse(abs) {
-		return nil, fmt.Errorf("direct v9 concurrent walk root is a reparse point: %s", abs)
+	if directPathIsReparse(abs) {
+		return nil, fmt.Errorf("direct concurrent walk root is a reparse point: %s", abs)
 	}
 	if report != nil {
 		report.Root = abs
@@ -103,9 +103,9 @@ func newDirectV9ConcurrentWalkSourceWithOptions(root string, exclusionRoots, exc
 		report.SourceComplete = true
 	}
 
-	s := &directV9ConcurrentWalkSource{
-		records:    make(chan directV9Record, options.Queue),
-		jobs:       make(chan directV9ConcurrentWalkJob, options.Queue),
+	s := &directConcurrentWalkSource{
+		records:    make(chan directRecord, options.Queue),
+		jobs:       make(chan directConcurrentWalkJob, options.Queue),
 		done:       make(chan struct{}),
 		finish:     make(chan struct{}),
 		report:     report,
@@ -120,14 +120,14 @@ func newDirectV9ConcurrentWalkSourceWithOptions(root string, exclusionRoots, exc
 	return s, nil
 }
 
-// newDirectV9ConcurrentWalkSourceWithExclusions keeps the same positional
+// newDirectConcurrentWalkSourceWithExclusions keeps the same positional
 // shape as the existing walk constructor and adds worker/queue bounds.
-func newDirectV9ConcurrentWalkSourceWithExclusions(root string, exclusionRoots, exclusionSuffixes []string, report *directV9WalkReport, workers, queue int) (directV9RecordSource, error) {
-	return newDirectV9ConcurrentWalkSourceWithOptions(root, exclusionRoots, exclusionSuffixes, report,
-		directV9ConcurrentWalkOptions{Workers: workers, Queue: queue})
+func newDirectConcurrentWalkSourceWithExclusions(root string, exclusionRoots, exclusionSuffixes []string, report *directWalkReport, workers, queue int) (directRecordSource, error) {
+	return newDirectConcurrentWalkSourceWithOptions(root, exclusionRoots, exclusionSuffixes, report,
+		directConcurrentWalkOptions{Workers: workers, Queue: queue})
 }
 
-func directV9ConcurrentCanonicalPaths(root string, exclusionRoots []string) (string, []string, error) {
+func directConcurrentCanonicalPaths(root string, exclusionRoots []string) (string, []string, error) {
 	abs, err := filepath.Abs(root)
 	if err != nil {
 		return "", nil, err
@@ -162,7 +162,7 @@ func directV9ConcurrentCanonicalPaths(root string, exclusionRoots []string) (str
 	return abs, canonical, nil
 }
 
-func (s *directV9ConcurrentWalkSource) runProducer(root string, exclusions, suffixes []string) {
+func (s *directConcurrentWalkSource) runProducer(root string, exclusions, suffixes []string) {
 	// Keep directory enumeration bounded as well as metadata reads. A worker
 	// owns one open directory at a time and reports at most 256 entries per
 	// batch; the coordinator is the only owner of the pending directory queue.
@@ -173,7 +173,7 @@ func (s *directV9ConcurrentWalkSource) runProducer(root string, exclusions, suff
 		dirWorkers = 1
 	}
 	dirJobs := make(chan string, dirWorkers)
-	dirResults := make(chan directV9ConcurrentDirBatch, dirWorkers*2)
+	dirResults := make(chan directConcurrentDirBatch, dirWorkers*2)
 	var dirWG sync.WaitGroup
 	for i := 0; i < dirWorkers; i++ {
 		dirWG.Add(1)
@@ -195,7 +195,7 @@ func (s *directV9ConcurrentWalkSource) runProducer(root string, exclusions, suff
 
 	if info, err := os.Lstat(root); err != nil {
 		s.note("inaccessible", root, true)
-	} else if !sendDirectV9WalkJob(s.done, s.jobs, directV9ConcurrentWalkJob{path: root, entry: directV9FileInfoDirEntry{info: info}}) {
+	} else if !sendDirectWalkJob(s.done, s.jobs, directConcurrentWalkJob{path: root, entry: directFileInfoDirEntry{info: info}}) {
 		close(dirJobs)
 		dirWG.Wait()
 		close(s.jobs)
@@ -228,7 +228,7 @@ func (s *directV9ConcurrentWalkSource) runProducer(root string, exclusions, suff
 			}
 			for _, entry := range batch.items {
 				path := filepath.Join(batch.root, entry.Name())
-				if directV9PathUnderAny(path, exclusions) {
+				if directPathUnderAny(path, exclusions) {
 					s.note("excluded", path, false)
 					continue
 				}
@@ -237,13 +237,13 @@ func (s *directV9ConcurrentWalkSource) runProducer(root string, exclusions, suff
 					break
 				default:
 				}
-				reparse := directV9PathIsReparse(path)
+				reparse := directPathIsReparse(path)
 				if reparse {
 					// The entry itself is valid input; only its target is not.
 					// Index it, but never enqueue a reparse directory for descent.
 					s.note("reparse-not-followed", path, false)
 				}
-				if directV9HasExcludedSuffix(path, suffixes) {
+				if directHasExcludedSuffix(path, suffixes) {
 					s.note("excluded", path, false)
 					continue
 				}
@@ -251,7 +251,7 @@ func (s *directV9ConcurrentWalkSource) runProducer(root string, exclusions, suff
 					pending = append(pending, path)
 				}
 				select {
-				case s.jobs <- directV9ConcurrentWalkJob{path: path, entry: entry}:
+				case s.jobs <- directConcurrentWalkJob{path: path, entry: entry}:
 				case <-s.done:
 					pending = nil
 				}
@@ -269,7 +269,7 @@ func (s *directV9ConcurrentWalkSource) runProducer(root string, exclusions, suff
 	close(s.finish)
 }
 
-func sendDirectV9WalkJob(done <-chan struct{}, jobs chan<- directV9ConcurrentWalkJob, job directV9ConcurrentWalkJob) bool {
+func sendDirectWalkJob(done <-chan struct{}, jobs chan<- directConcurrentWalkJob, job directConcurrentWalkJob) bool {
 	select {
 	case jobs <- job:
 		return true
@@ -278,7 +278,7 @@ func sendDirectV9WalkJob(done <-chan struct{}, jobs chan<- directV9ConcurrentWal
 	}
 }
 
-func directV9HasExcludedSuffix(path string, suffixes []string) bool {
+func directHasExcludedSuffix(path string, suffixes []string) bool {
 	lowerPath := strings.ToLower(path)
 	for _, suffix := range suffixes {
 		if strings.HasSuffix(lowerPath, strings.ToLower(suffix)) {
@@ -288,32 +288,32 @@ func directV9HasExcludedSuffix(path string, suffixes []string) bool {
 	return false
 }
 
-func (s *directV9ConcurrentWalkSource) enumerateDirectory(root string, results chan<- directV9ConcurrentDirBatch) {
+func (s *directConcurrentWalkSource) enumerateDirectory(root string, results chan<- directConcurrentDirBatch) {
 	f, err := os.Open(root)
 	if err != nil {
-		sendDirectV9DirBatch(s.done, results, directV9ConcurrentDirBatch{root: root, done: true, err: err})
+		sendDirectDirBatch(s.done, results, directConcurrentDirBatch{root: root, done: true, err: err})
 		return
 	}
 	defer f.Close()
 	for {
 		entries, readErr := f.ReadDir(256)
 		if len(entries) > 0 {
-			if !sendDirectV9DirBatch(s.done, results, directV9ConcurrentDirBatch{root: root, items: entries}) {
+			if !sendDirectDirBatch(s.done, results, directConcurrentDirBatch{root: root, items: entries}) {
 				return
 			}
 		}
 		if errors.Is(readErr, io.EOF) || len(entries) == 0 {
-			sendDirectV9DirBatch(s.done, results, directV9ConcurrentDirBatch{root: root, done: true, err: nil})
+			sendDirectDirBatch(s.done, results, directConcurrentDirBatch{root: root, done: true, err: nil})
 			return
 		}
 		if readErr != nil {
-			sendDirectV9DirBatch(s.done, results, directV9ConcurrentDirBatch{root: root, done: true, err: readErr})
+			sendDirectDirBatch(s.done, results, directConcurrentDirBatch{root: root, done: true, err: readErr})
 			return
 		}
 	}
 }
 
-func sendDirectV9DirBatch(done <-chan struct{}, results chan<- directV9ConcurrentDirBatch, batch directV9ConcurrentDirBatch) bool {
+func sendDirectDirBatch(done <-chan struct{}, results chan<- directConcurrentDirBatch, batch directConcurrentDirBatch) bool {
 	select {
 	case results <- batch:
 		return true
@@ -322,7 +322,7 @@ func sendDirectV9DirBatch(done <-chan struct{}, results chan<- directV9Concurren
 	}
 }
 
-func (s *directV9ConcurrentWalkSource) worker() {
+func (s *directConcurrentWalkSource) worker() {
 	defer s.workers.Done()
 	for {
 		select {
@@ -337,7 +337,7 @@ func (s *directV9ConcurrentWalkSource) worker() {
 	}
 }
 
-func (s *directV9ConcurrentWalkSource) emit(job directV9ConcurrentWalkJob) {
+func (s *directConcurrentWalkSource) emit(job directConcurrentWalkJob) {
 	select {
 	case <-s.done:
 		return
@@ -351,14 +351,14 @@ func (s *directV9ConcurrentWalkSource) emit(job directV9ConcurrentWalkJob) {
 	clean := filepath.Clean(job.path)
 	parent := uint64(0)
 	if filepath.Clean(s.root) != clean {
-		parent = directV9StablePathID(filepath.Dir(clean))
+		parent = directStablePathID(filepath.Dir(clean))
 	}
-	record := directV9Record{
-		FRN:       directV9StablePathID(clean),
+	record := directRecord{
+		FRN:       directStablePathID(clean),
 		ParentFRN: parent,
 		Mode:      uint32(info.Mode()),
 		Size:      info.Size(),
-		ModUnix:   directV9WalkModUnix(info),
+		ModUnix:   directWalkModUnix(info),
 		Name:      job.entry.Name(),
 		Path:      clean,
 	}
@@ -368,7 +368,7 @@ func (s *directV9ConcurrentWalkSource) emit(job directV9ConcurrentWalkJob) {
 	}
 }
 
-func (s *directV9ConcurrentWalkSource) note(kind, path string, incomplete bool) {
+func (s *directConcurrentWalkSource) note(kind, path string, incomplete bool) {
 	s.reportMu.Lock()
 	defer s.reportMu.Unlock()
 	if s.report == nil {
@@ -380,7 +380,7 @@ func (s *directV9ConcurrentWalkSource) note(kind, path string, incomplete bool) 
 	}
 }
 
-func (s *directV9ConcurrentWalkSource) setErr(err error) {
+func (s *directConcurrentWalkSource) setErr(err error) {
 	s.errMu.Lock()
 	defer s.errMu.Unlock()
 	if s.err == nil {
@@ -388,35 +388,35 @@ func (s *directV9ConcurrentWalkSource) setErr(err error) {
 	}
 }
 
-func (s *directV9ConcurrentWalkSource) sourceErr() error {
+func (s *directConcurrentWalkSource) sourceErr() error {
 	s.errMu.Lock()
 	defer s.errMu.Unlock()
 	return s.err
 }
 
-func (s *directV9ConcurrentWalkSource) Next(ctx context.Context) (directV9Record, error) {
+func (s *directConcurrentWalkSource) Next(ctx context.Context) (directRecord, error) {
 	select {
 	case <-s.done:
-		return directV9Record{}, io.EOF
+		return directRecord{}, io.EOF
 	default:
 	}
 	select {
 	case <-ctx.Done():
-		return directV9Record{}, ctx.Err()
+		return directRecord{}, ctx.Err()
 	case <-s.done:
-		return directV9Record{}, io.EOF
+		return directRecord{}, io.EOF
 	case record, ok := <-s.records:
 		if ok {
 			return record, nil
 		}
 		if err := s.sourceErr(); err != nil {
-			return directV9Record{}, err
+			return directRecord{}, err
 		}
-		return directV9Record{}, io.EOF
+		return directRecord{}, io.EOF
 	}
 }
 
-func (s *directV9ConcurrentWalkSource) Close() {
+func (s *directConcurrentWalkSource) Close() {
 	s.once.Do(func() { close(s.done) })
 	<-s.finish
 }

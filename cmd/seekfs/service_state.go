@@ -536,9 +536,25 @@ func serviceLowMemoryMode() bool {
 	return v == "lowmem" || v == "mmap" || v == "low-memory"
 }
 
-func envBool(name string) bool {
-	v := strings.ToLower(strings.TrimSpace(os.Getenv(name)))
+// envFirst returns the first set, non-empty value among names.  The trailing
+// names let a renamed environment knob keep accepting its previous spelling.
+func envFirst(names ...string) (string, bool) {
+	for _, name := range names {
+		if v := strings.TrimSpace(os.Getenv(name)); v != "" {
+			return v, true
+		}
+	}
+	return "", false
+}
+
+func envTruthy(v string) bool {
+	v = strings.ToLower(strings.TrimSpace(v))
 	return v == "1" || v == "true" || v == "yes" || v == "on"
+}
+
+func envBool(names ...string) bool {
+	v, ok := envFirst(names...)
+	return ok && envTruthy(v)
 }
 
 func serviceNameTrigramsEnabledForIndex(idx *Index) bool {

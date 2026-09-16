@@ -49,7 +49,7 @@ func readIndexMMap(mapped *mappedIndexFile) (*Index, error) {
 		TokenCount:  binary.LittleEndian.Uint64(data[64:]),
 	}
 	sectionTableOffset := uint64(0)
-	if header.Magic != indexMagicV9 {
+	if header.Magic != indexMagic {
 		return nil, errors.New("unsupported index format: only the v9 index format is supported")
 	}
 	if len(data) < headerSize+8 {
@@ -57,7 +57,7 @@ func readIndexMMap(mapped *mappedIndexFile) (*Index, error) {
 	}
 	sectionTableOffset = binary.LittleEndian.Uint64(data[headerSize:])
 	headerSize += 8
-	if header.Version != indexVersionV9 {
+	if header.Version != indexVersion {
 		return nil, fmt.Errorf("unsupported index version %d: only v9 indexes are supported", header.Version)
 	}
 	if header.Compact == 0 {

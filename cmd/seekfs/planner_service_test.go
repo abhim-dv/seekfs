@@ -460,7 +460,7 @@ func singleEntryKindCompactIndex(volume, name string, mode uint32) *Index {
 }
 
 func TestGlobalPlannerOverlayExtMatchesServiceVolumes(t *testing.T) {
-	vol := engineV9OverlaySearchTestVolume(t)
+	vol := engineOverlaySearchTestVolume(t)
 	vol.applyUSNChanges([]usnChange{
 		{FRN: 101, USN: 10, Reason: usnReasonFileDelete},
 		{FRN: 301, ParentFRN: 100, USN: 11, Reason: usnReasonFileCreate, Name: "aaa-overlay.txt"},
@@ -717,7 +717,7 @@ func TestGlobalPlannerComponentSortPathUsesGlobalPathOrder(t *testing.T) {
 }
 
 func TestGlobalPlannerOverlayComponentMatchesServiceVolumes(t *testing.T) {
-	vol := engineV9OverlaySearchTestVolume(t)
+	vol := engineOverlaySearchTestVolume(t)
 	vol.applyUSNChanges([]usnChange{{
 		FRN:       301,
 		ParentFRN: 200,
@@ -776,7 +776,7 @@ func TestGlobalPlannerOverlayComponentMatchesServiceVolumes(t *testing.T) {
 
 func TestGlobalPlannerOverlayDirectoryRenameUpdatesComponentDescendants(t *testing.T) {
 	t.Setenv("SEEKFS_GLOBAL_PLANNER", "1")
-	vol := engineV9OverlaySearchTestVolume(t)
+	vol := engineOverlaySearchTestVolume(t)
 	vol.applyUSNChanges([]usnChange{
 		{FRN: 301, ParentFRN: 100, USN: 11, Reason: usnReasonFileCreate, Name: "staging", Attr: fileAttributeDir},
 		{FRN: 302, ParentFRN: 301, USN: 12, Reason: usnReasonFileCreate, Name: "model_v2", Attr: fileAttributeDir},
@@ -850,7 +850,7 @@ func TestGlobalPlannerOverlayParentMatchesServiceVolumes(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			vol := engineV9OverlaySearchTestVolume(t)
+			vol := engineOverlaySearchTestVolume(t)
 			vol.applyUSNChanges(tc.changes)
 			opts := queryOptions{Query: tc.query, Limit: 10}
 			want, err := searchServiceVolumes([]*serviceVolumeIndex{vol}, opts, false)

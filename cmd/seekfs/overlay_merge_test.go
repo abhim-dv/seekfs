@@ -32,7 +32,7 @@ func buildOverlayLimitFixture(t *testing.T, matchCount int) *serviceVolumeIndex 
 		})
 	}
 	idx := &Index{
-		Version: indexVersionV9,
+		Version: indexVersion,
 		Roots:   []string{`F:\`},
 		Source:  "usn",
 		Volume:  "F:",
@@ -245,7 +245,7 @@ func TestOverlayMergeCountMatchesFreshOracleUnderTombstones(t *testing.T) {
 // documents a real, reproducible engine gap rather than a passing invariant.
 func TestOverlayDirectoryDeleteWithoutPerChildUSNLeavesOverlayOnlyChildVisible(t *testing.T) {
 	idx := &Index{
-		Version: indexVersionV9,
+		Version: indexVersion,
 		Roots:   []string{`F:\`},
 		Source:  "usn",
 		Volume:  "F:",
@@ -342,7 +342,7 @@ func TestOverlayFileDeleteBurstMatchesFreshOracle(t *testing.T) {
 	}
 
 	idx := &Index{
-		Version: indexVersionV9,
+		Version: indexVersion,
 		Roots:   []string{`F:\`},
 		Source:  "usn",
 		Volume:  "F:",

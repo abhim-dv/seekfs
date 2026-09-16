@@ -1260,7 +1260,7 @@ func compactOverlayIndex(vol *serviceVolumeIndex) *Index {
 func compactOverlayIndexLocked(vol *serviceVolumeIndex, foldOverlay *overlaySegment) *Index {
 	base := vol.index
 	out := &Index{
-		Version:      indexVersionV9,
+		Version:      indexVersion,
 		Roots:        append([]string(nil), base.Roots...),
 		BuiltAt:      time.Now(),
 		Source:       base.Source,

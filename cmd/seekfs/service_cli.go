@@ -24,7 +24,6 @@ func cmdService(args []string) error {
 	pipeName := fs.String("pipe", defaultServicePipe, "service named pipe")
 	sddl := fs.String("sddl", defaultServiceSDDL, "pipe security descriptor SDDL")
 	lowMemory := fs.Bool("lowmem", false, "run service in low-memory mmap mode")
-	skipStartupSync := fs.Bool("skip-startup-sync", false, "deprecated no-op; startup replay and catch-up always run")
 	remoteAddr := fs.String("remote-addr", "", "loopback address for the Mode L transport (e.g. 127.0.0.1:0); empty disables it (default)")
 	fs.Var(&dbs, "db", "index database path to load for service search; repeatable")
 	if err := fs.Parse(args); err != nil {
@@ -33,7 +32,6 @@ func cmdService(args []string) error {
 	if *lowMemory {
 		_ = os.Setenv("SEEKFS_MEMORY_MODE", "lowmem")
 	}
-	_ = *skipStartupSync
 	cfg, err := loadConfig(*configPath)
 	if err != nil {
 		return err

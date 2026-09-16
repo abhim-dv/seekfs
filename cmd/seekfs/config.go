@@ -109,11 +109,11 @@ func seekFSExclusionDirsUnder(sourceRoot string) []string {
 		if candidate == "" {
 			continue
 		}
-		canonical, err := directV9CanonicalPath(candidate)
+		canonical, err := directCanonicalPath(candidate)
 		if err != nil {
 			continue
 		}
-		if !directV9PathUnderAny(canonical, []string{sourceRoot}) {
+		if !directPathUnderAny(canonical, []string{sourceRoot}) {
 			continue
 		}
 		key := strings.ToLower(canonical)
@@ -193,14 +193,14 @@ func ownedReplayDirFRNs(volume string) map[uint64]struct{} {
 		return nil
 	}
 	root := vol + "\\"
-	canonicalRoot, err := directV9CanonicalPath(root)
+	canonicalRoot, err := directCanonicalPath(root)
 	if err != nil {
 		return nil
 	}
 	dirs := seekFSExclusionDirsUnder(canonicalRoot)
 	spool := nameGramSpoolDir()
-	if canonical, spoolErr := directV9CanonicalPath(spool); spoolErr == nil &&
-		directV9PathUnderAny(canonical, []string{canonicalRoot}) {
+	if canonical, spoolErr := directCanonicalPath(spool); spoolErr == nil &&
+		directPathUnderAny(canonical, []string{canonicalRoot}) {
 		dirs = append(dirs, canonical)
 	}
 	out := make(map[uint64]struct{})

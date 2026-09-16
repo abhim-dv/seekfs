@@ -20,24 +20,24 @@ import (
 	"time"
 )
 
-func TestDirectV9BuilderIsSourceOrderIndependentAndResolvesParents(t *testing.T) {
-	records := []directV9Record{
+func TestDirectBuilderIsSourceOrderIndependentAndResolvesParents(t *testing.T) {
+	records := []directRecord{
 		{FRN: 40, ParentFRN: 99, Name: "orphan.txt"},
 		{FRN: 30, ParentFRN: 20, Name: "child.txt"},
 		{FRN: 10, Name: "root"},
 		{FRN: 20, ParentFRN: 10, Name: "parent"},
 	}
-	build := func(name string, source []directV9Record, runRecords int) (string, directV9BuildStats) {
+	build := func(name string, source []directRecord, runRecords int) (string, directBuildStats) {
 		dir := t.TempDir()
 		path := filepath.Join(dir, name+".gsi")
-		stats, err := buildDirectV9(context.Background(), directV9BuildOptions{
+		stats, err := buildDirect(context.Background(), directBuildOptions{
 			OutputPath: path,
 			SpoolDir:   filepath.Join(dir, "spool"),
 			Roots:      []string{"X:\\"},
 			Volume:     "X:",
 			Source:     "direct-test",
 			BuiltAt:    time.Unix(123, 0),
-			Records:    newDirectV9SliceSource(source),
+			Records:    newDirectSliceSource(source),
 			RunRecords: runRecords,
 			RunBytes:   4096,
 		})
@@ -47,10 +47,10 @@ func TestDirectV9BuilderIsSourceOrderIndependentAndResolvesParents(t *testing.T)
 		return path, stats
 	}
 	first, firstStats := build("first", records, 2)
-	secondRecords := []directV9Record{records[2], records[0], records[3], records[1]}
+	secondRecords := []directRecord{records[2], records[0], records[3], records[1]}
 	second, secondStats := build("second", secondRecords, 3)
-	firstHash := directV9FileHash(t, first)
-	secondHash := directV9FileHash(t, second)
+	firstHash := directFileHash(t, first)
+	secondHash := directFileHash(t, second)
 	if firstHash != secondHash {
 		t.Fatalf("source order changed direct output: %s != %s", firstHash, secondHash)
 	}
@@ -62,7 +62,7 @@ func TestDirectV9BuilderIsSourceOrderIndependentAndResolvesParents(t *testing.T)
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = idx.MMapRecords.file.close() })
-	if idx.Version != indexVersionV9 || idx.compactRecordCount() != 4 {
+	if idx.Version != indexVersion || idx.compactRecordCount() != 4 {
 		t.Fatalf("loaded direct index = version %d records %d", idx.Version, idx.compactRecordCount())
 	}
 	wantParents := []int32{-1, 0, 1, -1}
@@ -88,12 +88,12 @@ func TestDirectV9BuilderIsSourceOrderIndependentAndResolvesParents(t *testing.T)
 	}
 }
 
-func TestDirectV9TopologyRejectsParentCycleAndCleans(t *testing.T) {
+func TestDirectTopologyRejectsParentCycleAndCleans(t *testing.T) {
 	dir := t.TempDir()
-	_, err := buildDirectV9(context.Background(), directV9BuildOptions{
+	_, err := buildDirect(context.Background(), directBuildOptions{
 		OutputPath: filepath.Join(dir, "cycle.gsi"),
 		SpoolDir:   filepath.Join(dir, "spool"),
-		Records: newDirectV9SliceSource([]directV9Record{
+		Records: newDirectSliceSource([]directRecord{
 			{FRN: 1, ParentFRN: 2, Name: "a"},
 			{FRN: 2, ParentFRN: 1, Name: "b"},
 		}),
@@ -102,7 +102,7 @@ func TestDirectV9TopologyRejectsParentCycleAndCleans(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "parent cycle") {
 		t.Fatalf("cycle error=%v", err)
 	}
-	if leftovers, globErr := filepath.Glob(filepath.Join(dir, "spool", "direct-v9-*.tmp")); globErr != nil || len(leftovers) != 0 {
+	if leftovers, globErr := filepath.Glob(filepath.Join(dir, "spool", "direct-*.tmp")); globErr != nil || len(leftovers) != 0 {
 		t.Fatalf("cycle scratch survived: %v (%v)", leftovers, globErr)
 	}
 }
@@ -131,8 +131,8 @@ func equalUint64s(a, b []uint64) bool {
 	return true
 }
 
-func TestDirectV9RankFamiliesMatchComparator(t *testing.T) {
-	records := []directV9Record{
+func TestDirectRankFamiliesMatchComparator(t *testing.T) {
+	records := []directRecord{
 		{FRN: 40, Name: "zeta.TXT", Path: `X:\zeta.TXT`, Size: 0, ModUnix: 0},
 		{FRN: 10, Name: "dir", Path: `X:\dir`, Mode: uint32(os.ModeDir), Size: 0, ModUnix: 20},
 		{FRN: 30, Name: "a.go", Path: `X:\dir\a.go`, Size: 5, ModUnix: 10},
@@ -140,7 +140,7 @@ func TestDirectV9RankFamiliesMatchComparator(t *testing.T) {
 	}
 	dir := t.TempDir()
 	out := filepath.Join(dir, "ranks.gsi")
-	stats, err := buildDirectV9(context.Background(), directV9BuildOptions{OutputPath: out, SpoolDir: filepath.Join(dir, "spool"), Records: newDirectV9SliceSource(records), RunRecords: 2, RunBytes: 4096})
+	stats, err := buildDirect(context.Background(), directBuildOptions{OutputPath: out, SpoolDir: filepath.Join(dir, "spool"), Records: newDirectSliceSource(records), RunRecords: 2, RunBytes: 4096})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -152,9 +152,9 @@ func TestDirectV9RankFamiliesMatchComparator(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = idx.MMapRecords.file.close() })
-	ordered := append([]directV9Record(nil), records...)
-	sort.Slice(ordered, func(i, j int) bool { return directV9RecordLess(ordered[i], ordered[j]) })
-	for _, spec := range directV9RankSpecs() {
+	ordered := append([]directRecord(nil), records...)
+	sort.Slice(ordered, func(i, j int) bool { return directRecordLess(ordered[i], ordered[j]) })
+	for _, spec := range directRankSpecs() {
 		want := make([]uint32, len(ordered))
 		for i := range want {
 			want[i] = uint32(i)
@@ -166,7 +166,7 @@ func TestDirectV9RankFamiliesMatchComparator(t *testing.T) {
 			}
 			return want[i] < want[j]
 		})
-		gotOrder, gotRank := directV9DerivedRank(idx, spec.Tag)
+		gotOrder, gotRank := directDerivedRank(idx, spec.Tag)
 		if len(gotOrder) != len(want) || len(gotRank) != len(want) {
 			t.Fatalf("%s lengths=%d/%d want=%d", spec.Name, len(gotOrder), len(gotRank), len(want))
 		}
@@ -178,26 +178,26 @@ func TestDirectV9RankFamiliesMatchComparator(t *testing.T) {
 	}
 }
 
-func TestDirectV9RankWorkerCountsPreserveOutput(t *testing.T) {
-	records := make([]directV9Record, 0, 256)
+func TestDirectRankWorkerCountsPreserveOutput(t *testing.T) {
+	records := make([]directRecord, 0, 256)
 	for i := 0; i < 256; i++ {
-		records = append(records, directV9SyntheticRecord(i))
+		records = append(records, directSyntheticRecord(i))
 	}
 	var wantHash string
 	for _, workers := range []int{1, 4, 8, 16} {
 		dir := t.TempDir()
 		out := filepath.Join(dir, fmt.Sprintf("workers-%d.gsi", workers))
-		stats, err := buildDirectV9(context.Background(), directV9BuildOptions{
+		stats, err := buildDirect(context.Background(), directBuildOptions{
 			OutputPath:  out,
 			SpoolDir:    filepath.Join(dir, "spool"),
-			Records:     newDirectV9SliceSource(records),
+			Records:     newDirectSliceSource(records),
 			RunRecords:  32,
 			RankWorkers: workers,
 		})
 		if err != nil {
 			t.Fatalf("workers=%d: %v", workers, err)
 		}
-		gotHash := directV9FileHash(t, out)
+		gotHash := directFileHash(t, out)
 		if workers == 1 {
 			wantHash = gotHash
 		} else if gotHash != wantHash {
@@ -206,7 +206,7 @@ func TestDirectV9RankWorkerCountsPreserveOutput(t *testing.T) {
 	}
 }
 
-func TestDirectV9SharedRankPassCancellationCleansOwnedRuns(t *testing.T) {
+func TestDirectSharedRankPassCancellationCleansOwnedRuns(t *testing.T) {
 	dir := t.TempDir()
 	finalPath := filepath.Join(dir, "records.final.tmp")
 	f, err := os.Create(finalPath)
@@ -214,7 +214,7 @@ func TestDirectV9SharedRankPassCancellationCleansOwnedRuns(t *testing.T) {
 		t.Fatal(err)
 	}
 	bw := bufio.NewWriter(f)
-	if _, err := writeDirectV9SpoolRecord(bw, directV9SyntheticRecord(0)); err != nil {
+	if _, err := writeDirectSpoolRecord(bw, directSyntheticRecord(0)); err != nil {
 		t.Fatal(err)
 	}
 	if err := bw.Flush(); err != nil {
@@ -226,17 +226,17 @@ func TestDirectV9SharedRankPassCancellationCleansOwnedRuns(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	owned := make([]string, 0)
-	_, err = directV9BuildRankRunsShared(ctx, finalPath, dir, 32, 4, directV9RankSpecs(), &owned)
+	_, err = directBuildRankRunsShared(ctx, finalPath, dir, 32, 4, directRankSpecs(), &owned)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("shared rank cancellation error=%v", err)
 	}
-	directV9RemoveOwned(owned)
-	if leftovers, globErr := filepath.Glob(filepath.Join(dir, "direct-v9-rank-*.tmp")); globErr != nil || len(leftovers) != 0 {
+	directRemoveOwned(owned)
+	if leftovers, globErr := filepath.Glob(filepath.Join(dir, "direct-rank-*.tmp")); globErr != nil || len(leftovers) != 0 {
 		t.Fatalf("shared rank cancellation leftovers=%v err=%v", leftovers, globErr)
 	}
 }
 
-func directV9DerivedRank(idx *Index, tag uint32) ([]uint32, []uint32) {
+func directDerivedRank(idx *Index, tag uint32) ([]uint32, []uint32) {
 	switch tag {
 	case indexSectionRANK:
 		return idx.Derived.NameOrder, idx.Derived.NameRank
@@ -255,32 +255,32 @@ func directV9DerivedRank(idx *Index, tag uint32) ([]uint32, []uint32) {
 	}
 }
 
-func TestDirectV9BuilderRejectsDuplicateFRNAndCleansOwnedScratch(t *testing.T) {
+func TestDirectBuilderRejectsDuplicateFRNAndCleansOwnedScratch(t *testing.T) {
 	dir := t.TempDir()
 	out := filepath.Join(dir, "duplicate.gsi")
-	_, err := buildDirectV9(context.Background(), directV9BuildOptions{
+	_, err := buildDirect(context.Background(), directBuildOptions{
 		OutputPath: out,
 		SpoolDir:   filepath.Join(dir, "owned-spool"),
 		BuiltAt:    time.Unix(123, 0),
-		Records: newDirectV9SliceSource([]directV9Record{
+		Records: newDirectSliceSource([]directRecord{
 			{FRN: 1, Name: "a"},
 			{FRN: 1, Name: "b"},
 		}),
 		RunRecords: 1,
 	})
-	if !errors.Is(err, errDirectV9DuplicateFRN) {
+	if !errors.Is(err, errDirectDuplicateFRN) {
 		t.Fatalf("duplicate error = %v", err)
 	}
 	if _, statErr := os.Stat(out); !errors.Is(statErr, os.ErrNotExist) {
 		t.Fatalf("duplicate build left output: %v", statErr)
 	}
-	if leftovers, globErr := filepath.Glob(filepath.Join(dir, "owned-spool", "direct-v9-*.tmp")); globErr != nil || len(leftovers) != 0 {
+	if leftovers, globErr := filepath.Glob(filepath.Join(dir, "owned-spool", "direct-*.tmp")); globErr != nil || len(leftovers) != 0 {
 		t.Fatalf("owned scratch survived cleanup: %v (%v)", leftovers, globErr)
 	}
 }
 
-func TestDirectV9MFTAndUSNAdaptersAreElevationFree(t *testing.T) {
-	mft := newDirectV9MFTSource(map[uint64]mftEntry{
+func TestDirectMFTAndUSNAdaptersAreElevationFree(t *testing.T) {
+	mft := newDirectMFTSource(map[uint64]mftEntry{
 		20: {frn: 20, parentFRN: 10, name: "child.bin", size: 7},
 		10: {frn: 10, name: "root", attr: fileAttributeDir, isDir: true},
 	})
@@ -294,8 +294,8 @@ func TestDirectV9MFTAndUSNAdaptersAreElevationFree(t *testing.T) {
 	}
 }
 
-func TestDirectV9MFTSourceNormalizesRootSelfParent(t *testing.T) {
-	mft := newDirectV9MFTSource(map[uint64]mftEntry{
+func TestDirectMFTSourceNormalizesRootSelfParent(t *testing.T) {
+	mft := newDirectMFTSource(map[uint64]mftEntry{
 		5:  {frn: 5, parentFRN: 5, name: "root", attr: fileAttributeDir, isDir: true},
 		10: {frn: 10, parentFRN: 5, name: "child.bin", size: 3},
 	})
@@ -309,8 +309,8 @@ func TestDirectV9MFTSourceNormalizesRootSelfParent(t *testing.T) {
 	}
 }
 
-func TestDirectV9USNAdapterIsElevationFree(t *testing.T) {
-	usn := newDirectV9USNSource(map[uint64]usnNode{
+func TestDirectUSNAdapterIsElevationFree(t *testing.T) {
+	usn := newDirectUSNSource(map[uint64]usnNode{
 		2: {frn: 2, parentFRN: 1, name: "child.bin"},
 		1: {frn: 1, name: "root", attr: fileAttributeDir},
 	})
@@ -324,7 +324,7 @@ func TestDirectV9USNAdapterIsElevationFree(t *testing.T) {
 	}
 }
 
-func TestDirectV9WalkSourceFeedsTheSameBuilder(t *testing.T) {
+func TestDirectWalkSourceFeedsTheSameBuilder(t *testing.T) {
 	root := t.TempDir()
 	if err := os.Mkdir(filepath.Join(root, "nested"), 0o755); err != nil {
 		t.Fatal(err)
@@ -335,14 +335,14 @@ func TestDirectV9WalkSourceFeedsTheSameBuilder(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, "nested", "beta.bin"), []byte("beta"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	source, err := newDirectV9WalkSource(root)
+	source, err := newDirectWalkSource(root)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer source.(*directV9WalkSource).Close()
+	defer source.(*directWalkSource).Close()
 	dir := t.TempDir()
 	out := filepath.Join(dir, "walk.gsi")
-	stats, err := buildDirectV9(context.Background(), directV9BuildOptions{
+	stats, err := buildDirect(context.Background(), directBuildOptions{
 		OutputPath: out,
 		SpoolDir:   filepath.Join(dir, "spool"),
 		Roots:      []string{root},
@@ -367,7 +367,7 @@ func TestDirectV9WalkSourceFeedsTheSameBuilder(t *testing.T) {
 	}
 }
 
-func TestDirectV9WalkSourceExcludesOwnedArtifactsBeforeTraversal(t *testing.T) {
+func TestDirectWalkSourceExcludesOwnedArtifactsBeforeTraversal(t *testing.T) {
 	root := t.TempDir()
 	owned := filepath.Join(root, "owned-run")
 	if err := os.MkdirAll(filepath.Join(root, "included"), 0o755); err != nil {
@@ -385,12 +385,12 @@ func TestDirectV9WalkSourceExcludesOwnedArtifactsBeforeTraversal(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	report := &directV9WalkReport{}
-	source, err := newDirectV9WalkSourceWithExclusions(root, []string{owned}, []string{".gsi"}, report)
+	report := &directWalkReport{}
+	source, err := newDirectWalkSourceWithExclusions(root, []string{owned}, []string{".gsi"}, report)
 	if err != nil {
 		t.Fatal(err)
 	}
-	walk := source.(*directV9WalkSource)
+	walk := source.(*directWalkSource)
 	defer walk.Close()
 	count := 0
 	for {
@@ -409,7 +409,7 @@ func TestDirectV9WalkSourceExcludesOwnedArtifactsBeforeTraversal(t *testing.T) {
 	}
 }
 
-func TestDirectV9ConcurrentWalkBuilderOutputIsWorkerIndependent(t *testing.T) {
+func TestDirectConcurrentWalkBuilderOutputIsWorkerIndependent(t *testing.T) {
 	root := t.TempDir()
 	for i := 0; i < 32; i++ {
 		dir := filepath.Join(root, fmt.Sprintf("d-%02d", i%4))
@@ -423,12 +423,12 @@ func TestDirectV9ConcurrentWalkBuilderOutputIsWorkerIndependent(t *testing.T) {
 	var want string
 	for _, workers := range []int{1, 4, 8, 16} {
 		dir := t.TempDir()
-		report := &directV9WalkReport{}
-		source, err := newDirectV9ConcurrentWalkSourceWithOptions(root, nil, nil, report, directV9ConcurrentWalkOptions{Workers: workers, Queue: workers * 2})
+		report := &directWalkReport{}
+		source, err := newDirectConcurrentWalkSourceWithOptions(root, nil, nil, report, directConcurrentWalkOptions{Workers: workers, Queue: workers * 2})
 		if err != nil {
 			t.Fatal(err)
 		}
-		stats, err := buildDirectV9(context.Background(), directV9BuildOptions{
+		stats, err := buildDirect(context.Background(), directBuildOptions{
 			OutputPath:  filepath.Join(dir, "walk.gsi"),
 			SpoolDir:    filepath.Join(dir, "spool"),
 			Records:     source,
@@ -440,7 +440,7 @@ func TestDirectV9ConcurrentWalkBuilderOutputIsWorkerIndependent(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		got := directV9FileHash(t, filepath.Join(dir, "walk.gsi"))
+		got := directFileHash(t, filepath.Join(dir, "walk.gsi"))
 		if workers == 1 {
 			want = got
 		} else if got != want {
@@ -448,17 +448,17 @@ func TestDirectV9ConcurrentWalkBuilderOutputIsWorkerIndependent(t *testing.T) {
 			if loadErr != nil {
 				t.Fatalf("workers=%d hash=%s want=%s load=%v stats=%+v", workers, got, want, loadErr, stats)
 			}
-			idxHash := directV9OrderHash(idx.Derived.NameOrder)
+			idxHash := directOrderHash(idx.Derived.NameOrder)
 			_ = idx.MMapRecords.file.close()
 			t.Fatalf("workers=%d hash=%s want=%s order_hash=%s stats=%+v", workers, got, want, idxHash, stats)
 		}
 	}
 }
 
-func TestDirectV9WalkPreflightUsesStableArtifactRootAcrossFreshRuns(t *testing.T) {
+func TestDirectWalkPreflightUsesStableArtifactRootAcrossFreshRuns(t *testing.T) {
 	// The preflight canonicalizes paths (EvalSymlinks), so compare in canonical
 	// space; a symlinked or short-named temp root would otherwise alias.
-	root, err := directV9CanonicalPath(t.TempDir())
+	root, err := directCanonicalPath(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -473,37 +473,37 @@ func TestDirectV9WalkPreflightUsesStableArtifactRootAcrossFreshRuns(t *testing.T
 			t.Fatal(err)
 		}
 	}
-	preOne, err := directV9WalkPreflightFor(root, filepath.Join(runOne, "one.gsi"), filepath.Join(runOne, "spool"))
+	preOne, err := directWalkPreflightFor(root, filepath.Join(runOne, "one.gsi"), filepath.Join(runOne, "spool"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	preTwo, err := directV9WalkPreflightFor(root, filepath.Join(runTwo, "two.gsi"), filepath.Join(runTwo, "spool"))
+	preTwo, err := directWalkPreflightFor(root, filepath.Join(runTwo, "two.gsi"), filepath.Join(runTwo, "spool"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !directV9PathUnderAny(preOne.Target, preOne.ExclusionRoots) || !directV9PathUnderAny(preOne.Spool, preOne.ExclusionRoots) ||
-		!directV9PathUnderAny(preTwo.Target, preTwo.ExclusionRoots) || !directV9PathUnderAny(preTwo.Spool, preTwo.ExclusionRoots) {
+	if !directPathUnderAny(preOne.Target, preOne.ExclusionRoots) || !directPathUnderAny(preOne.Spool, preOne.ExclusionRoots) ||
+		!directPathUnderAny(preTwo.Target, preTwo.ExclusionRoots) || !directPathUnderAny(preTwo.Spool, preTwo.ExclusionRoots) {
 		t.Fatalf("target/spool escaped stable exclusion: one=%+v two=%+v", preOne, preTwo)
 	}
-	if !directV9PathUnderAny(stable, preTwo.ExclusionRoots) || directV9PathUnderAny(root, preTwo.ExclusionRoots) {
+	if !directPathUnderAny(stable, preTwo.ExclusionRoots) || directPathUnderAny(root, preTwo.ExclusionRoots) {
 		t.Fatalf("stable root/source alias check failed: %+v", preTwo.ExclusionRoots)
 	}
-	if directV9PathUnderAny(preTwo.Target, []string{runOne}) {
+	if directPathUnderAny(preTwo.Target, []string{runOne}) {
 		t.Fatalf("fresh run target was covered only by stale prior-run root")
 	}
-	if !directV9PathUnderAny(preTwo.Target, preOne.ExclusionRoots) {
+	if !directPathUnderAny(preTwo.Target, preOne.ExclusionRoots) {
 		t.Fatalf("stable root should cover a future run without stale variables")
 	}
 }
 
-func TestDirectV9BuilderCancellationDoesNotPublishTarget(t *testing.T) {
+func TestDirectBuilderCancellationDoesNotPublishTarget(t *testing.T) {
 	dir := t.TempDir()
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	_, err := buildDirectV9(ctx, directV9BuildOptions{
+	_, err := buildDirect(ctx, directBuildOptions{
 		OutputPath: filepath.Join(dir, "cancelled.gsi"),
 		SpoolDir:   filepath.Join(dir, "owned-spool"),
-		Records:    newDirectV9SliceSource([]directV9Record{{FRN: 1, Name: "a"}}),
+		Records:    newDirectSliceSource([]directRecord{{FRN: 1, Name: "a"}}),
 	})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("cancellation error = %v", err)
@@ -513,20 +513,20 @@ func TestDirectV9BuilderCancellationDoesNotPublishTarget(t *testing.T) {
 	}
 }
 
-func TestDirectV9InaccessibleBoundDegradesWithinLimit(t *testing.T) {
+func TestDirectInaccessibleBoundDegradesWithinLimit(t *testing.T) {
 	dir := t.TempDir()
 	out := filepath.Join(dir, "degraded.gsi")
-	report := &directV9WalkReport{SourceComplete: false}
+	report := &directWalkReport{SourceComplete: false}
 	report.note("inaccessible", "X:\\protected\\dir-a")
 	report.note("inaccessible", "X:\\protected\\dir-b")
-	stats, err := buildDirectV9(context.Background(), directV9BuildOptions{
+	stats, err := buildDirect(context.Background(), directBuildOptions{
 		OutputPath:      out,
 		SpoolDir:        filepath.Join(dir, "spool"),
 		Roots:           []string{`X:\`},
 		Volume:          "X:",
 		Source:          "direct-walk",
 		BuiltAt:         time.Unix(0, 0),
-		Records:         newDirectV9SliceSource([]directV9Record{{FRN: 1, Name: "."}}),
+		Records:         newDirectSliceSource([]directRecord{{FRN: 1, Name: "."}}),
 		WalkReport:      report,
 		MaxInaccessible: 64,
 	})
@@ -547,18 +547,18 @@ func TestDirectV9InaccessibleBoundDegradesWithinLimit(t *testing.T) {
 	}
 }
 
-func TestDirectV9InaccessibleBoundRefusesAboveLimit(t *testing.T) {
+func TestDirectInaccessibleBoundRefusesAboveLimit(t *testing.T) {
 	dir := t.TempDir()
 	out := filepath.Join(dir, "refused.gsi")
-	report := &directV9WalkReport{SourceComplete: false, Inaccessible: 2}
-	_, err := buildDirectV9(context.Background(), directV9BuildOptions{
+	report := &directWalkReport{SourceComplete: false, Inaccessible: 2}
+	_, err := buildDirect(context.Background(), directBuildOptions{
 		OutputPath:      out,
 		SpoolDir:        filepath.Join(dir, "spool"),
 		Roots:           []string{`X:\`},
 		Volume:          "X:",
 		Source:          "direct-walk",
 		BuiltAt:         time.Unix(0, 0),
-		Records:         newDirectV9SliceSource([]directV9Record{{FRN: 1, Name: "."}}),
+		Records:         newDirectSliceSource([]directRecord{{FRN: 1, Name: "."}}),
 		WalkReport:      report,
 		MaxInaccessible: 1,
 	})
@@ -573,18 +573,18 @@ func TestDirectV9InaccessibleBoundRefusesAboveLimit(t *testing.T) {
 	}
 }
 
-func TestDirectV9InaccessibleZeroRequiresCleanSource(t *testing.T) {
+func TestDirectInaccessibleZeroRequiresCleanSource(t *testing.T) {
 	dir := t.TempDir()
-	report := &directV9WalkReport{SourceComplete: true, Inaccessible: 0}
+	report := &directWalkReport{SourceComplete: true, Inaccessible: 0}
 	out := filepath.Join(dir, "clean.gsi")
-	if _, err := buildDirectV9(context.Background(), directV9BuildOptions{
+	if _, err := buildDirect(context.Background(), directBuildOptions{
 		OutputPath:      out,
 		SpoolDir:        filepath.Join(dir, "spool"),
 		Roots:           []string{`X:\`},
 		Volume:          "X:",
 		Source:          "direct-walk",
 		BuiltAt:         time.Unix(0, 0),
-		Records:         newDirectV9SliceSource([]directV9Record{{FRN: 1, Name: "."}}),
+		Records:         newDirectSliceSource([]directRecord{{FRN: 1, Name: "."}}),
 		WalkReport:      report,
 		MaxInaccessible: 0,
 	}); err != nil {
@@ -595,10 +595,10 @@ func TestDirectV9InaccessibleZeroRequiresCleanSource(t *testing.T) {
 	}
 }
 
-func TestDirectV9CanonicalDerivedParity(t *testing.T) {
+func TestDirectCanonicalDerivedParity(t *testing.T) {
 	t.Setenv("SEEKFS_LOW_MEMORY_TRIGRAM_MAX_POSTING", "2")
-	t.Setenv("SEEKFS_V9_SELF_NAME_GRAMS", "1")
-	records := []directV9Record{
+	t.Setenv("SEEKFS_SELF_NAME_GRAMS", "1")
+	records := []directRecord{
 		{FRN: 1, Name: ".", Path: `X:\`, Mode: uint32(os.ModeDir)},
 		{FRN: 2, ParentFRN: 1, Name: "common", Path: `X:\common`, Mode: uint32(os.ModeDir)},
 		{FRN: 3, ParentFRN: 1, Name: "rare", Path: `X:\rare`, Mode: uint32(os.ModeDir)},
@@ -610,14 +610,14 @@ func TestDirectV9CanonicalDerivedParity(t *testing.T) {
 	}
 	dir := t.TempDir()
 	out := filepath.Join(dir, "canonical-parity.gsi")
-	if _, err := buildDirectV9(context.Background(), directV9BuildOptions{
+	if _, err := buildDirect(context.Background(), directBuildOptions{
 		OutputPath: out,
 		SpoolDir:   filepath.Join(dir, "spool"),
 		Roots:      []string{`X:\`},
 		Volume:     "X:",
 		Source:     "usn",
 		BuiltAt:    time.Unix(123, 0),
-		Records:    newDirectV9SliceSource(records),
+		Records:    newDirectSliceSource(records),
 		RunRecords: 2,
 		RunBytes:   4096,
 	}); err != nil {
@@ -635,8 +635,8 @@ func TestDirectV9CanonicalDerivedParity(t *testing.T) {
 	pathRank := append([]uint32(nil), idx.Derived.PathRank...)
 	vol := newServiceVolumeIndex(out, idx)
 
-	subt := directV9TestSectionData(t, out, indexSectionSUBT)
-	if parts := directV9TestUint32Parts(t, subt); len(parts) != 8 {
+	subt := directTestSectionData(t, out, indexSectionSUBT)
+	if parts := directTestUint32Parts(t, subt); len(parts) != 8 {
 		t.Fatalf("SUBT parts=%d, want canonical 8", len(parts))
 	}
 	for _, tc := range []struct {
@@ -662,12 +662,12 @@ func TestDirectV9CanonicalDerivedParity(t *testing.T) {
 			t.Fatalf("PCMP %q=%v, want own-directory roots %v", key, got, want)
 		}
 	}
-	pcmpData := directV9TestSectionData(t, out, indexSectionPCMP)
-	firstBlock, blockCount := directV9TestStringPostingBlocks(t, pcmpData, "common")
+	pcmpData := directTestSectionData(t, out, indexSectionPCMP)
+	firstBlock, blockCount := directTestStringPostingBlocks(t, pcmpData, "common")
 	if blockCount != 1 {
 		t.Fatalf("PCMP common blocks=%d, want 1", blockCount)
 	}
-	if got, want := directV9TestBlockMinRank(pcmpData, firstBlock), vol.queryIndex.nameRank[1]; got != want {
+	if got, want := directTestBlockMinRank(pcmpData, firstBlock), vol.queryIndex.nameRank[1]; got != want {
 		t.Fatalf("PCMP common minRank=%d, want name rank %d", got, want)
 	}
 	if got, want := pcmp.RankBounds, buildComponentPostingRankBounds(componentPostings, vol); !reflect.DeepEqual(got, want) {
@@ -693,13 +693,13 @@ func TestDirectV9CanonicalDerivedParity(t *testing.T) {
 	if got := idx.Derived.SelfNameTrigrams.countForGram(rareGram); got != 0 {
 		t.Fatalf("PNGC rare count=%d, want selective PNGR to own it", got)
 	}
-	pngcData := directV9TestSectionData(t, out, indexSectionPNGC)
-	firstBlock, blockCount = directV9TestGramPostingBlocks(t, pngcData, commonGram)
+	pngcData := directTestSectionData(t, out, indexSectionPNGC)
+	firstBlock, blockCount = directTestGramPostingBlocks(t, pngcData, commonGram)
 	if blockCount != 1 {
 		t.Fatalf("PNGC common blocks=%d, want 1", blockCount)
 	}
 	wantCommonRank := minRankForIDs([]uint32{1, 3, 4, 5}, vol.queryIndex.nameRank)
-	if got := directV9TestBlockMinRank(pngcData, firstBlock); got != wantCommonRank {
+	if got := directTestBlockMinRank(pngcData, firstBlock); got != wantCommonRank {
 		t.Fatalf("PNGC common minRank=%d, want name rank %d", got, wantCommonRank)
 	}
 
@@ -721,7 +721,7 @@ func TestDirectV9CanonicalDerivedParity(t *testing.T) {
 			if err != nil {
 				t.Fatalf("mapped search: %v", err)
 			}
-			gotPaths, wantPaths := directV9TestPaths(got), directV9TestPaths(want)
+			gotPaths, wantPaths := directTestPaths(got), directTestPaths(want)
 			if !strings.Contains(query, "sort:") {
 				sort.Strings(gotPaths)
 				sort.Strings(wantPaths)
@@ -762,13 +762,13 @@ func TestDecodeUint32SectionRejectsTrailingSUBTPart(t *testing.T) {
 	}
 }
 
-func directV9TestSectionData(t *testing.T, path string, tag uint32) []byte {
+func directTestSectionData(t *testing.T, path string, tag uint32) []byte {
 	t.Helper()
 	info, err := os.Stat(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	table, err := readRawV9SectionTable(path, info.Size())
+	table, err := readRawSectionTable(path, info.Size())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -785,7 +785,7 @@ func directV9TestSectionData(t *testing.T, path string, tag uint32) []byte {
 	return nil
 }
 
-func directV9TestUint32Parts(t *testing.T, data []byte) [][]uint32 {
+func directTestUint32Parts(t *testing.T, data []byte) [][]uint32 {
 	t.Helper()
 	parts := make([][]uint32, 0, 8)
 	for off := 0; off < len(data); {
@@ -808,7 +808,7 @@ func directV9TestUint32Parts(t *testing.T, data []byte) [][]uint32 {
 	return parts
 }
 
-func directV9TestStringPostingBlocks(t *testing.T, data []byte, key string) (int, int) {
+func directTestStringPostingBlocks(t *testing.T, data []byte, key string) (int, int) {
 	t.Helper()
 	entryCount := int(binary.LittleEndian.Uint32(data[0:]))
 	keyBlobLen := int(binary.LittleEndian.Uint32(data[4:]))
@@ -829,7 +829,7 @@ func directV9TestStringPostingBlocks(t *testing.T, data []byte, key string) (int
 	return 0, 0
 }
 
-func directV9TestGramPostingBlocks(t *testing.T, data []byte, gram uint32) (int, int) {
+func directTestGramPostingBlocks(t *testing.T, data []byte, gram uint32) (int, int) {
 	t.Helper()
 	entryCount := int(binary.LittleEndian.Uint32(data[0:]))
 	for i := 0; i < entryCount; i++ {
@@ -842,7 +842,7 @@ func directV9TestGramPostingBlocks(t *testing.T, data []byte, gram uint32) (int,
 	return 0, 0
 }
 
-func directV9TestBlockMinRank(data []byte, block int) uint32 {
+func directTestBlockMinRank(data []byte, block int) uint32 {
 	entryCount := int(binary.LittleEndian.Uint32(data[0:]))
 	entrySize := 20
 	if binary.LittleEndian.Uint32(data[4:]) == 0 {
@@ -851,7 +851,7 @@ func directV9TestBlockMinRank(data []byte, block int) uint32 {
 	return binary.LittleEndian.Uint32(data[16+entryCount*entrySize+block*28+24:])
 }
 
-func directV9TestPaths(entries []Entry) []string {
+func directTestPaths(entries []Entry) []string {
 	paths := make([]string, len(entries))
 	for i := range entries {
 		paths[i] = entries[i].Path
@@ -859,27 +859,27 @@ func directV9TestPaths(entries []Entry) []string {
 	return paths
 }
 
-func TestDirectV9PrototypeGate(t *testing.T) {
-	if os.Getenv("SEEKFS_DIRECT_V9_PROTOTYPE") != "1" {
-		t.Skip("set SEEKFS_DIRECT_V9_PROTOTYPE=1 to run the owned 500k/1M prototype gate")
+func TestDirectPrototypeGate(t *testing.T) {
+	if v, _ := envFirst("SEEKFS_DIRECT_PROTOTYPE", "SEEKFS_DIRECT_V9_PROTOTYPE"); v != "1" {
+		t.Skip("set SEEKFS_DIRECT_PROTOTYPE=1 to run the owned 500k/1M prototype gate")
 	}
 	records := 500_000
-	if value := os.Getenv("SEEKFS_DIRECT_V9_RECORDS"); value != "" {
+	if value, _ := envFirst("SEEKFS_DIRECT_RECORDS", "SEEKFS_DIRECT_V9_RECORDS"); value != "" {
 		parsed, err := strconv.Atoi(value)
 		if err != nil || parsed <= 0 {
-			t.Fatalf("invalid SEEKFS_DIRECT_V9_RECORDS=%q", value)
+			t.Fatalf("invalid SEEKFS_DIRECT_RECORDS=%q", value)
 		}
 		records = parsed
 	}
 	dir := t.TempDir()
-	stats, err := buildDirectV9(context.Background(), directV9BuildOptions{
+	stats, err := buildDirect(context.Background(), directBuildOptions{
 		OutputPath: filepath.Join(dir, "prototype.gsi"),
 		SpoolDir:   filepath.Join(dir, "spool"),
 		Roots:      []string{"X:\\"},
 		Volume:     "X:",
 		Source:     "synthetic-direct",
 		BuiltAt:    time.Unix(123, 0),
-		Records:    &directV9SyntheticSource{remaining: records},
+		Records:    &directSyntheticSource{remaining: records},
 		RunRecords: 64 * 1024,
 		RunBytes:   64 * 1024 * 1024,
 	})
@@ -895,13 +895,13 @@ func TestDirectV9PrototypeGate(t *testing.T) {
 		t.Fatalf("prototype loaded records/rank = %d/%d, want %d/%d", loaded.compactRecordCount(), len(loaded.Derived.NameOrder), records, records)
 	}
 	encoded, _ := json.Marshal(stats)
-	t.Logf("direct-v9 prototype stats=%s output_sha256=%s", encoded, directV9FileHash(t, filepath.Join(dir, "prototype.gsi")))
+	t.Logf("direct prototype stats=%s output_sha256=%s", encoded, directFileHash(t, filepath.Join(dir, "prototype.gsi")))
 }
 
-func TestDirectV9ExternalPrototypeValidation(t *testing.T) {
-	path := os.Getenv("SEEKFS_DIRECT_V9_VALIDATE_PATH")
+func TestDirectExternalPrototypeValidation(t *testing.T) {
+	path, _ := envFirst("SEEKFS_DIRECT_VALIDATE_PATH", "SEEKFS_DIRECT_V9_VALIDATE_PATH")
 	if path == "" {
-		t.Skip("set SEEKFS_DIRECT_V9_VALIDATE_PATH to validate an owned prototype target")
+		t.Skip("set SEEKFS_DIRECT_VALIDATE_PATH to validate an owned prototype target")
 	}
 	idx, err := loadIndexMMap(path)
 	if err != nil {
@@ -909,7 +909,7 @@ func TestDirectV9ExternalPrototypeValidation(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = idx.MMapRecords.file.close() })
 	n := idx.compactRecordCount()
-	if idx.Version != indexVersionV9 || n == 0 || len(idx.Derived.NameOrder) != n || len(idx.Derived.NameRank) != n {
+	if idx.Version != indexVersion || n == 0 || len(idx.Derived.NameOrder) != n || len(idx.Derived.NameRank) != n {
 		t.Fatalf("invalid direct prototype reader state: version=%d records=%d order=%d rank=%d", idx.Version, n, len(idx.Derived.NameOrder), len(idx.Derived.NameRank))
 	}
 	want := make([]uint32, n)
@@ -947,12 +947,12 @@ func TestDirectV9ExternalPrototypeValidation(t *testing.T) {
 			t.Fatalf("parent oracle mismatch for id %d: got %d want %d", id, got, wantParent)
 		}
 	}
-	wantHash := directV9OrderHash(want)
-	gotHash := directV9OrderHash(idx.Derived.NameOrder)
+	wantHash := directOrderHash(want)
+	gotHash := directOrderHash(idx.Derived.NameOrder)
 	if gotHash != wantHash {
 		t.Fatalf("default-order search hash mismatch: got %s want %s", gotHash, wantHash)
 	}
-	for _, spec := range directV9RankSpecs() {
+	for _, spec := range directRankSpecs() {
 		if spec.Tag == indexSectionRANK {
 			continue
 		}
@@ -961,14 +961,14 @@ func TestDirectV9ExternalPrototypeValidation(t *testing.T) {
 			wantFamily[i] = uint32(i)
 		}
 		sort.Slice(wantFamily, func(i, j int) bool {
-			ki := spec.Key(directV9SyntheticRecord(int(wantFamily[i])))
-			kj := spec.Key(directV9SyntheticRecord(int(wantFamily[j])))
+			ki := spec.Key(directSyntheticRecord(int(wantFamily[i])))
+			kj := spec.Key(directSyntheticRecord(int(wantFamily[j])))
 			if ki != kj {
 				return ki < kj
 			}
 			return wantFamily[i] < wantFamily[j]
 		})
-		gotOrder, gotRank := directV9DerivedRank(idx, spec.Tag)
+		gotOrder, gotRank := directDerivedRank(idx, spec.Tag)
 		if len(gotOrder) != n || len(gotRank) != n {
 			t.Fatalf("%s lengths=%d/%d want=%d", spec.Name, len(gotOrder), len(gotRank), n)
 		}
@@ -977,13 +977,13 @@ func TestDirectV9ExternalPrototypeValidation(t *testing.T) {
 				t.Fatalf("%s oracle mismatch at %d: got id/rank=%d/%d want=%d", spec.Name, pos, gotOrder[pos], gotRank[id], id)
 			}
 		}
-		t.Logf("direct-v9 %s hash=%s", spec.Name, directV9OrderHash(gotOrder))
+		t.Logf("direct %s hash=%s", spec.Name, directOrderHash(gotOrder))
 	}
-	t.Logf("direct-v9 reader/oracle valid records=%d default_order_hash=%s top20_hash=%s", n, gotHash, directV9OrderHash(idx.Derived.NameOrder[:min(20, n)]))
+	t.Logf("direct reader/oracle valid records=%d default_order_hash=%s top20_hash=%s", n, gotHash, directOrderHash(idx.Derived.NameOrder[:min(20, n)]))
 }
 
-func directV9SyntheticRecord(id int) directV9Record {
-	return directV9Record{
+func directSyntheticRecord(id int) directRecord {
+	return directRecord{
 		FRN:       uint64(id + 1),
 		ParentFRN: uint64(id),
 		Size:      int64(id % 100000),
@@ -993,7 +993,7 @@ func directV9SyntheticRecord(id int) directV9Record {
 	}
 }
 
-func directV9OrderHash(order []uint32) string {
+func directOrderHash(order []uint32) string {
 	h := sha256.New()
 	var buf [4]byte
 	for _, id := range order {
@@ -1003,7 +1003,7 @@ func directV9OrderHash(order []uint32) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-func directV9FileHash(t *testing.T, path string) string {
+func directFileHash(t *testing.T, path string) string {
 	t.Helper()
 	f, err := os.Open(path)
 	if err != nil {

@@ -15,7 +15,7 @@ import (
 // overlayAwareFastCount helper itself returns ok=true and the exact count,
 // so the fast route (not merely "some route") is exercised.
 func TestOverlayAwareFastCountExcludesTombstonesIncludesOverlayCreates(t *testing.T) {
-	vol := engineV9OverlaySearchTestVolume(t)
+	vol := engineOverlaySearchTestVolume(t)
 
 	logical := map[uint64]CompactRecord{
 		100: {FRN: 100, ParentFRN: 100, Parent: -1, Name: ".", Mode: uint32(os.ModeDir)},
@@ -76,7 +76,7 @@ func TestOverlayAwareFastCountExcludesTombstonesIncludesOverlayCreates(t *testin
 // active (e.g. two renames of the same file). Only the latest slot for that
 // FRN may count as a live match, never once per overlay slot.
 func TestOverlayAwareFastCountDeduplicatesReModifiedFRN(t *testing.T) {
-	vol := engineV9OverlaySearchTestVolume(t)
+	vol := engineOverlaySearchTestVolume(t)
 
 	logical := map[uint64]CompactRecord{
 		100: {FRN: 100, ParentFRN: 100, Parent: -1, Name: ".", Mode: uint32(os.ModeDir)},
@@ -138,7 +138,7 @@ func TestOverlayAwareFastCountDeduplicatesReModifiedFRN(t *testing.T) {
 // countServiceVolumes must still return the oracle-correct count via the
 // full search+merge fallback path.
 func TestOverlayAwareFastCountDeclinesForRegexDeclinesToFallback(t *testing.T) {
-	vol := engineV9OverlaySearchTestVolume(t)
+	vol := engineOverlaySearchTestVolume(t)
 
 	logical := map[uint64]CompactRecord{
 		100: {FRN: 100, ParentFRN: 100, Parent: -1, Name: ".", Mode: uint32(os.ModeDir)},
@@ -190,7 +190,7 @@ func TestOverlayAwareFastCountDeclinesForRegexDeclinesToFallback(t *testing.T) {
 // oracle for several query shapes the fast route is expected to handle
 // (ext:, plain term, type:dir).
 func TestOverlayAwareFastCountMatchesFreshOracleAcrossSeededMutations(t *testing.T) {
-	vol := engineV9OverlaySearchTestVolume(t)
+	vol := engineOverlaySearchTestVolume(t)
 
 	logical := map[uint64]CompactRecord{
 		100: {FRN: 100, ParentFRN: 100, Parent: -1, Name: ".", Mode: uint32(os.ModeDir)},
@@ -280,7 +280,7 @@ func BenchmarkOverlayAwareFastCountVsSearchFallback(b *testing.B) {
 		})
 	}
 	idx := &Index{
-		Version: indexVersionV9,
+		Version: indexVersion,
 		Roots:   []string{`F:\`},
 		BuiltAt: time.Unix(0, 123),
 		Source:  "usn",

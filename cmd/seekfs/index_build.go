@@ -54,7 +54,7 @@ func cmdUpgradeIndex(args []string) error {
 	if !idx.Compact {
 		return errors.New("upgrade-index requires a compact-capable index")
 	}
-	idx.Version = indexVersionV9
+	idx.Version = indexVersion
 	if err := saveIndex(*db, idx); err != nil {
 		return err
 	}
@@ -77,7 +77,7 @@ func cmdCompactIndex(args []string) error {
 	}
 	// Compaction only needs FRN and child topology to replay the WAL.  Building
 	// the full resident query index here duplicates the expensive writer view
-	// and was the dominant peak-memory source for large v8 inputs.
+	// and was the dominant peak-memory source for large indexes.
 	vol := newCompactionVolumeIndex(*db, idx)
 	if err := vol.replayWAL(); err != nil {
 		return err
@@ -266,7 +266,7 @@ func indexUSNVolume(volume string) (*Index, error) {
 	}
 
 	idx := &Index{
-		Version:    indexVersionV9,
+		Version:    indexVersion,
 		Roots:      []string{vol + `\`},
 		BuiltAt:    time.Now(),
 		Source:     "usn",

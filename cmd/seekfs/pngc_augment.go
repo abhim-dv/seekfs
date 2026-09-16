@@ -42,7 +42,7 @@ type PNGCAugmentResult struct {
 	Wall         time.Duration
 }
 
-type rawV9SectionTable struct {
+type rawSectionTable struct {
 	Offset  uint64
 	Entries []indexSectionTableEntry
 }
@@ -102,7 +102,7 @@ func augmentPNGC(ctx context.Context, sourcePath, targetPath string, opts PNGCAu
 	if err != nil {
 		return result, err
 	}
-	table, err := readRawV9SectionTable(sourcePath, info.Size())
+	table, err := readRawSectionTable(sourcePath, info.Size())
 	if err != nil {
 		return result, err
 	}
@@ -117,7 +117,7 @@ func augmentPNGC(ctx context.Context, sourcePath, targetPath string, opts PNGCAu
 		return result, fmt.Errorf("load v9 source: %w", err)
 	}
 	defer closeMappedIndex(idx)
-	if idx.Version != indexVersionV9 || idx.Derived.NameTrigrams == nil || len(idx.Derived.NameRank) == 0 {
+	if idx.Version != indexVersion || idx.Derived.NameTrigrams == nil || len(idx.Derived.NameRank) == 0 {
 		return result, errors.New("source lacks v9 selective PNGR/name-rank metadata")
 	}
 	if err := ctx.Err(); err != nil {
@@ -346,43 +346,43 @@ func copyPNGCAugmentSource(ctx context.Context, dst io.Writer, src io.Reader, si
 	return nil
 }
 
-func readRawV9SectionTable(path string, size int64) (rawV9SectionTable, error) {
+func readRawSectionTable(path string, size int64) (rawSectionTable, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return rawV9SectionTable{}, err
+		return rawSectionTable{}, err
 	}
 	defer f.Close()
 	headerSize := int64(binary.Size(diskHeader{}))
 	var header diskHeader
 	if err := binary.Read(f, binary.LittleEndian, &header); err != nil {
-		return rawV9SectionTable{}, err
+		return rawSectionTable{}, err
 	}
-	if header.Magic != indexMagicV9 || header.Version != indexVersionV9 {
-		return rawV9SectionTable{}, errors.New("source is not a v9 index")
+	if header.Magic != indexMagic || header.Version != indexVersion {
+		return rawSectionTable{}, errors.New("source is not a v9 index")
 	}
 	var ptr [8]byte
 	if _, err := io.ReadFull(f, ptr[:]); err != nil {
-		return rawV9SectionTable{}, err
+		return rawSectionTable{}, err
 	}
 	tableOffset := binary.LittleEndian.Uint64(ptr[:])
 	if tableOffset < uint64(headerSize+8) || tableOffset+4 > uint64(size) {
-		return rawV9SectionTable{}, errors.New("invalid v9 section table offset")
+		return rawSectionTable{}, errors.New("invalid v9 section table offset")
 	}
 	var countBuf [4]byte
 	if _, err := f.ReadAt(countBuf[:], int64(tableOffset)); err != nil {
-		return rawV9SectionTable{}, err
+		return rawSectionTable{}, err
 	}
 	count := int(binary.LittleEndian.Uint32(countBuf[:]))
 	if count <= 0 || count > pngcAugmentMaxSections {
-		return rawV9SectionTable{}, errors.New("invalid v9 section count")
+		return rawSectionTable{}, errors.New("invalid v9 section count")
 	}
 	tableBytes := int64(count) * 24
 	if tableOffset+4+uint64(tableBytes) < tableOffset || tableOffset+4+uint64(tableBytes) > uint64(size) {
-		return rawV9SectionTable{}, errors.New("truncated v9 section table")
+		return rawSectionTable{}, errors.New("truncated v9 section table")
 	}
 	raw := make([]byte, tableBytes)
 	if _, err := f.ReadAt(raw, int64(tableOffset+4)); err != nil {
-		return rawV9SectionTable{}, err
+		return rawSectionTable{}, err
 	}
 	entries := make([]indexSectionTableEntry, 0, count)
 	seen := make(map[uint32]struct{}, count)
@@ -394,15 +394,15 @@ func readRawV9SectionTable(path string, size int64) (rawV9SectionTable, error) {
 			flags:  binary.LittleEndian.Uint32(raw[off+20:]),
 		}
 		if _, ok := seen[entry.tag]; ok {
-			return rawV9SectionTable{}, errors.New("duplicate v9 section tag")
+			return rawSectionTable{}, errors.New("duplicate v9 section tag")
 		}
 		seen[entry.tag] = struct{}{}
 		if entry.offset > uint64(size) || entry.length > uint64(size) || entry.offset+entry.length < entry.offset || entry.offset+entry.length > uint64(size) {
-			return rawV9SectionTable{}, errors.New("truncated v9 section payload")
+			return rawSectionTable{}, errors.New("truncated v9 section payload")
 		}
 		entries = append(entries, entry)
 	}
-	return rawV9SectionTable{Offset: tableOffset, Entries: entries}, nil
+	return rawSectionTable{Offset: tableOffset, Entries: entries}, nil
 }
 
 func writeAlignmentFile(f *os.File, alignment int64) error {

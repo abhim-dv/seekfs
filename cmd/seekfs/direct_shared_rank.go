@@ -19,22 +19,22 @@ import (
 	"sync"
 )
 
-const directV9SharedRankChunkBytes = 2 * 1024 * 1024
+const directSharedRankChunkBytes = 2 * 1024 * 1024
 
-type directV9SharedRankRuns struct {
-	Runs       map[string][]directV9RunFile
+type directSharedRankRuns struct {
+	Runs       map[string][]directRunFile
 	LiveCounts map[string]int
 	MaxBytes   map[string]int64
 }
 
-type directV9RankSortJob struct {
+type directRankSortJob struct {
 	specIndex int
 	runIndex  int
 	path      string
-	items     []directV9RankItem
+	items     []directRankItem
 }
 
-func directV9WriteRankRunItems(path string, items []directV9RankItem) (int64, error) {
+func directWriteRankRunItems(path string, items []directRankItem) (int64, error) {
 	sort.Slice(items, func(i, j int) bool {
 		if items[i].Key != items[j].Key {
 			return items[i].Key < items[j].Key
@@ -56,7 +56,7 @@ func directV9WriteRankRunItems(path string, items []directV9RankItem) (int64, er
 		}
 		if uint64(len(item.Key)) > uint64(^uint32(0)) {
 			_ = f.Close()
-			return written, errors.New("direct v9 rank key too large")
+			return written, errors.New("direct rank key too large")
 		}
 		var n [4]byte
 		binary.LittleEndian.PutUint32(n[:], uint32(len(item.Key)))
@@ -78,9 +78,9 @@ func directV9WriteRankRunItems(path string, items []directV9RankItem) (int64, er
 	return written, f.Close()
 }
 
-func directV9BuildRankRunsShared(ctx context.Context, finalPath, spoolDir string, maxRecords, workers int, specs []directV9RankSpec, owned *[]string) (directV9SharedRankRuns, error) {
+func directBuildRankRunsShared(ctx context.Context, finalPath, spoolDir string, maxRecords, workers int, specs []directRankSpec, owned *[]string) (directSharedRankRuns, error) {
 	if maxRecords <= 0 {
-		maxRecords = directV9DefaultRunRecords
+		maxRecords = directDefaultRunRecords
 	}
 	if workers <= 0 {
 		workers = 1
@@ -91,21 +91,21 @@ func directV9BuildRankRunsShared(ctx context.Context, finalPath, spoolDir string
 	// Six small bounded chunks keep key-generation memory independent of the
 	// record count and avoid holding one full rank vector per family.
 	chunkRecords := min(maxRecords, max(4096, 65536/workers))
-	result := directV9SharedRankRuns{
-		Runs:       make(map[string][]directV9RunFile, len(specs)),
+	result := directSharedRankRuns{
+		Runs:       make(map[string][]directRunFile, len(specs)),
 		LiveCounts: make(map[string]int, len(specs)),
 		MaxBytes:   make(map[string]int64, len(specs)),
 	}
-	chunks := make([][]directV9RankItem, len(specs))
+	chunks := make([][]directRankItem, len(specs))
 	chunkBytes := make([]int64, len(specs))
 	for i, spec := range specs {
-		chunks[i] = make([]directV9RankItem, 0, chunkRecords)
+		chunks[i] = make([]directRankItem, 0, chunkRecords)
 		result.Runs[spec.Name] = nil
 	}
 
 	internalCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	jobs := make(chan directV9RankSortJob, workers*2)
+	jobs := make(chan directRankSortJob, workers*2)
 	var workerWG sync.WaitGroup
 	var firstErr error
 	var errMu sync.Mutex
@@ -129,7 +129,7 @@ func directV9BuildRankRunsShared(ctx context.Context, finalPath, spoolDir string
 				if err := internalCtx.Err(); err != nil {
 					return
 				}
-				bytes, err := directV9WriteRankRunItems(job.path, job.items)
+				bytes, err := directWriteRankRunItems(job.path, job.items)
 				if err != nil {
 					recordErr(err)
 					return
@@ -151,14 +151,14 @@ func directV9BuildRankRunsShared(ctx context.Context, finalPath, spoolDir string
 		spec := specs[specIndex]
 		resultMu.Lock()
 		runIndex := len(result.Runs[spec.Name])
-		path := filepath.Join(spoolDir, fmt.Sprintf("direct-v9-rank-%s-%06d.tmp", spec.Name, runIndex))
+		path := filepath.Join(spoolDir, fmt.Sprintf("direct-rank-%s-%06d.tmp", spec.Name, runIndex))
 		*owned = append(*owned, path)
-		result.Runs[spec.Name] = append(result.Runs[spec.Name], directV9RunFile{path: path})
+		result.Runs[spec.Name] = append(result.Runs[spec.Name], directRunFile{path: path})
 		resultMu.Unlock()
-		job := directV9RankSortJob{specIndex: specIndex, runIndex: runIndex, path: path, items: items}
+		job := directRankSortJob{specIndex: specIndex, runIndex: runIndex, path: path, items: items}
 		select {
 		case jobs <- job:
-			chunks[specIndex] = make([]directV9RankItem, 0, chunkRecords)
+			chunks[specIndex] = make([]directRankItem, 0, chunkRecords)
 			chunkBytes[specIndex] = 0
 			return nil
 		case <-internalCtx.Done():
@@ -182,7 +182,7 @@ func directV9BuildRankRunsShared(ctx context.Context, finalPath, spoolDir string
 			return result, internalCtx.Err()
 		default:
 		}
-		rec, readErr := readDirectV9SpoolRecord(r)
+		rec, readErr := readDirectSpoolRecord(r)
 		if errors.Is(readErr, io.EOF) {
 			break
 		}
@@ -196,10 +196,10 @@ func directV9BuildRankRunsShared(ctx context.Context, finalPath, spoolDir string
 				if spec.KeyWithID != nil {
 					key = spec.KeyWithID(id, rec)
 				}
-				chunks[i] = append(chunks[i], directV9RankItem{Key: key, ID: id})
+				chunks[i] = append(chunks[i], directRankItem{Key: key, ID: id})
 				chunkBytes[i] += int64(len(key))
 				result.LiveCounts[spec.Name]++
-				if len(chunks[i]) >= chunkRecords || chunkBytes[i] >= directV9SharedRankChunkBytes {
+				if len(chunks[i]) >= chunkRecords || chunkBytes[i] >= directSharedRankChunkBytes {
 					if err := flush(i); err != nil {
 						recordErr(err)
 						break

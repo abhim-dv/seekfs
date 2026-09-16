@@ -308,7 +308,7 @@ func queryNTFSVolumeData(handle windows.Handle) (ntfsVolumeDataBuffer, error) {
 	return data, nil
 }
 
-// directV9VolumeSource builds a record source for one NTFS volume from the raw
+// directVolumeSource builds a record source for one NTFS volume from the raw
 // $MFT, merging FSCTL_ENUM_USN_DATA names for any FRNs the MFT read missed.
 // This is the Everything-style fast build path (no directory walk), and like
 // Everything it requires an elevated raw-volume handle.  It returns the source,
@@ -316,7 +316,7 @@ func queryNTFSVolumeData(handle windows.Handle) (ntfsVolumeDataBuffer, error) {
 // published v9 index can resume incremental replay from exactly this point.
 // exclusions are paths (on this volume) whose whole subtrees are dropped from
 // the result; the seekfs dir and standard system folders are passed in.
-func directV9VolumeSource(volume string, exclusions []string) (directV9RecordSource, []string, uint64, int64, error) {
+func directVolumeSource(volume string, exclusions []string) (directRecordSource, []string, uint64, int64, error) {
 	vol := normalizeVolume(volume)
 	handle, err := openVolume(vol)
 	if err != nil {
@@ -333,15 +333,15 @@ func directV9VolumeSource(volume string, exclusions []string) (directV9RecordSou
 	}
 	if nodes, usnErr := enumUSN(handle, journal.NextUsn); usnErr == nil {
 		if added := mergeUSNNodesIntoMFT(entries, nodes); added > 0 {
-			serviceLog("direct v9 volume=%s mft=%d usn-merged=%d", vol, len(entries), added)
+			serviceLog("direct volume=%s mft=%d usn-merged=%d", vol, len(entries), added)
 		}
 	} else {
-		serviceLog("direct v9 volume=%s usn merge skipped err=%v", vol, usnErr)
+		serviceLog("direct volume=%s usn merge skipped err=%v", vol, usnErr)
 	}
 	if filtered := filterMFTExclusions(entries, vol, exclusions); filtered > 0 {
-		serviceLog("direct v9 volume=%s excluded=%d remaining=%d", vol, filtered, len(entries))
+		serviceLog("direct volume=%s excluded=%d remaining=%d", vol, filtered, len(entries))
 	}
-	return newDirectV9MFTSource(entries), []string{vol + `\`}, journal.UsnJournalID, journal.NextUsn, nil
+	return newDirectMFTSource(entries), []string{vol + `\`}, journal.UsnJournalID, journal.NextUsn, nil
 }
 
 // mftRootFRN is the MFT record number of the NTFS root directory.

@@ -20,16 +20,16 @@ import (
 	"strings"
 )
 
-type directV9AuxSection struct {
+type directAuxSection struct {
 	tag  uint32
 	name string
 	data []byte
 }
 
-func directV9WriteAuxiliarySections(ctx context.Context, cw *countingWriter, finalPath string, recordCount int, runRecords int, nameRankPath string, subtreeRankPaths []string, scratchDir string, owned *[]string, scratchHigh *int64) ([]indexSectionTableEntry, []directV9SectionReport, error) {
+func directWriteAuxiliarySections(ctx context.Context, cw *countingWriter, finalPath string, recordCount int, runRecords int, nameRankPath string, subtreeRankPaths []string, scratchDir string, owned *[]string, scratchHigh *int64) ([]indexSectionTableEntry, []directSectionReport, error) {
 	entries := make([]indexSectionTableEntry, 0, 8)
-	reports := make([]directV9SectionReport, 0, 8)
-	nameRanks, err := directV9ReadUint32Vector(nameRankPath, recordCount)
+	reports := make([]directSectionReport, 0, 8)
+	nameRanks, err := directReadUint32Vector(nameRankPath, recordCount)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -45,8 +45,8 @@ func directV9WriteAuxiliarySections(ctx context.Context, cw *countingWriter, fin
 		}
 		entry := indexSectionTableEntry{tag: tag, offset: offset, length: uint64(cw.n) - offset}
 		entries = append(entries, entry)
-		reports = append(reports, directV9SectionReport{Name: name, Tag: tag, Bytes: int64(entry.length)})
-		directV9AuxMemoryTrace(scratchDir, name+"-emitted")
+		reports = append(reports, directSectionReport{Name: name, Tag: tag, Bytes: int64(entry.length)})
+		directAuxMemoryTrace(scratchDir, name+"-emitted")
 		if int64(len(data)) > *scratchHigh {
 			*scratchHigh = int64(len(data))
 		}
@@ -55,17 +55,17 @@ func directV9WriteAuxiliarySections(ctx context.Context, cw *countingWriter, fin
 	if err := writeAlignment(cw, 8); err != nil {
 		return nil, nil, err
 	}
-	lowr, err := directV9WriteLOWRSectionFromSpool(ctx, cw, finalPath, recordCount)
+	lowr, err := directWriteLOWRSectionFromSpool(ctx, cw, finalPath, recordCount)
 	if err != nil {
 		return nil, nil, err
 	}
 	entries = append(entries, lowr)
-	reports = append(reports, directV9SectionReport{Name: "LOWR", Tag: indexSectionLOWR, Bytes: int64(lowr.length)})
+	reports = append(reports, directSectionReport{Name: "LOWR", Tag: indexSectionLOWR, Bytes: int64(lowr.length)})
 
 	// Collect every posting family in a single spool pass; the individual
 	// sections below then emit from the shared maps without re-reading the
 	// record spool.
-	maps, err := directV9CollectAuxMaps(ctx, finalPath)
+	maps, err := directCollectAuxMaps(ctx, finalPath)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -73,19 +73,19 @@ func directV9WriteAuxiliarySections(ctx context.Context, cw *countingWriter, fin
 	if err := emit(indexSectionPEXT, "PEXT", pext); err != nil {
 		return nil, nil, err
 	}
-	if err := emit(indexSectionPXRB, "PXRB", directV9ZeroPostingBounds(pext)); err != nil {
+	if err := emit(indexSectionPXRB, "PXRB", directZeroPostingBounds(pext)); err != nil {
 		return nil, nil, err
 	}
 	maps.ext = nil
 	pext = nil
 	runtime.GC()
-	directV9AuxMemoryTrace(scratchDir, "PEXT-released")
+	directAuxMemoryTrace(scratchDir, "PEXT-released")
 
 	pcmp := encodeStringPostingSection(maps.comp, nameRanks)
 	if err := emit(indexSectionPCMP, "PCMP", pcmp); err != nil {
 		return nil, nil, err
 	}
-	cmpBounds, err := directV9BuildComponentPostingRankBounds(maps.comp, subtreeRankPaths, recordCount)
+	cmpBounds, err := directBuildComponentPostingRankBounds(maps.comp, subtreeRankPaths, recordCount)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -95,25 +95,25 @@ func directV9WriteAuxiliarySections(ctx context.Context, cw *countingWriter, fin
 	maps.comp = nil
 	pcmp = nil
 	runtime.GC()
-	directV9AuxMemoryTrace(scratchDir, "PCMP-released")
+	directAuxMemoryTrace(scratchDir, "PCMP-released")
 
 	if err := emit(indexSectionPATR, "PATR", encodeAttrPostingSection(maps.attrs)); err != nil {
 		return nil, nil, err
 	}
 	maps.attrs = nil
 	runtime.GC()
-	directV9AuxMemoryTrace(scratchDir, "PATR-released")
+	directAuxMemoryTrace(scratchDir, "PATR-released")
 
-	stored, omitted := directV9PartitionNameGrams(maps.gramCnt, serviceLowMemoryTrigramStoredPostingMax())
+	stored, omitted := directPartitionNameGrams(maps.gramCnt, serviceLowMemoryTrigramStoredPostingMax())
 	maps.gramCnt = nil
 	// Build both gram run sets in one spool pass, then emit each section
 	// serially to the shared output writer.
-	runLimit := directV9GramRunLimit(runRecords)
-	pngrRuns, pngcRuns, err := directV9BuildGramRunSets(ctx, finalPath, scratchDir, runLimit, stored, directV9GramKeys(omitted), owned)
+	runLimit := directGramRunLimit(runRecords)
+	pngrRuns, pngcRuns, err := directBuildGramRunSets(ctx, finalPath, scratchDir, runLimit, stored, directGramKeys(omitted), owned)
 	if err != nil {
 		return nil, nil, err
 	}
-	gramEntry, gramReport, err := directV9WriteGramSectionFromRuns(ctx, cw, pngrRuns, omitted, nameRanks, gramPostingMetadataMagic, "PNGR", scratchDir, owned, scratchHigh)
+	gramEntry, gramReport, err := directWriteGramSectionFromRuns(ctx, cw, pngrRuns, omitted, nameRanks, gramPostingMetadataMagic, "PNGR", scratchDir, owned, scratchHigh)
 	for _, run := range pngrRuns {
 		_ = os.Remove(run.path)
 	}
@@ -123,10 +123,10 @@ func directV9WriteAuxiliarySections(ctx context.Context, cw *countingWriter, fin
 	entries = append(entries, gramEntry)
 	reports = append(reports, gramReport)
 	runtime.GC()
-	directV9AuxMemoryTrace(scratchDir, "PNGR-released")
+	directAuxMemoryTrace(scratchDir, "PNGR-released")
 
 	if len(pngcRuns) > 0 {
-		gramEntry, gramReport, err = directV9WriteGramSectionFromRuns(ctx, cw, pngcRuns, nil, nameRanks, gramPostingUnionMetadataMagic, "PNGC", scratchDir, owned, scratchHigh)
+		gramEntry, gramReport, err = directWriteGramSectionFromRuns(ctx, cw, pngcRuns, nil, nameRanks, gramPostingUnionMetadataMagic, "PNGC", scratchDir, owned, scratchHigh)
 		for _, run := range pngcRuns {
 			_ = os.Remove(run.path)
 		}
@@ -136,17 +136,17 @@ func directV9WriteAuxiliarySections(ctx context.Context, cw *countingWriter, fin
 		entries = append(entries, gramEntry)
 		reports = append(reports, gramReport)
 		runtime.GC()
-		directV9AuxMemoryTrace(scratchDir, "PNGC-released")
+		directAuxMemoryTrace(scratchDir, "PNGC-released")
 	}
 	_ = scratchDir
 	_ = owned
 	return entries, reports, nil
 }
 
-func directV9AuxMemoryTrace(dir, phase string) {
+func directAuxMemoryTrace(dir, phase string) {
 	var mem runtime.MemStats
 	runtime.ReadMemStats(&mem)
-	f, err := os.OpenFile(filepath.Join(dir, "direct-v9-aux-memory.log"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	f, err := os.OpenFile(filepath.Join(dir, "direct-aux-memory.log"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
 		return
 	}
@@ -154,18 +154,18 @@ func directV9AuxMemoryTrace(dir, phase string) {
 	_ = f.Close()
 }
 
-type directV9GramPair struct{ Gram, ID uint32 }
+type directGramPair struct{ Gram, ID uint32 }
 
-const directV9GramRunPairs32MiB = 4 * 1024 * 1024
+const directGramRunPairs32MiB = 4 * 1024 * 1024
 
-func directV9GramRunLimit(runRecords int) int {
-	if runRecords >= 64*1024 && runRecords < directV9GramRunPairs32MiB {
-		return directV9GramRunPairs32MiB
+func directGramRunLimit(runRecords int) int {
+	if runRecords >= 64*1024 && runRecords < directGramRunPairs32MiB {
+		return directGramRunPairs32MiB
 	}
 	return runRecords
 }
 
-func directV9WriteGramRun(path string, pairs []directV9GramPair) (int64, error) {
+func directWriteGramRun(path string, pairs []directGramPair) (int64, error) {
 	sort.Slice(pairs, func(i, j int) bool {
 		if pairs[i].Gram != pairs[j].Gram {
 			return pairs[i].Gram < pairs[j].Gram
@@ -198,13 +198,13 @@ func directV9WriteGramRun(path string, pairs []directV9GramPair) (int64, error) 
 	return written, f.Close()
 }
 
-// directV9BuildGramRunSets builds the PNGR and PNGC run files in a single pass
+// directBuildGramRunSets builds the PNGR and PNGC run files in a single pass
 // over the record spool.  Each record's grams are emitted to the stored (PNGR)
 // and omitted (PNGC) run sets according to the partition, halving the number of
 // full-spool traversals versus building the sections independently.
-func directV9BuildGramRunSets(ctx context.Context, finalPath, spoolDir string, maxPairs int, stored map[uint32]struct{}, omitted map[uint32]struct{}, owned *[]string) ([]directV9RunFile, []directV9RunFile, error) {
+func directBuildGramRunSets(ctx context.Context, finalPath, spoolDir string, maxPairs int, stored map[uint32]struct{}, omitted map[uint32]struct{}, owned *[]string) ([]directRunFile, []directRunFile, error) {
 	if maxPairs <= 0 {
-		maxPairs = directV9DefaultRunRecords
+		maxPairs = directDefaultRunRecords
 	}
 	f, err := os.Open(finalPath)
 	if err != nil {
@@ -212,20 +212,20 @@ func directV9BuildGramRunSets(ctx context.Context, finalPath, spoolDir string, m
 	}
 	defer f.Close()
 	r := bufio.NewReaderSize(f, 256*1024)
-	storedPairs := make([]directV9GramPair, 0, min(maxPairs, 4096))
-	omittedPairs := make([]directV9GramPair, 0, min(maxPairs, 4096))
-	var storedRuns, omittedRuns []directV9RunFile
-	flush := func(pairs []directV9GramPair, name string, runs []directV9RunFile) ([]directV9RunFile, error) {
+	storedPairs := make([]directGramPair, 0, min(maxPairs, 4096))
+	omittedPairs := make([]directGramPair, 0, min(maxPairs, 4096))
+	var storedRuns, omittedRuns []directRunFile
+	flush := func(pairs []directGramPair, name string, runs []directRunFile) ([]directRunFile, error) {
 		if len(pairs) == 0 {
 			return runs, nil
 		}
-		path := filepath.Join(spoolDir, fmt.Sprintf("direct-v9-%s-gram-run-%06d.tmp", strings.ToLower(name), len(runs)))
-		bytes, err := directV9WriteGramRun(path, pairs)
+		path := filepath.Join(spoolDir, fmt.Sprintf("direct-%s-gram-run-%06d.tmp", strings.ToLower(name), len(runs)))
+		bytes, err := directWriteGramRun(path, pairs)
 		if err != nil {
 			return runs, err
 		}
 		*owned = append(*owned, path)
-		return append(runs, directV9RunFile{path: path, bytes: bytes}), nil
+		return append(runs, directRunFile{path: path, bytes: bytes}), nil
 	}
 	for id := 0; ; id++ {
 		select {
@@ -233,7 +233,7 @@ func directV9BuildGramRunSets(ctx context.Context, finalPath, spoolDir string, m
 			return nil, nil, ctx.Err()
 		default:
 		}
-		rec, readErr := readDirectV9SpoolRecord(r)
+		rec, readErr := readDirectSpoolRecord(r)
 		if errors.Is(readErr, io.EOF) {
 			break
 		}
@@ -242,23 +242,23 @@ func directV9BuildGramRunSets(ctx context.Context, finalPath, spoolDir string, m
 		}
 		for _, gram := range uniqueTrigramKeys(strings.ToLower(rec.Name)) {
 			if _, ok := stored[gram]; ok {
-				storedPairs = append(storedPairs, directV9GramPair{Gram: gram, ID: uint32(id)})
+				storedPairs = append(storedPairs, directGramPair{Gram: gram, ID: uint32(id)})
 				if len(storedPairs) >= maxPairs {
 					storedRuns, err = flush(storedPairs, "PNGR", storedRuns)
 					if err != nil {
 						return nil, nil, err
 					}
-					storedPairs = make([]directV9GramPair, 0, min(maxPairs, 4096))
+					storedPairs = make([]directGramPair, 0, min(maxPairs, 4096))
 				}
 			}
 			if _, ok := omitted[gram]; ok {
-				omittedPairs = append(omittedPairs, directV9GramPair{Gram: gram, ID: uint32(id)})
+				omittedPairs = append(omittedPairs, directGramPair{Gram: gram, ID: uint32(id)})
 				if len(omittedPairs) >= maxPairs {
 					omittedRuns, err = flush(omittedPairs, "PNGC", omittedRuns)
 					if err != nil {
 						return nil, nil, err
 					}
-					omittedPairs = make([]directV9GramPair, 0, min(maxPairs, 4096))
+					omittedPairs = make([]directGramPair, 0, min(maxPairs, 4096))
 				}
 			}
 		}
@@ -274,22 +274,22 @@ func directV9BuildGramRunSets(ctx context.Context, finalPath, spoolDir string, m
 	return storedRuns, omittedRuns, nil
 }
 
-type directV9GramHead struct {
-	Pair directV9GramPair
+type directGramHead struct {
+	Pair directGramPair
 	Run  int
 }
-type directV9GramHeap struct{ items []directV9GramHead }
+type directGramHeap struct{ items []directGramHead }
 
-func (h directV9GramHeap) Len() int { return len(h.items) }
-func (h directV9GramHeap) Less(i, j int) bool {
+func (h directGramHeap) Len() int { return len(h.items) }
+func (h directGramHeap) Less(i, j int) bool {
 	if h.items[i].Pair.Gram != h.items[j].Pair.Gram {
 		return h.items[i].Pair.Gram < h.items[j].Pair.Gram
 	}
 	return h.items[i].Pair.ID < h.items[j].Pair.ID
 }
-func (h directV9GramHeap) Swap(i, j int) { h.items[i], h.items[j] = h.items[j], h.items[i] }
-func (h *directV9GramHeap) Push(x any)   { h.items = append(h.items, x.(directV9GramHead)) }
-func (h *directV9GramHeap) Pop() any {
+func (h directGramHeap) Swap(i, j int) { h.items[i], h.items[j] = h.items[j], h.items[i] }
+func (h *directGramHeap) Push(x any)   { h.items = append(h.items, x.(directGramHead)) }
+func (h *directGramHeap) Pop() any {
 	old := h.items
 	n := len(old)
 	x := old[n-1]
@@ -297,45 +297,45 @@ func (h *directV9GramHeap) Pop() any {
 	return x
 }
 
-func directV9WriteGramSectionFromRuns(ctx context.Context, cw *countingWriter, runs []directV9RunFile, omitted map[uint32]int, ranks []uint32, metadataMagic uint32, name, scratchDir string, owned *[]string, scratchHigh *int64) (indexSectionTableEntry, directV9SectionReport, error) {
-	entryPath := filepath.Join(scratchDir, "direct-v9-"+strings.ToLower(name)+"-entries.tmp")
-	metaPath := filepath.Join(scratchDir, "direct-v9-"+strings.ToLower(name)+"-meta.tmp")
-	blobPath := filepath.Join(scratchDir, "direct-v9-"+strings.ToLower(name)+"-blob.tmp")
+func directWriteGramSectionFromRuns(ctx context.Context, cw *countingWriter, runs []directRunFile, omitted map[uint32]int, ranks []uint32, metadataMagic uint32, name, scratchDir string, owned *[]string, scratchHigh *int64) (indexSectionTableEntry, directSectionReport, error) {
+	entryPath := filepath.Join(scratchDir, "direct-"+strings.ToLower(name)+"-entries.tmp")
+	metaPath := filepath.Join(scratchDir, "direct-"+strings.ToLower(name)+"-meta.tmp")
+	blobPath := filepath.Join(scratchDir, "direct-"+strings.ToLower(name)+"-blob.tmp")
 	*owned = append(*owned, entryPath, metaPath, blobPath)
 	ef, err := os.Create(entryPath)
 	if err != nil {
-		return indexSectionTableEntry{}, directV9SectionReport{}, err
+		return indexSectionTableEntry{}, directSectionReport{}, err
 	}
 	mf, err := os.Create(metaPath)
 	if err != nil {
 		_ = ef.Close()
-		return indexSectionTableEntry{}, directV9SectionReport{}, err
+		return indexSectionTableEntry{}, directSectionReport{}, err
 	}
 	bf, err := os.Create(blobPath)
 	if err != nil {
 		_ = ef.Close()
 		_ = mf.Close()
-		return indexSectionTableEntry{}, directV9SectionReport{}, err
+		return indexSectionTableEntry{}, directSectionReport{}, err
 	}
 	ew := bufio.NewWriterSize(ef, 256*1024)
 	mw := bufio.NewWriterSize(mf, 256*1024)
 	bw := bufio.NewWriterSize(bf, 256*1024)
 	files := make([]*os.File, len(runs))
 	readers := make([]*bufio.Reader, len(runs))
-	h := &directV9GramHeap{}
+	h := &directGramHeap{}
 	heap.Init(h)
 	for i, run := range runs {
 		f, openErr := os.Open(run.path)
 		if openErr != nil {
-			return indexSectionTableEntry{}, directV9SectionReport{}, openErr
+			return indexSectionTableEntry{}, directSectionReport{}, openErr
 		}
 		files[i] = f
 		readers[i] = bufio.NewReaderSize(f, 256*1024)
-		pair, readErr := directV9ReadGramPair(readers[i])
+		pair, readErr := directReadGramPair(readers[i])
 		if readErr == nil {
-			heap.Push(h, directV9GramHead{Pair: pair, Run: i})
+			heap.Push(h, directGramHead{Pair: pair, Run: i})
 		} else if !errors.Is(readErr, io.EOF) {
-			return indexSectionTableEntry{}, directV9SectionReport{}, readErr
+			return indexSectionTableEntry{}, directSectionReport{}, readErr
 		}
 	}
 	defer func() {
@@ -356,7 +356,7 @@ func directV9WriteGramSectionFromRuns(ctx context.Context, cw *countingWriter, r
 		}
 		encoded := encodeDeltaUvarint32(chunk)
 		if blobOffset+uint64(len(encoded)) > uint64(^uint32(0)) {
-			return errors.New("direct v9 gram blob exceeds format")
+			return errors.New("direct gram blob exceeds format")
 		}
 		if _, err := bw.Write(encoded); err != nil {
 			return err
@@ -410,20 +410,20 @@ func directV9WriteGramSectionFromRuns(ctx context.Context, cw *countingWriter, r
 	for h.Len() > 0 {
 		select {
 		case <-ctx.Done():
-			return indexSectionTableEntry{}, directV9SectionReport{}, ctx.Err()
+			return indexSectionTableEntry{}, directSectionReport{}, ctx.Err()
 		default:
 		}
-		head := heap.Pop(h).(directV9GramHead)
+		head := heap.Pop(h).(directGramHead)
 		pair := head.Pair
-		next, readErr := directV9ReadGramPair(readers[head.Run])
+		next, readErr := directReadGramPair(readers[head.Run])
 		if readErr == nil {
-			heap.Push(h, directV9GramHead{Pair: next, Run: head.Run})
+			heap.Push(h, directGramHead{Pair: next, Run: head.Run})
 		} else if !errors.Is(readErr, io.EOF) {
-			return indexSectionTableEntry{}, directV9SectionReport{}, readErr
+			return indexSectionTableEntry{}, directSectionReport{}, readErr
 		}
 		if !have || pair.Gram != current {
 			if err := finish(); err != nil {
-				return indexSectionTableEntry{}, directV9SectionReport{}, err
+				return indexSectionTableEntry{}, directSectionReport{}, err
 			}
 			current = pair.Gram
 			firstBlock = blockCount
@@ -441,31 +441,31 @@ func directV9WriteGramSectionFromRuns(ctx context.Context, cw *countingWriter, r
 		chunk = append(chunk, pair.ID)
 		if len(chunk) >= 1024 {
 			if err := flushChunk(); err != nil {
-				return indexSectionTableEntry{}, directV9SectionReport{}, err
+				return indexSectionTableEntry{}, directSectionReport{}, err
 			}
 		}
 	}
 	if err := finish(); err != nil {
-		return indexSectionTableEntry{}, directV9SectionReport{}, err
+		return indexSectionTableEntry{}, directSectionReport{}, err
 	}
 	if err := ew.Flush(); err != nil {
-		return indexSectionTableEntry{}, directV9SectionReport{}, err
+		return indexSectionTableEntry{}, directSectionReport{}, err
 	}
 	if err := mw.Flush(); err != nil {
-		return indexSectionTableEntry{}, directV9SectionReport{}, err
+		return indexSectionTableEntry{}, directSectionReport{}, err
 	}
 	if err := bw.Flush(); err != nil {
-		return indexSectionTableEntry{}, directV9SectionReport{}, err
+		return indexSectionTableEntry{}, directSectionReport{}, err
 	}
 	// Owned scratch section parts; copied into the atomic target and removed.
 	_ = ef.Close()
 	_ = mf.Close()
 	_ = bf.Close()
 	if entryCount > uint64(^uint32(0)) || blockCount > uint64(^uint32(0)) || blobBytes > uint64(^uint32(0)) {
-		return indexSectionTableEntry{}, directV9SectionReport{}, errors.New("direct v9 gram counts exceed format")
+		return indexSectionTableEntry{}, directSectionReport{}, errors.New("direct gram counts exceed format")
 	}
 	if err := writeAlignment(cw, 8); err != nil {
-		return indexSectionTableEntry{}, directV9SectionReport{}, err
+		return indexSectionTableEntry{}, directSectionReport{}, err
 	}
 	sectionOffset := uint64(cw.n)
 	var header [16]byte
@@ -473,22 +473,22 @@ func directV9WriteGramSectionFromRuns(ctx context.Context, cw *countingWriter, r
 	binary.LittleEndian.PutUint32(header[8:12], uint32(blockCount))
 	binary.LittleEndian.PutUint32(header[12:16], uint32(blobBytes))
 	if _, err := cw.Write(header[:]); err != nil {
-		return indexSectionTableEntry{}, directV9SectionReport{}, err
+		return indexSectionTableEntry{}, directSectionReport{}, err
 	}
-	if err := directV9CopyFile(cw, entryPath); err != nil {
-		return indexSectionTableEntry{}, directV9SectionReport{}, err
+	if err := directCopyFile(cw, entryPath); err != nil {
+		return indexSectionTableEntry{}, directSectionReport{}, err
 	}
-	if err := directV9CopyFile(cw, metaPath); err != nil {
-		return indexSectionTableEntry{}, directV9SectionReport{}, err
+	if err := directCopyFile(cw, metaPath); err != nil {
+		return indexSectionTableEntry{}, directSectionReport{}, err
 	}
-	if err := directV9CopyFile(cw, blobPath); err != nil {
-		return indexSectionTableEntry{}, directV9SectionReport{}, err
+	if err := directCopyFile(cw, blobPath); err != nil {
+		return indexSectionTableEntry{}, directSectionReport{}, err
 	}
 	var trailer [8]byte
 	binary.LittleEndian.PutUint32(trailer[0:4], metadataMagic)
 	binary.LittleEndian.PutUint32(trailer[4:8], uint32(len(omitted)))
 	if _, err := cw.Write(trailer[:]); err != nil {
-		return indexSectionTableEntry{}, directV9SectionReport{}, err
+		return indexSectionTableEntry{}, directSectionReport{}, err
 	}
 	if len(omitted) > 0 {
 		keys := make([]uint32, 0, len(omitted))
@@ -501,7 +501,7 @@ func directV9WriteGramSectionFromRuns(ctx context.Context, cw *countingWriter, r
 			binary.LittleEndian.PutUint32(pair[0:4], gram)
 			binary.LittleEndian.PutUint32(pair[4:8], uint32(omitted[gram]))
 			if _, err := cw.Write(pair[:]); err != nil {
-				return indexSectionTableEntry{}, directV9SectionReport{}, err
+				return indexSectionTableEntry{}, directSectionReport{}, err
 			}
 		}
 	}
@@ -526,23 +526,23 @@ func directV9WriteGramSectionFromRuns(ctx context.Context, cw *countingWriter, r
 		tag = indexSectionPNGC
 	}
 	entry := indexSectionTableEntry{tag: tag, offset: sectionOffset, length: uint64(cw.n) - sectionOffset}
-	return entry, directV9SectionReport{Name: name, Tag: tag, Runs: len(runs), Bytes: int64(entry.length), ScratchBytes: scratch}, nil
+	return entry, directSectionReport{Name: name, Tag: tag, Runs: len(runs), Bytes: int64(entry.length), ScratchBytes: scratch}, nil
 }
 
-func directV9ReadGramPair(r *bufio.Reader) (directV9GramPair, error) {
+func directReadGramPair(r *bufio.Reader) (directGramPair, error) {
 	var b [8]byte
 	if _, err := io.ReadFull(r, b[:]); err != nil {
-		return directV9GramPair{}, err
+		return directGramPair{}, err
 	}
-	return directV9GramPair{Gram: binary.LittleEndian.Uint32(b[0:4]), ID: binary.LittleEndian.Uint32(b[4:8])}, nil
+	return directGramPair{Gram: binary.LittleEndian.Uint32(b[0:4]), ID: binary.LittleEndian.Uint32(b[4:8])}, nil
 }
 
-// directV9WriteGramSectionStreaming preserves the existing gram wire format
+// directWriteGramSectionStreaming preserves the existing gram wire format
 // while keeping encoded posting bytes off the Go heap.  The gram dictionary is
 // already bounded by the current family; entries, block metadata, and delta
 // payloads are staged in owned files and copied to the atomic target only
 // after their counts and offsets are known.
-func directV9WriteGramSectionStreaming(ctx context.Context, cw *countingWriter, postings map[uint32][]uint32, recordCount int, metadataMagic uint32, name, scratchDir string, owned *[]string, scratchHigh *int64) (indexSectionTableEntry, directV9SectionReport, error) {
+func directWriteGramSectionStreaming(ctx context.Context, cw *countingWriter, postings map[uint32][]uint32, recordCount int, metadataMagic uint32, name, scratchDir string, owned *[]string, scratchHigh *int64) (indexSectionTableEntry, directSectionReport, error) {
 	keys := make([]uint32, 0, len(postings))
 	for gram, ids := range postings {
 		if len(ids) > 0 {
@@ -550,24 +550,24 @@ func directV9WriteGramSectionStreaming(ctx context.Context, cw *countingWriter, 
 		}
 	}
 	sortUint32s(keys)
-	entriesPath := filepath.Join(scratchDir, "direct-v9-"+strings.ToLower(name)+"-entries.tmp")
-	metaPath := filepath.Join(scratchDir, "direct-v9-"+strings.ToLower(name)+"-meta.tmp")
-	blobPath := filepath.Join(scratchDir, "direct-v9-"+strings.ToLower(name)+"-blob.tmp")
+	entriesPath := filepath.Join(scratchDir, "direct-"+strings.ToLower(name)+"-entries.tmp")
+	metaPath := filepath.Join(scratchDir, "direct-"+strings.ToLower(name)+"-meta.tmp")
+	blobPath := filepath.Join(scratchDir, "direct-"+strings.ToLower(name)+"-blob.tmp")
 	*owned = append(*owned, entriesPath, metaPath, blobPath)
 	entriesFile, err := os.Create(entriesPath)
 	if err != nil {
-		return indexSectionTableEntry{}, directV9SectionReport{}, err
+		return indexSectionTableEntry{}, directSectionReport{}, err
 	}
 	metaFile, err := os.Create(metaPath)
 	if err != nil {
 		_ = entriesFile.Close()
-		return indexSectionTableEntry{}, directV9SectionReport{}, err
+		return indexSectionTableEntry{}, directSectionReport{}, err
 	}
 	blobFile, err := os.Create(blobPath)
 	if err != nil {
 		_ = entriesFile.Close()
 		_ = metaFile.Close()
-		return indexSectionTableEntry{}, directV9SectionReport{}, err
+		return indexSectionTableEntry{}, directSectionReport{}, err
 	}
 	entryWriter := bufio.NewWriterSize(entriesFile, 256*1024)
 	metaWriter := bufio.NewWriterSize(metaFile, 256*1024)
@@ -582,7 +582,7 @@ func directV9WriteGramSectionStreaming(ctx context.Context, cw *countingWriter, 
 			_ = entriesFile.Close()
 			_ = metaFile.Close()
 			_ = blobFile.Close()
-			return indexSectionTableEntry{}, directV9SectionReport{}, ctx.Err()
+			return indexSectionTableEntry{}, directSectionReport{}, ctx.Err()
 		default:
 		}
 		ids := uniqueSortedUint32s(postings[gram])
@@ -598,13 +598,13 @@ func directV9WriteGramSectionStreaming(ctx context.Context, cw *countingWriter, 
 				_ = entriesFile.Close()
 				_ = metaFile.Close()
 				_ = blobFile.Close()
-				return indexSectionTableEntry{}, directV9SectionReport{}, errors.New("direct v9 gram spool exceeds format")
+				return indexSectionTableEntry{}, directSectionReport{}, errors.New("direct gram spool exceeds format")
 			}
 			if _, err := blobWriter.Write(encoded); err != nil {
 				_ = entriesFile.Close()
 				_ = metaFile.Close()
 				_ = blobFile.Close()
-				return indexSectionTableEntry{}, directV9SectionReport{}, err
+				return indexSectionTableEntry{}, directSectionReport{}, err
 			}
 			minRank := chunk[0]
 			for _, id := range chunk[1:] {
@@ -623,7 +623,7 @@ func directV9WriteGramSectionStreaming(ctx context.Context, cw *countingWriter, 
 				_ = entriesFile.Close()
 				_ = metaFile.Close()
 				_ = blobFile.Close()
-				return indexSectionTableEntry{}, directV9SectionReport{}, err
+				return indexSectionTableEntry{}, directSectionReport{}, err
 			}
 			offset += uint64(len(encoded))
 			blobBytes += uint64(len(encoded))
@@ -638,7 +638,7 @@ func directV9WriteGramSectionStreaming(ctx context.Context, cw *countingWriter, 
 			_ = entriesFile.Close()
 			_ = metaFile.Close()
 			_ = blobFile.Close()
-			return indexSectionTableEntry{}, directV9SectionReport{}, err
+			return indexSectionTableEntry{}, directSectionReport{}, err
 		}
 		entryCount++
 	}
@@ -646,22 +646,22 @@ func directV9WriteGramSectionStreaming(ctx context.Context, cw *countingWriter, 
 		_ = entriesFile.Close()
 		_ = metaFile.Close()
 		_ = blobFile.Close()
-		return indexSectionTableEntry{}, directV9SectionReport{}, errors.New("direct v9 gram counts exceed format")
+		return indexSectionTableEntry{}, directSectionReport{}, errors.New("direct gram counts exceed format")
 	}
 	if err := entryWriter.Flush(); err != nil {
-		return indexSectionTableEntry{}, directV9SectionReport{}, err
+		return indexSectionTableEntry{}, directSectionReport{}, err
 	}
 	if err := metaWriter.Flush(); err != nil {
-		return indexSectionTableEntry{}, directV9SectionReport{}, err
+		return indexSectionTableEntry{}, directSectionReport{}, err
 	}
 	if err := blobWriter.Flush(); err != nil {
-		return indexSectionTableEntry{}, directV9SectionReport{}, err
+		return indexSectionTableEntry{}, directSectionReport{}, err
 	}
 	_ = entriesFile.Close()
 	_ = metaFile.Close()
 	_ = blobFile.Close()
 	if err := writeAlignment(cw, 8); err != nil {
-		return indexSectionTableEntry{}, directV9SectionReport{}, err
+		return indexSectionTableEntry{}, directSectionReport{}, err
 	}
 	sectionOffset := uint64(cw.n)
 	var header [16]byte
@@ -670,32 +670,32 @@ func directV9WriteGramSectionStreaming(ctx context.Context, cw *countingWriter, 
 	binary.LittleEndian.PutUint32(header[8:12], uint32(blockCount))
 	binary.LittleEndian.PutUint32(header[12:16], uint32(blobBytes))
 	if _, err := cw.Write(header[:]); err != nil {
-		return indexSectionTableEntry{}, directV9SectionReport{}, err
+		return indexSectionTableEntry{}, directSectionReport{}, err
 	}
-	if err := directV9CopyFile(cw, entriesPath); err != nil {
-		return indexSectionTableEntry{}, directV9SectionReport{}, err
+	if err := directCopyFile(cw, entriesPath); err != nil {
+		return indexSectionTableEntry{}, directSectionReport{}, err
 	}
-	if err := directV9CopyFile(cw, metaPath); err != nil {
-		return indexSectionTableEntry{}, directV9SectionReport{}, err
+	if err := directCopyFile(cw, metaPath); err != nil {
+		return indexSectionTableEntry{}, directSectionReport{}, err
 	}
-	if err := directV9CopyFile(cw, blobPath); err != nil {
-		return indexSectionTableEntry{}, directV9SectionReport{}, err
+	if err := directCopyFile(cw, blobPath); err != nil {
+		return indexSectionTableEntry{}, directSectionReport{}, err
 	}
 	var trailer [8]byte
 	binary.LittleEndian.PutUint32(trailer[0:4], metadataMagic)
 	binary.LittleEndian.PutUint32(trailer[4:8], 0)
 	if _, err := cw.Write(trailer[:]); err != nil {
-		return indexSectionTableEntry{}, directV9SectionReport{}, err
+		return indexSectionTableEntry{}, directSectionReport{}, err
 	}
 	entry := indexSectionTableEntry{tag: map[string]uint32{"PNGR": indexSectionPNGR, "PNGC": indexSectionPNGC}[name], offset: sectionOffset, length: uint64(cw.n) - sectionOffset}
 	scratch := int64(blobBytes) + int64(blockCount*28) + int64(entryCount*16)
 	if scratch > *scratchHigh {
 		*scratchHigh = scratch
 	}
-	return entry, directV9SectionReport{Name: name, Tag: entry.tag, Runs: 0, Bytes: int64(entry.length), ScratchBytes: scratch}, nil
+	return entry, directSectionReport{Name: name, Tag: entry.tag, Runs: 0, Bytes: int64(entry.length), ScratchBytes: scratch}, nil
 }
 
-func directV9EncodeLOWR(ctx context.Context, finalPath string) ([]byte, error) {
+func directEncodeLOWR(ctx context.Context, finalPath string) ([]byte, error) {
 	f, err := os.Open(finalPath)
 	if err != nil {
 		return nil, err
@@ -711,7 +711,7 @@ func directV9EncodeLOWR(ctx context.Context, finalPath string) ([]byte, error) {
 			return nil, ctx.Err()
 		default:
 		}
-		rec, readErr := readDirectV9SpoolRecord(r)
+		rec, readErr := readDirectSpoolRecord(r)
 		if errors.Is(readErr, io.EOF) {
 			break
 		}
@@ -720,14 +720,14 @@ func directV9EncodeLOWR(ctx context.Context, finalPath string) ([]byte, error) {
 		}
 		lower := strings.ToLower(rec.Name)
 		if len(lower) > int(^uint16(0)) {
-			return nil, errors.New("direct v9 lower name too large")
+			return nil, errors.New("direct lower name too large")
 		}
 		lens = append(lens, uint16(len(lower)))
 		if lower == rec.Name {
 			offs = append(offs, packedLowerSameAsName)
 		} else {
 			if uint64(blob.Len())+uint64(len(lower)) > uint64(^uint32(0)) {
-				return nil, errors.New("direct v9 lower blob too large")
+				return nil, errors.New("direct lower blob too large")
 			}
 			offs = append(offs, uint32(blob.Len()))
 			_, _ = blob.WriteString(lower)
@@ -742,26 +742,26 @@ func directV9EncodeLOWR(ctx context.Context, finalPath string) ([]byte, error) {
 	return out.Bytes(), nil
 }
 
-// directV9AuxMaps carries every posting family collected in one spool pass so
+// directAuxMaps carries every posting family collected in one spool pass so
 // the PEXT/PCMP/PATR/PNGR sections no longer each re-read the record spool.
-type directV9AuxMaps struct {
+type directAuxMaps struct {
 	ext     map[string][]uint32
 	comp    map[string][]uint32
 	attrs   map[uint32][]uint32
 	gramCnt map[uint32]int
 }
 
-// directV9CollectAuxMaps reads the final spool once and produces the extension,
+// directCollectAuxMaps reads the final spool once and produces the extension,
 // component, attribute, and filename-gram count maps together.  The per-key
 // posting lists are sorted and deduplicated, matching the individual
 // collectors' output exactly.
-func directV9CollectAuxMaps(ctx context.Context, finalPath string) (*directV9AuxMaps, error) {
+func directCollectAuxMaps(ctx context.Context, finalPath string) (*directAuxMaps, error) {
 	f, err := os.Open(finalPath)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
-	out := &directV9AuxMaps{
+	out := &directAuxMaps{
 		ext:     make(map[string][]uint32),
 		comp:    make(map[string][]uint32),
 		attrs:   make(map[uint32][]uint32),
@@ -774,7 +774,7 @@ func directV9CollectAuxMaps(ctx context.Context, finalPath string) (*directV9Aux
 			return nil, ctx.Err()
 		default:
 		}
-		rec, readErr := readDirectV9SpoolRecord(r)
+		rec, readErr := readDirectSpoolRecord(r)
 		if errors.Is(readErr, io.EOF) {
 			break
 		}
@@ -804,20 +804,20 @@ func directV9CollectAuxMaps(ctx context.Context, finalPath string) (*directV9Aux
 	return out, nil
 }
 
-func directV9ReadUint32Vector(path string, expected int) ([]uint32, error) {
+func directReadUint32Vector(path string, expected int) ([]uint32, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
 	if len(data) != expected*4 {
-		return nil, fmt.Errorf("direct v9 rank vector bytes=%d want=%d", len(data), expected*4)
+		return nil, fmt.Errorf("direct rank vector bytes=%d want=%d", len(data), expected*4)
 	}
 	return mappedUint32Slice(data), nil
 }
 
-func directV9BuildComponentPostingRankBounds(postings map[string][]uint32, rankPaths []string, recordCount int) (postingRankBounds, error) {
+func directBuildComponentPostingRankBounds(postings map[string][]uint32, rankPaths []string, recordCount int) (postingRankBounds, error) {
 	if len(rankPaths) != 6 {
-		return postingRankBounds{}, fmt.Errorf("direct v9 component bounds rank families=%d want=6", len(rankPaths))
+		return postingRankBounds{}, fmt.Errorf("direct component bounds rank families=%d want=6", len(rankPaths))
 	}
 	keys := make([]string, 0, len(postings))
 	for key, ids := range postings {
@@ -828,7 +828,7 @@ func directV9BuildComponentPostingRankBounds(postings map[string][]uint32, rankP
 	sort.Strings(keys)
 	parts := make([][]uint32, len(rankPaths))
 	for family, path := range rankPaths {
-		ranks, err := directV9ReadUint32Vector(path, recordCount)
+		ranks, err := directReadUint32Vector(path, recordCount)
 		if err != nil {
 			return postingRankBounds{}, err
 		}
@@ -845,7 +845,7 @@ func directV9BuildComponentPostingRankBounds(postings map[string][]uint32, rankP
 	return postingRankBounds{BlockCount: len(parts[0]), Name: parts[0], Size: parts[1], Modified: parts[2], Extension: parts[3], Type: parts[4], Path: parts[5]}, nil
 }
 
-func directV9PartitionNameGrams(counts map[uint32]int, maxPostingCount int) (map[uint32]struct{}, map[uint32]int) {
+func directPartitionNameGrams(counts map[uint32]int, maxPostingCount int) (map[uint32]struct{}, map[uint32]int) {
 	stored := make(map[uint32]struct{}, len(counts))
 	omitted := make(map[uint32]int)
 	for gram, count := range counts {
@@ -858,7 +858,7 @@ func directV9PartitionNameGrams(counts map[uint32]int, maxPostingCount int) (map
 	return stored, omitted
 }
 
-func directV9GramKeys(counts map[uint32]int) map[uint32]struct{} {
+func directGramKeys(counts map[uint32]int) map[uint32]struct{} {
 	keys := make(map[uint32]struct{}, len(counts))
 	for gram := range counts {
 		keys[gram] = struct{}{}
@@ -866,7 +866,7 @@ func directV9GramKeys(counts map[uint32]int) map[uint32]struct{} {
 	return keys
 }
 
-func directV9MakeGramIndex(postings map[uint32][]uint32, recordCount int, union bool) *compressedTrigramIndex {
+func directMakeGramIndex(postings map[uint32][]uint32, recordCount int, union bool) *compressedTrigramIndex {
 	segment := trigramSegment{postings: make(map[uint32]compressedPosting)}
 	counts := make(map[uint32]int, len(postings))
 	for gram, ids := range postings {
@@ -877,7 +877,7 @@ func directV9MakeGramIndex(postings map[uint32][]uint32, recordCount int, union 
 	return &compressedTrigramIndex{segments: []trigramSegment{segment}, counts: counts, gramCountsComplete: true, gramUnionComplete: union, gramSize: 3, recordCount: recordCount}
 }
 
-func directV9ZeroPostingBounds(data []byte) []byte {
+func directZeroPostingBounds(data []byte) []byte {
 	if len(data) < 16 {
 		return nil
 	}

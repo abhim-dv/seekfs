@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-const indexVersionV9 = 9
+const indexVersion = 9
 const servicePathCacheLimit = 25_000
 const serviceStartupDefaultWorkers = 2
 const serviceResidentNameOrderMaxRecords = 2_000_000
@@ -49,7 +49,7 @@ const (
 	nameTrigramStateReady
 )
 
-var indexMagicV9 = [8]byte{'G', 'O', 'S', 'R', 'C', 'H', '0', '9'}
+var indexMagic = [8]byte{'G', 'O', 'S', 'R', 'C', 'H', '0', '9'}
 var walMagicV1 = []byte{'S', 'W', 'A', 'L', '1'}
 
 const (

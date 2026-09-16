@@ -10,11 +10,11 @@ import (
 func TestGlobalPlannerMultiVolumeParityAndTrace(t *testing.T) {
 	cIndex := compatibilityIndexForVolume("C:")
 	fIndex := compatibilityIndexForVolume("F:")
-	v9c := roundTripCompatibilityIndex(t, cIndex, true, false)
-	v9f := roundTripCompatibilityIndex(t, fIndex, true, false)
+	cIdx := roundTripCompatibilityIndex(t, cIndex, true, false)
+	fIdx := roundTripCompatibilityIndex(t, fIndex, true, false)
 	volumes := []*serviceVolumeIndex{
-		newServiceVolumeIndex("mixed-v9-c.gsi", v9c),
-		newServiceVolumeIndex("mixed-v9-f.gsi", v9f),
+		newServiceVolumeIndex("mixed-v9-c.gsi", cIdx),
+		newServiceVolumeIndex("mixed-v9-f.gsi", fIdx),
 	}
 
 	for _, tc := range []struct {
@@ -27,7 +27,7 @@ func TestGlobalPlannerMultiVolumeParityAndTrace(t *testing.T) {
 	} {
 		t.Run(tc.query, func(t *testing.T) {
 			opts := queryOptions{Query: tc.query, MatchPath: true, Limit: 20}
-			want, err := searchAll([]*Index{v9c, v9f}, opts, false)
+			want, err := searchAll([]*Index{cIdx, fIdx}, opts, false)
 			if err != nil {
 				t.Fatalf("oracle search: %v", err)
 			}
@@ -56,11 +56,11 @@ func TestGlobalPlannerMultiVolumeParityAndTrace(t *testing.T) {
 }
 
 func TestGlobalPlannerFallbackTrace(t *testing.T) {
-	v9c := roundTripCompatibilityIndex(t, compatibilityIndexForVolume("C:"), true, false)
-	v9f := roundTripCompatibilityIndex(t, compatibilityIndexForVolume("F:"), true, false)
+	cIdx := roundTripCompatibilityIndex(t, compatibilityIndexForVolume("C:"), true, false)
+	fIdx := roundTripCompatibilityIndex(t, compatibilityIndexForVolume("F:"), true, false)
 	volumes := []*serviceVolumeIndex{
-		newServiceVolumeIndex("fallback-v9-c.gsi", v9c),
-		newServiceVolumeIndex("fallback-v9-f.gsi", v9f),
+		newServiceVolumeIndex("fallback-v9-c.gsi", cIdx),
+		newServiceVolumeIndex("fallback-v9-f.gsi", fIdx),
 	}
 	// Force the ext planner to decline for C: by removing every ext posting
 	// source so the bounded fallback must run.
@@ -74,7 +74,7 @@ func TestGlobalPlannerFallbackTrace(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want, err := searchAll([]*Index{v9c, v9f}, queryOptions{Query: "ext:txt", Limit: 20}, false)
+	want, err := searchAll([]*Index{cIdx, fIdx}, queryOptions{Query: "ext:txt", Limit: 20}, false)
 	if err != nil {
 		t.Fatal(err)
 	}

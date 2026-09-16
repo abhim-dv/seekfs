@@ -13,12 +13,12 @@ import (
 	"sort"
 )
 
-type directV9ChildPair struct {
+type directChildPair struct {
 	Parent uint32
 	Child  uint32
 }
 
-func directV9WriteChildRun(path string, pairs []directV9ChildPair) (int64, error) {
+func directWriteChildRun(path string, pairs []directChildPair) (int64, error) {
 	sort.Slice(pairs, func(i, j int) bool {
 		if pairs[i].Parent != pairs[j].Parent {
 			return pairs[i].Parent < pairs[j].Parent
@@ -49,24 +49,24 @@ func directV9WriteChildRun(path string, pairs []directV9ChildPair) (int64, error
 	return written, f.Close()
 }
 
-type directV9ChildHead struct {
-	Pair directV9ChildPair
+type directChildHead struct {
+	Pair directChildPair
 	Run  int
 }
 
-type directV9ChildHeap struct{ items []directV9ChildHead }
+type directChildHeap struct{ items []directChildHead }
 
-func (h directV9ChildHeap) Len() int { return len(h.items) }
-func (h directV9ChildHeap) Less(i, j int) bool {
+func (h directChildHeap) Len() int { return len(h.items) }
+func (h directChildHeap) Less(i, j int) bool {
 	a, b := h.items[i].Pair, h.items[j].Pair
 	if a.Parent != b.Parent {
 		return a.Parent < b.Parent
 	}
 	return a.Child < b.Child
 }
-func (h directV9ChildHeap) Swap(i, j int) { h.items[i], h.items[j] = h.items[j], h.items[i] }
-func (h *directV9ChildHeap) Push(x any)   { h.items = append(h.items, x.(directV9ChildHead)) }
-func (h *directV9ChildHeap) Pop() any {
+func (h directChildHeap) Swap(i, j int) { h.items[i], h.items[j] = h.items[j], h.items[i] }
+func (h *directChildHeap) Push(x any)   { h.items = append(h.items, x.(directChildHead)) }
+func (h *directChildHeap) Pop() any {
 	old := h.items
 	n := len(old)
 	x := old[n-1]
@@ -74,21 +74,21 @@ func (h *directV9ChildHeap) Pop() any {
 	return x
 }
 
-func directV9ReadChildPair(r *bufio.Reader) (directV9ChildPair, error) {
+func directReadChildPair(r *bufio.Reader) (directChildPair, error) {
 	var buf [8]byte
 	if _, err := io.ReadFull(r, buf[:]); err != nil {
-		return directV9ChildPair{}, err
+		return directChildPair{}, err
 	}
-	return directV9ChildPair{Parent: binary.LittleEndian.Uint32(buf[0:4]), Child: binary.LittleEndian.Uint32(buf[4:8])}, nil
+	return directChildPair{Parent: binary.LittleEndian.Uint32(buf[0:4]), Child: binary.LittleEndian.Uint32(buf[4:8])}, nil
 }
 
-func directV9CheckParentCycles(ctx context.Context, parentPath string, recordCount int) error {
+func directCheckParentCycles(ctx context.Context, parentPath string, recordCount int) error {
 	data, err := os.ReadFile(parentPath)
 	if err != nil {
 		return err
 	}
 	if len(data) < recordCount*4 {
-		return errors.New("direct v9 topology parents file too short")
+		return errors.New("direct topology parents file too short")
 	}
 	state := make([]byte, recordCount)
 	stamp := make([]uint32, recordCount)
@@ -99,7 +99,7 @@ func directV9CheckParentCycles(ctx context.Context, parentPath string, recordCou
 			return -1, nil
 		}
 		if value >= uint32(recordCount) {
-			return -1, errors.New("direct v9 topology parent ID out of range")
+			return -1, errors.New("direct topology parent ID out of range")
 		}
 		return int32(value), nil
 	}
@@ -122,7 +122,7 @@ func directV9CheckParentCycles(ctx context.Context, parentPath string, recordCou
 			default:
 			}
 			if stamp[cur] == walkID {
-				return errors.New("direct v9 topology parent cycle")
+				return errors.New("direct topology parent cycle")
 			}
 			stamp[cur] = walkID
 			parent, err := readParent(cur)
@@ -144,7 +144,7 @@ func directV9CheckParentCycles(ctx context.Context, parentPath string, recordCou
 	return nil
 }
 
-func directV9CopyFile(cw *countingWriter, path string) error {
+func directCopyFile(cw *countingWriter, path string) error {
 	f, err := os.Open(path)
 	if err != nil {
 		return err
@@ -154,10 +154,10 @@ func directV9CopyFile(cw *countingWriter, path string) error {
 	return err
 }
 
-func directV9MergeChildRuns(ctx context.Context, cw *countingWriter, runs []directV9RunFile, expected int) error {
+func directMergeChildRuns(ctx context.Context, cw *countingWriter, runs []directRunFile, expected int) error {
 	files := make([]*os.File, len(runs))
 	readers := make([]*bufio.Reader, len(runs))
-	h := &directV9ChildHeap{}
+	h := &directChildHeap{}
 	heap.Init(h)
 	for i, run := range runs {
 		f, err := os.Open(run.path)
@@ -171,9 +171,9 @@ func directV9MergeChildRuns(ctx context.Context, cw *countingWriter, runs []dire
 		}
 		files[i] = f
 		readers[i] = bufio.NewReaderSize(f, 256*1024)
-		pair, readErr := directV9ReadChildPair(readers[i])
+		pair, readErr := directReadChildPair(readers[i])
 		if readErr == nil {
-			heap.Push(h, directV9ChildHead{Pair: pair, Run: i})
+			heap.Push(h, directChildHead{Pair: pair, Run: i})
 		} else if !errors.Is(readErr, io.EOF) {
 			for _, opened := range files {
 				if opened != nil {
@@ -198,30 +198,30 @@ func directV9MergeChildRuns(ctx context.Context, cw *countingWriter, runs []dire
 			return ctx.Err()
 		default:
 		}
-		head := heap.Pop(h).(directV9ChildHead)
+		head := heap.Pop(h).(directChildHead)
 		binary.LittleEndian.PutUint32(buf[:], head.Pair.Child)
 		if _, err := cw.Write(buf[:]); err != nil {
 			return err
 		}
 		written++
-		next, readErr := directV9ReadChildPair(readers[head.Run])
+		next, readErr := directReadChildPair(readers[head.Run])
 		if readErr == nil {
-			heap.Push(h, directV9ChildHead{Pair: next, Run: head.Run})
+			heap.Push(h, directChildHead{Pair: next, Run: head.Run})
 		} else if !errors.Is(readErr, io.EOF) {
 			return readErr
 		}
 	}
 	if written != expected {
-		return fmt.Errorf("direct v9 topology child count mismatch: wrote %d want %d", written, expected)
+		return fmt.Errorf("direct topology child count mismatch: wrote %d want %d", written, expected)
 	}
 	return nil
 }
 
-func directV9WriteTopologySections(ctx context.Context, cw *countingWriter, finalPath, frnPath, spoolDir string, recordCount, maxRecords int, owned *[]string, scratchHigh *int64) ([]indexSectionTableEntry, []directV9SectionReport, error) {
-	parentPath := filepath.Join(spoolDir, "direct-v9-parents.tmp")
-	offsetsPath := filepath.Join(spoolDir, "direct-v9-child-offsets.tmp")
-	rootsPath := filepath.Join(spoolDir, "direct-v9-roots.tmp")
-	sizesPath := filepath.Join(spoolDir, "direct-v9-sizes.tmp")
+func directWriteTopologySections(ctx context.Context, cw *countingWriter, finalPath, frnPath, spoolDir string, recordCount, maxRecords int, owned *[]string, scratchHigh *int64) ([]indexSectionTableEntry, []directSectionReport, error) {
+	parentPath := filepath.Join(spoolDir, "direct-parents.tmp")
+	offsetsPath := filepath.Join(spoolDir, "direct-child-offsets.tmp")
+	rootsPath := filepath.Join(spoolDir, "direct-roots.tmp")
+	sizesPath := filepath.Join(spoolDir, "direct-sizes.tmp")
 	*owned = append(*owned, parentPath, offsetsPath, rootsPath, sizesPath)
 	parents, err := os.Create(parentPath)
 	if err != nil {
@@ -249,7 +249,7 @@ func directV9WriteTopologySections(ctx context.Context, cw *countingWriter, fina
 		_ = sizes.Close()
 		return nil, nil, err
 	}
-	frnMap, frns, err := directV9MapFRNs(frnPath, recordCount)
+	frnMap, frns, err := directMapFRNs(frnPath, recordCount)
 	if err != nil {
 		_ = final.Close()
 		_ = parents.Close()
@@ -271,7 +271,7 @@ func directV9WriteTopologySections(ctx context.Context, cw *countingWriter, fina
 			return nil, nil, ctx.Err()
 		default:
 		}
-		rec, readErr := readDirectV9SpoolRecord(r)
+		rec, readErr := readDirectSpoolRecord(r)
 		if readErr != nil {
 			_ = final.Close()
 			_ = parents.Close()
@@ -296,14 +296,14 @@ func directV9WriteTopologySections(ctx context.Context, cw *countingWriter, fina
 		}
 		parentID := int32(-1)
 		if rec.ParentFRN != 0 {
-			parentID = directV9LookupIDMapped(frns, rec.ParentFRN)
+			parentID = directLookupIDMapped(frns, rec.ParentFRN)
 		}
 		if parentID == int32(id) {
 			_ = final.Close()
 			_ = parents.Close()
 			_ = roots.Close()
 			_ = sizes.Close()
-			return nil, nil, errors.New("direct v9 topology self-parent")
+			return nil, nil, errors.New("direct topology self-parent")
 		}
 		var b [4]byte
 		if parentID < 0 {
@@ -349,7 +349,7 @@ func directV9WriteTopologySections(ctx context.Context, cw *countingWriter, fina
 	_ = parents.Close()
 	_ = roots.Close()
 	_ = sizes.Close()
-	if err := directV9CheckParentCycles(ctx, parentPath, recordCount); err != nil {
+	if err := directCheckParentCycles(ctx, parentPath, recordCount); err != nil {
 		return nil, nil, err
 	}
 	offsets, err := os.Create(offsetsPath)
@@ -379,30 +379,30 @@ func directV9WriteTopologySections(ctx context.Context, cw *countingWriter, fina
 	}
 	_ = offsets.Close()
 	if childCount > uint64(^uint32(0)) {
-		return nil, nil, errors.New("direct v9 topology child count exceeds format")
+		return nil, nil, errors.New("direct topology child count exceeds format")
 	}
 	if maxRecords <= 0 {
-		maxRecords = directV9DefaultRunRecords
+		maxRecords = directDefaultRunRecords
 	}
 	pfile, err := os.Open(parentPath)
 	if err != nil {
 		return nil, nil, err
 	}
 	reader := bufio.NewReaderSize(pfile, 256*1024)
-	pairs := make([]directV9ChildPair, 0, min(maxRecords, 4096))
-	runs := make([]directV9RunFile, 0)
+	pairs := make([]directChildPair, 0, min(maxRecords, 4096))
+	runs := make([]directRunFile, 0)
 	flush := func() error {
 		if len(pairs) == 0 {
 			return nil
 		}
-		path := filepath.Join(spoolDir, fmt.Sprintf("direct-v9-child-%06d.tmp", len(runs)))
-		bytes, err := directV9WriteChildRun(path, pairs)
+		path := filepath.Join(spoolDir, fmt.Sprintf("direct-child-%06d.tmp", len(runs)))
+		bytes, err := directWriteChildRun(path, pairs)
 		if err != nil {
 			return err
 		}
 		*owned = append(*owned, path)
-		runs = append(runs, directV9RunFile{path: path, bytes: bytes})
-		pairs = make([]directV9ChildPair, 0, min(maxRecords, 4096))
+		runs = append(runs, directRunFile{path: path, bytes: bytes})
+		pairs = make([]directChildPair, 0, min(maxRecords, 4096))
 		return nil
 	}
 	for id := 0; id < recordCount; id++ {
@@ -413,7 +413,7 @@ func directV9WriteTopologySections(ctx context.Context, cw *countingWriter, fina
 		}
 		parent := binary.LittleEndian.Uint32(b[:])
 		if parent != ^uint32(0) {
-			pairs = append(pairs, directV9ChildPair{Parent: parent, Child: uint32(id)})
+			pairs = append(pairs, directChildPair{Parent: parent, Child: uint32(id)})
 		}
 		if len(pairs) >= maxRecords {
 			if err := flush(); err != nil {
@@ -448,7 +448,7 @@ func directV9WriteTopologySections(ctx context.Context, cw *countingWriter, fina
 		*scratchHigh = base
 	}
 	entries := make([]indexSectionTableEntry, 0, 2)
-	reports := make([]directV9SectionReport, 0, 2)
+	reports := make([]directSectionReport, 0, 2)
 	if err := writeAlignment(cw, 8); err != nil {
 		return nil, nil, err
 	}
@@ -456,24 +456,24 @@ func directV9WriteTopologySections(ctx context.Context, cw *countingWriter, fina
 	if err := binary.Write(cw, binary.LittleEndian, uint32(recordCount+1)); err != nil {
 		return nil, nil, err
 	}
-	if err := directV9CopyFile(cw, offsetsPath); err != nil {
+	if err := directCopyFile(cw, offsetsPath); err != nil {
 		return nil, nil, err
 	}
 	if err := binary.Write(cw, binary.LittleEndian, uint32(childCount)); err != nil {
 		return nil, nil, err
 	}
-	if err := directV9MergeChildRuns(ctx, cw, runs, int(childCount)); err != nil {
+	if err := directMergeChildRuns(ctx, cw, runs, int(childCount)); err != nil {
 		return nil, nil, err
 	}
 	rootCount := int(rootInfo.Size() / 4)
 	if err := binary.Write(cw, binary.LittleEndian, uint32(rootCount)); err != nil {
 		return nil, nil, err
 	}
-	if err := directV9CopyFile(cw, rootsPath); err != nil {
+	if err := directCopyFile(cw, rootsPath); err != nil {
 		return nil, nil, err
 	}
 	entries = append(entries, indexSectionTableEntry{tag: indexSectionCHLD, offset: offset, length: uint64(cw.n) - offset})
-	reports = append(reports, directV9SectionReport{Name: "CHLD", Tag: indexSectionCHLD, Runs: len(runs), Bytes: int64(cw.n) - int64(offset), ScratchBytes: topoScratch})
+	reports = append(reports, directSectionReport{Name: "CHLD", Tag: indexSectionCHLD, Runs: len(runs), Bytes: int64(cw.n) - int64(offset), ScratchBytes: topoScratch})
 	for _, run := range runs {
 		_ = os.Remove(run.path)
 	}
@@ -484,7 +484,7 @@ func directV9WriteTopologySections(ctx context.Context, cw *countingWriter, fina
 	if err := binary.Write(cw, binary.LittleEndian, uint32(recordCount)); err != nil {
 		return nil, nil, err
 	}
-	if err := directV9CopyFile(cw, frnPath); err != nil {
+	if err := directCopyFile(cw, frnPath); err != nil {
 		return nil, nil, err
 	}
 	if err := binary.Write(cw, binary.LittleEndian, uint32(recordCount)); err != nil {
@@ -502,6 +502,6 @@ func directV9WriteTopologySections(ctx context.Context, cw *countingWriter, fina
 		start += count
 	}
 	entries = append(entries, indexSectionTableEntry{tag: indexSectionFRNS, offset: offset, length: uint64(cw.n) - offset})
-	reports = append(reports, directV9SectionReport{Name: "FRNS", Tag: indexSectionFRNS, Runs: 0, Bytes: int64(cw.n) - int64(offset), ScratchBytes: 0})
+	reports = append(reports, directSectionReport{Name: "FRNS", Tag: indexSectionFRNS, Runs: 0, Bytes: int64(cw.n) - int64(offset), ScratchBytes: 0})
 	return entries, reports, nil
 }

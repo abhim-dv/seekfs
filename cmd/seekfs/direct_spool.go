@@ -13,11 +13,11 @@ import (
 	"sort"
 )
 
-func writeDirectV9SpoolRecord(w io.Writer, rec directV9Record) (int64, error) {
+func writeDirectSpoolRecord(w io.Writer, rec directRecord) (int64, error) {
 	if uint64(len(rec.Name)) > uint64(^uint32(0)) || uint64(len(rec.Path)) > uint64(^uint32(0)) {
-		return 0, errors.New("direct v9 record name or path too large")
+		return 0, errors.New("direct record name or path too large")
 	}
-	var header [directV9SpoolHeaderBytes]byte
+	var header [directSpoolHeaderBytes]byte
 	binary.LittleEndian.PutUint64(header[0:8], rec.FRN)
 	binary.LittleEndian.PutUint64(header[8:16], rec.ParentFRN)
 	binary.LittleEndian.PutUint32(header[16:20], rec.Mode)
@@ -49,28 +49,28 @@ func writeDirectV9SpoolRecord(w io.Writer, rec directV9Record) (int64, error) {
 	return int64(n + m + p), nil
 }
 
-func readDirectV9SpoolRecord(r *bufio.Reader) (directV9Record, error) {
-	var header [directV9SpoolHeaderBytes]byte
+func readDirectSpoolRecord(r *bufio.Reader) (directRecord, error) {
+	var header [directSpoolHeaderBytes]byte
 	if _, err := io.ReadFull(r, header[:]); err != nil {
-		return directV9Record{}, err
+		return directRecord{}, err
 	}
 	nameLen := binary.LittleEndian.Uint32(header[36:40])
 	pathLen := binary.LittleEndian.Uint32(header[40:44])
 	if uint64(nameLen) > uint64(^uint(0)>>1) {
-		return directV9Record{}, errors.New("direct v9 spool name too large")
+		return directRecord{}, errors.New("direct spool name too large")
 	}
 	name := make([]byte, int(nameLen))
 	if _, err := io.ReadFull(r, name); err != nil {
-		return directV9Record{}, err
+		return directRecord{}, err
 	}
 	if uint64(pathLen) > uint64(^uint(0)>>1) {
-		return directV9Record{}, errors.New("direct v9 spool path too large")
+		return directRecord{}, errors.New("direct spool path too large")
 	}
 	path := make([]byte, int(pathLen))
 	if _, err := io.ReadFull(r, path); err != nil {
-		return directV9Record{}, err
+		return directRecord{}, err
 	}
-	return directV9Record{
+	return directRecord{
 		FRN:       binary.LittleEndian.Uint64(header[0:8]),
 		ParentFRN: binary.LittleEndian.Uint64(header[8:16]),
 		Mode:      binary.LittleEndian.Uint32(header[16:20]),
@@ -81,7 +81,7 @@ func readDirectV9SpoolRecord(r *bufio.Reader) (directV9Record, error) {
 	}, nil
 }
 
-func directV9RecordLess(a, b directV9Record) bool {
+func directRecordLess(a, b directRecord) bool {
 	if a.FRN != b.FRN {
 		return a.FRN < b.FRN
 	}
@@ -103,8 +103,8 @@ func directV9RecordLess(a, b directV9Record) bool {
 	return a.ModUnix < b.ModUnix
 }
 
-func directV9WriteRun(path string, records []directV9Record) (int64, error) {
-	sort.Slice(records, func(i, j int) bool { return directV9RecordLess(records[i], records[j]) })
+func directWriteRun(path string, records []directRecord) (int64, error) {
+	sort.Slice(records, func(i, j int) bool { return directRecordLess(records[i], records[j]) })
 	f, err := os.Create(path)
 	if err != nil {
 		return 0, err
@@ -113,7 +113,7 @@ func directV9WriteRun(path string, records []directV9Record) (int64, error) {
 	bw := bufio.NewWriterSize(f, 256*1024)
 	var written int64
 	for _, rec := range records {
-		n, err := writeDirectV9SpoolRecord(bw, rec)
+		n, err := writeDirectSpoolRecord(bw, rec)
 		written += n
 		if err != nil {
 			return written, err
@@ -127,15 +127,15 @@ func directV9WriteRun(path string, records []directV9Record) (int64, error) {
 	return written, f.Close()
 }
 
-func directV9BuildRuns(ctx context.Context, source directV9RecordSource, spoolDir string, maxRecords int, maxBytes int64, owned *[]string) ([]directV9RunFile, int64, error) {
+func directBuildRuns(ctx context.Context, source directRecordSource, spoolDir string, maxRecords int, maxBytes int64, owned *[]string) ([]directRunFile, int64, error) {
 	if maxRecords <= 0 {
-		maxRecords = directV9DefaultRunRecords
+		maxRecords = directDefaultRunRecords
 	}
 	if maxBytes <= 0 {
-		maxBytes = directV9DefaultRunBytes
+		maxBytes = directDefaultRunBytes
 	}
-	var runs []directV9RunFile
-	chunk := make([]directV9Record, 0, min(maxRecords, 4096))
+	var runs []directRunFile
+	chunk := make([]directRecord, 0, min(maxRecords, 4096))
 	var chunkBytes int64
 	var maxChunkBytes int64
 	flush := func() error {
@@ -143,14 +143,14 @@ func directV9BuildRuns(ctx context.Context, source directV9RecordSource, spoolDi
 			return nil
 		}
 		maxChunkBytes = max(maxChunkBytes, chunkBytes)
-		path := filepath.Join(spoolDir, fmt.Sprintf("direct-v9-run-%06d.tmp", len(runs)))
-		bytes, err := directV9WriteRun(path, chunk)
+		path := filepath.Join(spoolDir, fmt.Sprintf("direct-run-%06d.tmp", len(runs)))
+		bytes, err := directWriteRun(path, chunk)
 		if err != nil {
 			return err
 		}
 		*owned = append(*owned, path)
-		runs = append(runs, directV9RunFile{path: path, bytes: bytes})
-		chunk = make([]directV9Record, 0, min(maxRecords, 4096))
+		runs = append(runs, directRunFile{path: path, bytes: bytes})
+		chunk = make([]directRecord, 0, min(maxRecords, 4096))
 		chunkBytes = 0
 		return nil
 	}
@@ -166,10 +166,10 @@ func directV9BuildRuns(ctx context.Context, source directV9RecordSource, spoolDi
 			return nil, 0, err
 		}
 		if len(rec.Name) > int(^uint16(0)) {
-			return nil, 0, errors.New("direct v9 record name exceeds v9 token limit")
+			return nil, 0, errors.New("direct record name exceeds v9 token limit")
 		}
 		chunk = append(chunk, rec)
-		chunkBytes += int64(directV9SpoolHeaderBytes + len(rec.Name) + len(rec.Path))
+		chunkBytes += int64(directSpoolHeaderBytes + len(rec.Name) + len(rec.Path))
 		if len(chunk) >= maxRecords || chunkBytes >= maxBytes {
 			if err := flush(); err != nil {
 				return nil, 0, err
@@ -178,7 +178,7 @@ func directV9BuildRuns(ctx context.Context, source directV9RecordSource, spoolDi
 	}
 }
 
-func directV9MergeRuns(ctx context.Context, runs []directV9RunFile, finalPath, frnPath string, owned *[]string) (int, int64, error) {
+func directMergeRuns(ctx context.Context, runs []directRunFile, finalPath, frnPath string, owned *[]string) (int, int64, error) {
 	if len(runs) == 0 {
 		f, err := os.Create(finalPath)
 		if err != nil {
@@ -225,12 +225,12 @@ func directV9MergeRuns(ctx context.Context, runs []directV9RunFile, finalPath, f
 	*owned = append(*owned, finalPath, frnPath)
 	bw := bufio.NewWriterSize(final, 256*1024)
 	frnWriter := bufio.NewWriterSize(frns, 256*1024)
-	h := &directV9RunHeap{}
+	h := &directRunHeap{}
 	heap.Init(h)
 	for i, reader := range readers {
-		rec, readErr := readDirectV9SpoolRecord(reader)
+		rec, readErr := readDirectSpoolRecord(reader)
 		if readErr == nil {
-			heap.Push(h, directV9RunHead{rec: rec, run: i})
+			heap.Push(h, directRunHead{rec: rec, run: i})
 			continue
 		}
 		if !errors.Is(readErr, io.EOF) {
@@ -251,15 +251,15 @@ func directV9MergeRuns(ctx context.Context, runs []directV9RunFile, finalPath, f
 			return 0, 0, ctx.Err()
 		default:
 		}
-		head := heap.Pop(h).(directV9RunHead)
+		head := heap.Pop(h).(directRunHead)
 		if haveLast && head.rec.FRN == lastFRN {
 			_ = final.Close()
 			_ = frns.Close()
-			return 0, 0, errDirectV9DuplicateFRN
+			return 0, 0, errDirectDuplicateFRN
 		}
 		haveLast = true
 		lastFRN = head.rec.FRN
-		n, writeErr := writeDirectV9SpoolRecord(bw, head.rec)
+		n, writeErr := writeDirectSpoolRecord(bw, head.rec)
 		written += n
 		if writeErr != nil {
 			_ = final.Close()
@@ -274,9 +274,9 @@ func directV9MergeRuns(ctx context.Context, runs []directV9RunFile, finalPath, f
 			return 0, 0, writeErr
 		}
 		count++
-		next, readErr := readDirectV9SpoolRecord(readers[head.run])
+		next, readErr := readDirectSpoolRecord(readers[head.run])
 		if readErr == nil {
-			heap.Push(h, directV9RunHead{rec: next, run: head.run})
+			heap.Push(h, directRunHead{rec: next, run: head.run})
 		} else if !errors.Is(readErr, io.EOF) {
 			_ = final.Close()
 			_ = frns.Close()
@@ -303,7 +303,7 @@ func directV9MergeRuns(ctx context.Context, runs []directV9RunFile, finalPath, f
 	return count, written, nil
 }
 
-func directV9LookupIDMapped(frns []uint64, frn uint64) int32 {
+func directLookupIDMapped(frns []uint64, frn uint64) int32 {
 	if frn == 0 || len(frns) == 0 {
 		return -1
 	}
@@ -322,10 +322,10 @@ func directV9LookupIDMapped(frns []uint64, frn uint64) int32 {
 	return int32(lo)
 }
 
-// directV9MapFRNs maps the merged FRN file for in-memory parent lookups.  The
+// directMapFRNs maps the merged FRN file for in-memory parent lookups.  The
 // caller must close the returned mapped file.  A nil mapping is returned when
 // the file is empty (no records).
-func directV9MapFRNs(path string, count int) (*mappedIndexFile, []uint64, error) {
+func directMapFRNs(path string, count int) (*mappedIndexFile, []uint64, error) {
 	if count == 0 {
 		return nil, nil, nil
 	}
@@ -336,7 +336,7 @@ func directV9MapFRNs(path string, count int) (*mappedIndexFile, []uint64, error)
 	frns := mappedUint64Slice(m.data)
 	if len(frns) < count {
 		_ = m.close()
-		return nil, nil, fmt.Errorf("direct v9 FRN map bytes=%d want=%d", len(frns), count)
+		return nil, nil, fmt.Errorf("direct FRN map bytes=%d want=%d", len(frns), count)
 	}
 	frns = frns[:count]
 	return m, frns, nil

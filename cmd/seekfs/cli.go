@@ -48,8 +48,8 @@ func run(args []string) error {
 		return cmdCompactIndex(args[1:])
 	case "augment-pngc":
 		return cmdAugmentPNGC(args[1:])
-	case "direct-v9":
-		return cmdDirectV9(args[1:])
+	case "direct", "direct-v9":
+		return cmdDirect(args[1:])
 	case "service":
 		return cmdService(args[1:])
 	case "install":
@@ -181,7 +181,7 @@ func printUsage(w io.Writer) {
   seekfs upgrade-index -db seekfs.gsi
   seekfs compact-index -db seekfs.gsi
   seekfs augment-pngc -db source.gsi -out target.gsi [-max-output-growth bytes] [-max-heap bytes] [-min-free-disk bytes]
-  seekfs direct-v9 -out target.gsi (-root path | -records N) [-spool-dir path] [-run-records N] [-run-bytes bytes] [--json]
+  seekfs direct -out target.gsi (-root path | -records N) [-spool-dir path] [-run-records N] [-run-bytes bytes] [--json]
   seekfs launch [-db index.gsi...] [--json]
   seekfs install [-pipe \\.\pipe\seekfs-service] [-sddl <sddl>] [-db index.gsi...]
   seekfs setup-service [-pipe \\.\pipe\seekfs-service] [-sddl <sddl>] [-db index.gsi...] [-no-start]
@@ -451,7 +451,7 @@ func cmdIndex(args []string) error {
 	}
 
 	start := time.Now()
-	idx := &Index{Version: indexVersionV9, Roots: roots, BuiltAt: time.Now(), Source: "walk"}
+	idx := &Index{Version: indexVersion, Roots: roots, BuiltAt: time.Now(), Source: "walk"}
 	for _, root := range roots {
 		if err := walkRoot(root, idx); err != nil {
 			fmt.Fprintf(os.Stderr, "warning: %s: %v\n", root, err)

@@ -43,4 +43,4 @@ jobs:
       - name: Install race compiler
         run: choco install mingw -y --no-progress
       - name: Go race test subset
-        run: go test -race ./cmd/seekfs -run "TestSeededQueryOracleMatrix|TestSecondOracleSeededSubsample|TestEngineV9OverlayMutationStateMachineMatchesFreshOracle|TestEngineV9ConcurrentChurnQueryStress|TestEngineV9OverlayMergeFillsLimitAndRanksCreates|TestEngineV9OverlayCountOnlySearchIncludesCreatesAndExcludesTombstones|TestStandaloneServicePipeSearchEndToEnd|TestBroadPathScanCancellationPropagates"
+        run: go test -race ./cmd/seekfs -run "TestSeededQueryOracleMatrix|TestSecondOracleSeededSubsample|TestEngineOverlayMutationStateMachineMatchesFreshOracle|TestEngineConcurrentChurnQueryStress|TestEngineOverlayMergeFillsLimitAndRanksCreates|TestEngineOverlayCountOnlySearchIncludesCreatesAndExcludesTombstones|TestStandaloneServicePipeSearchEndToEnd|TestBroadPathScanCancellationPropagates"

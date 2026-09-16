@@ -91,10 +91,6 @@ On service startup, seekfs replays the sidecar before reading newer NTFS journal
 changes. A successful full index save removes the sidecar. Keep `.gsi.wal` files
 with their matching `.gsi` files when copying or backing up a live index.
 
-The legacy `service -skip-startup-sync` flag is a deprecated no-op. Startup WAL
-replay and catch-up now always run; remove the flag after one compatibility
-release once older UI/service launch scripts have aged out.
-
 Use `info --json` to inspect index layout and size contributors:
 
 ```powershell
