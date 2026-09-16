@@ -13,7 +13,8 @@ import (
 	"time"
 )
 
-func TestOptionalSelfNameGramRoundTripLegacyUnknownAndCorruption(t *testing.T) {	idx := dottedPathBenchmarkIndex(2_000)
+func TestOptionalSelfNameGramRoundTripLegacyUnknownAndCorruption(t *testing.T) {
+	idx := dottedPathBenchmarkIndex(2_000)
 	selective := buildSelectiveNameTrigramIndex(idx, 1)
 	if len(selective.omitted) == 0 {
 		t.Fatal("fixture did not produce an omitted common gram")
@@ -389,7 +390,6 @@ func TestGlobLiteralDrivesGramLane(t *testing.T) {
 		t.Fatal("single-char wildcard glob should not be driveable")
 	}
 }
-
 
 func TestGlobalNameSupportedGlob(t *testing.T) {
 	pq, err := parseQuery(queryOptions{Query: "glob:*acme*", Limit: 10})

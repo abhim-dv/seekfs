@@ -216,13 +216,13 @@ func fuzzyNameDistance(nameLower, term string, tau int) (dist int, prefix bool, 
 }
 
 type fuzzyScoredEntry struct {
-	entry      Entry
-	dist       int
-	prefix     bool
-	windowPos  int
-	rank       uint64
-	path       string
-	lenDiff    int
+	entry     Entry
+	dist      int
+	prefix    bool
+	windowPos int
+	rank      uint64
+	path      string
+	lenDiff   int
 }
 
 // appendFuzzyServiceMatches tops up an underfilled exact result set with
@@ -506,7 +506,6 @@ func fuzzyTopTermVariants(volumes []*serviceVolumeIndex, termLower string, n int
 	return result
 }
 
-
 // fuzzyRewriteTrial is one candidate query rewrite: a single term swapped for
 // its best close-match variant, every other byte of the query untouched.
 type fuzzyRewriteTrial struct {
@@ -647,17 +646,17 @@ func fuzzyShortTermInsertionTrials(volumes []*serviceVolumeIndex, opts queryOpti
 				score = s
 			}
 		}
-	if !proven {
-		// No volume's metadata could judge; fall back to a cheap
-		// stop-at-first-match solo probe per variant.  The rune-length gate
-		// inside fuzzySoloMatchCount is bypassed: the whole point of the
-		// insertion path is 1-2 rune source terms, and the variants are
-		// full-length words.
-		if count, evaluated := fuzzySoloMatchCountAllowShort(volumes, variant, 1); evaluated && count > 0 {
-			out = append(out, scored{variant: variant, score: 1})
+		if !proven {
+			// No volume's metadata could judge; fall back to a cheap
+			// stop-at-first-match solo probe per variant.  The rune-length gate
+			// inside fuzzySoloMatchCount is bypassed: the whole point of the
+			// insertion path is 1-2 rune source terms, and the variants are
+			// full-length words.
+			if count, evaluated := fuzzySoloMatchCountAllowShort(volumes, variant, 1); evaluated && count > 0 {
+				out = append(out, scored{variant: variant, score: 1})
+			}
+			continue
 		}
-		continue
-	}
 		if score <= 0 {
 			continue
 		}

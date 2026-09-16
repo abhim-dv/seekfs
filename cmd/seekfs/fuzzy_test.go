@@ -290,7 +290,8 @@ func TestShortTermFuzzyInsertionRewrite(t *testing.T) {
 	}
 }
 
-func TestTryMultiTermFuzzyRewriteMaskedSubstringStillFires(t *testing.T) {	vol := buildMultiTermFuzzyTestVolume(t)
+func TestTryMultiTermFuzzyRewriteMaskedSubstringStillFires(t *testing.T) {
+	vol := buildMultiTermFuzzyTestVolume(t)
 	// A name containing the typo as a literal substring makes the broken term
 	// look healthy to a solo check; the masked-term trial must still fire.
 	vol.applyUSNChanges([]usnChange{{FRN: 900, ParentFRN: 10, USN: 12, Reason: usnReasonFileCreate, Name: "coreproto.txt"}})

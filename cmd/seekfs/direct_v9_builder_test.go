@@ -520,14 +520,14 @@ func TestDirectV9InaccessibleBoundDegradesWithinLimit(t *testing.T) {
 	report.note("inaccessible", "X:\\protected\\dir-a")
 	report.note("inaccessible", "X:\\protected\\dir-b")
 	stats, err := buildDirectV9(context.Background(), directV9BuildOptions{
-		OutputPath:     out,
-		SpoolDir:       filepath.Join(dir, "spool"),
-		Roots:          []string{`X:\`},
-		Volume:         "X:",
-		Source:         "direct-walk",
-		BuiltAt:        time.Unix(0, 0),
-		Records:        newDirectV9SliceSource([]directV9Record{{FRN: 1, Name: "."}}),
-		WalkReport:     report,
+		OutputPath:      out,
+		SpoolDir:        filepath.Join(dir, "spool"),
+		Roots:           []string{`X:\`},
+		Volume:          "X:",
+		Source:          "direct-walk",
+		BuiltAt:         time.Unix(0, 0),
+		Records:         newDirectV9SliceSource([]directV9Record{{FRN: 1, Name: "."}}),
+		WalkReport:      report,
 		MaxInaccessible: 64,
 	})
 	if err != nil {
@@ -552,14 +552,14 @@ func TestDirectV9InaccessibleBoundRefusesAboveLimit(t *testing.T) {
 	out := filepath.Join(dir, "refused.gsi")
 	report := &directV9WalkReport{SourceComplete: false, Inaccessible: 2}
 	_, err := buildDirectV9(context.Background(), directV9BuildOptions{
-		OutputPath:     out,
-		SpoolDir:       filepath.Join(dir, "spool"),
-		Roots:          []string{`X:\`},
-		Volume:         "X:",
-		Source:         "direct-walk",
-		BuiltAt:        time.Unix(0, 0),
-		Records:        newDirectV9SliceSource([]directV9Record{{FRN: 1, Name: "."}}),
-		WalkReport:     report,
+		OutputPath:      out,
+		SpoolDir:        filepath.Join(dir, "spool"),
+		Roots:           []string{`X:\`},
+		Volume:          "X:",
+		Source:          "direct-walk",
+		BuiltAt:         time.Unix(0, 0),
+		Records:         newDirectV9SliceSource([]directV9Record{{FRN: 1, Name: "."}}),
+		WalkReport:      report,
 		MaxInaccessible: 1,
 	})
 	if err == nil {
@@ -578,14 +578,14 @@ func TestDirectV9InaccessibleZeroRequiresCleanSource(t *testing.T) {
 	report := &directV9WalkReport{SourceComplete: true, Inaccessible: 0}
 	out := filepath.Join(dir, "clean.gsi")
 	if _, err := buildDirectV9(context.Background(), directV9BuildOptions{
-		OutputPath:     out,
-		SpoolDir:       filepath.Join(dir, "spool"),
-		Roots:          []string{`X:\`},
-		Volume:         "X:",
-		Source:         "direct-walk",
-		BuiltAt:        time.Unix(0, 0),
-		Records:        newDirectV9SliceSource([]directV9Record{{FRN: 1, Name: "."}}),
-		WalkReport:     report,
+		OutputPath:      out,
+		SpoolDir:        filepath.Join(dir, "spool"),
+		Roots:           []string{`X:\`},
+		Volume:          "X:",
+		Source:          "direct-walk",
+		BuiltAt:         time.Unix(0, 0),
+		Records:         newDirectV9SliceSource([]directV9Record{{FRN: 1, Name: "."}}),
+		WalkReport:      report,
 		MaxInaccessible: 0,
 	}); err != nil {
 		t.Fatalf("clean build failed: %v", err)

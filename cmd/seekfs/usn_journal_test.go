@@ -128,7 +128,7 @@ func TestFilterMFTExclusions(t *testing.T) {
 
 func TestFilterMFTExclusionsNoMatchKeepsAll(t *testing.T) {
 	entries := map[uint64]mftEntry{
-		5: {frn: 5, parentFRN: 5, name: "", attr: fileAttributeDir, isDir: true},
+		5:  {frn: 5, parentFRN: 5, name: "", attr: fileAttributeDir, isDir: true},
 		11: {frn: 11, parentFRN: 5, name: "keep.txt", attr: 0x20},
 	}
 	if got := filterMFTExclusions(entries, `C:\`, []string{`C:\ProgramData\seekfs`}); got != 0 {

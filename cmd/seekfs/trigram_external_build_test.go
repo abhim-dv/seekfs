@@ -77,7 +77,9 @@ func TestNameGramExternalSpillsMatchInMemory(t *testing.T) {
 }
 
 func TestShouldUseExternalNameGram(t *testing.T) {
-	os.Unsetenv("SEEKFS_MEMORY_MODE"); os.Unsetenv("SEEKFS_NAME_GRAM_EXTERNAL"); os.Unsetenv("SEEKFS_NAME_GRAM_EXTERNAL_MIN_RECORDS")
+	os.Unsetenv("SEEKFS_MEMORY_MODE")
+	os.Unsetenv("SEEKFS_NAME_GRAM_EXTERNAL")
+	os.Unsetenv("SEEKFS_NAME_GRAM_EXTERNAL_MIN_RECORDS")
 	t.Cleanup(func() { os.Unsetenv("SEEKFS_NAME_GRAM_EXTERNAL"); os.Unsetenv("SEEKFS_NAME_GRAM_EXTERNAL_MIN_RECORDS") })
 	if shouldUseExternalNameGram(10) {
 		t.Fatal("tiny volumes should stay on the in-memory builder")

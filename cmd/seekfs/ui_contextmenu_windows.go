@@ -72,14 +72,14 @@ func makeIntResourceW(id uint16) uintptr {
 }
 
 var (
-	shell32DLLContextMenu = syscall.NewLazyDLL("shell32.dll")
-	procSHParseDisplayName          = shell32DLLContextMenu.NewProc("SHParseDisplayName")
-	procSHGetDesktopFolder           = shell32DLLContextMenu.NewProc("SHGetDesktopFolder")
-	procSHBindToParent               = shell32DLLContextMenu.NewProc("SHBindToParent")
-	procSHCreateDefaultContextMenu   = shell32DLLContextMenu.NewProc("SHCreateDefaultContextMenu")
+	shell32DLLContextMenu          = syscall.NewLazyDLL("shell32.dll")
+	procSHParseDisplayName         = shell32DLLContextMenu.NewProc("SHParseDisplayName")
+	procSHGetDesktopFolder         = shell32DLLContextMenu.NewProc("SHGetDesktopFolder")
+	procSHBindToParent             = shell32DLLContextMenu.NewProc("SHBindToParent")
+	procSHCreateDefaultContextMenu = shell32DLLContextMenu.NewProc("SHCreateDefaultContextMenu")
 
-	kernel32DLLContextMenu     = syscall.NewLazyDLL("kernel32.dll")
-	procGetModuleHandleW       = kernel32DLLContextMenu.NewProc("GetModuleHandleW")
+	kernel32DLLContextMenu = syscall.NewLazyDLL("kernel32.dll")
+	procGetModuleHandleW   = kernel32DLLContextMenu.NewProc("GetModuleHandleW")
 
 	user32DLLContextMenu    = syscall.NewLazyDLL("user32.dll")
 	procCreatePopupMenu     = user32DLLContextMenu.NewProc("CreatePopupMenu")
@@ -285,12 +285,12 @@ type contextMenuService struct {
 }
 
 type ctxMenuRequest struct {
-	cmd    ctxMenuCmd
-	paths  []string
+	cmd     ctxMenuCmd
+	paths   []string
 	screenX int32
 	screenY int32
-	owner  uintptr
-	result chan ctxMenuResult
+	owner   uintptr
+	result  chan ctxMenuResult
 }
 
 type ctxMenuCmd int

@@ -17,6 +17,14 @@ jobs:
         run: go test ./...
       - name: Go vet
         run: go vet ./...
+      - name: gofmt
+        shell: pwsh
+        run: |
+          $out = gofmt -l ./cmd/seekfs
+          if ($out) {
+            Write-Error "gofmt needed on:`n$out"
+            exit 1
+          }
       - name: Build
         run: go build -o seekfs.exe ./cmd/seekfs
       - name: CLI integration test
