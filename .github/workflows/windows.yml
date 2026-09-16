@@ -18,7 +18,7 @@ jobs:
       - name: Go test (UI build tags)
         run: go test -tags "seekfs_ui production" ./cmd/seekfs
       - name: Frontend unit test
-        run: node --test scripts/ui_query.test.cjs
+        run: node --test scripts/
       - name: Go vet
         run: go vet ./...
       - name: gofmt
