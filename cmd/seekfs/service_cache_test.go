@@ -37,7 +37,6 @@ func TestCompactMMapEntryCountUsesMappedRecordCount(t *testing.T) {
 }
 
 func TestServiceVolumeIndexTrimSearchCachesLockedClearsOversizedCaches(t *testing.T) {
-	t.Setenv("SEEKFS_LOW_MEMORY", "0")
 	t.Setenv("SEEKFS_POSTING_CACHE_MB", "1")
 	vol := syntheticServiceVolumeIndexForCacheTests()
 	for i := 0; i <= servicePathCacheLimit; i++ {

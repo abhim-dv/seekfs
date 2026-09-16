@@ -358,11 +358,11 @@ func (s *goSearchService) sweepStaleIndexTempFiles() {
 func stageIndexFile(path string, idx *Index) (string, error) {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return "", err
+		return "", fmt.Errorf("create index directory %s: %w", dir, err)
 	}
 	f, err := os.CreateTemp(dir, filepath.Base(path)+".*.tmp")
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("stage index %s: %w", path, err)
 	}
 	tmp := f.Name()
 	if !idx.Compact {
@@ -374,15 +374,15 @@ func stageIndexFile(path string, idx *Index) (string, error) {
 	closeErr := f.Close()
 	if err != nil {
 		_ = os.Remove(tmp)
-		return "", err
+		return "", fmt.Errorf("write index %s: %w", path, err)
 	}
 	if syncErr != nil {
 		_ = os.Remove(tmp)
-		return "", syncErr
+		return "", fmt.Errorf("sync index %s: %w", path, syncErr)
 	}
 	if closeErr != nil {
 		_ = os.Remove(tmp)
-		return "", closeErr
+		return "", fmt.Errorf("close staged index %s: %w", path, closeErr)
 	}
 	return tmp, nil
 }
@@ -399,18 +399,18 @@ func commitStageIndexFile(path, tmp string) error {
 		// old mapping is invalidated by future loads.
 		if !serviceLowMemoryMode() {
 			_ = os.Remove(tmp)
-			return err
+			return fmt.Errorf("replace index %s: %w", path, err)
 		}
 		if inPlaceErr := replaceIndexFileInPlace(path, tmp); inPlaceErr != nil {
 			_ = os.Remove(tmp)
-			return fmt.Errorf("remove %s: %v; in-place fallback: %w", path, err, inPlaceErr)
+			return fmt.Errorf("remove %s: %w; in-place fallback: %w", path, err, inPlaceErr)
 		}
 		_ = os.Remove(tmp)
 		return nil
 	}
 	if err := os.Rename(tmp, path); err != nil {
 		_ = os.Remove(tmp)
-		return err
+		return fmt.Errorf("replace index %s: %w", path, err)
 	}
 	if dir, err := os.Open(filepath.Dir(path)); err == nil {
 		_ = dir.Sync()
@@ -1813,12 +1813,16 @@ func (vol *serviceVolumeIndex) buildSubtreeBytes() []uint64 {
 func loadIndex(path string) (*Index, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("open index %s: %w", path, err)
 	}
 	defer f.Close()
 	info, err := f.Stat()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("stat index %s: %w", path, err)
 	}
-	return readIndexWithReaderAt(bufio.NewReaderSize(f, 16*1024*1024), f, info.Size())
+	idx, err := readIndexWithReaderAt(bufio.NewReaderSize(f, 16*1024*1024), f, info.Size())
+	if err != nil {
+		return nil, fmt.Errorf("read index %s: %w", path, err)
+	}
+	return idx, nil
 }

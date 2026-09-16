@@ -15,6 +15,10 @@ jobs:
           go-version-file: go.mod
       - name: Go test
         run: go test ./...
+      - name: Go test (UI build tags)
+        run: go test -tags "seekfs_ui production" ./cmd/seekfs
+      - name: Frontend unit test
+        run: node --test scripts/ui_query.test.cjs
       - name: Go vet
         run: go vet ./...
       - name: gofmt
@@ -43,4 +47,4 @@ jobs:
       - name: Install race compiler
         run: choco install mingw -y --no-progress
       - name: Go race test subset
-        run: go test -race ./cmd/seekfs -run "TestSeededQueryOracleMatrix|TestSecondOracleSeededSubsample|TestEngineOverlayMutationStateMachineMatchesFreshOracle|TestEngineConcurrentChurnQueryStress|TestEngineOverlayMergeFillsLimitAndRanksCreates|TestEngineOverlayCountOnlySearchIncludesCreatesAndExcludesTombstones|TestStandaloneServicePipeSearchEndToEnd|TestBroadPathScanCancellationPropagates"
+        run: go test -race ./cmd/seekfs -run "TestSeededQueryOracleMatrix|TestSecondOracleSeededSubsample|TestEngineOverlayMutationStateMachineMatchesFreshOracle|TestEngineConcurrentChurnQueryStress|TestEngineOverlayMergeFillsLimitAndRanksCreates|TestEngineOverlayCountOnlySearchIncludesCreatesAndExcludesTombstones|TestEngineReadViewCachesUseSnapshotGeneration|TestEnginePersistVolumeCompactsOverlayToMappedBase|TestServiceVolumeIndexReplaysBinaryWAL|TestRewriteWALWithNoFramesResetsTheWAL|TestReplayLoopRetiresWhenGenChanges|TestReplayGenGuardDropsStaleBatch|TestPersistOverlayCarryKeepsPostSnapshotChanges|TestBackgroundNameTrigramBuildPublishesAtomicIndex|TestBackgroundNameOrderBuildPublishesResidentView|TestLockVolumeSearchCancelsWhileWaiting|TestPostingPrefetchHonorsBoundAndCancellation|TestServiceWatchDeltaCreatesModifiesDeletes|TestStandaloneServicePipeSearchEndToEnd|TestBroadPathScanCancellationPropagates"

@@ -17,12 +17,12 @@ import (
 func loadIndexMMap(path string) (*Index, error) {
 	mapped, err := mapIndexFile(path)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("map index %s: %w", path, err)
 	}
 	idx, err := readIndexMMap(mapped)
 	if err != nil {
 		_ = mapped.close()
-		return nil, err
+		return nil, fmt.Errorf("read mapped index %s: %w", path, err)
 	}
 	idx.DBPath = path
 	return idx, nil

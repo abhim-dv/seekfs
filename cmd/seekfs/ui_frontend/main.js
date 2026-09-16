@@ -1,3 +1,5 @@
+const { normalizeLiveQuery } = window.SeekfsQuery;
+
 const state = {
   seq: 0,
   rows: [],
@@ -632,21 +634,6 @@ async function searchNow() {
     els.empty.textContent = err.message;
     els.summary.textContent = err.message;
   }
-}
-
-function normalizeLiveQuery(query) {
-  if (!query) return "";
-  if (/^[^\w*?]{1}$/.test(query)) return "";
-  if (hasIncompleteTrailingToken(query)) return "";
-  return query;
-}
-
-function hasIncompleteTrailingToken(query) {
-  const trimmed = query.trim();
-  if (!trimmed) return false;
-  const fields = trimmed.split(/\s+/);
-  const last = fields[fields.length - 1] || "";
-  return last === "." || /:$/i.test(last);
 }
 
 function handleSearchResponse(response) {
