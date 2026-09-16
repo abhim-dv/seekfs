@@ -67,10 +67,12 @@ input {
 }
 
 .results {
-  /* Shrink-wrap: the table is exactly as wide as its columns, so narrower
+  /* Columns shrink-wrap to their configured widths; main.js sets an explicit
+     pixel table width so table-layout: fixed engages (an auto width falls back
+     to content sizing and long paths would widen their column). Narrower
      columns leave empty space on the right (native Explorer behavior) and a
      horizontal scrollbar appears only when columns spill past the window. */
-  width: auto;
+  width: max-content;
   border-collapse: collapse;
   table-layout: fixed;
   font-size: 13px;

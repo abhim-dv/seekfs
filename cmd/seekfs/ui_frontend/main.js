@@ -155,13 +155,14 @@ function updateSelectedFooter() {
 }
 
 function formatSize(row) {
-  if (row.is_dir) return "";
   if (!row.exists) return "";
   if (row.size === undefined || row.size === null) return "";
   const size = Number(row.size || 0);
   if (size < 1024) return `${size.toLocaleString()} B`;
   if (size < 1024 * 1024) return `${Math.ceil(size / 1024).toLocaleString()} KB`;
-  return `${Math.ceil(size / 1024 / 1024).toLocaleString()} MB`;
+  if (size < 1024 * 1024 * 1024) return `${Math.ceil(size / 1024 / 1024).toLocaleString()} MB`;
+  if (size < 1024 * 1024 * 1024 * 1024) return `${Math.ceil(size / 1024 / 1024 / 1024).toLocaleString()} GB`;
+  return `${Math.ceil(size / 1024 / 1024 / 1024 / 1024).toLocaleString()} TB`;
 }
 
 function formatDate(value) {
@@ -583,22 +584,22 @@ async function refreshStatus() {
 
 function buildQueryWithSort(rawQuery) {
   const fields = rawQuery.split(/\s+/).filter(Boolean);
-  const kept = fields.filter((field) => !/^sort:/i.test(field));
-  const query = kept.join(" ");
-  if (state.sort) {
-    return query ? `${query} sort:${state.sort}` : `sort:${state.sort}`;
-  }
-  const existing = fields.find((field) => /^sort:/i.test(field));
-  if (existing) {
-    const matched = /^sort:([a-z]+)/i.exec(existing);
-    const column = matched ? matched[1].toLowerCase() : "";
-    if (sortSupported(column)) {
-      state.sort = column;
-      applySortIndicator();
-      return query;
+  const kept = [];
+  for (const field of fields) {
+    const matched = /^sort:([a-z]+)/i.exec(field);
+    if (matched) {
+      // A typed sort: token drives the header indicator too.
+      if (sortSupported(matched[1].toLowerCase())) state.sort = matched[1].toLowerCase();
+      continue;
     }
+    kept.push(field);
   }
-  return query;
+  // The service sorts before it applies the result limit, so the page always
+  // holds the globally top-N rows for the active sort rather than the first N
+  // matches reordered locally.
+  if (state.sort) kept.push(`sort:${state.sort}`);
+  applySortIndicator();
+  return kept.join(" ");
 }
 
 async function searchNow() {
@@ -676,14 +677,15 @@ function headerColumn(header) {
 function applySortIndicator() {
   for (const header of els.headers) {
     const column = headerColumn(header);
-    header.classList.toggle("sorted", column === state.sort);
-    const arrow = header.querySelector(".sort-arrow");
-    if (column === state.sort) {
+    const active = column !== "" && column === state.sort;
+    header.classList.toggle("sorted", active);
+    let arrow = header.querySelector(".sort-arrow");
+    if (active) {
       if (!arrow) {
-        const span = document.createElement("span");
-        span.className = "sort-arrow";
-        span.textContent = " ▲";
-        header.appendChild(span);
+        arrow = document.createElement("span");
+        arrow.className = "sort-arrow";
+        arrow.textContent = " ▲";
+        header.appendChild(arrow);
       }
     } else if (arrow) {
       arrow.remove();
@@ -691,19 +693,14 @@ function applySortIndicator() {
   }
 }
 
+// Sorting re-queries the service so the result limit is applied to the sorted
+// set; clicking the active column (or the unsorted Name column) clears it.
 function setSort(column) {
-  if (column === "name") {
-    if (state.sort !== "") {
-      state.sort = "";
-      applySortIndicator();
-      searchNow();
-    }
-    return;
-  }
-  if (state.sort === column) {
+  if (!sortSupported(column)) {
+    if (state.sort === "") return;
     state.sort = "";
   } else {
-    state.sort = column;
+    state.sort = state.sort === column ? "" : column;
   }
   applySortIndicator();
   searchNow();
@@ -718,6 +715,8 @@ els.headers.forEach((header) => {
 
 const COLUMN_WIDTHS_KEY = "seekfs.columnWidths";
 const COLUMN_MIN_WIDTH = 60;
+const COLUMN_ORDER = ["name", "path", "size", "modified"];
+const COLUMN_DEFAULT_WIDTHS = { name: 300, path: 340, size: 108, modified: 190 };
 
 function colWidths() {
   let saved = {};
@@ -737,43 +736,57 @@ function saveColWidths() {
   }
 }
 
+function columnWidth(column) {
+  const width = state.colWidths && state.colWidths[column];
+  return width || COLUMN_DEFAULT_WIDTHS[column];
+}
+
+// The table gets an explicit pixel width: table-layout: fixed only takes
+// effect when the table has a non-auto width, otherwise the browser falls back
+// to content-based sizing and a long path widens its column after every query.
 function applyColWidths() {
   const cols = document.querySelectorAll(".results col");
-  const map = { name: 0, path: 1, size: 2, modified: 3 };
-  const saved = colWidths();
-  state.colWidths = state.colWidths || saved;
-  for (const header of els.headers) {
-    const column = headerColumn(header) || "name";
-    const index = map[column];
-    if (index === undefined || !cols[index]) continue;
-    const width = state.colWidths[column];
-    if (width) cols[index].style.width = `${width}px`;
-  }
+  const table = document.querySelector(".results");
+  let total = 0;
+  COLUMN_ORDER.forEach((column, index) => {
+    const width = columnWidth(column);
+    total += width;
+    if (cols[index]) cols[index].style.width = `${width}px`;
+  });
+  if (table) table.style.width = `${total}px`;
 }
 
 function beginColumnResize(header, event) {
   const column = headerColumn(header) || "name";
-  const cols = document.querySelectorAll(".results col");
-  const map = { name: 0, path: 1, size: 2, modified: 3 };
-  const index = map[column];
-  if (index === undefined || !cols[index]) return;
+  if (COLUMN_ORDER.indexOf(column) === -1) return;
   event.preventDefault();
   event.stopPropagation();
+  state.colWidths = state.colWidths || {};
   const startX = event.clientX;
-  const startWidth = cols[index].getBoundingClientRect().width;
+  const startWidth = columnWidth(column);
   const table = header.closest("table");
   table.classList.add("resizing");
+  let frame = 0;
+  let width = startWidth;
+  const apply = () => {
+    frame = 0;
+    state.colWidths[column] = width;
+    applyColWidths();
+  };
   const onMove = (moveEvent) => {
-    const delta = moveEvent.clientX - startX;
-    const width = Math.max(COLUMN_MIN_WIDTH, Math.round(startWidth + delta));
-    cols[index].style.width = `${width}px`;
+    width = Math.max(COLUMN_MIN_WIDTH, Math.round(startWidth + moveEvent.clientX - startX));
+    if (!frame) frame = requestAnimationFrame(apply);
   };
   const onUp = () => {
+    if (frame) {
+      cancelAnimationFrame(frame);
+      frame = 0;
+    }
     table.classList.remove("resizing");
     window.removeEventListener("pointermove", onMove);
     window.removeEventListener("pointerup", onUp);
-    state.colWidths = state.colWidths || {};
-    state.colWidths[column] = Math.round(cols[index].getBoundingClientRect().width);
+    state.colWidths[column] = width;
+    applyColWidths();
     saveColWidths();
   };
   try {
@@ -798,10 +811,7 @@ function initColumnResize() {
       event.stopPropagation();
     });
   });
-  window.addEventListener("resize", () => {
-    // Preserve explicit widths on relayout; colgroup widths are sticky.
-    applyColWidths();
-  });
+  window.addEventListener("resize", applyColWidths);
 }
 
 initColumnResize();
