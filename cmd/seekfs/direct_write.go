@@ -144,6 +144,14 @@ func directCompactFlags(recordCount int) uint32 {
 	return flags
 }
 
+// directRankFamilyResult is one computed (but not yet emitted) rank section.
+type directRankFamilyResult struct {
+	spec     directRankSpec
+	runBytes int64
+	report   directRankReport
+	rankPath string
+}
+
 func directWriteAtomic(ctx context.Context, opts directBuildOptions, finalPath, frnPath string, recordCount int, nameBlobLen int64, tokenPath string, rankSpecs []directRankSpec, baseScratch int64, reports *[]directRankReport, sectionReports *[]directSectionReport, scratchHigh *int64, owned *[]string) (int64, error) {
 	reportPhase := func(name string, d time.Duration) {
 		if opts.PhaseReporter != nil {
@@ -151,6 +159,7 @@ func directWriteAtomic(ctx context.Context, opts directBuildOptions, finalPath, 
 		}
 	}
 	dir := filepath.Dir(opts.OutputPath)
+	spoolDir := filepath.Dir(finalPath)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return 0, err
 	}
@@ -175,100 +184,32 @@ func directWriteAtomic(ctx context.Context, opts directBuildOptions, finalPath, 
 	entries := make([]indexSectionTableEntry, 0, len(rankSpecs))
 	rankScratchPaths := make([]string, 0, len(rankSpecs))
 	t0 = time.Now()
-	sharedRankRuns, sharedRankErr := directBuildRankRunsShared(ctx, finalPath, filepath.Dir(finalPath), opts.RunRecords, opts.RankWorkers, rankSpecs, owned)
+	sharedRankRuns, sharedRankErr := directBuildRankRunsShared(ctx, finalPath, spoolDir, opts.RunRecords, opts.RankWorkers, rankSpecs, owned)
 	if sharedRankErr != nil {
 		cleanup()
 		return 0, sharedRankErr
 	}
 	reportPhase("rank-runs", time.Since(t0))
-	// Compute every rank family concurrently with a bounded worker pool, then
-	// emit the finished sections serially in tag order.  The section bytes are
-	// written to private temp files during the merge so the parallel phase is
-	// memory-bounded and the serial phase stays byte-deterministic.
-	rankWorkers := opts.RankWorkers
-	if rankWorkers < 1 {
-		rankWorkers = 1
-	}
-	if rankWorkers > 16 {
-		rankWorkers = 16
-	}
-	type rankFamilyResult struct {
-		spec     directRankSpec
-		entry    indexSectionTableEntry
-		runBytes int64
-		report   directRankReport
-		section  directSectionReport
-		rankPath string
-	}
-	results := make([]*rankFamilyResult, len(rankSpecs))
-	ctxRanks, cancelRanks := context.WithCancel(ctx)
-	defer cancelRanks()
 	t0 = time.Now()
-	jobs := make(chan int, len(rankSpecs))
-	var workerWG sync.WaitGroup
-	var firstRankErr error
-	var rankErrMu sync.Mutex
-	for worker := 0; worker < rankWorkers; worker++ {
-		workerWG.Add(1)
-		go func() {
-			defer workerWG.Done()
-			for index := range jobs {
-				spec := rankSpecs[index]
-				runs := sharedRankRuns.Runs[spec.Name]
-				liveCount := sharedRankRuns.LiveCounts[spec.Name]
-				maxRunBytes := sharedRankRuns.MaxBytes[spec.Name]
-				var runBytes int64
-				for _, run := range runs {
-					runBytes += run.bytes
-				}
-				sectionPath := filepath.Join(filepath.Dir(finalPath), fmt.Sprintf("direct-rank-section-%s.tmp", spec.Name))
-				rankPath := filepath.Join(filepath.Dir(finalPath), fmt.Sprintf("direct-rank-by-id-%s.tmp", spec.Name))
-				if _, err := directComputeRankFamily(ctxRanks, spec.Tag, runs, recordCount, liveCount, sectionPath, rankPath, owned); err != nil {
-					rankErrMu.Lock()
-					if firstRankErr == nil {
-						firstRankErr = err
-						cancelRanks()
-					}
-					rankErrMu.Unlock()
-					continue
-				}
-				results[index] = &rankFamilyResult{
-					spec:     spec,
-					runBytes: runBytes,
-					report:   directRankReport{Name: spec.Name, Tag: spec.Tag, Runs: len(runs), RunBytes: runBytes, MaxRunBytes: maxRunBytes},
-					rankPath: rankPath,
-				}
-			}
-		}()
-	}
-	for index := range rankSpecs {
-		select {
-		case jobs <- index:
-		case <-ctxRanks.Done():
-			break
-		}
-	}
-	close(jobs)
-	workerWG.Wait()
+	rankResults, rankErr := directComputeRankFamilies(ctx, rankSpecs, sharedRankRuns, recordCount, opts.RankWorkers, spoolDir, owned)
 	reportPhase("rank-families", time.Since(t0))
-	if firstRankErr != nil {
+	if rankErr != nil {
 		cleanup()
-		return 0, firstRankErr
+		return 0, rankErr
 	}
-	for _, result := range results {
+	for _, result := range rankResults {
 		if result == nil {
 			cleanup()
 			return 0, errors.New("direct rank family was not computed")
 		}
 		spec := result.spec
 		rankRuns := sharedRankRuns.Runs[spec.Name]
-		sectionPath := filepath.Join(filepath.Dir(finalPath), fmt.Sprintf("direct-rank-section-%s.tmp", spec.Name))
+		sectionPath := filepath.Join(spoolDir, fmt.Sprintf("direct-rank-section-%s.tmp", spec.Name))
 		entry, emitErr := directEmitRankSection(cw, spec.Tag, sectionPath)
 		if emitErr != nil {
 			cleanup()
 			return 0, emitErr
 		}
-		result.entry = entry
 		if high := baseScratch + result.runBytes + int64(recordCount)*4; high > *scratchHigh {
 			*scratchHigh = high
 		}
@@ -292,7 +233,7 @@ func directWriteAtomic(ctx context.Context, opts directBuildOptions, finalPath, 
 		_ = os.Remove(sectionPath)
 	}
 	t0 = time.Now()
-	topologyEntries, topologyReports, topologyErr := directWriteTopologySections(ctx, cw, finalPath, frnPath, filepath.Dir(finalPath), recordCount, opts.RunRecords, owned, scratchHigh)
+	topologyEntries, topologyReports, topologyErr := directWriteTopologySections(ctx, cw, finalPath, frnPath, spoolDir, recordCount, opts.RunRecords, owned, scratchHigh)
 	if topologyErr != nil {
 		cleanup()
 		return 0, topologyErr
@@ -302,8 +243,8 @@ func directWriteAtomic(ctx context.Context, opts directBuildOptions, finalPath, 
 	if sectionReports != nil {
 		*sectionReports = append(*sectionReports, topologyReports...)
 	}
-	parentPath := filepath.Join(filepath.Dir(finalPath), "direct-parents.tmp")
-	sizesPath := filepath.Join(filepath.Dir(finalPath), "direct-sizes.tmp")
+	parentPath := filepath.Join(spoolDir, "direct-parents.tmp")
+	sizesPath := filepath.Join(spoolDir, "direct-sizes.tmp")
 	t0 = time.Now()
 	subtreeEntries, subtreeReports, subtreeRankPaths, subtreeErr := directWriteSubtreeSection(ctx, cw, parentPath, sizesPath, recordCount, rankScratchPaths, owned, scratchHigh)
 	if subtreeErr != nil {
@@ -316,7 +257,7 @@ func directWriteAtomic(ctx context.Context, opts directBuildOptions, finalPath, 
 		*sectionReports = append(*sectionReports, subtreeReports...)
 	}
 	t0 = time.Now()
-	auxEntries, auxReports, auxErr := directWriteAuxiliarySections(ctx, cw, finalPath, recordCount, opts.RunRecords, rankScratchPaths[0], subtreeRankPaths, filepath.Dir(finalPath), owned, scratchHigh)
+	auxEntries, auxReports, auxErr := directWriteAuxiliarySections(ctx, cw, finalPath, recordCount, opts.RunRecords, rankScratchPaths[0], subtreeRankPaths, spoolDir, owned, scratchHigh)
 	if auxErr != nil {
 		cleanup()
 		return 0, auxErr
@@ -338,50 +279,134 @@ func directWriteAtomic(ctx context.Context, opts directBuildOptions, finalPath, 
 		return 0, err
 	}
 	tableOffset := uint64(cw.n)
-	if err := binary.Write(cw, binary.LittleEndian, uint32(len(entries))); err != nil {
+	if err := directWriteSectionTable(cw, entries); err != nil {
 		cleanup()
 		return 0, err
+	}
+	if err := directFinalizeOutput(f, bw, tmp, opts.OutputPath, dir, tableOffset); err != nil {
+		return 0, err
+	}
+	reportPhase("finalize", time.Since(t0))
+	return fileSize(opts.OutputPath)
+}
+
+// directComputeRankFamilies builds every rank family concurrently with a
+// bounded worker pool.  The section bytes are written to private temp files
+// during the merge so the parallel phase is memory-bounded and the later serial
+// emit stays byte-deterministic.
+func directComputeRankFamilies(ctx context.Context, specs []directRankSpec, shared directSharedRankRuns, recordCount, workers int, spoolDir string, owned *[]string) ([]*directRankFamilyResult, error) {
+	if workers < 1 {
+		workers = 1
+	}
+	if workers > 16 {
+		workers = 16
+	}
+	results := make([]*directRankFamilyResult, len(specs))
+	ctxRanks, cancelRanks := context.WithCancel(ctx)
+	defer cancelRanks()
+	jobs := make(chan int, len(specs))
+	var workerWG sync.WaitGroup
+	var firstErr error
+	var errMu sync.Mutex
+	for worker := 0; worker < workers; worker++ {
+		workerWG.Add(1)
+		go func() {
+			defer workerWG.Done()
+			for index := range jobs {
+				spec := specs[index]
+				runs := shared.Runs[spec.Name]
+				liveCount := shared.LiveCounts[spec.Name]
+				maxRunBytes := shared.MaxBytes[spec.Name]
+				var runBytes int64
+				for _, run := range runs {
+					runBytes += run.bytes
+				}
+				sectionPath := filepath.Join(spoolDir, fmt.Sprintf("direct-rank-section-%s.tmp", spec.Name))
+				rankPath := filepath.Join(spoolDir, fmt.Sprintf("direct-rank-by-id-%s.tmp", spec.Name))
+				if _, err := directComputeRankFamily(ctxRanks, spec.Tag, runs, recordCount, liveCount, sectionPath, rankPath, owned); err != nil {
+					errMu.Lock()
+					if firstErr == nil {
+						firstErr = err
+						cancelRanks()
+					}
+					errMu.Unlock()
+					continue
+				}
+				results[index] = &directRankFamilyResult{
+					spec:     spec,
+					runBytes: runBytes,
+					report:   directRankReport{Name: spec.Name, Tag: spec.Tag, Runs: len(runs), RunBytes: runBytes, MaxRunBytes: maxRunBytes},
+					rankPath: rankPath,
+				}
+			}
+		}()
+	}
+	for index := range specs {
+		select {
+		case jobs <- index:
+		case <-ctxRanks.Done():
+			break
+		}
+	}
+	close(jobs)
+	workerWG.Wait()
+	return results, firstErr
+}
+
+// directWriteSectionTable writes the counted section-table entries.
+func directWriteSectionTable(cw *countingWriter, entries []indexSectionTableEntry) error {
+	if err := binary.Write(cw, binary.LittleEndian, uint32(len(entries))); err != nil {
+		return err
 	}
 	for _, entry := range entries {
 		for _, value := range []any{entry.tag, entry.offset, entry.length, entry.flags} {
 			if err := binary.Write(cw, binary.LittleEndian, value); err != nil {
-				cleanup()
-				return 0, err
+				return err
 			}
 		}
 	}
+	return nil
+}
+
+// directFinalizeOutput flushes the buffered writer, patches the section-table
+// offset into the header, fsyncs, and atomically renames the temp file onto the
+// output path.
+func directFinalizeOutput(f *os.File, bw *bufio.Writer, tmp, outputPath, dir string, tableOffset uint64) error {
 	if err := bw.Flush(); err != nil {
-		cleanup()
-		return 0, err
+		closeAll(f)
+		_ = os.Remove(tmp)
+		return err
 	}
 	if _, err := f.Seek(int64(binary.Size(diskHeader{})), io.SeekStart); err != nil {
-		cleanup()
-		return 0, err
+		closeAll(f)
+		_ = os.Remove(tmp)
+		return err
 	}
 	var patch [8]byte
 	binary.LittleEndian.PutUint64(patch[:], tableOffset)
 	if _, err := f.Write(patch[:]); err != nil {
-		cleanup()
-		return 0, err
+		closeAll(f)
+		_ = os.Remove(tmp)
+		return err
 	}
 	if err := f.Sync(); err != nil {
-		cleanup()
-		return 0, err
+		closeAll(f)
+		_ = os.Remove(tmp)
+		return err
 	}
 	if err := f.Close(); err != nil {
 		_ = os.Remove(tmp)
-		return 0, err
+		return err
 	}
-	if err := os.Rename(tmp, opts.OutputPath); err != nil {
+	if err := os.Rename(tmp, outputPath); err != nil {
 		_ = os.Remove(tmp)
-		return 0, err
+		return err
 	}
 	if dirFile, openErr := os.Open(dir); openErr == nil {
 		_ = dirFile.Sync()
 		_ = dirFile.Close()
 	}
-	reportPhase("finalize", time.Since(t0))
-	return fileSize(opts.OutputPath)
+	return nil
 }
 
 func fileSize(path string) (int64, error) {

@@ -218,66 +218,104 @@ func directMergeChildRuns(ctx context.Context, cw *countingWriter, runs []direct
 }
 
 func directWriteTopologySections(ctx context.Context, cw *countingWriter, finalPath, frnPath, spoolDir string, recordCount, maxRecords int, owned *[]string, scratchHigh *int64) ([]indexSectionTableEntry, []directSectionReport, error) {
+	scan, err := directTopologyScanSpool(ctx, finalPath, frnPath, spoolDir, recordCount, owned)
+	if err != nil {
+		return nil, nil, err
+	}
+	childCount, err := directTopologyWriteChildOffsets(scan.offsetsPath, scan.counts, recordCount)
+	if err != nil {
+		return nil, nil, err
+	}
+	if maxRecords <= 0 {
+		maxRecords = directDefaultRunRecords
+	}
+	runs, runBytes, err := directTopologyBuildChildRuns(spoolDir, scan.parentPath, recordCount, maxRecords, owned)
+	if err != nil {
+		return nil, nil, err
+	}
+	topoScratch, rootCount, err := directTopologyScratch(scan, runBytes)
+	if err != nil {
+		return nil, nil, err
+	}
+	if topoScratch > *scratchHigh {
+		*scratchHigh = topoScratch
+	}
+	chldEntry, chldReport, err := directTopologyEmitCHLD(ctx, cw, scan, runs, childCount, rootCount, recordCount, topoScratch)
+	if err != nil {
+		return nil, nil, err
+	}
+	frnsEntry, frnsReport, err := directTopologyEmitFRNS(cw, frnPath, recordCount)
+	if err != nil {
+		return nil, nil, err
+	}
+	return []indexSectionTableEntry{chldEntry, frnsEntry}, []directSectionReport{chldReport, frnsReport}, nil
+}
+
+// directTopologyScan holds the per-record parent/root/size sidecars produced by
+// the topology scan pass.
+type directTopologyScan struct {
+	counts      []uint32
+	parentPath  string
+	offsetsPath string
+	rootsPath   string
+	sizesPath   string
+}
+
+// directTopologyScanSpool streams the final spool once, writing per-record
+// directory sizes, parent ids, and root records to sidecar files, then verifies
+// the parent links are acyclic.
+func directTopologyScanSpool(ctx context.Context, finalPath, frnPath, spoolDir string, recordCount int, owned *[]string) (*directTopologyScan, error) {
 	parentPath := filepath.Join(spoolDir, "direct-parents.tmp")
 	offsetsPath := filepath.Join(spoolDir, "direct-child-offsets.tmp")
 	rootsPath := filepath.Join(spoolDir, "direct-roots.tmp")
 	sizesPath := filepath.Join(spoolDir, "direct-sizes.tmp")
 	*owned = append(*owned, parentPath, offsetsPath, rootsPath, sizesPath)
+
 	parents, err := os.Create(parentPath)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	roots, err := os.Create(rootsPath)
 	if err != nil {
-		_ = parents.Close()
-		return nil, nil, err
+		closeAll(parents)
+		return nil, err
 	}
 	sizes, err := os.Create(sizesPath)
 	if err != nil {
-		_ = parents.Close()
-		_ = roots.Close()
-		return nil, nil, err
+		closeAll(parents, roots)
+		return nil, err
 	}
 	parentWriter := bufio.NewWriterSize(parents, 256*1024)
 	rootWriter := bufio.NewWriterSize(roots, 256*1024)
 	sizeWriter := bufio.NewWriterSize(sizes, 256*1024)
-	counts := make([]uint32, recordCount)
+
 	final, err := os.Open(finalPath)
 	if err != nil {
-		_ = parents.Close()
-		_ = roots.Close()
-		_ = sizes.Close()
-		return nil, nil, err
+		closeAll(parents, roots, sizes)
+		return nil, err
 	}
 	frnMap, frns, err := directMapFRNs(frnPath, recordCount)
 	if err != nil {
-		_ = final.Close()
-		_ = parents.Close()
-		_ = roots.Close()
-		_ = sizes.Close()
-		return nil, nil, err
+		closeAll(final, parents, roots, sizes)
+		return nil, err
 	}
 	if frnMap != nil {
 		defer frnMap.close()
 	}
+
+	counts := make([]uint32, recordCount)
 	r := bufio.NewReaderSize(final, 256*1024)
 	for id := 0; id < recordCount; id++ {
 		select {
 		case <-ctx.Done():
-			_ = final.Close()
-			_ = parents.Close()
-			_ = roots.Close()
-			_ = sizes.Close()
-			return nil, nil, ctx.Err()
+			closeAll(final, parents, roots, sizes)
+			return nil, ctx.Err()
 		default:
 		}
 		rec, readErr := readDirectSpoolRecord(r)
 		if readErr != nil {
-			_ = final.Close()
-			_ = parents.Close()
-			_ = roots.Close()
-			_ = sizes.Close()
-			return nil, nil, readErr
+			closeAll(final, parents, roots, sizes)
+			return nil, readErr
 		}
 		// Directory aggregate sizes sum descendant file sizes; a directory's
 		// own entry contributes nothing so the subtree post-order sum is exact.
@@ -288,81 +326,69 @@ func directWriteTopologySections(ctx context.Context, cw *countingWriter, finalP
 		var sz [8]byte
 		binary.LittleEndian.PutUint64(sz[:], size)
 		if _, err := sizeWriter.Write(sz[:]); err != nil {
-			_ = final.Close()
-			_ = parents.Close()
-			_ = roots.Close()
-			_ = sizes.Close()
-			return nil, nil, err
+			closeAll(final, parents, roots, sizes)
+			return nil, err
 		}
 		parentID := int32(-1)
 		if rec.ParentFRN != 0 {
 			parentID = directLookupIDMapped(frns, rec.ParentFRN)
 		}
 		if parentID == int32(id) {
-			_ = final.Close()
-			_ = parents.Close()
-			_ = roots.Close()
-			_ = sizes.Close()
-			return nil, nil, errors.New("direct topology self-parent")
+			closeAll(final, parents, roots, sizes)
+			return nil, errors.New("direct topology self-parent")
 		}
 		var b [4]byte
 		if parentID < 0 {
 			binary.LittleEndian.PutUint32(b[:], ^uint32(0))
-			if _, err := rootWriter.Write(func() []byte { var v [4]byte; binary.LittleEndian.PutUint32(v[:], uint32(id)); return v[:] }()); err != nil {
-				_ = final.Close()
-				_ = parents.Close()
-				_ = roots.Close()
-				_ = sizes.Close()
-				return nil, nil, err
+			var rootID [4]byte
+			binary.LittleEndian.PutUint32(rootID[:], uint32(id))
+			if _, err := rootWriter.Write(rootID[:]); err != nil {
+				closeAll(final, parents, roots, sizes)
+				return nil, err
 			}
 		} else {
 			binary.LittleEndian.PutUint32(b[:], uint32(parentID))
 			counts[parentID]++
 		}
 		if _, err := parentWriter.Write(b[:]); err != nil {
-			_ = final.Close()
-			_ = parents.Close()
-			_ = roots.Close()
-			_ = sizes.Close()
-			return nil, nil, err
+			closeAll(final, parents, roots, sizes)
+			return nil, err
 		}
 	}
 	_ = final.Close()
 	if err := parentWriter.Flush(); err != nil {
-		_ = parents.Close()
-		_ = roots.Close()
-		_ = sizes.Close()
-		return nil, nil, err
+		closeAll(parents, roots, sizes)
+		return nil, err
 	}
 	if err := rootWriter.Flush(); err != nil {
-		_ = parents.Close()
-		_ = roots.Close()
-		_ = sizes.Close()
-		return nil, nil, err
+		closeAll(parents, roots, sizes)
+		return nil, err
 	}
 	if err := sizeWriter.Flush(); err != nil {
-		_ = parents.Close()
-		_ = roots.Close()
-		_ = sizes.Close()
-		return nil, nil, err
+		closeAll(parents, roots, sizes)
+		return nil, err
 	}
-	_ = parents.Close()
-	_ = roots.Close()
-	_ = sizes.Close()
+	closeAll(parents, roots, sizes)
 	if err := directCheckParentCycles(ctx, parentPath, recordCount); err != nil {
-		return nil, nil, err
+		return nil, err
 	}
+	return &directTopologyScan{counts: counts, parentPath: parentPath, offsetsPath: offsetsPath, rootsPath: rootsPath, sizesPath: sizesPath}, nil
+}
+
+// directTopologyWriteChildOffsets writes the prefix-sum child offset table and
+// returns the total child count.
+func directTopologyWriteChildOffsets(offsetsPath string, counts []uint32, recordCount int) (uint64, error) {
 	offsets, err := os.Create(offsetsPath)
 	if err != nil {
-		return nil, nil, err
+		return 0, err
 	}
 	offsetWriter := bufio.NewWriterSize(offsets, 256*1024)
 	var childCount uint64
-	var off [4]byte
 	for _, count := range counts {
 		childCount += uint64(count)
 	}
 	var running uint32
+	var off [4]byte
 	for i := 0; i <= recordCount; i++ {
 		if i > 0 {
 			running += counts[i-1]
@@ -370,23 +396,26 @@ func directWriteTopologySections(ctx context.Context, cw *countingWriter, finalP
 		binary.LittleEndian.PutUint32(off[:], running)
 		if _, err := offsetWriter.Write(off[:]); err != nil {
 			_ = offsets.Close()
-			return nil, nil, err
+			return 0, err
 		}
 	}
 	if err := offsetWriter.Flush(); err != nil {
 		_ = offsets.Close()
-		return nil, nil, err
+		return 0, err
 	}
 	_ = offsets.Close()
 	if childCount > uint64(^uint32(0)) {
-		return nil, nil, errors.New("direct topology child count exceeds format")
+		return 0, errors.New("direct topology child count exceeds format")
 	}
-	if maxRecords <= 0 {
-		maxRecords = directDefaultRunRecords
-	}
+	return childCount, nil
+}
+
+// directTopologyBuildChildRuns partitions the parent sidecar into sorted,
+// bounded child runs for the external merge.
+func directTopologyBuildChildRuns(spoolDir, parentPath string, recordCount, maxRecords int, owned *[]string) ([]directRunFile, int64, error) {
 	pfile, err := os.Open(parentPath)
 	if err != nil {
-		return nil, nil, err
+		return nil, 0, err
 	}
 	reader := bufio.NewReaderSize(pfile, 256*1024)
 	pairs := make([]directChildPair, 0, min(maxRecords, 4096))
@@ -409,7 +438,7 @@ func directWriteTopologySections(ctx context.Context, cw *countingWriter, finalP
 		var b [4]byte
 		if _, err := io.ReadFull(reader, b[:]); err != nil {
 			_ = pfile.Close()
-			return nil, nil, err
+			return nil, 0, err
 		}
 		parent := binary.LittleEndian.Uint32(b[:])
 		if parent != ^uint32(0) {
@@ -418,77 +447,87 @@ func directWriteTopologySections(ctx context.Context, cw *countingWriter, finalP
 		if len(pairs) >= maxRecords {
 			if err := flush(); err != nil {
 				_ = pfile.Close()
-				return nil, nil, err
+				return nil, 0, err
 			}
 		}
 	}
 	if err := flush(); err != nil {
 		_ = pfile.Close()
-		return nil, nil, err
+		return nil, 0, err
 	}
 	_ = pfile.Close()
 	var runBytes int64
 	for _, run := range runs {
 		runBytes += run.bytes
 	}
-	parentInfo, _ := os.Stat(parentPath)
-	offsetInfo, _ := os.Stat(offsetsPath)
-	rootInfo, _ := os.Stat(rootsPath)
-	topoScratch := runBytes
-	if parentInfo != nil {
-		topoScratch += parentInfo.Size()
+	return runs, runBytes, nil
+}
+
+// directTopologyScratch returns the peak scratch footprint and root count for
+// the CHLD section.
+func directTopologyScratch(scan *directTopologyScan, runBytes int64) (int64, int, error) {
+	scratch := runBytes
+	if info, err := os.Stat(scan.parentPath); err == nil {
+		scratch += info.Size()
 	}
-	if offsetInfo != nil {
-		topoScratch += offsetInfo.Size()
+	if info, err := os.Stat(scan.offsetsPath); err == nil {
+		scratch += info.Size()
 	}
-	if rootInfo != nil {
-		topoScratch += rootInfo.Size()
+	info, err := os.Stat(scan.rootsPath)
+	if err != nil {
+		return 0, 0, fmt.Errorf("stat topology roots: %w", err)
 	}
-	if base := topoScratch; base > *scratchHigh {
-		*scratchHigh = base
-	}
-	entries := make([]indexSectionTableEntry, 0, 2)
-	reports := make([]directSectionReport, 0, 2)
+	scratch += info.Size()
+	return scratch, int(info.Size() / 4), nil
+}
+
+// directTopologyEmitCHLD writes the CHLD section and removes its runs.
+func directTopologyEmitCHLD(ctx context.Context, cw *countingWriter, scan *directTopologyScan, runs []directRunFile, childCount uint64, rootCount, recordCount int, topoScratch int64) (indexSectionTableEntry, directSectionReport, error) {
 	if err := writeAlignment(cw, 8); err != nil {
-		return nil, nil, err
+		return indexSectionTableEntry{}, directSectionReport{}, err
 	}
 	offset := uint64(cw.n)
 	if err := binary.Write(cw, binary.LittleEndian, uint32(recordCount+1)); err != nil {
-		return nil, nil, err
+		return indexSectionTableEntry{}, directSectionReport{}, err
 	}
-	if err := directCopyFile(cw, offsetsPath); err != nil {
-		return nil, nil, err
+	if err := directCopyFile(cw, scan.offsetsPath); err != nil {
+		return indexSectionTableEntry{}, directSectionReport{}, err
 	}
 	if err := binary.Write(cw, binary.LittleEndian, uint32(childCount)); err != nil {
-		return nil, nil, err
+		return indexSectionTableEntry{}, directSectionReport{}, err
 	}
 	if err := directMergeChildRuns(ctx, cw, runs, int(childCount)); err != nil {
-		return nil, nil, err
+		return indexSectionTableEntry{}, directSectionReport{}, err
 	}
-	rootCount := int(rootInfo.Size() / 4)
 	if err := binary.Write(cw, binary.LittleEndian, uint32(rootCount)); err != nil {
-		return nil, nil, err
+		return indexSectionTableEntry{}, directSectionReport{}, err
 	}
-	if err := directCopyFile(cw, rootsPath); err != nil {
-		return nil, nil, err
+	if err := directCopyFile(cw, scan.rootsPath); err != nil {
+		return indexSectionTableEntry{}, directSectionReport{}, err
 	}
-	entries = append(entries, indexSectionTableEntry{tag: indexSectionCHLD, offset: offset, length: uint64(cw.n) - offset})
-	reports = append(reports, directSectionReport{Name: "CHLD", Tag: indexSectionCHLD, Runs: len(runs), Bytes: int64(cw.n) - int64(offset), ScratchBytes: topoScratch})
 	for _, run := range runs {
 		_ = os.Remove(run.path)
 	}
+	entry := indexSectionTableEntry{tag: indexSectionCHLD, offset: offset, length: uint64(cw.n) - offset}
+	report := directSectionReport{Name: "CHLD", Tag: indexSectionCHLD, Runs: len(runs), Bytes: int64(cw.n) - int64(offset), ScratchBytes: topoScratch}
+	return entry, report, nil
+}
+
+// directTopologyEmitFRNS writes the FRNS section: FRN sidecar plus the identity
+// id vector.
+func directTopologyEmitFRNS(cw *countingWriter, frnPath string, recordCount int) (indexSectionTableEntry, directSectionReport, error) {
 	if err := writeAlignment(cw, 8); err != nil {
-		return nil, nil, err
+		return indexSectionTableEntry{}, directSectionReport{}, err
 	}
-	offset = uint64(cw.n)
+	offset := uint64(cw.n)
 	if err := binary.Write(cw, binary.LittleEndian, uint32(recordCount)); err != nil {
-		return nil, nil, err
+		return indexSectionTableEntry{}, directSectionReport{}, err
 	}
 	if err := directCopyFile(cw, frnPath); err != nil {
-		return nil, nil, err
+		return indexSectionTableEntry{}, directSectionReport{}, err
 	}
 	if err := binary.Write(cw, binary.LittleEndian, uint32(recordCount)); err != nil {
-		return nil, nil, err
+		return indexSectionTableEntry{}, directSectionReport{}, err
 	}
 	var ids [256]byte
 	for start := 0; start < recordCount; {
@@ -497,11 +536,19 @@ func directWriteTopologySections(ctx context.Context, cw *countingWriter, finalP
 			binary.LittleEndian.PutUint32(ids[i*4:], uint32(start+i))
 		}
 		if _, err := cw.Write(ids[:count*4]); err != nil {
-			return nil, nil, err
+			return indexSectionTableEntry{}, directSectionReport{}, err
 		}
 		start += count
 	}
-	entries = append(entries, indexSectionTableEntry{tag: indexSectionFRNS, offset: offset, length: uint64(cw.n) - offset})
-	reports = append(reports, directSectionReport{Name: "FRNS", Tag: indexSectionFRNS, Runs: 0, Bytes: int64(cw.n) - int64(offset), ScratchBytes: 0})
-	return entries, reports, nil
+	entry := indexSectionTableEntry{tag: indexSectionFRNS, offset: offset, length: uint64(cw.n) - offset}
+	report := directSectionReport{Name: "FRNS", Tag: indexSectionFRNS, Runs: 0, Bytes: int64(cw.n) - int64(offset), ScratchBytes: 0}
+	return entry, report, nil
+}
+
+func closeAll(closers ...io.Closer) {
+	for _, c := range closers {
+		if c != nil {
+			_ = c.Close()
+		}
+	}
 }
