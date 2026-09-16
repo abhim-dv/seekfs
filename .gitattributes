@@ -1,0 +1,9 @@
+# Keep Go sources checked out as LF on every platform. Without this, the
+# Windows CI runner checks out CRLF (core.autocrlf=true) and `gofmt -l` reports
+# every file as unformatted.
+*.go text eol=lf
+
+# Keep the frontend and test scripts LF too so the node test runner and diffs
+# are consistent across platforms.
+*.js text eol=lf
+*.cjs text eol=lf
