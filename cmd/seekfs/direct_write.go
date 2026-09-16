@@ -341,6 +341,11 @@ func directComputeRankFamilies(ctx context.Context, specs []directRankSpec, shar
 			}
 		}()
 	}
+	// TODO: this `break` exits the select, not the loop, so a cancelled context
+	// does not stop the job feed. It is harmless today because the workers keep
+	// draining jobs until the channel closes, but a labeled break here would
+	// make the cancel path exit promptly. Pre-existing; kept verbatim in the
+	// extraction that split this function.
 	for index := range specs {
 		select {
 		case jobs <- index:
