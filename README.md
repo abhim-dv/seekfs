@@ -125,7 +125,7 @@ Inspect an index:
 
 ## Current Benchmark Snapshot
 
-On the development machine, packed v8 C: + F: indexes measured:
+On the development machine, packed v9 C: + F: indexes measured:
 
 ```text
 C: + F: entries: about 23.7M
@@ -163,10 +163,10 @@ Representative warm service CLI timings:
 ## Documentation
 
 - [Service setup](docs/SERVICE.md)
+- [Search syntax](search-syntax.md)
 - [Configuration](docs/CONFIG.md)
 - [Service pipe protocol](docs/OPEN_PROTOCOL.md)
 - [Benchmarks](docs/BENCHMARKS.md)
-- [Incremental updates plan](docs/INCREMENTAL_UPDATES.md)
 - [Security notes](SECURITY.md)
 
 ## Config Shortcuts
@@ -184,7 +184,7 @@ Representative warm service CLI timings:
 go test ./...
 go vet ./...
 go build -o seekfs.exe ./cmd/seekfs
-powershell -ExecutionPolicy Bypass -File .\test_seekfs_cli.ps1
+powershell -ExecutionPolicy Bypass -File .\scripts\test_seekfs_cli.ps1
 ```
 
 ## Release Artifacts

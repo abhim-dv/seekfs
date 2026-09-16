@@ -21,7 +21,7 @@ jobs:
         run: go build -o seekfs.exe ./cmd/seekfs
       - name: CLI integration test
         shell: pwsh
-        run: powershell -ExecutionPolicy Bypass -File .\test_seekfs_cli.ps1
+        run: powershell -ExecutionPolicy Bypass -File .\scripts\test_seekfs_cli.ps1
   race:
     runs-on: windows-latest
     env:

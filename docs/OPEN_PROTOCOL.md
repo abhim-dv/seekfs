@@ -94,13 +94,11 @@ pipe plus each loaded database and its incremental state.
 service can still answer from the loaded index but could not validate or read
 the NTFS journal; `stale_reason` contains the failure.
 
-`derived_sections` and `derived_bytes` are present for gated v9 indexes created
-or converted with `SEEKFS_ENGINE_V9=1`. Older v8 indexes omit these fields and
-fall back to the service's runtime secondary-index builds. `PEXT`, `PCMP`, and
-`PNGR` are consumed by service startup for extension, component, and name
-trigram lookups. Extension, component, and name-trigram candidate paths prefer
-keyed mapped lookups; broader planner block-iterator cleanup remains gated
-implementation work.
+`derived_sections` and `derived_bytes` are present for v9 indexes, the only
+supported format. `PEXT`, `PCMP`, and `PNGR` are consumed by service startup for
+extension, component, and name trigram lookups. Extension, component, and
+name-trigram candidate paths prefer keyed mapped lookups; broader planner
+block-iterator cleanup remains gated implementation work.
 
 ## Error Response
 

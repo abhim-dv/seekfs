@@ -23,7 +23,7 @@ __pycache__/
 .vscode/
 .idea/
 .claude/
-dist/
+dist*/
 build/
 bin/
 .r5tmp/

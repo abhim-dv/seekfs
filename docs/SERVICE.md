@@ -65,19 +65,17 @@ dotted token remains a normal name substring, so `.pdf` can match
 `manual.pdf.bak`. Use `ext:pdf` when exact extension matching is desired in any
 mode.
 
-When `SEEKFS_ENGINE_V9=1` is set while building or upgrading an index, seekfs
-writes the gated v9 container with mapped derived sections for rank, children,
-subtree intervals, FRNs, lowercase names, and posting metadata. Convert an
-existing index offline with:
+Every index seekfs writes uses the v9 container with mapped derived sections for
+rank, children, subtree intervals, FRNs, lowercase names, and posting metadata.
+Older v8 indexes are no longer readable; rebuild them by re-indexing:
 
 ```powershell
-$env:SEEKFS_ENGINE_V9=1; .\seekfs.exe upgrade-index -db C:\ProgramData\seekfs\indexes\seekfs_c.gsi
+.\seekfs.exe index-volumes -volume C:
 ```
 
-`loaded --json` reports `derived_sections` and `derived_bytes` for mapped v9
-indexes. Default v8 indexes remain readable and use the existing runtime builds.
-When the v9 gate is enabled, live update WAL appends use CRC-protected binary
-frames; the replay path still accepts the older JSON WAL format.
+`loaded --json` reports `derived_sections` and `derived_bytes` for v9 indexes.
+Live update WAL appends use CRC-protected binary frames; the replay path still
+accepts the older JSON WAL format.
 
 ## Incremental Durability
 

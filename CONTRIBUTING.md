@@ -8,7 +8,7 @@ Use Go on Windows for the primary development path:
 go test ./...
 go vet ./...
 go build -o seekfs.exe ./cmd/seekfs
-powershell -ExecutionPolicy Bypass -File .\test_seekfs_cli.ps1
+powershell -ExecutionPolicy Bypass -File .\scripts\test_seekfs_cli.ps1
 ```
 
 Do not commit generated indexes, sidecars, benchmark outputs, logs, extracted

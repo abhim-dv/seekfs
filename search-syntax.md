@@ -75,6 +75,4 @@
 
 ## Not Implemented Yet
 
-- Directory sizes (Everything reports folders at the recursive size of their
-  contents; seekfs reports directory size as 0).
 - Everything-compatible ranking.

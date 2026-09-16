@@ -363,16 +363,16 @@ func assertPlannerBudget(t *testing.T, tc deterministicQueryCase, trace searchTr
 	if trace.Candidates > budget {
 		t.Fatalf("query %q source=%s candidates=%d budget=%d", tc.Query, trace.Source, trace.Candidates, budget)
 	}
-	if trace.Source == "compact-name-order-scan" && trace.Candidates > maxInt(512, tc.Limit*4) {
+	if trace.Source == "compact-name-order-scan" && trace.Candidates > max(512, tc.Limit*4) {
 		t.Fatalf("query %q used broad compact-name-order-scan candidates=%d", tc.Query, trace.Candidates)
 	}
 }
 
 func deterministicCandidateBudget(tc deterministicQueryCase, limit, resultCount, recordCount int) int {
-	budget := maxInt(4*limit, 512)
+	budget := max(4*limit, 512)
 	switch tc.Family {
 	case "broad-common", "cold-trigram", "dotted-extension", "mixed-filter", "negation", "under":
-		return min(recordCount, maxInt(budget, 50_000))
+		return min(recordCount, max(budget, 50_000))
 	default:
 		return min(recordCount, budget)
 	}
@@ -452,7 +452,7 @@ func assertCoverageGapFamily(t *testing.T, volumes []*serviceVolumeIndex, tc cov
 	if !completeTrace(trace) {
 		t.Fatalf("query %q search trace is not complete: source=%s mode=%s", tc.Query, trace.Source, trace.PlannerMode)
 	}
-	if len(got) != minInt(tc.Limit, wantCount) {
+	if len(got) != min(tc.Limit, wantCount) {
 		t.Fatalf("query %q search results = %d, want min(limit=%d, count=%d)", tc.Query, len(got), tc.Limit, wantCount)
 	}
 
