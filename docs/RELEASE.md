@@ -19,6 +19,22 @@ Contents:
 
 Indexes and benchmark output are not included.
 
+## Cutting a release
+
+Releases are automated by `.github/workflows/release.yml`. Push a v-prefixed tag
+from a commit that is green on CI, and the workflow runs `scripts/build.ps1`,
+verifies the archive, writes a SHA-256 checksum, and publishes a GitHub release:
+
+```powershell
+git tag v1.10.3
+git push origin v1.10.3
+```
+
+The release body comes from `docs/RELEASE_NOTES_<version>.md` when that file
+exists (version without the leading `v`); otherwise GitHub generates the notes
+from the previous release. The tag is passed through verbatim, so
+`seekfs version` reports `seekfs v1.10.3`.
+
 ## Current Release
 
 Current release: `v1.10.2`.

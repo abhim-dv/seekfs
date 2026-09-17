@@ -5,6 +5,15 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# $ErrorActionPreference='Stop' does not turn a native command's non-zero exit
+# into a terminating error, so every go/git invocation is checked explicitly.
+function Assert-LastExit {
+    param([string]$Step)
+    if ($LASTEXITCODE -ne 0) {
+        throw "build step failed: $Step (exit $LASTEXITCODE)"
+    }
+}
+
 $Root = Split-Path -Parent $PSScriptRoot
 Set-Location $Root
 
@@ -24,6 +33,7 @@ New-Item -ItemType Directory -Force -Path $Target | Out-Null
 
 $LdFlags = "-s -w -X main.version=$Version -X main.commit=$Commit -X main.date=$Date"
 go build -trimpath -ldflags $LdFlags -o (Join-Path $Target "seekfs.exe") ./cmd/seekfs
+Assert-LastExit "go build (seekfs.exe)"
 
 # The UI is launched by double-click and must run elevated so its spawned
 # service can open raw volumes for USN-based index rebuild/verification.  Embed
@@ -39,7 +49,9 @@ $UiManifest = Join-Path $UiPkg "seekfs-ui.manifest"
 Copy-Item $UiSyso $UiSysoBackup -Force
 try {
     go run ./scripts/ui-rsrcgen -arch amd64 -ico $UiIcon -manifest $UiManifest -o $UiSyso
+    Assert-LastExit "ui resource generation"
     go build -trimpath -tags "seekfs_ui production" -ldflags "$LdFlags -H windowsgui" -o (Join-Path $Target "seekfs-ui.exe") ./cmd/seekfs
+    Assert-LastExit "go build (seekfs-ui.exe)"
 } finally {
     Copy-Item $UiSysoBackup $UiSyso -Force
     Remove-Item $UiSysoBackup -Force -ErrorAction SilentlyContinue
@@ -50,6 +62,7 @@ Copy-Item README.md,LICENSE,NOTICE.md -Destination $Target
 # Copy only files tracked by git so local research notes, private benchmark
 # data, and other untracked docs cannot leak into release artifacts.
 $DocFiles = git ls-files docs
+Assert-LastExit "git ls-files docs"
 foreach ($doc in $DocFiles) {
     $dest = Join-Path $Target $doc
     $destDir = Split-Path -Parent $dest

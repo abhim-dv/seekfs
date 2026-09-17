@@ -1,0 +1,56 @@
+name: Release
+
+on:
+  push:
+    tags: [ 'v*' ]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history so `gh release create --generate-notes` can build the
+          # changelog from the commits since the previous tag.
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      # scripts/build.ps1 produces dist/seekfs-windows-amd64.zip: both binaries,
+      # README, LICENSE, NOTICE and tracked docs, as docs/RELEASE.md describes.
+      - name: Build
+        shell: pwsh
+        run: ./scripts/build.ps1 -Version $env:GITHUB_REF_NAME
+      # Publishing is not easily undone, so fail before it if the archive is
+      # not what docs/RELEASE.md promises.
+      - name: Verify artifact
+        shell: pwsh
+        run: |
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zip = [System.IO.Compression.ZipFile]::OpenRead("$PWD\dist\seekfs-windows-amd64.zip")
+          try { $entries = $zip.Entries | ForEach-Object { $_.FullName } } finally { $zip.Dispose() }
+          foreach ($required in 'seekfs.exe', 'seekfs-ui.exe', 'README.md', 'LICENSE', 'NOTICE.md') {
+            if ($entries -notcontains $required) { throw "release artifact is missing $required" }
+          }
+      - name: Checksum
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash dist/seekfs-windows-amd64.zip -Algorithm SHA256).Hash.ToLower()
+          "$hash  seekfs-windows-amd64.zip" | Set-Content -Path dist/seekfs-windows-amd64.zip.sha256 -Encoding ascii
+      - name: Publish
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          $notes = "docs/RELEASE_NOTES_$($tag.TrimStart('v')).md"
+          $assets = @('dist/seekfs-windows-amd64.zip', 'dist/seekfs-windows-amd64.zip.sha256')
+          if (Test-Path $notes) {
+            gh release create $tag @assets --title $tag --notes-file $notes
+          } else {
+            gh release create $tag @assets --title $tag --generate-notes
+          }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
