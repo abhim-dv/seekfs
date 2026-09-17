@@ -13,10 +13,12 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - name: Install staticcheck
+      - name: Install analyzers
         shell: pwsh
         run: |
-          go install honnef.co/go/tools/cmd/staticcheck@v0.6.1
+          go install honnef.co/go/tools/cmd/staticcheck@2026.2.1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          go install golang.org/x/vuln/cmd/govulncheck@v1.8.0
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Add-Content -Path $env:GITHUB_PATH -Value "$(go env GOPATH)\bin"
       # scripts/ci.ps1 is the source of truth for this job; see CONTRIBUTING.md.

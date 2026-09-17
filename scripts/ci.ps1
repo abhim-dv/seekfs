@@ -117,6 +117,13 @@ if ($staticcheckCode -ne 0) {
     throw "staticcheck reported findings (exit $staticcheckCode)"
 }
 
+if (-not (Get-Command govulncheck -ErrorAction SilentlyContinue)) {
+    throw 'govulncheck not found; install it with: go install golang.org/x/vuln/cmd/govulncheck@latest'
+}
+Invoke-Native 'govulncheck' {
+    govulncheck ./...
+}
+
 Invoke-Native 'go test ./... (with coverage)' {
     # Quoted: PowerShell splits an unquoted -flag=value at the dot (go sees ".out").
     go test '-coverprofile=coverage.out' '-covermode=atomic' ./...

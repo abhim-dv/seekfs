@@ -46,12 +46,25 @@ compatibility cleanups.
 
 - The codebase is gofmt-clean and CI enforces it.
 
+- CI gates on `staticcheck` and `govulncheck` and reports statement coverage.
+
+- Dependencies were updated (`golang.org/x/text` v0.42.0, `golang.org/x/sys`
+  v0.48.0, `wails/v2` v2.16.0); `govulncheck` reports no reachable
+  vulnerabilities. Building from source needs Go 1.26.3, which the `go`
+  directive in `go.mod` fetches automatically.
+
+- Pushing a `v*` tag builds and publishes the release zip plus a SHA-256
+  checksum (`docs/RELEASE.md`).
+
 ## Validation
 
-- `go test ./...`, `go vet ./...`, and `go test -tags "seekfs_ui production"
-  ./cmd/seekfs` are green.
+- `go test ./...` (67% statement coverage), `go vet ./...`, staticcheck,
+  govulncheck, and `go test -tags "seekfs_ui production" ./cmd/seekfs` are green.
 
-- The new frontend unit tests run under `node --test scripts/`.
+- `scripts/ci.ps1` runs those gates locally and the `Windows CI` workflow calls
+  it, so local and CI runs exercise the same commands.
+
+- The frontend unit tests run via `node --test` on explicit files.
 
 - The refactors were verified as pure moves: declaration sets and function
   bodies match the originals, and the existing parity/hash tests
