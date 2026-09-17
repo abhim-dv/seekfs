@@ -338,17 +338,17 @@ func (vol *serviceVolumeIndex) altPlanSource(alt parsedQuery, matchPath bool) (c
 
 // isOnly reports whether the alternative carries exactly one kind of constraint
 // (named by kind) and nothing else, so it can be turned into a single posting.
-func (alt parsedQuery) isOnly(kind string) bool {
+func (pq parsedQuery) isOnly(kind string) bool {
 	counts := map[string]int{
-		"ext":    len(alt.Exts),
-		"glob":   len(alt.Globs),
-		"term":   len(alt.Terms),
-		"parent": len(alt.Parents),
-		"attrib": len(alt.AttrFilters),
+		"ext":    len(pq.Exts),
+		"glob":   len(pq.Globs),
+		"term":   len(pq.Terms),
+		"parent": len(pq.Parents),
+		"attrib": len(pq.AttrFilters),
 	}
-	other := len(alt.Dirs) + len(alt.Regexps) + len(alt.SizeFilters) +
-		len(alt.DateFilters) + len(alt.OrGroups) + len(alt.NotGroups)
-	if alt.Type != "" {
+	other := len(pq.Dirs) + len(pq.Regexps) + len(pq.SizeFilters) +
+		len(pq.DateFilters) + len(pq.OrGroups) + len(pq.NotGroups)
+	if pq.Type != "" {
 		other++
 	}
 	if other != 0 {

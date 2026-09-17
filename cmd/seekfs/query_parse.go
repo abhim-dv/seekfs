@@ -233,9 +233,7 @@ func applyQueryToken(pq *parsedQuery, raw string) error {
 				// strict parser semantics do not trigger a full-volume scan.
 				pq.Impossible = true
 			}
-			for _, part := range queryPlainTerms(term, pq.CaseSensitive, true) {
-				pq.Terms = append(pq.Terms, part)
-			}
+			pq.Terms = append(pq.Terms, queryPlainTerms(term, pq.CaseSensitive, true)...)
 		}
 	case strings.HasPrefix(raw, "parent:"):
 		parent := strings.TrimPrefix(raw, "parent:")

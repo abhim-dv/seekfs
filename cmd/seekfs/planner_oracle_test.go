@@ -1129,9 +1129,7 @@ func renderParsedQueryForTest(pq parsedQuery) string {
 	if pq.Type != "" {
 		fields = append(fields, "type:"+pq.Type)
 	}
-	for _, term := range pq.Terms {
-		fields = append(fields, term)
-	}
+	fields = append(fields, pq.Terms...)
 	for _, ext := range pq.Exts {
 		fields = append(fields, "ext:"+ext)
 	}
@@ -1144,9 +1142,7 @@ func renderParsedQueryForTest(pq parsedQuery) string {
 	for _, glob := range pq.Globs {
 		fields = append(fields, "glob:"+glob)
 	}
-	for _, term := range pq.RegexTerms {
-		fields = append(fields, term)
-	}
+	fields = append(fields, pq.RegexTerms...)
 	for _, group := range pq.OrGroups {
 		parts := make([]string, 0, len(group))
 		for _, alt := range group {

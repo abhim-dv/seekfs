@@ -420,7 +420,6 @@ func TestOverlayFileDeleteBurstMatchesFreshOracle(t *testing.T) {
 		usn++
 	}
 	deleteChanges = append(deleteChanges, usnChange{FRN: 101, USN: usn, Reason: usnReasonFileDelete})
-	usn++
 	vol.applyUSNChanges(deleteChanges)
 	applyLogicalUSNChanges(logical, deleteChanges)
 

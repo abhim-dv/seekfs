@@ -226,6 +226,7 @@ func (s *directConcurrentWalkSource) runProducer(root string, exclusions, suffix
 				}
 				continue
 			}
+		entries:
 			for _, entry := range batch.items {
 				path := filepath.Join(batch.root, entry.Name())
 				if directPathUnderAny(path, exclusions) {
@@ -234,7 +235,7 @@ func (s *directConcurrentWalkSource) runProducer(root string, exclusions, suffix
 				}
 				select {
 				case <-s.done:
-					break
+					break entries
 				default:
 				}
 				reparse := directPathIsReparse(path)

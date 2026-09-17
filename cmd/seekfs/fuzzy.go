@@ -570,6 +570,7 @@ func multiTermFuzzyRewriteTrials(volumes []*serviceVolumeIndex, opts queryOption
 			out := make([]string, len(fields))
 			replaced := false
 			for i, field := range fields {
+				//lint:ignore SA6005 ToLower compares the parser's normalization; EqualFold folds differently (e.g. ſ vs s) and would drop valid rewrites
 				if !replaced && strings.ToLower(field) == strings.ToLower(term) {
 					out[i] = variant
 					replaced = true

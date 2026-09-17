@@ -54,6 +54,11 @@ func globalComponentDefaultHasRoot(pq parsedQuery) bool {
 			(pq.Type != "" || pq.Exists || pq.HasModAfter || len(pq.SizeFilters) != 0 || len(pq.DateFilters) != 0)) {
 		return true
 	}
+	// Validate every alternative in every OR group, matching the per-group
+	// walk in globalComponentDefaultTermsLong. Groups are intersected and
+	// alternatives unioned, so one unrooted alternative means the default
+	// component cannot answer from postings alone; declining here only routes
+	// the query to the fallback path.
 	for _, group := range pq.OrGroups {
 		if len(group) == 0 {
 			return false
@@ -63,9 +68,8 @@ func globalComponentDefaultHasRoot(pq parsedQuery) bool {
 				return false
 			}
 		}
-		return true
 	}
-	return false
+	return len(pq.OrGroups) > 0
 }
 
 func globalComponentVolumeAnchored(pq parsedQuery) bool {

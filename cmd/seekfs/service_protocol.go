@@ -157,16 +157,15 @@ func servicePrincipalForPipeConn(conn *os.File) servicePrincipal {
 		}
 	}
 
-	if th, err := windows.GetCurrentThread(); err == nil {
-		var token windows.Token
-		// openAsSelf=true: access the thread (impersonation) token using the
-		// process token's security context, which is what we want here.
-		if err := windows.OpenThreadToken(th, windows.TOKEN_QUERY, true, &token); err == nil {
-			principal = servicePrincipalFromToken(token)
-			token.Close()
-			serviceRevertToSelfOrDie()
-			return principal
-		}
+	th := windows.CurrentThread()
+	var token windows.Token
+	// openAsSelf=true: access the thread (impersonation) token using the
+	// process token's security context, which is what we want here.
+	if err := windows.OpenThreadToken(th, windows.TOKEN_QUERY, true, &token); err == nil {
+		principal = servicePrincipalFromToken(token)
+		token.Close()
+		serviceRevertToSelfOrDie()
+		return principal
 	}
 	// Could not open/read the client token: fail closed to read-only.
 	serviceRevertToSelfOrDie()

@@ -50,10 +50,11 @@ func TestBenchResultHashAndDiagnostics(t *testing.T) {
 		BlocksSkipped:  3,
 		Complete:       &complete,
 	}
-	if got := benchResultHash(resp, false); got == "" {
+	first := benchResultHash(resp, false)
+	if first == "" {
 		t.Fatal("search result hash is empty")
 	}
-	if benchResultHash(resp, false) != benchResultHash(resp, false) {
+	if second := benchResultHash(resp, false); second != first {
 		t.Fatal("search result hash is not deterministic")
 	}
 	if got := benchResultHash(resp, true); got == "" {

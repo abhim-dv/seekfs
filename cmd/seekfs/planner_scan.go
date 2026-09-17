@@ -72,7 +72,7 @@ func (vol *serviceVolumeIndex) scanPathTermPrefixLimited(pq parsedQuery, term st
 	if term == "" || limit <= 0 || maxScan <= 0 {
 		return nil
 	}
-	orderLen := vol.index.compactRecordCount()
+	var orderLen int
 	if vol.queryIndex != nil && len(vol.queryIndex.nameOrder) > 0 {
 		orderLen = len(vol.queryIndex.nameOrder)
 	} else {

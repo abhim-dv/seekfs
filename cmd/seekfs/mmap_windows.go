@@ -49,8 +49,13 @@ func mapIndexFile(path string) (*mappedIndexFile, error) {
 	}, nil
 }
 
+// mappedViewBytes exposes a mapped region at an arbitrary address as a []byte.
+// The reflect.SliceHeader form is deliberate: the modern
+// unsafe.Slice((*byte)(unsafe.Pointer(addr)), size) trips go vet's unsafeptr
+// check on the uintptr-to-pointer conversion.
 func mappedViewBytes(addr uintptr, size int) []byte {
 	var data []byte
+	//lint:ignore SA1019 reflect.SliceHeader is the vet-clean way to back a slice with a mapped address
 	header := (*reflect.SliceHeader)(unsafe.Pointer(&data))
 	header.Data = addr
 	header.Len = size

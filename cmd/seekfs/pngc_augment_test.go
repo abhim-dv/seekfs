@@ -244,7 +244,7 @@ func TestPNGCAugmentStreamingRejectsSpoolCorruptionAndWriteFailure(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := stream2.writePayload(context.Background(), failAfterWriter{limit: 8}, nil, entries, blocks); err == nil {
+	if _, err := stream2.writePayload(context.Background(), &failAfterWriter{limit: 8}, nil, entries, blocks); err == nil {
 		t.Fatal("write failure unexpectedly succeeded")
 	}
 	if _, err := stream2.writePayload(canceledContext(), io.Discard, nil, entries, blocks); err == nil {
@@ -337,7 +337,7 @@ func TestPNGCAugmentLegacyNoMetadataUsesBoundedDiscovery(t *testing.T) {
 
 type failAfterWriter struct{ written, limit int }
 
-func (w failAfterWriter) Write(p []byte) (int, error) {
+func (w *failAfterWriter) Write(p []byte) (int, error) {
 	if w.written >= w.limit {
 		return 0, errors.New("injected write failure")
 	}

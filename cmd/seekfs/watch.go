@@ -25,7 +25,7 @@ type watchEntry struct {
 
 // watchEvent is one JSON line emitted on stdout.
 type watchEvent struct {
-	Ts    string `json:"ts"`
+	TS    string `json:"ts"`
 	Event string `json:"event"`
 	Path  string `json:"path"`
 	Size  *int64 `json:"size,omitempty"`
@@ -151,7 +151,7 @@ func runWatch(args []string) error {
 
 	emit := func(ev watchDeltaEvent) {
 		now := time.Now().UTC().Format(time.RFC3339Nano)
-		out := watchEvent{Ts: now, Event: ev.Event, Path: ev.Path}
+		out := watchEvent{TS: now, Event: ev.Event, Path: ev.Path}
 		if ev.Size != 0 {
 			size := ev.Size
 			out.Size = &size
