@@ -4,14 +4,16 @@
 
 Use Go on Windows for the primary development path. `scripts/ci.ps1` is the
 source of truth for CI: it runs the same gates the `Windows CI` workflow does.
-Run the `test` stage before pushing, and the `race` stage for concurrency
-changes. Local toolchain versions can still differ from the runner's, so these
-reduce surprises rather than guarantee a green run.
+Run it before pushing, and the race stage for concurrency changes. Local
+toolchain versions can still differ from the runner's, so these reduce
+surprises rather than guarantee a green run.
 
 ```powershell
-./scripts/ci.ps1              # full test stage (what CI runs on push)
-./scripts/ci.ps1 -Quick       # same, minus the slower end-to-end CLI test
-./scripts/ci.ps1 -Stage race  # the -race subset (needs a C compiler, e.g. mingw)
+./scripts/ci.ps1                  # every stage (what CI runs, across its jobs)
+./scripts/ci.ps1 -Quick           # same, minus the slower end-to-end CLI test
+./scripts/ci.ps1 -Stage analysis  # staticcheck + govulncheck only
+./scripts/ci.ps1 -Stage test      # tests only
+./scripts/ci.ps1 -Stage race      # the -race subset (needs a C compiler, e.g. mingw)
 ```
 
 Keep the workflow jobs delegating to that script. A gate that lives in only one

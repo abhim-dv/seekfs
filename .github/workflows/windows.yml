@@ -6,7 +6,9 @@ on:
   pull_request:
 
 jobs:
-  test:
+  # Static analysis is its own job so it runs in parallel with the tests and a
+  # failure points at one or the other instead of a single blended step.
+  analysis:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -21,9 +23,19 @@ jobs:
           go install golang.org/x/vuln/cmd/govulncheck@v1.8.0
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Add-Content -Path $env:GITHUB_PATH -Value "$(go env GOPATH)\bin"
-      # scripts/ci.ps1 is the source of truth for this job; see CONTRIBUTING.md.
+      # scripts/ci.ps1 is the source of truth; see CONTRIBUTING.md.
+      - name: Analysis stage
+        run: pwsh -ExecutionPolicy Bypass -NoProfile -File ./scripts/ci.ps1 -Stage analysis
+
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
       - name: Test stage
-        run: pwsh -ExecutionPolicy Bypass -NoProfile -File ./scripts/ci.ps1
+        run: pwsh -ExecutionPolicy Bypass -NoProfile -File ./scripts/ci.ps1 -Stage test
 
   race:
     runs-on: windows-latest
