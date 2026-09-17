@@ -24,6 +24,14 @@ compatibility cleanups.
   precomputed extension/component rank bounds and fall back at query time.
   Rebuild (`index-volumes` or `index-usn`) to restore the optimization.
 
+## Fixed
+
+- **`watch -exec` mangled event paths containing spaces.** The command template
+  was split on plain whitespace and the path was substituted as a Go string
+  literal, so `C:\Program Files\...` became several arguments with every
+  backslash doubled. The template is now split quote-aware and the path is
+  substituted per argument, so it always arrives intact.
+
 ## Notes
 
 - The large `main.go`, `query_planner.go`, and `query_planner_test.go` are split

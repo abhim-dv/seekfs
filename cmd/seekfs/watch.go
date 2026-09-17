@@ -10,7 +10,6 @@ import (
 	"os/exec"
 	"os/signal"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 )
@@ -238,31 +237,66 @@ func runWatch(args []string) error {
 
 // runWatchExec launches the user's -exec command for one watch event. The
 // placeholder {} in the command is replaced by the event path. Without
-// -exec-shell the command is split on whitespace and executed directly;
-// with it, the command is passed to cmd /C for full shell semantics.
+// -exec-shell the template is split on whitespace (keeping quoted runs
+// together) and the path is substituted into each argument, so a path
+// containing spaces stays one argument; with it, the command is passed to
+// cmd /C for full shell semantics.
 func runWatchExec(cmdTemplate, path string, shell bool) {
-	cmdText := strings.ReplaceAll(cmdTemplate, "{}", strconv.Quote(path))
 	if shell {
-		c := exec.Command("cmd", "/C", cmdText)
+		// cmd.exe needs the path quoted, with any quote it already contains
+		// doubled.
+		quoted := `"` + strings.ReplaceAll(path, `"`, `""`) + `"`
+		c := exec.Command("cmd", "/C", strings.ReplaceAll(cmdTemplate, "{}", quoted))
 		c.Stdout = os.Stderr
 		c.Stderr = os.Stderr
 		if err := c.Start(); err != nil {
 			fmt.Fprintf(os.Stderr, "watch: exec start: %v\n", err)
-			return
 		}
 		return
 	}
-	parts := strings.Fields(cmdText)
-	if len(parts) == 0 {
+	args := splitCommandLine(cmdTemplate)
+	for i, arg := range args {
+		args[i] = strings.ReplaceAll(arg, "{}", path)
+	}
+	if len(args) == 0 {
 		return
 	}
-	c := exec.Command(parts[0], parts[1:]...)
+	c := exec.Command(args[0], args[1:]...)
 	c.Stdout = os.Stderr
 	c.Stderr = os.Stderr
 	if err := c.Start(); err != nil {
 		fmt.Fprintf(os.Stderr, "watch: exec start: %v\n", err)
-		return
 	}
+}
+
+// splitCommandLine splits a command template on whitespace, keeping a
+// double-quoted run together so `"C:\Program Files\x"` stays one argument.
+// The quotes are stripped, matching how a shell would deliver the argument.
+func splitCommandLine(s string) []string {
+	var args []string
+	var current strings.Builder
+	quoted := false
+	started := false
+	for _, r := range s {
+		switch {
+		case r == '"':
+			quoted = !quoted
+			started = true
+		case (r == ' ' || r == '\t') && !quoted:
+			if started {
+				args = append(args, current.String())
+				current.Reset()
+				started = false
+			}
+		default:
+			current.WriteRune(r)
+			started = true
+		}
+	}
+	if started {
+		args = append(args, current.String())
+	}
+	return args
 }
 
 // snapshotFromResponse collects the current result set keyed by path,

@@ -326,12 +326,25 @@ func TestServiceWatchDeltaMultiVolume(t *testing.T) {
 
 func TestRunWatchExecSubstitution(t *testing.T) {
 	dir := t.TempDir()
+	// The event path contains a space: it has to reach the command as a single
+	// argument rather than being split on whitespace.
+	spaced := filepath.Join(dir, "with space")
+	if err := os.MkdirAll(spaced, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	delta := filepath.Join(spaced, "delta1.txt")
+
 	log := filepath.Join(dir, "log.txt")
 	script := filepath.Join(dir, "w.ps1")
-	os.WriteFile(script, []byte("param($p) Add-Content -Path $env:OUTLOG -Value $p\n"), 0o644)
-	os.Setenv("OUTLOG", log)
-	runWatchExec("powershell -NoProfile -File "+script+" {}", filepath.Join(dir, "delta1.txt"), false)
-	deadline := time.Now().Add(5 * time.Second)
+	if err := os.WriteFile(script, []byte("param($p) Add-Content -Path $env:OUTLOG -Value $p\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("OUTLOG", log)
+	runWatchExec("powershell -NoProfile -File "+script+" {}", delta, false)
+
+	// PowerShell can take several seconds to start on a loaded CI runner, and
+	// the temp dir vanishes as soon as the test returns, so poll generously.
+	deadline := time.Now().Add(30 * time.Second)
 	var b []byte
 	var err error
 	for time.Now().Before(deadline) {
@@ -344,7 +357,28 @@ func TestRunWatchExecSubstitution(t *testing.T) {
 	if err != nil || len(b) == 0 {
 		t.Fatalf("exec log not written: %v (content=%q)", err, b)
 	}
-	if !strings.Contains(string(b), "delta1.txt") {
-		t.Fatalf("exec log = %q, want delta1.txt", b)
+	if !strings.Contains(string(b), delta) {
+		t.Fatalf("exec log = %q, want the whole path %q", b, delta)
+	}
+}
+
+func TestSplitCommandLine(t *testing.T) {
+	cases := []struct {
+		in   string
+		want []string
+	}{
+		{`prog a b`, []string{"prog", "a", "b"}},
+		{`prog "C:\Program Files\x"`, []string{"prog", `C:\Program Files\x`}},
+		{`prog  "a b"   c`, []string{"prog", "a b", "c"}},
+		{`prog {}`, []string{"prog", "{}"}},
+		{`prog --file={} tail`, []string{"prog", "--file={}", "tail"}},
+		{`prog ""`, []string{"prog", ""}},
+		{``, nil},
+		{`   `, nil},
+	}
+	for _, tc := range cases {
+		if got := splitCommandLine(tc.in); !reflect.DeepEqual(got, tc.want) {
+			t.Errorf("splitCommandLine(%q) = %#v, want %#v", tc.in, got, tc.want)
+		}
 	}
 }
