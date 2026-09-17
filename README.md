@@ -1,5 +1,7 @@
 # seekfs
 
+[![Windows CI](https://github.com/abhim-dv/seekfs/actions/workflows/windows.yml/badge.svg)](https://github.com/abhim-dv/seekfs/actions/workflows/windows.yml)
+
 `seekfs` is a Windows-first CLI and service for fast local file-name and
 full-path search. It builds compact local indexes and can keep them resident in
 a Windows service so command-line searches avoid loading large databases on
