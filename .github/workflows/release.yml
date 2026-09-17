@@ -16,7 +16,7 @@ jobs:
           # Full history so `gh release create --generate-notes` can build the
           # changelog from the commits since the previous tag.
           fetch-depth: 0
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
       # scripts/build.ps1 produces dist/seekfs-windows-amd64.zip: both binaries,
