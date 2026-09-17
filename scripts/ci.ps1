@@ -95,9 +95,35 @@ Invoke-Native 'go vet' {
     go vet ./...
 }
 
-Invoke-Native 'go test ./...' {
-    go test ./...
+Write-Step 'staticcheck'
+if (-not (Get-Command staticcheck -ErrorAction SilentlyContinue)) {
+    throw 'staticcheck not found; install it with: go install honnef.co/go/tools/cmd/staticcheck@latest'
 }
+# U1000 (unused symbols) is excluded: without a tag-aware run, code that only
+# compiles under the seekfs_ui tag reads as dead.
+$previousPreference = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+try {
+    $staticcheckOut = (& staticcheck '-checks=all,-U1000' ./... 2>&1 | Out-String)
+    $staticcheckCode = $LASTEXITCODE
+} finally {
+    $ErrorActionPreference = $previousPreference
+}
+if ($staticcheckOut -match 'internal error in importing|unsupported version') {
+    throw 'staticcheck is too old for this Go toolchain; upgrade it with: go install honnef.co/go/tools/cmd/staticcheck@latest'
+}
+if ($staticcheckCode -ne 0) {
+    Write-Host $staticcheckOut
+    throw "staticcheck reported findings (exit $staticcheckCode)"
+}
+
+Invoke-Native 'go test ./... (with coverage)' {
+    # Quoted: PowerShell splits an unquoted -flag=value at the dot (go sees ".out").
+    go test '-coverprofile=coverage.out' '-covermode=atomic' ./...
+}
+
+Write-Step 'coverage total'
+Write-Host "  $((go tool cover '-func=coverage.out' | Select-Object -Last 1))"
 
 Invoke-Native 'go test (UI build tags)' {
     go test -tags 'seekfs_ui production' ./cmd/seekfs
